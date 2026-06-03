@@ -177,10 +177,55 @@ The valuable, risky work is deterministic and must not live inside an LLM. Build
 
 ## 7. Data model (SQLite)
 
-WAL mode. Four tables. **Versioning is the heart of the safety story.**
+WAL mode. **Versioning is the heart of the safety story.** `PRAGMA user_version`
+tracks the applied schema version (M1 = 1).
+
+### 7.1 Created NOW (M1 — the read-path snapshot)
+
+A file's stable identity is a **DB-assigned integer surrogate** (`files.id`), anchored
+by `(folder, filename)` at first scan. This is the durable id every later history table
+references; it resolves the §15 identity question. The old `path` column is split into
+the mutable `folder` (absolute directory) + `filename` (basename). Tags are stored in a
+**normalized EAV linked table** (`file_tags`) — one row per value, no raw JSON.
 
 ```sql
--- One row per unique artist name encountered (the dedupe + cache unit)
+CREATE TABLE IF NOT EXISTS files (
+  id              INTEGER PRIMARY KEY,           -- stable surrogate identity
+  folder          TEXT NOT NULL,                 -- absolute directory
+  filename        TEXT NOT NULL,                 -- basename incl. extension
+  ext             TEXT NOT NULL,                 -- lowercased, e.g. '.flac'
+  size_bytes      INTEGER,                       -- signature part 1
+  mtime_ns        INTEGER,                       -- signature part 2 (st_mtime_ns)
+  is_missing      INTEGER NOT NULL DEFAULT 0,    -- 1 = path gone from disk
+  first_seen_at   TEXT NOT NULL,                 -- ISO-8601 UTC
+  updated_at      TEXT NOT NULL,                 -- ISO-8601 UTC
+  tags_updated_at TEXT,                          -- NULL = tags not yet read ("unprocessed")
+  status          TEXT NOT NULL DEFAULT 'scanned',
+  UNIQUE (folder, filename)
+);
+
+CREATE TABLE IF NOT EXISTS file_tags (
+  file_id   INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+  name      TEXT NOT NULL,                -- canonical tag name, lowercase
+  ordinal   INTEGER NOT NULL DEFAULT 0,   -- 0-based index for multi-value tags
+  value     TEXT NOT NULL,
+  PRIMARY KEY (file_id, name, ordinal)
+);
+CREATE INDEX IF NOT EXISTS idx_file_tags_name_value ON file_tags(name, value);
+```
+
+The signature is **`size_bytes` + `mtime_ns`** (fast, NAS-friendly); an incremental
+scan re-reads a file's tags only when that signature changes or the file was never read.
+
+### 7.2 Created LATER (M2/M3 — caches + tag history)
+
+These are **documented, not yet created**. `artist_cache` + `lastfm_cache` land in
+**M2** (Last.fm). `tag_revisions` (the append-only undo log) formally starts in **M3**
+(write path), including the version-0 baseline; it is **re-keyed to `files.id`** with a
+composite PK `(file_id, version)`.
+
+```sql
+-- M2: one row per unique artist name encountered (the dedupe + cache unit)
 CREATE TABLE artist_cache (
   input_name      TEXT PRIMARY KEY,   -- the raw name as found in files
   canonical_name  TEXT,               -- from artist.getCorrection
@@ -191,27 +236,16 @@ CREATE TABLE artist_cache (
   reviewed_at     TEXT
 );
 
--- Raw Last.fm responses, so re-runs never re-hit the API
+-- M2: raw Last.fm responses, so re-runs never re-hit the API
 CREATE TABLE lastfm_cache (
   request_key     TEXT PRIMARY KEY,   -- hash of method+params
   response        TEXT,               -- JSON
   fetched_at      TEXT
 );
 
--- One row per file; points at its current revision
-CREATE TABLE files (
-  path            TEXT PRIMARY KEY,
-  sig             TEXT,               -- size+mtime signature → "needs rescan?"
-  artist_key      TEXT REFERENCES artist_cache(input_name),
-  album           TEXT,
-  current_version INTEGER,            -- → tag_revisions.version
-  status          TEXT,               -- pending|auto|needs_review|approved|applied|error
-  updated_at      TEXT
-);
-
--- APPEND-ONLY revision log. Unique on (path, version). Never updated, never deleted.
+-- M3: APPEND-ONLY revision log, keyed by the stable file_id. Never updated/deleted.
 CREATE TABLE tag_revisions (
-  path            TEXT,
+  file_id         INTEGER REFERENCES files(id),
   version         INTEGER,            -- 0 = original as-found; +1 per write
   created_at      TEXT,
   origin          TEXT,               -- scan | auto | manual | revert
@@ -219,28 +253,24 @@ CREATE TABLE tag_revisions (
   managed_tags    TEXT,              -- JSON: FULL snapshot of managed tags at this version
   diff            TEXT,              -- JSON: {tag: {from, to}} human-readable change
   note            TEXT,
-  PRIMARY KEY (path, version)
+  PRIMARY KEY (file_id, version)
 );
 ```
 
-> **Note — file identity vs. path (relevant once §18 organize lands).** The tables
-> above key files by `path`. That's fine while files never move. The opt-in
-> move/rename feature (**§18**) breaks that assumption: a file's path changes but its
-> tag-revision history must follow it. The plan there is to introduce a stable
-> surrogate `file_id` (content-derived or DB-assigned at first scan) that `files`,
-> `tag_revisions`, and the new `path_revisions` table all reference, demoting `path`
-> to a mutable attribute. We keep `path`-keyed tables for the v1 read/write path and
-> migrate to `file_id` when we build organize, so the two history logs (tags *and*
-> paths) stay linked across a move. Final identity scheme is an open question (§15).
+> **File identity — resolved in M1.** A file's durable identity is the integer
+> surrogate `files.id`, assigned at first scan and anchored by `(folder, filename)`.
+> `path` is now a *mutable* attribute split into `folder` + `filename`, so a future
+> move/rename (§18) only updates those columns while the `id` — and therefore the
+> `tag_revisions` and `path_revisions` history hanging off it — stays continuous.
 
 ### Versioning / undo semantics (your requirement)
 
 - **Version 0** is captured **at first scan, before any write** — the original
   as-found tags. This is the permanent safety baseline.
-- Every write **appends** a new row with an incremented `version`, storing both a
-  **full snapshot** of the managed tag set (`managed_tags`) and a **diff** of what
-  changed. `files.current_version` advances.
-- **Revert(path, target_version)** = read `managed_tags` from the target revision,
+- Every write **appends** a new row (keyed by `file_id`) with an incremented
+  `version`, storing both a **full snapshot** of the managed tag set (`managed_tags`)
+  and a **diff** of what changed.
+- **Revert(file_id, target_version)** = read `managed_tags` from the target revision,
   write them back to the file, then **append a new revision** with
   `origin='revert'` and `reverted_from=target_version`. History is append-only —
   you can revert a revert, and you never lose any prior state.
@@ -337,7 +367,8 @@ scan ──> pending
 
 | Tool | Purpose |
 |---|---|
-| `scan(path)` | Walk a folder, populate `files` + capture version-0 baselines. |
+| `scan_library(path, mode)` | Walk a folder into the `files`/`file_tags` snapshot; `mode` ∈ incremental/full/presence. **(M1, shipped.)** |
+| `library_stats()` | Library-wide snapshot counts (total/present/missing/unprocessed, by ext, tag-value total). **(M1, shipped.)** |
 | `resolve_artists()` | Query Last.fm (cached/paced), classify auto vs needs_review. |
 | `list_pending_review()` | Return artists/files needing human/LLM decisions. |
 | `get_artist_candidate(name)` | Full Last.fm context for one artist (tags, correction, similar). |
@@ -345,8 +376,8 @@ scan ──> pending
 | `commit_artist(input_name)` | Apply approved tags to all that artist's files (bumps versions). |
 | `revert(path, version)` | Restore a file to a prior revision (append-only). |
 | `history(path)` | Show the revision log + diffs for a file. |
-| `stats()` | Library-wide progress (pending/auto/applied/error counts). |
-| `health_check()` | **Readiness probe (M0):** verify settings load, music path is reachable & readable, and the SQLite ledger opens. The first tool we ship; callable from the MCP Inspector to prove the environment is wired up. |
+| `review_stats()` | Review-workflow progress (pending/auto/applied/error counts). |
+| `health_check()` | **Readiness probe (M0, shipped):** verify settings load, music path is reachable & readable, and the SQLite ledger opens. The first tool we shipped; callable from the MCP Inspector to prove the environment is wired up. |
 
 **Organize (opt-in, §18) — added once M6 lands:**
 
@@ -374,11 +405,14 @@ music-tag-mender/             # GitHub repo slug (SEO)
 │   ├── config.py            # settings.json in OS config dir via platformdirs (§19)
 │   ├── engine/
 │   │   ├── db.py             # SQLite connection (WAL); schema added per-feature later
+│   │   ├── schema.py         # DDL for files/file_tags + PRAGMA user_version (M1)
 │   │   ├── doctor.py         # health_check: settings + music path + db readiness (M0)
-│   │   ├── scan.py           # walk library, signatures, version-0 capture
+│   │   ├── scan.py           # filesystem discovery + signatures (size/mtime)
+│   │   ├── store.py          # pure data access for files/file_tags (M1)
+│   │   ├── library.py        # scan orchestration (3 modes) + stats (M1)
 │   │   ├── lastfm.py         # client: getCorrection/getTopTags, cache, pacing
 │   │   ├── classify.py       # vocabulary, thresholds, auto vs review
-│   │   ├── tags.py           # mutagen read/write of managed tag set
+│   │   ├── tags.py           # mutagen read (M1) / write (M3) of the tag set
 │   │   ├── versioning.py     # tag-revision append + revert
 │   │   └── moves.py          # opt-in file/folder reorganization + path_revisions (§18)
 │   ├── data/
@@ -402,8 +436,14 @@ so there is one install, one command, and the MCP server is just one of its mode
 - **M0 — Skeleton.** Repo, `pyproject`, strict ruff + mypy gates, shared logger,
   `settings.json` config, SQLite connection (WAL, no tables yet), FastMCP server +
   CLI wired together, and a working `health_check`/`doctor` that proves the music
-  path is reachable. Dry-run only, nothing writes. **← current milestone.**
-- **M1 — Read path.** `scan` + version-0 capture; `tags.py` read; `stats`.
+  path is reachable. Dry-run only, nothing writes.
+- **M1 — Read path (shipped).** `files` + `file_tags` snapshot (stable integer
+  `file_id`, normalized EAV tags); `scan_library` with three modes
+  (incremental/full/presence); `library_stats`; `tags.py` read via mutagen "easy"
+  mode + alias map. CLI `scan`/`stats` + MCP `scan_library`/`library_stats`. Reads
+  files into the ledger only — never writes music files. The version-0 baseline and
+  `tag_revisions` formally start in **M3** (write path), per the deferred-audit
+  decision. **← current milestone.**
 - **M2 — Last.fm.** Client with cache + pacing; `resolve_artists`; classification.
 - **M3 — Write path + versioning.** `commit_artist`, append revisions,
   atomic writes, `revert`, `history`. **Backups proven before any real run.**
@@ -418,12 +458,14 @@ so there is one install, one command, and the MCP server is just one of its mode
 
 - Genre scope default: artist-level only in v1, or detect mixed-catalog artists?
 - Multi-value genres (e.g. `synthwave; retrowave`) — allow N, or force single?
-- Signature: `size+mtime` (fast, NAS-friendly) vs content hash (safer, slow)?
+- ~~Signature: `size+mtime` vs content hash?~~ **RESOLVED (M1):** `size_bytes` +
+  `mtime_ns` (`st_mtime_ns`) — fast and NAS-friendly.
 - Should `revert` be exposed in the CLI bulk path or MCP-only (to keep it deliberate)?
-- **Organize (§18):** what is the stable `file_id` — content hash (survives moves
-  *and* re-tags, but slow on a NAS) vs. a DB-assigned id anchored by `(size, mtime,
-  path)` at first scan (fast, but re-identifying a file moved outside the tool is
-  harder)?
+- ~~Tag storage: raw JSON vs normalized?~~ **RESOLVED (M1):** normalized EAV linked
+  table (`file_tags`), one row per value, no raw JSON.
+- ~~Stable `file_id` scheme?~~ **RESOLVED (M1):** DB-assigned integer surrogate
+  (`files.id`), anchored by `(folder, filename)` at first scan. (Re-identifying a file
+  moved *outside* the tool is handled later by the move log, not by the id itself.)
 - **Organize (§18):** what is the default target naming scheme
   (`Artist/(Year) Album/NN Title.ext`?), and how configurable should it be?
 - **Organize (§18):** when a folder rename collapses two artist spellings into one
@@ -599,3 +641,48 @@ LLM-assisted development. All three must pass before anything is considered done
    library.
 
 Exact commands live in `CLAUDE.md` so any fresh context can run the gate immediately.
+
+---
+
+## 22. Database naming conventions
+
+Applied consistently across every table the engine creates, so the schema reads
+predictably as it grows milestone by milestone:
+
+- **Tables:** plural `snake_case` (`files`, `file_tags`, `artist_cache`).
+- **Surrogate primary key:** a bare `id` (`INTEGER PRIMARY KEY`) where a table needs a
+  stable internal identity (e.g. `files.id`).
+- **Foreign keys:** `<singular>_id` referencing the parent's `id` (e.g. `file_id`
+  references `files(id)`); declare `ON DELETE CASCADE` where children are owned.
+- **Caches:** keep the `_cache` suffix (`artist_cache`, `lastfm_cache`).
+- **Timestamps:** ISO-8601 **UTC** stored as `TEXT`, with an `_at` suffix
+  (`first_seen_at`, `updated_at`, `tags_updated_at`). Produced via
+  `datetime.now(UTC).isoformat()` — never a naive datetime.
+- **Booleans:** `INTEGER` 0/1 with an `is_` prefix (`is_missing`).
+- **Append-only logs:** `_revisions` suffix (`tag_revisions`, `path_revisions`) with a
+  composite PK `(file_id, version)`; **version 0 = baseline**, never updated/deleted.
+- **SQL safety:** all values bound via `?` placeholders (never string-formatted —
+  bandit S608); identifier-only interpolation (column lists) is the sole exception and
+  carries a `# noqa: S608` with no untrusted input.
+
+## 23. CLI & MCP tool conventions
+
+The three layers (core engine ↔ CLI ↔ MCP) map **1:1** onto the same operation, and a
+shared enum (`ScanMode`) is used identically across all three so behavior can't drift:
+
+- **Engine functions:** `snake_case`, **verb-first**, descriptive
+  (`scan_library`, `library_stats`, `read_tags`). All logic lives here; the frontends
+  are thin marshalling wrappers.
+- **CLI subcommands:** terse verbs matching the existing style (`doctor`, `scan`,
+  `stats`) — short to type for the unattended bulk path.
+- **MCP tool names:** descriptive `verb_noun` (`scan_library`, `library_stats`,
+  `health_check`) for LLM clarity, since the tool name is part of the model-facing UX
+  and benefits from being self-describing.
+- **The 1:1 map (M1 example):** core `library.scan_library` ↔ CLI `scan` ↔ MCP
+  `scan_library`; core `library.library_stats` ↔ CLI `stats` ↔ MCP `library_stats`.
+- **Shared enums:** `ScanMode` (`incremental`/`full`/`presence`) is the single source
+  of truth; the CLI takes it directly as a Typer option and the MCP tool accepts the
+  equivalent `Literal[...]` string and maps it onto the same enum.
+- **Errors:** the engine raises `ValueError` for caller/config problems; the CLI
+  catches it, echoes the message, and exits non-zero; the MCP tool catches it and
+  returns `{"ok": False, "error": ...}` (never raising across the JSON-RPC boundary).

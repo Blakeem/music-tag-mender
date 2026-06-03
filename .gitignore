@@ -1,3 +1,19 @@
+# ── TagMend project-specific ───────────────────────────────────────────────
+# Local test music library: real, copyrighted files used during development and
+# manual testing. NEVER commit these. Unit tests must use synthesized fixtures
+# under tests/fixtures/ instead (see CLAUDE.md / PLAN.md §21).
+music/
+
+# Local SQLite ledger if a dev ever points it at the repo root
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+
+# Local settings copy if one is dropped in-repo (real settings live in the OS
+# config dir; see src/tagmend/config.py)
+/settings.json
+# ───────────────────────────────────────────────────────────────────────────
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

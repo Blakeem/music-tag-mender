@@ -1,0 +1,126 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Project metadata
+# ─────────────────────────────────────────────────────────────────────────────
+[project]
+name = "tagmend"
+version = "0.0.1"
+description = "Mend your music tags — genre & artist-name cleanup from Last.fm community tags, with full revertible history."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [{ name = "Blake", email = "blakeem@gmail.com" }]
+keywords = [
+    "music", "metadata", "id3", "flac", "tagging",
+    "genre", "lastfm", "musicbrainz", "mcp", "cli",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Sound/Audio",
+    "Typing :: Typed",
+]
+dependencies = [
+    "mutagen>=1.47",     # multi-format tag read/write (FLAC/MP3/M4A)
+    "mcp>=1.2",          # official MCP SDK; FastMCP lives in mcp.server.fastmcp
+    "httpx>=0.27",       # async-friendly HTTP for Last.fm
+    "typer>=0.12",       # CLI framework (type-hint driven)
+    "platformdirs>=4.0", # OS-correct config/data dirs for settings.json + ledger
+    "pyyaml>=6.0",       # genre vocabulary file
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "mypy>=1.10",
+    "ruff>=0.6",
+    "types-PyYAML>=6.0",
+]
+
+[project.scripts]
+tagmend = "tagmend.cli:app"
+
+[project.urls]
+Homepage = "https://github.com/blakeem/music-tag-mender"
+Repository = "https://github.com/blakeem/music-tag-mender"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tagmend"]
+
+[tool.hatch.build]
+# Ship the default genre vocabulary alongside the package.
+artifacts = ["src/tagmend/data/*.yml"]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Ruff — VERY strict. We opt into the entire rule set and then carve out only the
+# handful that conflict with the formatter or with each other. Tuned to surface
+# bugs, security issues, and maintainability problems early (LLM-assisted dev).
+# ─────────────────────────────────────────────────────────────────────────────
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = [
+    "D203",   # one-blank-line-before-class — conflicts with D211 (we use D211)
+    "D213",   # multi-line-summary-second-line — conflicts with D212 (we use D212)
+    "COM812", # trailing comma — handled by the formatter; avoids churn
+    "ISC001", # implicit-str-concat on one line — conflicts with the formatter
+    "TRY003", # allow descriptive messages passed to exceptions
+    "CPY001", # don't require a copyright header on every file
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests may assert, use magic values, skip docstrings/annotations, and live
+# outside an importable package.
+"tests/**" = [
+    "S101",    # assert is the point of a test
+    "ANN",     # don't require full annotations on test functions/fixtures
+    "D",       # don't require docstrings in tests
+    "PLR2004", # magic values are fine in assertions
+    "INP001",  # tests/ is intentionally not a package
+    "SLF001",  # tests may poke private members
+    "ARG",     # pytest fixtures are passed by name, sometimes unused
+    "TC",      # don't force type-checking import blocks in tests
+]
+# Typer expresses CLI flags as boolean parameters; that's not a "boolean trap".
+"src/tagmend/cli.py" = ["FBT001", "FBT002"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "pep257"
+
+[tool.ruff.format]
+docstring-code-format = true
+
+# ─────────────────────────────────────────────────────────────────────────────
+# mypy — strict static typing.
+# ─────────────────────────────────────────────────────────────────────────────
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unreachable = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_no_return = true
+files = ["src", "tests"]
+
+[[tool.mypy.overrides]]
+# mutagen does not ship complete type information.
+module = ["mutagen.*"]
+ignore_missing_imports = true
+
+# ─────────────────────────────────────────────────────────────────────────────
+# pytest
+# ─────────────────────────────────────────────────────────────────────────────
+[tool.pytest.ini_options]
+addopts = "-ra -q --strict-markers --strict-config"
+testpaths = ["tests"]

@@ -1,0 +1,45 @@
+# TagMend default genre vocabulary (starter set — user-overridable).
+#
+# Two parts:
+#   allow:  Last.fm community tags we accept as genre signal. Anything not listed
+#           here is treated as junk (e.g. "seen live", "favorites", "00s").
+#   map:    Normalize a raw Last.fm tag (left) to the canonical genre string we
+#           write to files (right). Tags in `allow` but absent from `map` are
+#           written as-is (title-cased at resolution time).
+#
+# This is intentionally small for M0. It will be tuned heavily in M5 and is the
+# main place the LLM-in-the-loop adds value (see PLAN.md §9/§10).
+
+allow:
+  # synthwave family
+  - synthwave
+  - retrowave
+  - outrun
+  - darksynth
+  - synthpop
+  - synth
+  # rock family
+  - rock
+  - alternative rock
+  - alternative
+  - grunge
+  - hard rock
+  - progressive rock
+  # industrial / electronic
+  - industrial
+  - industrial rock
+  - industrial metal
+  - electronic
+  - electro
+  - ebm
+  # broad fallbacks
+  - metal
+  - pop
+  - punk
+  - indie
+
+map:
+  synth: synthwave
+  outrun: synthwave
+  electro: electronic
+  alternative: alternative rock

@@ -17,6 +17,9 @@ from mcp.types import TextContent
 
 from conftest import make_track
 from tagmend import mcp_server
+from tagmend.config import load_settings
+from tagmend.engine import store
+from tagmend.engine.db import connect
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -76,8 +79,137 @@ def test_real_call_tool_roundtrip(music_dir: Path) -> None:
 def test_list_tools_exposes_expected_tools_and_schema() -> None:
     tools = asyncio.run(mcp_server.mcp.list_tools())
     names = {tool.name for tool in tools}
-    assert {"health_check", "scan_library", "library_stats"} <= names
+    assert {
+        "health_check",
+        "scan_library",
+        "library_stats",
+        "list_files",
+        "get_file",
+        "stage_tags",
+        "unstage_tags",
+        "diff_tags",
+        "commit_tags",
+        "history_tags",
+        "revert_tags",
+        "list_commits",
+        "get_commit",
+    } <= names
+    # Retired names must be gone.
+    assert names.isdisjoint({"unstage", "list_pending", "resume_commits"})
 
     scan_tool = next(tool for tool in tools if tool.name == "scan_library")
     mode_schema = scan_tool.inputSchema["properties"]["mode"]
     assert mode_schema["enum"] == ["incremental", "full", "presence"]
+
+
+def _scanned_track_id(music_dir: Path, filename: str = "track.mp3") -> int:
+    """Make + scan one track via the MCP scan tool and return its stable file id."""
+    track = make_track(music_dir / filename, {"genre": ["Electronic"]})
+    mcp_server.scan_library(path=str(music_dir))
+    conn = connect(load_settings().db_path)
+    try:
+        row = store.get_file(conn, str(music_dir), track.name)
+        assert row is not None
+        return row.id
+    finally:
+        conn.close()
+
+
+def test_stage_diff_commit_roundtrip(music_dir: Path) -> None:
+    file_id = _scanned_track_id(music_dir)
+
+    assert mcp_server.stage_tags(file_id, {"genre": ["Synthwave"]}) == {"ok": True}
+
+    diff = mcp_server.diff_tags()
+    assert diff["ok"] is True
+    changes = diff["changes"]
+    assert isinstance(changes, list)
+    assert len(changes) == 1
+    assert changes[0]["diff"] == {"genre": {"from": ["Electronic"], "to": ["Synthwave"]}}
+
+    committed = mcp_server.commit_tags(message="reclassify")
+    assert committed["ok"] is True
+    assert committed["committed"] == 1
+    assert committed["missing_files"] == []
+    assert "resumed" not in committed
+
+
+def test_stage_tags_unmanaged_key_returns_error(music_dir: Path) -> None:
+    file_id = _scanned_track_id(music_dir)
+
+    payload = mcp_server.stage_tags(file_id, {"title": ["Nope"]})
+
+    assert payload["ok"] is False
+    assert "error" in payload
+
+
+def test_unstage_tags_and_empty_commit_are_clean_noops(music_dir: Path) -> None:
+    file_id = _scanned_track_id(music_dir)
+    mcp_server.stage_tags(file_id, {"genre": ["Synthwave"]})
+
+    assert mcp_server.unstage_tags(file_id) == {"ok": True, "removed": True}
+    assert mcp_server.diff_tags()["changes"] == []
+
+    # Nothing staged -> a commit is a clean no-op with no commit id.
+    committed = mcp_server.commit_tags()
+    assert committed["ok"] is True
+    assert committed["commit_id"] is None
+    assert committed["committed"] == 0
+
+
+def test_list_files_and_get_file(music_dir: Path) -> None:
+    file_id = _scanned_track_id(music_dir)
+
+    listed = mcp_server.list_files()
+    assert listed["ok"] is True
+    files = listed["files"]
+    assert isinstance(files, list)
+    assert len(files) == 1
+    assert files[0]["file_id"] == file_id
+    assert files[0]["managed_tags"]["genre"] == ["Electronic"]
+
+    got = mcp_server.get_file(file_id)
+    assert got["ok"] is True
+    assert got["file"]["file_id"] == file_id
+
+    assert mcp_server.get_file(9999)["ok"] is False
+
+
+def test_history_and_revert_roundtrip(music_dir: Path) -> None:
+    file_id = _scanned_track_id(music_dir)  # genre Electronic
+    mcp_server.stage_tags(file_id, {"genre": ["Synthwave"]})
+    mcp_server.commit_tags()
+
+    hist = mcp_server.history_tags(file_id)
+    assert hist["ok"] is True
+    history = hist["history"]
+    assert isinstance(history, list)
+    assert [r["version"] for r in history] == [0, 1]
+
+    reverted = mcp_server.revert_tags(file_id, 0)
+    assert reverted["ok"] is True
+    assert reverted["new_version"] == 2
+
+    # An unknown version is an error, not a crash.
+    assert mcp_server.revert_tags(file_id, 99)["ok"] is False
+
+
+def test_list_commits_and_get_commit(music_dir: Path) -> None:
+    file_id = _scanned_track_id(music_dir)
+    mcp_server.stage_tags(file_id, {"genre": ["Synthwave"]})
+    committed = mcp_server.commit_tags(message="reclassify")
+    commit_id = committed["commit_id"]
+    assert isinstance(commit_id, int)
+
+    listed = mcp_server.list_commits()
+    assert listed["ok"] is True
+    commits_list = listed["commits"]
+    assert isinstance(commits_list, list)
+    assert any(c["id"] == commit_id for c in commits_list)
+
+    got = mcp_server.get_commit(commit_id)
+    assert got["ok"] is True
+    assert got["commit"]["status"] == "applied"
+    assert got["commit"]["message"] == "reclassify"
+
+    assert mcp_server.get_commit(9999)["ok"] is False

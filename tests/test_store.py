@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import sqlite3
 from typing import TYPE_CHECKING
+
+import pytest
 
 from tagmend.engine import store
 
 if TYPE_CHECKING:
-    import sqlite3
     from pathlib import Path
 
 _NOW = "2026-06-02T00:00:00+00:00"
@@ -168,3 +170,129 @@ def test_delete_file_cascades_to_tags(db_conn: sqlite3.Connection) -> None:
         (file_id,),
     ).fetchone()
     assert remaining[0] == 0
+
+
+# --- tag_revisions ------------------------------------------------------------------
+
+
+def _insert_revision(  # noqa: PLR0913 - thin keyword-only wrapper over insert_revision
+    conn: sqlite3.Connection,
+    file_id: int,
+    *,
+    version: int,
+    origin: str = "manual",
+    managed_tags: dict[str, list[str]] | None = None,
+    diff: dict[str, dict[str, list[str]]] | None = None,
+    reverted_from: int | None = None,
+) -> None:
+    store.insert_revision(
+        conn,
+        file_id=file_id,
+        version=version,
+        origin=origin,
+        managed_tags={} if managed_tags is None else managed_tags,
+        diff={} if diff is None else diff,
+        now=_NOW,
+        reverted_from=reverted_from,
+    )
+
+
+def test_get_file_by_id_round_trip(db_conn: sqlite3.Connection) -> None:
+    file_id = _insert(db_conn, folder="/lib", filename="a.mp3")
+
+    row = store.get_file_by_id(db_conn, file_id)
+    assert row is not None
+    assert row.id == file_id
+    assert row.folder == "/lib"
+    assert row.filename == "a.mp3"
+    assert store.get_file_by_id(db_conn, 9999) is None
+
+
+def test_max_version_none_when_unversioned(db_conn: sqlite3.Connection) -> None:
+    file_id = _insert(db_conn, folder="/lib", filename="a.mp3")
+    assert store.max_version(db_conn, file_id) is None
+
+
+def test_insert_and_get_revision_round_trip(db_conn: sqlite3.Connection) -> None:
+    file_id = _insert(db_conn, folder="/lib", filename="a.mp3")
+
+    store.insert_revision(
+        db_conn,
+        file_id=file_id,
+        version=0,
+        origin="scan",
+        managed_tags={"genre": ["Electronic"], "artist": ["A"]},
+        diff={},
+        now=_NOW,
+    )
+
+    rev = store.get_revision(db_conn, file_id, 0)
+    assert rev is not None
+    assert rev.version == 0
+    assert rev.origin == "scan"
+    assert rev.reverted_from is None
+    assert rev.commit_id is None
+    assert rev.note is None
+    # JSON columns come back as parsed, typed maps — not raw strings.
+    assert rev.managed_tags == {"genre": ["Electronic"], "artist": ["A"]}
+    assert rev.diff == {}
+    assert store.max_version(db_conn, file_id) == 0
+
+
+def test_get_revisions_orders_by_version(db_conn: sqlite3.Connection) -> None:
+    file_id = _insert(db_conn, folder="/lib", filename="a.mp3")
+    # Insert out of order to prove ORDER BY version (not insertion order).
+    for version in (2, 0, 1):
+        _insert_revision(db_conn, file_id, version=version)
+
+    revisions = store.get_revisions(db_conn, file_id)
+    assert [r.version for r in revisions] == [0, 1, 2]
+    assert store.max_version(db_conn, file_id) == 2
+
+
+def test_get_revision_absent_returns_none(db_conn: sqlite3.Connection) -> None:
+    file_id = _insert(db_conn, folder="/lib", filename="a.mp3")
+    assert store.get_revision(db_conn, file_id, 0) is None
+
+
+def test_insert_revision_rejects_unknown_origin(db_conn: sqlite3.Connection) -> None:
+    file_id = _insert(db_conn, folder="/lib", filename="a.mp3")
+    with pytest.raises(ValueError, match="unknown revision origin"):
+        _insert_revision(db_conn, file_id, version=0, origin="bogus")
+
+
+def test_duplicate_revision_version_raises(db_conn: sqlite3.Connection) -> None:
+    file_id = _insert(db_conn, folder="/lib", filename="a.mp3")
+    _insert_revision(db_conn, file_id, version=0, origin="scan")
+    with pytest.raises(sqlite3.IntegrityError):
+        _insert_revision(db_conn, file_id, version=0)
+
+
+def test_revisions_cascade_on_file_delete(db_conn: sqlite3.Connection) -> None:
+    file_id = _insert(db_conn, folder="/lib", filename="a.mp3")
+    _insert_revision(db_conn, file_id, version=0, managed_tags={"genre": ["X"]})
+
+    db_conn.execute("DELETE FROM files WHERE id = ?", (file_id,))
+
+    remaining = db_conn.execute(
+        "SELECT COUNT(*) FROM tag_revisions WHERE file_id = ?",
+        (file_id,),
+    ).fetchone()
+    assert remaining[0] == 0
+
+
+def test_revision_json_serialized_with_sorted_keys(db_conn: sqlite3.Connection) -> None:
+    file_id = _insert(db_conn, folder="/lib", filename="a.mp3")
+    _insert_revision(
+        db_conn,
+        file_id,
+        version=0,
+        managed_tags={"genre": ["X"], "artist": ["A"]},
+    )
+
+    raw = db_conn.execute(
+        "SELECT managed_tags FROM tag_revisions WHERE file_id = ? AND version = 0",
+        (file_id,),
+    ).fetchone()[0]
+    # sort_keys=True + compact separators -> deterministic, "artist" before "genre".
+    assert raw == '{"artist":["A"],"genre":["X"]}'

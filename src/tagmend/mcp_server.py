@@ -13,7 +13,7 @@ from typing import Literal
 from mcp.server.fastmcp import FastMCP
 
 from tagmend.config import load_settings
-from tagmend.engine import library
+from tagmend.engine import commits, library, staging, versioning
 from tagmend.engine.doctor import run_health_check
 from tagmend.engine.library import ScanMode
 from tagmend.log import get_logger
@@ -81,6 +81,227 @@ def library_stats() -> dict[str, object]:
     later resolve/commit steps.
     """
     return {"ok": True, **library.library_stats(load_settings())}
+
+
+@mcp.tool()
+def stage_tags(
+    file_id: int,
+    tags: dict[str, list[str]],
+    note: str | None = None,
+) -> dict[str, object]:
+    """Stage a managed-tag change for one file (the git "index"). Writes nothing to disk.
+
+    Records *tags* as the desired target for *file_id*, replacing any pending change for
+    that file. Only managed tags are allowed (``genre``, ``artist``, ``albumartist``,
+    ``musicbrainz_artistid``). The music file is not touched and no history is recorded
+    until you call ``commit_tags``.
+
+    Args:
+        file_id: Stable id of the file (from ``scan_library`` / the snapshot).
+        tags: Target managed tags as name -> ordered values, e.g. ``{"genre": ["Synthwave"]}``.
+        note: Optional free-text note stored with the eventual revision.
+
+    Returns:
+        ``{"ok": True}`` on success, or ``{"ok": False, "error": ...}`` on a bad request.
+    """
+    try:
+        staging.stage_tags(
+            load_settings(),
+            file_id=file_id,
+            managed_tags=tags,
+            note=note,
+        )
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    return {"ok": True}
+
+
+@mcp.tool()
+def unstage_tags(file_id: int) -> dict[str, object]:
+    """Remove a pending staged change for one file.
+
+    Returns ``{"ok": True, "removed": <bool>}`` — ``removed`` is ``False`` when the file
+    had nothing staged.
+    """
+    removed = staging.unstage_tags(load_settings(), file_id=file_id)
+    return {"ok": True, "removed": removed}
+
+
+@mcp.tool()
+def diff_tags(path: str | None = None) -> dict[str, object]:
+    """Show staged-but-uncommitted tag changes, enriched with the current→target diff.
+
+    This is ``git diff --staged`` (staged-vs-snapshot), not working-tree: ``current`` is
+    the last committed/scanned snapshot and may lag the file on disk after an interrupted
+    commit. A no-op stage still appears, with ``diff == {}``.
+
+    Args:
+        path: When given, only staged changes for files at this folder or nested under it
+            are returned; otherwise all staged changes are listed.
+
+    Returns:
+        ``{"ok": True, "changes": [{file_id, folder, filename, is_missing, origin, note,
+        staged_at, current, target, diff}, ...]}``.
+    """
+    changes = staging.diff_tags(
+        load_settings(),
+        root=Path(path) if path is not None else None,
+    )
+    return {"ok": True, "changes": [view.to_dict() for view in changes]}
+
+
+@mcp.tool()
+def commit_tags(message: str | None = None, path: str | None = None) -> dict[str, object]:
+    """Apply all staged tag changes to disk as one revertible commit.
+
+    Writes each staged file's target tags to disk and appends an append-only revision
+    under a shared commit id, so the whole batch reverts as a unit. Files that vanished
+    from disk since staging are flagged missing, dropped, and reported under
+    ``missing_files`` — the commit still completes for the rest. Any commit left
+    ``applying`` by a prior crash is marked interrupted first and its leftover staged rows
+    are swept into this commit.
+
+    Args:
+        message: Optional commit message stored on the commit.
+        path: When given, only staged changes for files at this folder or nested under it
+            are committed; otherwise all staged changes are committed.
+
+    Returns:
+        ``{"ok": True, ...}`` with per-file ``outcomes`` and ``committed`` / ``noop`` /
+        ``missing`` counts, or ``{"ok": False, "error": ...}`` on a bad request.
+    """
+    try:
+        result = staging.commit_tags(
+            load_settings(),
+            message=message,
+            root=Path(path) if path is not None else None,
+        )
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    return {"ok": True, **result.to_dict()}
+
+
+@mcp.tool()
+def list_files(path: str | None = None, limit: int | None = None) -> dict[str, object]:
+    """List tracked files with their current managed tags (to discover file ids).
+
+    Each entry carries the stable ``file_id`` you pass to ``stage_tags`` / ``history_tags``
+    / ``revert_tags``, plus the file's folder/filename and current managed tags
+    (``genre``, ``artist``, ``albumartist``, ``musicbrainz_artistid``). Run ``scan_library``
+    first to populate the snapshot.
+
+    Args:
+        path: When given, only files at this folder or nested under it are returned.
+        limit: Cap the number of files returned (applied before reading tags).
+
+    Returns:
+        ``{"ok": True, "files": [{file_id, folder, filename, ext, is_missing,
+        managed_tags}, ...]}``.
+    """
+    views = library.list_files(
+        load_settings(),
+        root=Path(path) if path is not None else None,
+        limit=limit,
+    )
+    return {"ok": True, "files": [view.to_dict() for view in views]}
+
+
+@mcp.tool()
+def get_file(file_id: int) -> dict[str, object]:
+    """Return one tracked file with its current managed tags, by stable ``file_id``.
+
+    Returns ``{"ok": True, "file": {file_id, folder, filename, ext, is_missing,
+    managed_tags}}``, or ``{"ok": False, "error": ...}`` if the id is unknown.
+    """
+    view = library.get_file_view(load_settings(), file_id)
+    if view is None:
+        return {"ok": False, "error": f"unknown file_id={file_id}"}
+    return {"ok": True, "file": view.to_dict()}
+
+
+@mcp.tool()
+def history_tags(file_id: int) -> dict[str, object]:
+    """Show the append-only tag-revision log for one file, oldest (version 0) first.
+
+    Each revision carries its ``version``, ``origin`` (scan|auto|manual|revert), the
+    ``commit_id`` that grouped it, the full ``managed_tags`` snapshot at that version, and
+    the ``diff`` from the prior version. Use a ``version`` here with ``revert_tags``.
+
+    Returns ``{"ok": True, "history": [{version, created_at, origin, reverted_from,
+    commit_id, managed_tags, diff, note}, ...]}`` (empty if the file has no history).
+    """
+    revisions = versioning.history_for(load_settings(), file_id)
+    return {
+        "ok": True,
+        "history": [
+            {
+                "version": r.version,
+                "created_at": r.created_at,
+                "origin": r.origin,
+                "reverted_from": r.reverted_from,
+                "commit_id": r.commit_id,
+                "managed_tags": r.managed_tags,
+                "diff": r.diff,
+                "note": r.note,
+            }
+            for r in revisions
+        ],
+    }
+
+
+@mcp.tool()
+def revert_tags(file_id: int, version: int, note: str | None = None) -> dict[str, object]:
+    """Restore a file's managed tags to a prior ``version`` (append-only, revertible).
+
+    Writes the target revision's tags back to disk and appends a *new* ``revert`` revision
+    — nothing is destroyed, and you can revert a revert. Get valid versions from
+    ``history_tags``.
+
+    Returns ``{"ok": True, "new_version": int}``, or ``{"ok": False, "error": ...}`` if the
+    file or version is unknown or the file is missing on disk.
+    """
+    try:
+        new_version = versioning.revert(load_settings(), file_id, version, note=note)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    return {"ok": True, "new_version": new_version}
+
+
+@mcp.tool()
+def list_commits(limit: int | None = None) -> dict[str, object]:
+    """List commits newest first (the revertible units that group tag changes).
+
+    Returns ``{"ok": True, "commits": [{id, created_at, origin, message, reverted_from,
+    status}, ...]}``. ``status`` is ``applied`` (clean), ``applying`` (in flight), or
+    ``interrupted`` (a crashed run whose leftovers were swept into a later commit).
+    """
+    rows = commits.list_commits_for(load_settings(), limit=limit)
+    return {"ok": True, "commits": [_commit_to_dict(c) for c in rows]}
+
+
+@mcp.tool()
+def get_commit(commit_id: int) -> dict[str, object]:
+    """Return one commit by id.
+
+    Returns ``{"ok": True, "commit": {id, created_at, origin, message, reverted_from,
+    status}}``, or ``{"ok": False, "error": ...}`` if the id is unknown.
+    """
+    commit = commits.get_commit_for(load_settings(), commit_id)
+    if commit is None:
+        return {"ok": False, "error": f"unknown commit_id={commit_id}"}
+    return {"ok": True, "commit": _commit_to_dict(commit)}
+
+
+def _commit_to_dict(commit: commits.Commit) -> dict[str, object]:
+    """JSON-serializable form of a commit row."""
+    return {
+        "id": commit.id,
+        "created_at": commit.created_at,
+        "origin": commit.origin,
+        "message": commit.message,
+        "reverted_from": commit.reverted_from,
+        "status": commit.status,
+    }
 
 
 def run() -> None:

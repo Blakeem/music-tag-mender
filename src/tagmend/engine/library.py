@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING
 
 import mutagen
 
-from tagmend.engine import db, scan, schema, store
+from tagmend.engine import db, scan, schema, store, versioning
 from tagmend.engine.tags import read_tags
 from tagmend.log import get_logger
 
@@ -34,6 +34,78 @@ if TYPE_CHECKING:
     from tagmend.config import Settings
 
 logger = get_logger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class FileView:
+    """One tracked file plus its current managed tags, for the discovery tools."""
+
+    file_id: int
+    folder: str
+    filename: str
+    ext: str
+    is_missing: bool
+    managed_tags: dict[str, list[str]]
+
+    def to_dict(self) -> dict[str, object]:
+        """JSON-serializable form for the MCP tool."""
+        return {
+            "file_id": self.file_id,
+            "folder": self.folder,
+            "filename": self.filename,
+            "ext": self.ext,
+            "is_missing": self.is_missing,
+            "managed_tags": self.managed_tags,
+        }
+
+
+def _to_view(conn: sqlite3.Connection, row: store.FileRow) -> FileView:
+    """Build a :class:`FileView` from a file row, reading its managed-tag subset."""
+    return FileView(
+        file_id=row.id,
+        folder=row.folder,
+        filename=row.filename,
+        ext=row.ext,
+        is_missing=row.is_missing,
+        managed_tags=versioning.managed_subset(store.get_tags(conn, row.id)),
+    )
+
+
+def list_files(
+    settings: Settings,
+    *,
+    root: Path | None = None,
+    limit: int | None = None,
+) -> list[FileView]:
+    """Return tracked files (id order) with their managed tags, for discovery.
+
+    Optionally limited to files under *root* and/or capped at *limit* rows. The cap is
+    applied before reading tags, so a large library stays cheap to browse. Read-only.
+    """
+    connection = db.connect(settings.db_path)
+    try:
+        schema.apply_schema(connection)
+        rows = (
+            store.tracked_files_under(connection, root)
+            if root is not None
+            else store.list_files(connection, limit=limit)
+        )
+        if root is not None and limit is not None:
+            rows = rows[:limit]
+        return [_to_view(connection, row) for row in rows]
+    finally:
+        connection.close()
+
+
+def get_file_view(settings: Settings, file_id: int) -> FileView | None:
+    """Return one tracked file with its managed tags, or ``None`` if unknown. Read-only."""
+    connection = db.connect(settings.db_path)
+    try:
+        schema.apply_schema(connection)
+        row = store.get_file_by_id(connection, file_id)
+        return None if row is None else _to_view(connection, row)
+    finally:
+        connection.close()
 
 
 class ScanMode(StrEnum):

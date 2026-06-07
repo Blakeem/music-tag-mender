@@ -5,7 +5,10 @@ from __future__ import annotations
 from pathlib import Path
 
 from tagmend.config import Settings
+from tagmend.engine import commits
+from tagmend.engine.db import connect
 from tagmend.engine.doctor import run_health_check
+from tagmend.engine.schema import apply_schema
 
 
 def _settings(music_path: Path | None, tmp_path: Path) -> Settings:
@@ -19,7 +22,29 @@ def _settings(music_path: Path | None, tmp_path: Path) -> Settings:
 def test_passes_for_valid_library(temp_library: Path, tmp_path: Path) -> None:
     report = run_health_check(_settings(temp_library, tmp_path))
     assert report.ok
-    assert {c.name for c in report.checks} == {"music_path", "database"}
+    assert {c.name for c in report.checks} == {"music_path", "database", "commits"}
+
+
+def test_interrupted_commit_is_reported_but_not_a_failure(
+    temp_library: Path,
+    tmp_path: Path,
+) -> None:
+    settings = _settings(temp_library, tmp_path)
+    # Leave a commit stuck in 'applying' (a crash remnant).
+    conn = connect(settings.db_path)
+    try:
+        apply_schema(conn)
+        commits.create_commit(conn, origin="manual", message=None, now="2026-06-02T00:00:00+00:00")
+        conn.commit()
+    finally:
+        conn.close()
+
+    report = run_health_check(settings)
+
+    assert report.ok  # informational only — never flips overall readiness
+    commits_check = next(c for c in report.checks if c.name == "commits")
+    assert "interrupted" in commits_check.detail
+    assert commits_check.ok
 
 
 def test_to_dict_shape(temp_library: Path, tmp_path: Path) -> None:

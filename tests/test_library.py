@@ -14,7 +14,13 @@ from conftest import make_track
 from tagmend.config import Settings
 from tagmend.engine import store
 from tagmend.engine.db import connect
-from tagmend.engine.library import ScanMode, library_stats, scan_library
+from tagmend.engine.library import (
+    ScanMode,
+    get_file_view,
+    library_stats,
+    list_files,
+    scan_library,
+)
 from tagmend.engine.schema import apply_schema
 
 if TYPE_CHECKING:
@@ -56,6 +62,52 @@ def _file_row(settings: Settings, folder: Path, filename: str) -> store.FileRow:
         return row
     finally:
         conn.close()
+
+
+def test_list_files_returns_views_with_managed_tags(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    _populate(music_dir, _N)
+    scan_library(engine_settings)
+
+    views = list_files(engine_settings)
+
+    assert len(views) == _N
+    first = views[0]
+    assert first.filename == "track00.mp3"
+    assert first.is_missing is False
+    # Only managed tags surface (artist/genre managed; title would be dropped).
+    assert first.managed_tags["genre"] == ["Synthwave"]
+    assert first.managed_tags["artist"] == ["Artist 0"]
+
+
+def test_list_files_respects_limit_and_root(
+    engine_settings: Settings,
+    music_dir: Path,
+    tmp_path: Path,
+) -> None:
+    _populate(music_dir, _N)
+    other = tmp_path / "elsewhere"
+    make_track(other / "x.mp3", {"genre": ["Jazz"]})
+    scan_library(engine_settings, path=music_dir)
+    scan_library(engine_settings, path=other)
+
+    assert len(list_files(engine_settings, limit=2)) == 2
+    under_music = list_files(engine_settings, root=music_dir)
+    assert {v.filename for v in under_music} == {"track00.mp3", "track01.mp3", "track02.mp3"}
+
+
+def test_get_file_view(engine_settings: Settings, music_dir: Path) -> None:
+    track = _populate(music_dir, 1)[0]
+    scan_library(engine_settings)
+    file_id = _file_row(engine_settings, music_dir, track.name).id
+
+    view = get_file_view(engine_settings, file_id)
+    assert view is not None
+    assert view.file_id == file_id
+    assert view.managed_tags["genre"] == ["Synthwave"]
+    assert get_file_view(engine_settings, 9999) is None
 
 
 def test_first_scan_adds_and_reads(engine_settings: Settings, music_dir: Path) -> None:

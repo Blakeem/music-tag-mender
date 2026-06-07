@@ -7,8 +7,15 @@ tracked & revertible). Engine-first: all logic lives in `tagmend.engine`; the CL
 MCP server are thin wrappers. **Read `PLAN.md` for the full design** — this file is
 just how to work in the repo.
 
-Current status: **M0 skeleton complete** (config, logger, SQLite connection, CLI +
-MCP server wired, `doctor`/`health_check` working). No tag writing yet.
+Current status: **M1 read path + M3 write-path core shipped.** The git-like
+stage → commit → history → revert engine is built and tested: a domain-neutral commit
+core (`engine/commits.py` — the `commits` table, the `RevisionDomain` seam, the
+crash-safe `run_commit` loop, **resume-free** recovery), the tags domain
+(`engine/staging.py` — `stage_tags`/`unstage_tags`/`diff_tags`/`commit_tags`, v0 baseline
+captured at stage time), plus `versioning.py` (revert/history) and the full tags MCP
+family + discovery (`list_files`/`get_file`) + commit inspection (`list_commits`/
+`get_commit`). Schema is **v5** (staged tables carry no `commit_id`). **Next: M2 Last.fm**
+(`lastfm.py`/`classify.py` are stubs); M6 organize/moves (`moves.py`) is a paper sketch.
 
 ## Python
 
@@ -27,10 +34,11 @@ MCP server wired, `doctor`/`health_check` working). No tag writing yet.
 - **Settings live on disk, not in env.** The MCP server can't see the CLI's shell.
   Read config via `tagmend.config.load_settings()`; never read env/JSON directly.
 - **Tests never touch the real `music/` folder** (it's gitignored, copyrighted).
-  Use `tmp_path` / the `temp_library` fixture. Real-artist synthesized fixtures for
-  format coverage come later (PLAN.md §21).
+  Use `tmp_path` / the `temp_library` fixture for snapshot tests, or `make_track`
+  (copies a silent `.mp3`/`.flac`/`.m4a`/`.ogg` template + writes tags) for real-audio
+  read/write/commit/revert coverage across all four formats.
 
-## Quality gates — all three must pass before anything is "done"
+## Quality gates — all four must pass before anything is "done"
 
 Run from the repo root (venv at `.venv`):
 
@@ -41,7 +49,7 @@ Run from the repo root (venv at `.venv`):
 .\.venv\Scripts\pytest.exe                # tests
 ```
 
-Lint, types, and tests are **required** every change. Ruff is configured with
+Lint, format, types, and tests are **required** every change. Ruff is configured with
 `select = ["ALL"]` minus a few formatter-conflicting rules — fix issues, don't
 broaden the ignore list without reason. `cli.py` intentionally omits
 `from __future__ import annotations` because Typer evaluates annotations at runtime.
@@ -93,13 +101,21 @@ src/tagmend/
   log.py            shared logger (use everywhere)
   config.py         settings.json (platformdirs) + typed Settings
   cli.py            Typer CLI (thin)
-  mcp_server.py     FastMCP server (thin)
+  mcp_server.py     FastMCP server (thin) — 13 tools
   engine/
-    db.py           SQLite connection (WAL); schema added per feature
-    scan.py         library discovery (real)
-    doctor.py       health_check / readiness (real)
-    tags.py lastfm.py classify.py versioning.py moves.py   # documented stubs
-tests/              pytest; conftest isolates config + builds temp libraries
+    db.py           SQLite connection (WAL)
+    schema.py       all DDL + PRAGMA user_version (v5)
+    scan.py         filesystem discovery + signatures
+    doctor.py       health_check / readiness + interrupted-commit report
+    store.py        pure data access: files/file_tags + tag_revisions[_staged]
+    library.py      scan orchestration (3 modes) + stats + list_files/get_file
+    tags.py         mutagen read/write of the managed tag set
+    versioning.py   tag-revision baseline/append + revert + history
+    commits.py      domain-neutral commit core: commits table + RevisionDomain + run_commit
+    staging.py      tags domain (TagDomain) + stage/diff/commit_tags orchestration
+    lastfm.py classify.py   # STUBS — M2 (Last.fm + classification)
+    moves.py                # STUB + PathDomain paper sketch — M6 (organize/moves)
+tests/              pytest; conftest isolates config + builds temp libraries (make_track)
 ```
 
 ## Roadmap pointer

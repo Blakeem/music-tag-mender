@@ -12,7 +12,7 @@ import sqlite3
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from tagmend.engine import db, scan
+from tagmend.engine import commits, db, scan, schema
 from tagmend.log import get_logger
 
 if TYPE_CHECKING:
@@ -56,6 +56,7 @@ def run_health_check(settings: Settings) -> HealthReport:
     checks = [
         _check_music_path(settings.music_path),
         _check_database(settings.db_path),
+        _check_interrupted_commits(settings.db_path),
     ]
     report = HealthReport(checks=checks)
     logger.info("health check complete: ok=%s", report.ok)
@@ -97,3 +98,31 @@ def _check_database(db_path: Path) -> Check:
     except (sqlite3.Error, OSError) as exc:
         return Check(name=name, ok=False, detail=f"cannot open ledger at {db_path}: {exc}")
     return Check(name=name, ok=True, detail=f"ledger OK at {db_path}")
+
+
+def _check_interrupted_commits(db_path: Path) -> Check:
+    """Report any commit left ``applying`` by a crash. Informational — never fails the report.
+
+    A lingering ``applying`` commit is recovered by simply running ``commit_tags`` again
+    (the resume-free model), so this is a hint, not a readiness blocker — it always reports
+    ``ok=True``. Real ledger problems are caught by :func:`_check_database`.
+    """
+    name = "commits"
+    try:
+        connection = db.connect(db_path)
+        try:
+            schema.apply_schema(connection)
+            interrupted = commits.get_applying_commits(connection)
+        finally:
+            connection.close()
+    except (sqlite3.Error, OSError) as exc:
+        return Check(name=name, ok=True, detail=f"(could not check interrupted runs: {exc})")
+
+    if not interrupted:
+        return Check(name=name, ok=True, detail="no interrupted runs")
+    ids = ", ".join(str(c.id) for c in interrupted)
+    return Check(
+        name=name,
+        ok=True,
+        detail=f"{len(interrupted)} interrupted run(s) ({ids}) — run commit_tags to recover",
+    )

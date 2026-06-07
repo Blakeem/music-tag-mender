@@ -178,7 +178,10 @@ The valuable, risky work is deterministic and must not live inside an LLM. Build
 ## 7. Data model (SQLite)
 
 WAL mode. **Versioning is the heart of the safety story.** `PRAGMA user_version`
-tracks the applied schema version (M1 = 1).
+tracks the applied schema version (**currently 5**: the read-path snapshot landed at
+M1; the `commits` / `tag_revisions` / `tag_revisions_staged` change-tracking tables
+shipped at M3). The model is **resume-free** — a crash just leaves work staged for the
+next commit to sweep up; see the semantics below.
 
 ### 7.1 Created NOW (M1 — the read-path snapshot)
 
@@ -217,12 +220,24 @@ CREATE INDEX IF NOT EXISTS idx_file_tags_name_value ON file_tags(name, value);
 The signature is **`size_bytes` + `mtime_ns`** (fast, NAS-friendly); an incremental
 scan re-reads a file's tags only when that signature changes or the file was never read.
 
-### 7.2 Created LATER (M2/M3 — caches + tag history)
+### 7.2 The caches (M2) + the change-tracking tables (M3, shipped)
 
-These are **documented, not yet created**. `artist_cache` + `lastfm_cache` land in
-**M2** (Last.fm). `tag_revisions` (the append-only undo log) formally starts in **M3**
-(write path), including the version-0 baseline; it is **re-keyed to `files.id`** with a
-composite PK `(file_id, version)`.
+`artist_cache` + `lastfm_cache` are **documented, not yet created** — they land in
+**M2** (Last.fm). The change-tracking tables (`commits`, `tag_revisions`,
+`tag_revisions_staged`) **shipped in M3** (write path), including the version-0
+baseline; the revision logs are **keyed to `files.id`** with a composite PK
+`(file_id, version)`.
+
+The model deliberately mirrors **git** (see §7's semantics): a **`commits`** row is a
+group of changes applied together (git's *commit*); its `id` is the `commit_id` each
+revision references. A **staging area** (`*_staged`, git's *index*) holds the desired
+target until you commit; committing turns each staged row into an append-only revision
+and deletes it. Per-file `version` is the friendly per-file restore handle.
+
+The shared commit machinery (the `commits` table, the crash-safe per-file commit loop,
+and a small `RevisionDomain` seam) lives in `engine/commits.py` and is **domain-neutral**,
+so the tags side (`engine/staging.py`, shipped) and the future paths side
+(`engine/moves.py`, §18) are two parallel implementations of the same lifecycle.
 
 ```sql
 -- M2: one row per unique artist name encountered (the dedupe + cache unit)
@@ -243,13 +258,37 @@ CREATE TABLE lastfm_cache (
   fetched_at      TEXT
 );
 
+-- M3: one row per commit (a group of changes applied together). id == commit_id.
+CREATE TABLE commits (
+  id              INTEGER PRIMARY KEY,
+  created_at      TEXT,
+  origin          TEXT,               -- auto | manual | revert | organize
+  message         TEXT,               -- the group-level human description
+  reverted_from   INTEGER REFERENCES commits(id),  -- the commit this one undoes
+  status          TEXT                -- applying | applied | interrupted (crash marker)
+);
+
+-- M3: staging area (git's index). One pending tag change per file; holds the TARGET.
+-- Resume-free (schema v5): staged rows carry NO commit_id (no claiming). A commit turns
+-- each staged row into a tag_revisions row then deletes it; a crash leaves leftover rows
+-- staged for the next commit to sweep into a new commit.
+CREATE TABLE tag_revisions_staged (
+  file_id         INTEGER REFERENCES files(id),
+  managed_tags    TEXT,               -- JSON: proposed target snapshot of managed tags
+  origin          TEXT,               -- auto | manual
+  note            TEXT,
+  staged_at       TEXT,
+  PRIMARY KEY (file_id)
+);
+
 -- M3: APPEND-ONLY revision log, keyed by the stable file_id. Never updated/deleted.
 CREATE TABLE tag_revisions (
   file_id         INTEGER REFERENCES files(id),
   version         INTEGER,            -- 0 = original as-found; +1 per write
+  commit_id       INTEGER REFERENCES commits(id),  -- NULL for the version-0 baseline
   created_at      TEXT,
   origin          TEXT,               -- scan | auto | manual | revert
-  reverted_from   INTEGER,            -- set when origin='revert'
+  reverted_from   INTEGER,            -- target version restored (origin='revert')
   managed_tags    TEXT,              -- JSON: FULL snapshot of managed tags at this version
   diff            TEXT,              -- JSON: {tag: {from, to}} human-readable change
   note            TEXT,
@@ -265,18 +304,50 @@ CREATE TABLE tag_revisions (
 
 ### Versioning / undo semantics (your requirement)
 
-- **Version 0** is captured **at first scan, before any write** — the original
-  as-found tags. This is the permanent safety baseline.
-- Every write **appends** a new row (keyed by `file_id`) with an incremented
-  `version`, storing both a **full snapshot** of the managed tag set (`managed_tags`)
-  and a **diff** of what changed.
+The mental model is **git**, mapped onto the library:
+
+| git | TagMend |
+|---|---|
+| working tree | the audio files + the live `files`/`file_tags` snapshot |
+| index / staging | `tag_revisions_staged` / `path_revisions_staged` (the desired target) |
+| commit | apply staged changes to disk + append revision rows under one `commit_id` |
+| revert / checkout | restore to a prior `version`, recorded as a *new* commit (append-only) |
+| log / diff | `history(file)` + the `diff` column |
+
+It's cleaner than git in one way: the working files aren't mutated until **commit**, so
+staging = "the plan" and commit = "apply + record." Concretely:
+
+- **Stage.** A proposed change lands in `*_staged` (one pending change per file — a
+  re-stage replaces it). Nothing on disk changes. The **version-0 baseline is captured
+  here** (see below), but no further history is written until commit.
+- **Commit.** Create a `commits` row (`status='applying'`), then per file: write the
+  file on disk (idempotent), and in **one DB transaction** append the revision (with this
+  `commit_id`) **and** delete the staged row. Flip the commit to `status='applied'` when
+  done. A commit groups many files (e.g. an artist cascade, §10, or an organize run, §18)
+  so it can be reverted as a unit.
+- **Crash recovery (resume-free).** The staged table *is* the journal: anything still in
+  `*_staged` was not durably committed. There is **no claim step** — recovery is simply
+  *running commit again*: the leftover staged rows are swept into a **new** commit (so a
+  batch interrupted mid-way can split across two commit ids), and any commit left
+  `applying` is flipped to the terminal `interrupted` status. Every step is idempotent.
+- **Version 0** is captured **at stage time** — the original as-found tags, with
+  `commit_id` NULL (it precedes any commit). Capturing it when the change is *staged*
+  (not at commit) means a crash-then-rescan can never overwrite the snapshot before the
+  baseline is frozen. This is the permanent safety baseline.
 - **Revert(file_id, target_version)** = read `managed_tags` from the target revision,
-  write them back to the file, then **append a new revision** with
-  `origin='revert'` and `reverted_from=target_version`. History is append-only —
-  you can revert a revert, and you never lose any prior state.
+  write them back to the file, then **append a new revision** under a fresh
+  `origin='revert'` commit with `reverted_from=target_version`. History is append-only —
+  you can revert a revert, and you never lose any prior state. Reverting a whole
+  `commit_id` undoes an entire run.
 - "Managed tags" = a deliberately **narrow** set: `GENRE`, `ARTIST`(careful),
   `ALBUMARTIST`, `MUSICBRAINZ_ARTISTID`. We never touch title/track/art, so
   snapshots stay small and reverts can't damage unrelated metadata.
+
+> **Why not just use git directly?** It would version whole binary files (doubling a
+> large library on disk, defeating the surgical managed-tag-only revert), entangle the
+> tag and path axes we deliberately split, and assume it owns a tree that other tools
+> (Picard, the file manager) also edit. We borrow git's *ideas* — commit-as-batch and
+> "a folder exists iff it holds files" — without those costs.
 
 ---
 
@@ -363,32 +434,54 @@ scan ──> pending
 
 ---
 
-## 12. MCP tool surface (v1)
+## 12. MCP tool surface
+
+The tags side organizes into a **symmetric family** mirroring git, so a future paths
+side (§18) reads identically: `stage_/unstage_/diff_/commit_/history_/revert_` × the
+domain (`tags` | `paths`), plus domain-neutral discovery (`list_files`, `get_file`) and
+commit inspection (`list_commits`, `get_commit`).
+
+**Shipped (M0 readiness + M1 read path + M3 write path), 13 tools:**
 
 | Tool | Purpose |
 |---|---|
-| `scan_library(path, mode)` | Walk a folder into the `files`/`file_tags` snapshot; `mode` ∈ incremental/full/presence. **(M1, shipped.)** |
-| `library_stats()` | Library-wide snapshot counts (total/present/missing/unprocessed, by ext, tag-value total). **(M1, shipped.)** |
+| `health_check()` | Readiness probe (M0): settings load, music path reachable, ledger opens; also reports any `interrupted` commit left by a crash. |
+| `scan_library(path, mode)` | Walk a folder into the `files`/`file_tags` snapshot; `mode` ∈ incremental/full/presence. (M1.) |
+| `library_stats()` | Library-wide snapshot counts (total/present/missing/unprocessed, by ext, tag-value total). (M1.) |
+| `list_files(path?, limit?)` | List tracked files with their current managed tags — the way to discover the `file_id`s the tag tools take. (M3.) |
+| `get_file(file_id)` | One tracked file with its current managed tags. (M3.) |
+| `stage_tags(file_id, tags, note?)` | Stage a managed-tag target (git's index); captures the v0 baseline; writes nothing to disk. (M3.) |
+| `unstage_tags(file_id)` | Drop a pending staged change. (M3.) |
+| `diff_tags(path?)` | Show staged-but-uncommitted changes enriched with the current→target diff (`git diff --staged`). (M3.) |
+| `commit_tags(message?, path?)` | Apply all (or a subtree of) staged changes to disk as one revertible commit; append revisions. (M3.) |
+| `history_tags(file_id)` | The append-only revision log + diffs for a file. (M3.) |
+| `revert_tags(file_id, version, note?)` | Restore a file's managed tags to a prior version (append-only). (M3.) |
+| `list_commits(limit?)` | List commits newest first (the revertible units); status applied/applying/interrupted. (M3.) |
+| `get_commit(commit_id)` | One commit row by id. (M3.) |
+
+> The MCP layer is intentionally `origin`-free: every MCP call is `manual`. The engine
+> keeps a constrained `origin` (`auto`|`manual`) so M2's auto path can stage with
+> `origin="auto"` internally.
+
+**Last.fm + review loop (M2/M4) — not yet built:**
+
+| Tool | Purpose |
+|---|---|
 | `resolve_artists()` | Query Last.fm (cached/paced), classify auto vs needs_review. |
-| `list_pending_review()` | Return artists/files needing human/LLM decisions. |
+| `list_pending_review()` | Artists/files needing a human/LLM decision. |
 | `get_artist_candidate(name)` | Full Last.fm context for one artist (tags, correction, similar). |
 | `approve_mapping(input_name, canonical_name, genre)` | Record an approved artist-level decision. |
-| `commit_artist(input_name)` | Apply approved tags to all that artist's files (bumps versions). |
-| `revert(path, version)` | Restore a file to a prior revision (append-only). |
-| `history(path)` | Show the revision log + diffs for a file. |
+| `commit_artist(input_name)` | Stage the approved tags for all that artist's files, then `commit_tags` them. |
 | `review_stats()` | Review-workflow progress (pending/auto/applied/error counts). |
-| `health_check()` | **Readiness probe (M0, shipped):** verify settings load, music path is reachable & readable, and the SQLite ledger opens. The first tool we shipped; callable from the MCP Inspector to prove the environment is wired up. |
 
-**Organize (opt-in, §18) — added once M6 lands:**
+**Organize / paths family (opt-in, §18) — added once M6 lands:** the `*_paths` mirror of
+the tags family. A `plan_organize(path)`-style step computes destination paths from the
+target scheme and **stages** them (`stage_paths`); `commit_paths` applies the moves;
+`diff_paths` / `history_paths` / `revert_paths` round it out. Because the path domain is
+the same `RevisionDomain` seam, tags and paths revert **independently**.
 
-| Tool | Purpose |
-|---|---|
-| `plan_organize(path)` | Compute the dry-run move/rename plan (folder + file targets) without touching disk. |
-| `commit_organize(plan_id)` | Execute an approved move plan atomically per item; append `path_revisions`. |
-| `revert_move(file_id, version)` | Restore a file/folder to a prior path revision (append-only). |
-| `move_history(file_id)` | Show the path-revision log for a file. |
-
-Mirror the same operations as CLI subcommands.
+Each tool mirrors a 1:1 engine operation; CLI subcommands are added selectively (the CLI
+surface is being chosen *after* the MCP set proves out in practice).
 
 ---
 
@@ -404,17 +497,20 @@ music-tag-mender/             # GitHub repo slug (SEO)
 │   ├── log.py               # one shared logger factory — used everywhere (§20)
 │   ├── config.py            # settings.json in OS config dir via platformdirs (§19)
 │   ├── engine/
-│   │   ├── db.py             # SQLite connection (WAL); schema added per-feature later
-│   │   ├── schema.py         # DDL for files/file_tags + PRAGMA user_version (M1)
-│   │   ├── doctor.py         # health_check: settings + music path + db readiness (M0)
+│   │   ├── db.py             # SQLite connection (WAL); schema added per-feature
+│   │   ├── schema.py         # DDL for all tables + PRAGMA user_version (v5)
+│   │   ├── doctor.py         # health_check: settings + music + db + interrupted-commit (M0/M3)
 │   │   ├── scan.py           # filesystem discovery + signatures (size/mtime)
-│   │   ├── store.py          # pure data access for files/file_tags (M1)
-│   │   ├── library.py        # scan orchestration (3 modes) + stats (M1)
-│   │   ├── lastfm.py         # client: getCorrection/getTopTags, cache, pacing
-│   │   ├── classify.py       # vocabulary, thresholds, auto vs review
-│   │   ├── tags.py           # mutagen read (M1) / write (M3) of the tag set
-│   │   ├── versioning.py     # tag-revision append + revert
-│   │   └── moves.py          # opt-in file/folder reorganization + path_revisions (§18)
+│   │   ├── store.py          # pure data access for files/file_tags + tag_revisions[_staged] (M1/M3)
+│   │   ├── library.py        # scan orchestration (3 modes) + stats + list_files/get_file (M1/M3)
+│   │   ├── lastfm.py         # client: getCorrection/getTopTags, cache, pacing — STUB (M2)
+│   │   ├── classify.py       # vocabulary, thresholds, auto vs review — STUB (M2)
+│   │   ├── tags.py           # mutagen read (M1) / write (M3) of the managed tag set
+│   │   ├── versioning.py     # tag-revision baseline/append + revert + history (M3)
+│   │   ├── commits.py        # domain-neutral commit core: commits table + RevisionDomain
+│   │   │                     #   seam + the shared crash-safe run_commit loop (M3)
+│   │   ├── staging.py        # tags domain (TagDomain) + stage/diff/commit_tags orchestration (M3)
+│   │   └── moves.py          # opt-in paths domain + path_revisions (§18) — STUB (M6)
 │   ├── data/
 │   │   └── genre_vocabulary.yml  # default tag→genre allow-list (shipped as package data)
 │   ├── mcp_server.py          # FastMCP — thin wrapper over engine
@@ -441,13 +537,20 @@ so there is one install, one command, and the MCP server is just one of its mode
   `file_id`, normalized EAV tags); `scan_library` with three modes
   (incremental/full/presence); `library_stats`; `tags.py` read via mutagen "easy"
   mode + alias map. CLI `scan`/`stats` + MCP `scan_library`/`library_stats`. Reads
-  files into the ledger only — never writes music files. The version-0 baseline and
-  `tag_revisions` formally start in **M3** (write path), per the deferred-audit
-  decision. **← current milestone.**
-- **M2 — Last.fm.** Client with cache + pacing; `resolve_artists`; classification.
-- **M3 — Write path + versioning.** `commit_artist`, append revisions,
-  atomic writes, `revert`, `history`. **Backups proven before any real run.**
-- **M4 — Review loop.** `list_pending_review`, `approve_mapping`, cascade + re-run.
+  files into the ledger only — never writes music files.
+- **M2 — Last.fm (next — not started).** Client with cache + pacing;
+  `resolve_artists`; classification. Feeds the already-built commit core via
+  `stage_tags(origin="auto")`. *Note: M3's write-path core was built ahead of M2.*
+- **M3 — Write path + versioning + commit core (core shipped).** The git-like
+  stage → commit → history → revert engine: the **domain-neutral commit core**
+  (`commits.py`: `commits` table, the `RevisionDomain` seam, the crash-safe
+  `run_commit` loop, **resume-free** recovery), the tags domain (`staging.py`:
+  `stage_tags`/`unstage_tags`/`diff_tags`/`commit_tags` with v0 baseline captured at
+  stage time), atomic mutagen writes, `revert`, `history`, and the full tags MCP family
+  + discovery + commit-inspection tools (§12). **Remaining for M4:** the artist-level
+  `commit_artist` cascade convenience. **Backups proven before any real run.**
+- **M4 — Review loop.** `list_pending_review`, `approve_mapping`, `commit_artist`
+  cascade + re-run.
 - **M5 — Polish.** Genre vocabulary tuning, album-level override, docs, packaging.
 - **M6 — Organize (opt-in moves & renames).** Stable `file_id` migration,
   `plan_organize` (dry-run path plan), `commit_organize` (atomic per-item moves),
@@ -460,7 +563,9 @@ so there is one install, one command, and the MCP server is just one of its mode
 - Multi-value genres (e.g. `synthwave; retrowave`) — allow N, or force single?
 - ~~Signature: `size+mtime` vs content hash?~~ **RESOLVED (M1):** `size_bytes` +
   `mtime_ns` (`st_mtime_ns`) — fast and NAS-friendly.
-- Should `revert` be exposed in the CLI bulk path or MCP-only (to keep it deliberate)?
+- ~~Should `revert` be exposed in the CLI bulk path or MCP-only?~~ **RESOLVED (M3):**
+  shipped as the MCP `revert_tags(file_id, version)`; per-file and deliberate. The CLI
+  surface (which MCP tools become subcommands) is deferred until the MCP set proves out.
 - ~~Tag storage: raw JSON vs normalized?~~ **RESOLVED (M1):** normalized EAV linked
   table (`file_tags`), one row per value, no raw JSON.
 - ~~Stable `file_id` scheme?~~ **RESOLVED (M1):** DB-assigned integer surrogate
@@ -471,7 +576,9 @@ so there is one install, one command, and the MCP server is just one of its mode
 - **Organize (§18):** when a folder rename collapses two artist spellings into one
   destination, how do we handle the merge / collision (refuse, suffix, or merge)?
 - **Organize (§18):** do we move non-audio sidecars (cover art, `.nfo`) with the
-  album, and do we delete now-empty source folders?
+  album? (~~delete now-empty source folders?~~ **RESOLVED:** yes — prune source dirs
+  that become empty after a move, scoped to those dirs and gated by
+  `organize.prune_empty_dirs`; no global empty-folder sweep. See §18.3.)
 
 ## 16. References
 
@@ -531,49 +638,75 @@ so a file keeps one continuous identity across any combination of re-tags and mo
 
 ### 18.2 Proposed data model (finalized at M6)
 
+The path side reuses the **same `commits` + staging machinery as the tag side** (§7):
+`path_revisions_staged` is the move plan (git's index), and the shared `commits` table
+groups a whole organize run — so there is **no separate `move_plans` table**, and the
+old `plan_id` is just `commit_id`. There is also **no `kind` column**: folders are not
+first-class. A folder rename is simply N per-file move rows sharing one `commit_id`
+(the folder is the common path prefix); rename-vs-move is derivable from `from_path` /
+`to_path`; and folders are created on demand and **pruned when empty** (§18.3), which is
+how we reproduce git's "a folder exists iff it holds files" for free.
+
 ```sql
 -- APPEND-ONLY location log. One row per move/rename. Never updated, never deleted.
 CREATE TABLE path_revisions (
-  file_id       TEXT,                -- stable identity (see §7 note / §15)
+  file_id       INTEGER REFERENCES files(id),
   version       INTEGER,             -- 0 = path as-found at first scan; +1 per move
+  commit_id     INTEGER REFERENCES commits(id),  -- NULL for the version-0 baseline
   created_at    TEXT,
   origin        TEXT,                -- scan | organize | revert
-  reverted_from INTEGER,            -- set when origin='revert'
-  kind          TEXT,               -- file_rename | folder_rename | move
+  reverted_from INTEGER,            -- target version restored (origin='revert')
   from_path     TEXT,               -- absolute source path
   to_path       TEXT,               -- absolute destination path
-  plan_id       TEXT,               -- groups all moves committed together (one organize run)
   note          TEXT,
   PRIMARY KEY (file_id, version)
 );
 
--- Optional: a row per planned-but-not-yet-committed reorganization, for review/approval.
-CREATE TABLE move_plans (
-  plan_id       TEXT PRIMARY KEY,
-  created_at    TEXT,
-  status        TEXT,               -- proposed | approved | committed | aborted
-  summary       TEXT                -- JSON: list of {file_id, kind, from, to}
+-- Staging area (git's index) for moves: one pending move per file; holds the TARGET.
+-- Mirrors tag_revisions_staged (§7) — resume-free, so NO commit_id. A commit applies +
+-- clears it; a crash leaves leftovers staged for the next commit.
+CREATE TABLE path_revisions_staged (
+  file_id       INTEGER REFERENCES files(id),
+  to_path       TEXT,               -- proposed destination absolute path
+  origin        TEXT,               -- organize
+  note          TEXT,
+  staged_at     TEXT,
+  PRIMARY KEY (file_id)
 );
 ```
 
-Folder renames are modeled as a set of per-file move rows sharing a `plan_id`
-(the folder is just the common path prefix), so revert can operate per-file or
-per-plan, and an interrupted run is recoverable by replaying the plan.
+Because revert is keyed by `file_id`/`version` and grouped by `commit_id`, it can
+operate per-file or per-run, and an interrupted run recovers the **resume-free** way (§7):
+the next `commit_paths` sweeps the rows still in `path_revisions_staged` into a new commit.
+
+`PathDomain` will be the second `RevisionDomain` (the first is the shipped tags
+`TagDomain`), reusing the commit core in `engine/commits.py` unchanged. The move-specific
+parts — the disk action, plus three **parked seam questions** (intra-batch move ordering
+to avoid clobber, the collision policy of §15, and folder-rename atomicity vs the per-file
+commit boundary) — are sketched as a design note in `engine/moves.py`.
 
 ### 18.3 Semantics
 
 - **Plan first.** `plan_organize(path)` computes destination paths from the target
-  scheme + the (already cleaned) tags, detects collisions, and returns a dry-run
-  diff. Nothing on disk changes.
-- **Commit atomically.** `commit_organize(plan_id)` moves each item with a temp +
+  scheme + the (already cleaned) tags, detects collisions, and **stages** them into
+  `path_revisions_staged`. Nothing on disk changes.
+- **Commit atomically.** `commit_organize()` opens a `commits` row, then per item:
+  ensures the destination folder exists (`mkdir -p`), moves the file with a temp +
   atomic-rename where the OS/filesystem allows (NAS-safe), appends a `path_revisions`
-  row per item, and advances the file's current path version. Non-audio sidecars
-  (art, `.nfo`) move with their album by default (configurable).
-- **Revert.** `revert_move(file_id, version)` moves the file back to the target
-  revision's path and appends a new `origin='revert'` row — same append-only model
-  as tag reverts. `revert` of a whole `plan_id` undoes an entire run.
-- **Empty source folders** left behind by a move are removed only when empty and
-  only if `organize.prune_empty_dirs = true`.
+  row under the run's `commit_id`, and clears the staged row. Non-audio sidecars (art,
+  `.nfo`) move with their album by default (configurable).
+- **Folders emerge; pruning is by emptiness, not by tracking creates.** After a move,
+  a source directory that is now empty is removed (walking upward), gated by
+  `organize.prune_empty_dirs`. We **scope pruning to the source dirs of the move** — we
+  never sweep the whole library for empty folders — and `rmdir` naturally refuses on a
+  non-empty dir, so a folder still holding art/junk is left alone.
+- **Revert.** `revert_move(file_id, version)` `mkdir -p`s the target path, moves the
+  file back, prunes any now-empty source dir, and appends a new `origin='revert'` row —
+  same append-only model as tag reverts. Reverting a whole `commit_id` undoes a run.
+- **This is why we need no `kind` and no folder-create records:** reverting a move that
+  *created* folder `B` removes `B` simply because the move-back leaves it empty — and if
+  you had meanwhile dropped another file into `B`, it is *not* empty, so it (and your
+  file) survive. Emptiness is a safer signal than a tracked "created" flag.
 
 ### 18.4 Default target scheme (proposed, configurable)
 
@@ -661,6 +794,17 @@ predictably as it grows milestone by milestone:
 - **Booleans:** `INTEGER` 0/1 with an `is_` prefix (`is_missing`).
 - **Append-only logs:** `_revisions` suffix (`tag_revisions`, `path_revisions`) with a
   composite PK `(file_id, version)`; **version 0 = baseline**, never updated/deleted.
+- **Commits (the batch grouping):** a `commits` table whose `id` is referenced as
+  `commit_id` on the revision rows it groups (git's commit). One commit = one organize
+  run or one artist cascade, so it reverts as a unit; baselines have `commit_id` NULL.
+  `status` is `applying` → `applied`, or the terminal `interrupted` a later commit stamps
+  onto a crashed run.
+- **Staging area:** `_staged` suffix on a mirror of each revision log
+  (`tag_revisions_staged`, `path_revisions_staged`), PK `file_id` (one pending change
+  per file), holding the desired target until committed. **Resume-free (schema v5):**
+  staged rows carry **no `commit_id`** — there is no claiming. This is the *only* place
+  rows are mutated/deleted — committing moves a row into the append-only log and clears
+  it; a crash just leaves the row staged for the next commit to sweep up.
 - **SQL safety:** all values bound via `?` placeholders (never string-formatted —
   bandit S608); identifier-only interpolation (column lists) is the sole exception and
   carries a `# noqa: S608` with no untrusted input.

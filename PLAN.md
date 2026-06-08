@@ -584,10 +584,12 @@ so there is one install, one command, and the MCP server is just one of its mode
 
 ## 15. Open questions
 
-- **Genre tag source: Last.fm vs MusicBrainz vs both?** The canonical *vocabulary* is
-  MusicBrainz either way; the open question is where the per-file genre *tags* come from.
-  Being evaluated before M2 implementation (Picard/MusicBrainz gave the user junk/missing
-  genres — understanding why drives this choice). See §8.
+- ~~Genre tag source: Last.fm vs MusicBrainz vs both?~~ **RESOLVED: Last.fm only** (+ the
+  bundled MusicBrainz vocabulary as the offline filter). Tested on the user's obscure
+  library — MusicBrainz genres were *empty* for half the artists; Last.fm's folksonomy is
+  far denser and, once vocab-filtered, clean. MusicBrainz's value is **identity** (MBID /
+  disambiguation), used in Phase 2, where Last.fm can be queried by MBID. See
+  `docs/genre-tagging-spec.md` §2.3 / §11.
 - ~~Genre scope default: artist-level only, or mixed-catalog?~~ **RESOLVED:** merge
   artist + album tags (no precedence); album tags add per-record accuracy. See §9 / spec.
 - ~~Multi-value genres — allow N, or force single?~~ **RESOLVED:** multi-value, ordered

@@ -1,0 +1,30 @@
+# TagMend user/AI-managed genre overlay — EDIT THIS FILE (never genre_vocabulary.yml).
+#
+# `genre_vocabulary.yml` is GENERATED from MusicBrainz and gets overwritten on every
+# refresh. This overlay is the durable, hand-/AI-maintained layer that survives those
+# refreshes and is merged OVER the MusicBrainz vocabulary at load time.
+#
+# Two uses (both keyed by fold-key — lowercase, strip non-alphanumerics):
+#   1. Genres MusicBrainz omits but you want written (e.g. bare "alternative", "indie",
+#      which MusicBrainz treats as too broad and only lists qualified, e.g. "indie rock").
+#   2. Extra spellings for a genre MusicBrainz already has — set `name` to the MusicBrainz
+#      canonical spelling and list the variants (e.g. name: chiptune, aliases: [8-bit]).
+#
+# Merge rules (see docs/genre-tagging-spec.md §4.5):
+#   - If `name` folds to an existing MusicBrainz genre, its aliases are added to it.
+#   - Otherwise it becomes a new genre (no MBID).
+#   - Fold-key collisions are reported, never silently applied.
+#
+# This is the file the LLM grows from Last.fm tags that match nothing (the "unmatched
+# bucket", §5.1). Keep entries lowercase to match the MusicBrainz canonical style.
+version: 1
+genres:
+  # --- Genres MusicBrainz considers too broad to list, but common in real libraries ---
+  - name: alternative
+    aliases: []
+  - name: indie
+    aliases: []
+
+  # --- Extra spellings for genres MusicBrainz already has ---
+  - name: chiptune
+    aliases: [8-bit, 8bit, 8 bit]

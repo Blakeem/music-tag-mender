@@ -65,6 +65,26 @@ Computer has `1997(35)`, Discovery `2001(33)`. Also mood/list junk (`favourite a
 top tag" would write **"2013"** as a genre. The vocabulary allow-list is what drops all of
 this: a tag is kept **iff it matches the controlled list**, not because of its weight.
 
+### 2.3 Why Last.fm, not MusicBrainz, supplies the genre *tags* (decided)
+
+MusicBrainz supplies the **vocabulary** (§4); it does **not** supply the per-file genre
+tags. We evaluated using MusicBrainz genres (`inc=genres`, which returns clean, weighted,
+already-canonical genres) and rejected it as the tag *source* because its coverage is too
+sparse for an obscure library. Head-to-head on the user's actual music (2026-06-08):
+
+| Artist | MusicBrainz genres | Last.fm (after vocab filter) |
+|---|---|---|
+| Thermostatic | **none** | synth-pop, electronic, bitpop, electropop, chiptune |
+| Ours | **none** | alternative rock, rock, indie rock |
+| Download | industrial(3), electronic(2) | industrial, idm, experimental, electronic, ebm … |
+| Therapy? | alt rock(5), alt metal(4) … | alternative rock, rock, hard rock, metal, alt metal |
+
+Two of four had **zero** MusicBrainz genres but rich Last.fm tags. Last.fm's folksonomy is
+far denser for obscure music (more taggers), and once filtered through the MusicBrainz
+vocabulary it is also clean. **Runtime genre sourcing = Last.fm only + the bundled MB
+vocabulary file (no runtime MusicBrainz calls).** MusicBrainz's real value is *identity /
+disambiguation*, handled in Phase 2 (§11).
+
 ---
 
 ## 3. Core model: fold-key vs. canonical spelling
@@ -191,6 +211,26 @@ kinds occur, and real MusicBrainz data contains both:
 Every merge/skip is emitted as a warning at build time so the outcome is auditable. At
 load time `classify.py` rebuilds the same `fold-key → name` index and asserts it is
 single-valued (the file is already collision-free by construction).
+
+### 4.5 The user/AI overlay (`genre_overlay.yml`)
+
+`genre_vocabulary.yml` is GENERATED and overwritten on every MusicBrainz refresh, so it is
+**never** hand-edited. A second bundled file, `genre_overlay.yml`, is the **durable,
+editable layer** that survives refreshes. `classify.py` loads both and **merges the
+overlay over the vocabulary in memory** (the build script does not bake it in — they stay
+separate so a refresh can't clobber user data). Two uses:
+
+1. **Genres MusicBrainz omits** but are common in the wild. MusicBrainz deliberately has
+   no bare `alternative` or `indie` (only qualified forms like `alternative rock`,
+   `indie pop`), so the filter would drop those very common tags. The overlay adds them.
+2. **Extra spellings** for an existing genre — `name` is set to the MusicBrainz canonical
+   spelling and `aliases` lists the variants (e.g. `chiptune` ← `8-bit`, `8bit`).
+
+Same fold-key + collision rules as §4.2/§4.4. An overlay entry whose `name` folds to an
+existing genre **adds its aliases**; otherwise it becomes a **new genre** (no MBID).
+Overlay/vocabulary collisions are reported, never silent. This file is what the **LLM
+grows** from Last.fm tags that match nothing (§5.1) — the primary place the alias/genre
+vocabulary improves over time.
 
 ---
 
@@ -334,22 +374,31 @@ vocabulary* where:
 
 ---
 
-## 11. Phase 2 (next planning session) — artist & album resolution + verification
+## 11. Phase 2 — artist & album resolution + verification (MBID-anchored)
 
-**Not designed here. Captured so it isn't lost.** The genre path above assumes the
-file's `artist`/`album` strings are good enough to query. Often they aren't — names are
-written inconsistently, and some artists/albums don't exist on Last.fm at all. The next
-session designs how we **maximize auto-coverage and route the rest to a manual/LLM
-bucket**. Working assumptions to evaluate (the user's lean — keep it simple):
+**Being planned now (separate plan doc).** The genre path above queries Last.fm by the
+file's `artist`/`album` strings. That works for the common case but has a real failure
+mode proven on the user's library: **homonyms**. A MusicBrainz search for `Ours` returns 3
+distinct artists; `Download` returns 3 (Canadian industrial, a US metal band, a trance
+producer). Last.fm has **no disambiguation** — query by name and you silently get the
+*most popular* artist's tags, which may be the wrong act.
 
-- **Exact-match first, report the misses.** Normalize via `artist.getCorrection`; artists
-  that don't resolve fall through to a bucket the LLM works, inferring the correct name.
-- **Boolean state flags** on artists/albums (e.g. `verified`, `ignored`/not-on-Last.fm)
-  rather than nuanced status enums — simple to reason about and to expose as MCP tools.
-- **Explicit tools** to **flag / view / modify** those booleans, so the LLM can drive a
-  "get everything matched" loop and park genuinely-absent entities as `ignored`.
-- Open questions: where the flags live (extend `artist_cache`? a new `album_cache`?); how
-  "ignored" interacts with re-scans; whether album identity needs `(artist, album)` or an
-  MBID; how the unmatched-tag bucket (§5.1.2) and the unmatched-artist bucket relate.
+This is where **MusicBrainz earns its place — for identity, not genres** — and the bridge
+is clean:
 
-Decisions in §3–§7 are settled; §11 is the agenda for next time.
+- **`artist.getTopTags` (and album) accept an `mbid`** (verified). So once an artist is
+  resolved to a MusicBrainz MBID, we query Last.fm **by MBID**, eliminating name ambiguity.
+- The LLM **never types a corrected name** — it supplies/confirms an **MBID** (or another
+  stable id), and the engine dereferences it to the canonical name. Corrections become
+  *verifiable* (resolve the MBID and see what it is) and *deterministic* (no typos).
+- Direction for the flag model: a single **status** per artist/album
+  (`unresolved → matched → verified → ignored`) plus the `mbid` link, over the
+  already-planned `artist_cache.status`/`mbid` columns (PLAN §7.2), with explicit
+  `flag`/`view`/`modify` MCP tools. `ignored` parks entities genuinely absent from the
+  databases so they stop resurfacing.
+
+Open questions for the plan doc: album identity key (`(artist, album)` vs release-group
+MBID); how `ignored` interacts with re-scans; how the unmatched-tag bucket (§5.1) and the
+unmatched-artist bucket share one review surface.
+
+Decisions in §2–§7 are settled.

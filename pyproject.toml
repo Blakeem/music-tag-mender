@@ -94,6 +94,12 @@ ignore = [
 ]
 # Typer expresses CLI flags as boolean parameters; that's not a "boolean trap".
 "src/tagmend/cli.py" = ["FBT001", "FBT002"]
+# Standalone maintenance scripts: not an importable package, and they print progress
+# to stderr rather than going through the package logger.
+"scripts/**" = [
+    "INP001",  # scripts/ is intentionally not a package
+    "T201",    # print() is the right progress channel for a CLI script
+]
 
 [tool.ruff.lint.pydocstyle]
 convention = "pep257"

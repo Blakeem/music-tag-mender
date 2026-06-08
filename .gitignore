@@ -3,6 +3,9 @@
 # manual testing. NEVER commit these. Unit tests must use synthesized fixtures
 # under tests/fixtures/ instead (see CLAUDE.md / PLAN.md §21).
 music/
+# Unchanged backup of the real library, used to restore music/ between manual test
+# runs (see the M2 plan). Also copyrighted — NEVER commit.
+music-raw-backup/
 
 # Local SQLite ledger if a dev ever points it at the repo root
 *.sqlite3

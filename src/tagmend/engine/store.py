@@ -471,3 +471,219 @@ def list_staged_tags_under(conn: sqlite3.Connection, root: Path) -> list[StagedT
 def delete_staged_tag(conn: sqlite3.Connection, file_id: int) -> None:
     """Remove the pending change for *file_id* (no-op if none)."""
     conn.execute("DELETE FROM tag_revisions_staged WHERE file_id = ?", (file_id,))
+
+
+# --- lastfm_cache (persistent parsed-tag cache; PLAN — Last.fm genre tagging) --------
+
+
+def get_cached_tags(
+    conn: sqlite3.Connection,
+    request_key: str,
+) -> tuple[bool, list[tuple[str, int]]] | None:
+    """Return the cached lookup for *request_key*, or ``None`` on a cache miss.
+
+    ``None`` distinguishes a never-cached key from a cached negative result. A hit is
+    ``(found, tags)``: ``(False, [])`` is the negative-cache sentinel (genuinely absent
+    from Last.fm), while ``(True, [...])`` is a found result (possibly with an empty
+    list when found-but-no-tags). Tags come back as ``(name, weight)`` pairs.
+    """
+    cursor = conn.execute(
+        "SELECT found, tags FROM lastfm_cache WHERE request_key = ?",
+        (request_key,),
+    )
+    row = cursor.fetchone()
+    if row is None:
+        return None
+    found = bool(row[0])
+    tags = _parse_tag_pairs(str(row[1]))
+    return (found, tags)
+
+
+def put_cached_tags(
+    conn: sqlite3.Connection,
+    *,
+    request_key: str,
+    found: bool,
+    tags: list[tuple[str, int]],
+    now: str,
+) -> None:
+    """Insert or replace the cached lookup for *request_key*.
+
+    A re-fetch overwrites any prior cached value. ``tags`` is stored as a JSON array of
+    ``[name, weight]`` pairs; pass ``found=False`` with ``tags=[]`` to negative-cache.
+    """
+    payload = [[name, weight] for name, weight in tags]
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO lastfm_cache (request_key, found, tags, fetched_at)
+        VALUES (?, ?, ?, ?)
+        """,
+        (request_key, 1 if found else 0, _dump_json(payload), now),
+    )
+
+
+def _parse_tag_pairs(raw: str) -> list[tuple[str, int]]:
+    """Parse a stored ``tags`` blob (JSON ``[name, weight]`` array) into typed pairs."""
+    parsed = cast("list[list[object]]", json.loads(raw))
+    return [(str(name), _as_int(weight)) for name, weight in parsed]
+
+
+# --- file_genre_status (terminal/negative decisions; PLAN — Status model) -----------
+
+
+@dataclass(frozen=True, slots=True)
+class GenreStatusRow:
+    """One row from ``file_genre_status`` (a ``'no_match'`` / ``'manual'`` decision)."""
+
+    status: str
+    source_artist: str | None
+    source_album: str | None
+
+
+def get_genre_status(conn: sqlite3.Connection, file_id: int) -> GenreStatusRow | None:
+    """Return *file_id*'s terminal genre decision, or ``None`` if it has none."""
+    cursor = conn.execute(
+        "SELECT status, source_artist, source_album FROM file_genre_status WHERE file_id = ?",
+        (file_id,),
+    )
+    row = cursor.fetchone()
+    if row is None:
+        return None
+    return GenreStatusRow(
+        status=str(row[0]),
+        source_artist=None if row[1] is None else str(row[1]),
+        source_album=None if row[2] is None else str(row[2]),
+    )
+
+
+def set_genre_status(  # noqa: PLR0913 - cohesive keyword-only status payload
+    conn: sqlite3.Connection,
+    *,
+    file_id: int,
+    status: str,
+    source_artist: str | None,
+    source_album: str | None,
+    now: str,
+) -> None:
+    """Insert or replace *file_id*'s terminal genre decision.
+
+    ``source_artist``/``source_album`` record what the decision was computed against, so
+    a later tag change can mark a ``'no_match'`` stale and re-processable.
+    """
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO file_genre_status (
+            file_id, status, source_artist, source_album, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (file_id, status, source_artist, source_album, now),
+    )
+
+
+def delete_genre_status(conn: sqlite3.Connection, file_id: int) -> None:
+    """Remove *file_id*'s terminal genre decision (no-op if none)."""
+    conn.execute("DELETE FROM file_genre_status WHERE file_id = ?", (file_id,))
+
+
+# --- "done" derivation + scope selection (PLAN — Selection set) ---------------------
+
+
+def is_staged(conn: sqlite3.Connection, file_id: int) -> bool:
+    """Return whether *file_id* has a pending change in ``tag_revisions_staged``."""
+    row = conn.execute(
+        "SELECT EXISTS(SELECT 1 FROM tag_revisions_staged WHERE file_id = ?)",
+        (file_id,),
+    ).fetchone()
+    return bool(row[0])
+
+
+def has_auto_revision(conn: sqlite3.Connection, file_id: int) -> bool:
+    """Return whether *file_id* has a committed ``origin='auto'`` revision."""
+    row = conn.execute(
+        "SELECT EXISTS(SELECT 1 FROM tag_revisions WHERE file_id = ? AND origin = 'auto')",
+        (file_id,),
+    ).fetchone()
+    return bool(row[0])
+
+
+def distinct_artists(conn: sqlite3.Connection) -> list[tuple[str, int]]:
+    """Return each distinct ``artist`` tag value with its file count, ordered by value."""
+    cursor = conn.execute(
+        """
+        SELECT value, COUNT(DISTINCT file_id)
+        FROM file_tags
+        WHERE name = 'artist'
+        GROUP BY value
+        ORDER BY value
+        """,
+    )
+    return [(str(row[0]), _as_int(row[1])) for row in cursor.fetchall()]
+
+
+def files_in_scope(
+    conn: sqlite3.Connection,
+    *,
+    artist: str | None = None,
+    album: str | None = None,
+    file_ids: list[int] | None = None,
+) -> list[int]:
+    """Return the file ids in scope, in ascending id order.
+
+    Precedence mirrors the ``stage_genres`` scope rules:
+
+    * *file_ids* given → the subset of those that actually exist (others dropped);
+    * else *artist* given → files whose ``artist`` tag equals it, narrowed by *album*
+      when given (both via ``file_tags`` joins on ``idx_file_tags_name_value``);
+    * else → every tracked file.
+    """
+    if file_ids is not None:
+        return _files_in_scope_by_ids(conn, file_ids)
+    if artist is not None:
+        return _files_in_scope_by_tags(conn, artist=artist, album=album)
+    cursor = conn.execute("SELECT id FROM files ORDER BY id")
+    return [_as_int(row[0]) for row in cursor.fetchall()]
+
+
+def _files_in_scope_by_ids(conn: sqlite3.Connection, file_ids: list[int]) -> list[int]:
+    """Return the subset of *file_ids* that exist in ``files``, in ascending id order."""
+    if not file_ids:
+        return []
+    placeholders = ",".join("?" for _ in file_ids)
+    cursor = conn.execute(
+        f"SELECT id FROM files WHERE id IN ({placeholders}) ORDER BY id",  # noqa: S608
+        tuple(file_ids),
+    )
+    return [_as_int(row[0]) for row in cursor.fetchall()]
+
+
+def _files_in_scope_by_tags(
+    conn: sqlite3.Connection,
+    *,
+    artist: str,
+    album: str | None,
+) -> list[int]:
+    """Return file ids matching the ``artist`` tag (and ``album`` if given), id order."""
+    if album is None:
+        cursor = conn.execute(
+            """
+            SELECT DISTINCT a.file_id
+            FROM file_tags a
+            WHERE a.name = 'artist' AND a.value = ?
+            ORDER BY a.file_id
+            """,
+            (artist,),
+        )
+        return [_as_int(row[0]) for row in cursor.fetchall()]
+    cursor = conn.execute(
+        """
+        SELECT DISTINCT a.file_id
+        FROM file_tags a
+        JOIN file_tags b ON b.file_id = a.file_id
+        WHERE a.name = 'artist' AND a.value = ?
+          AND b.name = 'album' AND b.value = ?
+        ORDER BY a.file_id
+        """,
+        (artist, album),
+    )
+    return [_as_int(row[0]) for row in cursor.fetchall()]

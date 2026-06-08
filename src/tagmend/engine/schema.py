@@ -23,8 +23,17 @@ The change-tracking model mirrors git (PLAN.md §7):
 
 The two revision logs are append-only, keyed by ``files.id`` with a composite PK
 ``(file_id, version)`` (version 0 = baseline with ``commit_id`` NULL, +1 per change;
-never updated/deleted). Last.fm caches (``artist_cache``, ``lastfm_cache``) land in M2
-and are *not* here yet.
+never updated/deleted).
+
+The M2 Last.fm genre path adds two side tables (PLAN — Last.fm genre tagging, phase 1):
+
+* ``lastfm_cache`` — a persistent cache of parsed Last.fm tag lists keyed by a request
+  hash, surviving MCP restarts. ``found`` is the negative-cache sentinel (0 = the
+  artist/album genuinely is not on Last.fm; 1 = found), distinct from ``found=1`` with an
+  empty ``tags`` array.
+* ``file_genre_status`` — stores ONLY the terminal/negative per-file decisions
+  (``'no_match'`` / ``'manual'``). "Done" is *derived* elsewhere from the staged/committed
+  revision tables, so there is deliberately no ``'tagged'`` state to desync.
 """
 
 from __future__ import annotations
@@ -38,7 +47,7 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
-SCHEMA_VERSION: Final = 5
+SCHEMA_VERSION: Final = 6
 
 _FILES_DDL: Final = """
 CREATE TABLE IF NOT EXISTS files (
@@ -154,6 +163,38 @@ CREATE TABLE IF NOT EXISTS path_revisions_staged (
 )
 """
 
+# Persistent cache of parsed Last.fm tag lists, keyed by a request hash (so it survives
+# MCP restarts and inspector re-launches). ``found`` is the negative-cache sentinel
+# (0 = artist/album genuinely absent from Last.fm; 1 = found), distinct from ``found=1``
+# with an empty ``tags`` array. ``tags`` is a JSON array of ``[name, weight]`` pairs
+# (``[]`` when found-but-empty, or when not found). See PLAN — Last.fm genre tagging §
+# "Caching & pacing".
+_LASTFM_CACHE_DDL: Final = """
+CREATE TABLE IF NOT EXISTS lastfm_cache (
+  request_key TEXT PRIMARY KEY,
+  found       INTEGER NOT NULL,
+  tags        TEXT NOT NULL,
+  fetched_at  TEXT NOT NULL
+)
+"""
+
+# Per-file terminal/negative genre decisions. Stores ONLY the two outcomes that are not
+# otherwise represented by the revision tables: ``'no_match'`` (nothing usable on
+# Last.fm) and ``'manual'`` (user/LLM excluded it). "Done" is DERIVED elsewhere from the
+# staged/committed revision tables, so there is no ``'tagged'`` state to desync.
+# ``source_artist``/``source_album`` record what the decision was computed against, so a
+# later tag change makes a ``'no_match'`` stale and re-processable. See PLAN —
+# Last.fm genre tagging § "Status model".
+_FILE_GENRE_STATUS_DDL: Final = """
+CREATE TABLE IF NOT EXISTS file_genre_status (
+  file_id       INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
+  status        TEXT NOT NULL,
+  source_artist TEXT,
+  source_album  TEXT,
+  updated_at    TEXT NOT NULL
+)
+"""
+
 
 def apply_schema(connection: sqlite3.Connection) -> None:
     """Create all tables (idempotently) and stamp ``PRAGMA user_version``.
@@ -185,4 +226,6 @@ def apply_schema(connection: sqlite3.Connection) -> None:
     connection.execute(_PATH_REVISIONS_DDL)
     connection.execute(_TAG_REVISIONS_STAGED_DDL)
     connection.execute(_PATH_REVISIONS_STAGED_DDL)
+    connection.execute(_LASTFM_CACHE_DDL)
+    connection.execute(_FILE_GENRE_STATUS_DDL)
     connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")

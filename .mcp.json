@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "tagmend": {
+      "command": "E:\\music-tag-mender\\.venv\\Scripts\\tagmend.exe",
+      "args": ["mcp"]
+    }
+  }
+}

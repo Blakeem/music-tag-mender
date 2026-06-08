@@ -13,7 +13,7 @@ from typing import Literal
 from mcp.server.fastmcp import FastMCP
 
 from tagmend.config import load_settings
-from tagmend.engine import commits, library, staging, versioning
+from tagmend.engine import commits, genres, library, staging, versioning
 from tagmend.engine.doctor import run_health_check
 from tagmend.engine.library import ScanMode
 from tagmend.log import get_logger
@@ -302,6 +302,125 @@ def _commit_to_dict(commit: commits.Commit) -> dict[str, object]:
         "reverted_from": commit.reverted_from,
         "status": commit.status,
     }
+
+
+@mcp.tool()
+def stage_genres(
+    artist: str | None = None,
+    album: str | None = None,
+    file_ids: list[int] | None = None,
+    limit: int | None = None,
+) -> dict[str, object]:
+    """Look up Last.fm genres for in-scope files and stage the result (writes nothing to disk).
+
+    For each in-scope file this looks up its artist (``albumartist`` when present, else
+    ``artist``) and optionally album on Last.fm, classifies the community tags against the
+    controlled genre vocabulary, and stages the resolved genres as an ``auto`` change
+    (replacing ONLY ``genre`` — other managed tags are preserved). Review with
+    ``diff_tags`` and apply with ``commit_tags``; ``revert_tags`` undoes it.
+
+    It deliberately **skips** files that are already done (already staged, or already have
+    a committed ``auto`` genre revision), files marked ``no_match`` (unless the artist or
+    album tag has changed since), files marked ``manual``, and files with no artist tag at
+    all. Files whose artist isn't on Last.fm (or yield no usable genre) are recorded
+    ``no_match`` and not re-tried until their tags change. A transient Last.fm error leaves
+    that artist pending and is reported under ``errors`` so a re-run retries it.
+
+    Args:
+        artist: Limit to files whose ``artist`` tag equals this value.
+        album: Narrow an ``artist`` scope to one album.
+        file_ids: Limit to these specific file ids (overrides ``artist``/``album``).
+        limit: Max files to process this call (default ``genre_stage_limit``). Remaining
+            candidates are reported via ``pending_remaining`` / ``more`` — call again to
+            continue.
+
+    Returns:
+        ``{"ok": True, processed, staged, no_match, skipped{done,no_match,manual,no_artist},
+        pending_remaining, more, errors, no_match_artists, summary}``, or
+        ``{"ok": False, "error": ...}`` (e.g. no API key configured).
+    """
+    try:
+        result = genres.stage_genres(
+            load_settings(),
+            artist=artist,
+            album=album,
+            file_ids=file_ids,
+            limit=limit,
+        )
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    return {"ok": True, **result.to_dict()}
+
+
+@mcp.tool()
+def list_artists() -> dict[str, object]:
+    """List distinct ``artist`` tag values with file counts (to scope ``stage_genres``).
+
+    Returns ``{"ok": True, "artists": [{artist, file_count}, ...]}`` in artist-value order.
+    Run ``scan_library`` first to populate the snapshot.
+    """
+    rows = genres.list_artists(load_settings())
+    return {"ok": True, "artists": [row.to_dict() for row in rows]}
+
+
+@mcp.tool()
+def set_genre_status(
+    status: Literal["manual", "pending"],
+    file_ids: list[int] | None = None,
+    artist: str | None = None,
+) -> dict[str, object]:
+    """Exclude files from genre tagging (``manual``) or re-queue them (``pending``).
+
+    ``manual`` marks the in-scope files as a deliberate human/LLM choice: ``stage_genres``
+    skips them until you reset. ``pending`` removes any status row, re-queuing them. You
+    may exclude or re-include files, but cannot set engine-owned outcomes (e.g.
+    ``no_match`` — that is decided by the Last.fm lookup).
+
+    Args:
+        status: ``manual`` to exclude, ``pending`` to re-queue.
+        file_ids: Limit to these file ids.
+        artist: Limit to files whose ``artist`` tag equals this value (used when
+            ``file_ids`` is omitted).
+
+    Returns:
+        ``{"ok": True, "affected": <count>}``, or ``{"ok": False, "error": ...}``.
+    """
+    try:
+        affected = genres.set_genre_status(
+            load_settings(),
+            file_ids=file_ids,
+            artist=artist,
+            status=status,
+        )
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    return {"ok": True, "affected": affected}
+
+
+@mcp.tool()
+def reset_genre_status(
+    file_ids: list[int] | None = None,
+    artist: str | None = None,
+) -> dict[str, object]:
+    """Clear any genre status row for in-scope files, returning them to ``pending``.
+
+    Removes both ``no_match`` and ``manual`` decisions so ``stage_genres`` will reconsider
+    the files on its next run.
+
+    Args:
+        file_ids: Limit to these file ids.
+        artist: Limit to files whose ``artist`` tag equals this value (used when
+            ``file_ids`` is omitted).
+
+    Returns:
+        ``{"ok": True, "affected": <count>}``.
+    """
+    affected = genres.reset_genre_status(
+        load_settings(),
+        file_ids=file_ids,
+        artist=artist,
+    )
+    return {"ok": True, "affected": affected}
 
 
 def run() -> None:

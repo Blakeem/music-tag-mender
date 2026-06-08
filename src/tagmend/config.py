@@ -39,6 +39,7 @@ _KNOWN_KEYS: Final[frozenset[str]] = frozenset(
 
 # Defaults for the M2 genre-tagging settings (used by the coercion helpers below).
 _GENRE_MIN_WEIGHT_DEFAULT: Final = 2
+_GENRE_MAX_COUNT_DEFAULT: Final = 4
 _LASTFM_RATE_PER_SEC_DEFAULT: Final = 1.0
 _GENRE_STAGE_LIMIT_DEFAULT: Final = 300
 
@@ -85,7 +86,7 @@ class Settings:
     # M2 genre/Last.fm settings carry defaults so direct construction (tests, fixtures)
     # needn't restate them; ``load_settings`` always passes the coerced values.
     genre_min_weight: int = _GENRE_MIN_WEIGHT_DEFAULT
-    genre_max_count: int | None = None
+    genre_max_count: int | None = _GENRE_MAX_COUNT_DEFAULT
     genre_use_album_tags: bool = True
     lastfm_rate_per_sec: float = _LASTFM_RATE_PER_SEC_DEFAULT
     genre_stage_limit: int = _GENRE_STAGE_LIMIT_DEFAULT
@@ -159,20 +160,26 @@ def _coerce_float(key: str, value: str | None, default: float) -> float:
 
 
 def _coerce_max_count(value: str | None) -> int | None:
-    """Parse ``genre_max_count``: a "none" sentinel → ``None`` (unlimited), else ``int``.
+    """Parse ``genre_max_count``: unset → default cap; a sentinel → ``None`` (unlimited).
 
-    The sentinel tokens (empty string, ``0``, ``none``, ``null``; case-insensitive) all
-    mean "no cap". A malformed non-sentinel value warns and falls back to ``None``.
+    Unset (not configured) yields the default cap of ``_GENRE_MAX_COUNT_DEFAULT``. The
+    sentinel tokens (empty string, ``0``, ``none``, ``null``; case-insensitive) explicitly
+    mean "no cap" (``None``). Any other value is parsed as ``int``; a malformed one warns
+    and falls back to the default cap.
     """
     if value is None:
-        return None
+        return _GENRE_MAX_COUNT_DEFAULT
     if value.strip().lower() in _NONE_TOKENS:
         return None
     try:
         return int(value)
     except ValueError:
-        logger.warning("invalid genre_max_count=%r; using default None", value)
-        return None
+        logger.warning(
+            "invalid genre_max_count=%r; using default %d",
+            value,
+            _GENRE_MAX_COUNT_DEFAULT,
+        )
+        return _GENRE_MAX_COUNT_DEFAULT
 
 
 def _coerce_bool(value: str | None, *, default: bool) -> bool:

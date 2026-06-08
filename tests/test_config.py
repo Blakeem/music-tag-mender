@@ -18,7 +18,7 @@ def test_defaults_when_no_file() -> None:
     assert settings.db_path == config.default_db_path()
     # M2 genre/Last.fm settings fall back to their built-in defaults.
     assert settings.genre_min_weight == 2
-    assert settings.genre_max_count is None
+    assert settings.genre_max_count == 4
     assert settings.genre_use_album_tags is True
     assert settings.lastfm_rate_per_sec == 1.0
     assert settings.genre_stage_limit == 300
@@ -56,9 +56,9 @@ def test_genre_max_count_none_sentinel(token: str) -> None:
     assert config.load_settings().genre_max_count is None
 
 
-def test_genre_max_count_malformed_falls_back_to_none() -> None:
+def test_genre_max_count_malformed_falls_back_to_default() -> None:
     config.set_setting("genre_max_count", "lots")
-    assert config.load_settings().genre_max_count is None
+    assert config.load_settings().genre_max_count == 4
 
 
 @pytest.mark.parametrize("token", ["false", "0", "no", "off", "OFF", "No"])

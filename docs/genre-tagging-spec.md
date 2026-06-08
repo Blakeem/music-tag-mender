@@ -321,7 +321,7 @@ Added to `Settings` / `settings.json` (read via `config.load_settings()`):
 | Setting | Type | Default | Meaning |
 |---|---|---|---|
 | `genre_min_weight` | int | `2` | Drop Last.fm tags below this normalized weight. `2` removes the `count==1` tail ("bottom 1%" / 1-vote). `0` keeps all matches. |
-| `genre_max_count` | int \| null | `null` | Cap on genres written per file. `null` = unlimited. Set small for "top genres only". |
+| `genre_max_count` | int \| null | `4` | Cap on genres written per file. Default `4` (tuned on the real library — unbounded gave a verbose 5–7/file). Set `0`/`none` for unlimited, or smaller for "top genres only". |
 | `genre_use_album_tags` | bool | `true` | Include `album.getTopTags` in the merge. |
 
 All three are tunable later; defaults are conservative. Real-world accuracy on the user's

@@ -76,9 +76,11 @@ def library_stats() -> dict[str, object]:
     """Report library-wide snapshot counts.
 
     Returns totals for tracked files, how many are present vs missing on disk, how many
-    are still ``unprocessed`` (no tags read yet), a per-extension breakdown, and the
-    total number of stored tag values. Useful for gauging scan progress before running
-    later resolve/commit steps.
+    are still ``unprocessed`` (no tags read yet), a per-extension breakdown, the total
+    number of stored tag values, and a ``genre`` block counting every file's genre
+    workflow state (``pending`` / ``staged`` / ``done`` / ``no_match`` / ``manual``) —
+    the progress gauge for ``stage_genres``. Drill into a non-zero ``no_match`` or
+    ``manual`` count with ``list_files(genre_status=...)``.
     """
     return {"ok": True, **library.library_stats(load_settings())}
 
@@ -182,27 +184,47 @@ def commit_tags(message: str | None = None, path: str | None = None) -> dict[str
 
 
 @mcp.tool()
-def list_files(path: str | None = None, limit: int | None = None) -> dict[str, object]:
+def list_files(
+    path: str | None = None,
+    limit: int | None = None,
+    genre_status: Literal["pending", "no_match", "manual", "staged", "done"] | None = None,
+) -> dict[str, object]:
     """List tracked files with their current managed tags (to discover file ids).
 
     Each entry carries the stable ``file_id`` you pass to ``stage_tags`` / ``history_tags``
-    / ``revert_tags``, plus the file's folder/filename and current managed tags
-    (``genre``, ``artist``, ``albumartist``, ``musicbrainz_artistid``). Run ``scan_library``
-    first to populate the snapshot.
+    / ``revert_tags``, plus the file's folder/filename, current managed tags
+    (``genre``, ``artist``, ``albumartist``, ``musicbrainz_artistid``), and its genre
+    workflow ``genre_status``. Run ``scan_library`` first to populate the snapshot.
+
+    ``genre_status="no_match"`` is the **fix-by-hand worklist**: files Last.fm had nothing
+    for. Each carries ``genre_source_artist``/``genre_source_album`` — the identity the
+    lookup used — so a misspelled artist/album is visible next to the current tags (fix
+    the tags, rescan, and ``stage_genres`` retries automatically). ``manual`` lists the
+    sticky exclusions (``set_genre_status``). A stored status is reported even if the
+    file's identity changed since (compare the source fields to spot staleness).
+    ``pending`` includes files ``stage_genres`` cannot process for lack of an artist tag.
 
     Args:
         path: When given, only files at this folder or nested under it are returned.
-        limit: Cap the number of files returned (applied before reading tags).
+        limit: Cap the number of files returned. With ``genre_status`` the cap counts
+            *matching* files; without it, it is applied before reading tags.
+        genre_status: Return only files in this genre workflow state
+            (``pending`` | ``no_match`` | ``manual`` | ``staged`` | ``done``).
 
     Returns:
         ``{"ok": True, "files": [{file_id, folder, filename, ext, is_missing,
-        managed_tags}, ...]}``.
+        managed_tags, genre_status, genre_source_artist, genre_source_album}, ...]}``,
+        or ``{"ok": False, "error": ...}`` on a bad request.
     """
-    views = library.list_files(
-        load_settings(),
-        root=Path(path) if path is not None else None,
-        limit=limit,
-    )
+    try:
+        views = library.list_files(
+            load_settings(),
+            root=Path(path) if path is not None else None,
+            limit=limit,
+            genre_status=genre_status,
+        )
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
     return {"ok": True, "files": [view.to_dict() for view in views]}
 
 
@@ -211,7 +233,8 @@ def get_file(file_id: int) -> dict[str, object]:
     """Return one tracked file with its current managed tags, by stable ``file_id``.
 
     Returns ``{"ok": True, "file": {file_id, folder, filename, ext, is_missing,
-    managed_tags}}``, or ``{"ok": False, "error": ...}`` if the id is unknown.
+    managed_tags, genre_status, genre_source_artist, genre_source_album}}``, or
+    ``{"ok": False, "error": ...}`` if the id is unknown.
     """
     view = library.get_file_view(load_settings(), file_id)
     if view is None:
@@ -254,17 +277,64 @@ def revert_tags(file_id: int, version: int, note: str | None = None) -> dict[str
     """Restore a file's managed tags to a prior ``version`` (append-only, revertible).
 
     Writes the target revision's tags back to disk and appends a *new* ``revert`` revision
-    — nothing is destroyed, and you can revert a revert. Get valid versions from
-    ``history_tags``.
+    under its own single-file ``origin='revert'`` commit — nothing is destroyed, you can
+    revert a revert, and the revert shows in ``list_commits`` (undoable via
+    ``revert_commit``). Get valid versions from ``history_tags``. Refused while the file
+    has a staged change — commit or unstage it first.
 
-    Returns ``{"ok": True, "new_version": int}``, or ``{"ok": False, "error": ...}`` if the
-    file or version is unknown or the file is missing on disk.
+    Returns ``{"ok": True, "new_version": int, "commit_id": int, ...}``, or
+    ``{"ok": False, "error": ...}`` if the file or version is unknown, the file is
+    missing on disk, or the file has a pending staged change.
     """
     try:
-        new_version = versioning.revert(load_settings(), file_id, version, note=note)
+        result = versioning.revert(load_settings(), file_id, version, note=note)
     except ValueError as exc:
         return {"ok": False, "error": str(exc)}
-    return {"ok": True, "new_version": new_version}
+    return {"ok": True, **result.to_dict()}
+
+
+@mcp.tool()
+def revert_commit(
+    commit_id: int,
+    note: str | None = None,
+    dry_run: bool = False,  # noqa: FBT001, FBT002 - MCP tool surface, not a Python API
+) -> dict[str, object]:
+    """Undo an entire commit as a unit: every file it changed goes back to its pre-commit tags.
+
+    The group counterpart of ``revert_tags``: all reverts land under ONE new
+    ``origin='revert'`` commit whose ``reverted_from`` records the undone commit, so the
+    rollback is itself a tracked, revertible commit. History stays append-only — nothing
+    after the commit is ever lost. Find commit ids with ``list_commits``.
+
+    Safety rules: files changed again by a LATER commit are skipped and reported
+    (``skipped_later_changes`` — revert those per-file with ``revert_tags`` if really
+    wanted); the staging area must be empty (commit or unstage pending work first);
+    missing files are reported, not fatal. Use ``dry_run=true`` to preview the exact
+    per-file plan without touching anything.
+
+    Args:
+        commit_id: The commit to undo (from ``list_commits``).
+        note: Optional message stored on the new revert commit and its revisions.
+        dry_run: When true, classify and report only — no disk or ledger changes
+            (``commit_id`` in the result is ``null``; ``status='reverted'`` means
+            "would be reverted").
+
+    Returns:
+        ``{"ok": True, "commit_id": ..., "reverted_from": ..., "dry_run": ...,
+        "reverted"/"skipped"/"missing"/"errors": counts, "outcomes": [...]}`` with one
+        outcome per file, or ``{"ok": False, "error": ...}`` if the commit id is
+        unknown, the commit is still ``applying``, or the staging area is not empty.
+    """
+    try:
+        result = versioning.revert_commit(
+            load_settings(),
+            commit_id,
+            note=note,
+            dry_run=dry_run,
+        )
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    return {"ok": True, **result.to_dict()}
 
 
 @mcp.tool()

@@ -20,6 +20,7 @@ from tagmend import mcp_server
 from tagmend.config import load_settings
 from tagmend.engine import store
 from tagmend.engine.db import connect
+from tagmend.engine.tags import read_tags
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -91,6 +92,7 @@ def test_list_tools_exposes_expected_tools_and_schema() -> None:
         "commit_tags",
         "history_tags",
         "revert_tags",
+        "revert_commit",
         "list_commits",
         "get_commit",
     } <= names
@@ -100,6 +102,11 @@ def test_list_tools_exposes_expected_tools_and_schema() -> None:
     scan_tool = next(tool for tool in tools if tool.name == "scan_library")
     mode_schema = scan_tool.inputSchema["properties"]["mode"]
     assert mode_schema["enum"] == ["incremental", "full", "presence"]
+
+
+def read_tags_via_disk(music_dir: Path, filename: str = "track.mp3") -> list[str]:
+    """Read the genre tag straight off disk for the single track ``_scanned_track_id`` makes."""
+    return read_tags(music_dir / filename).tags.get("genre", [])
 
 
 def _scanned_track_id(music_dir: Path, filename: str = "track.mp3") -> int:
@@ -188,7 +195,12 @@ def test_history_and_revert_roundtrip(music_dir: Path) -> None:
 
     reverted = mcp_server.revert_tags(file_id, 0)
     assert reverted["ok"] is True
+    assert reverted["file_id"] == file_id
+    assert reverted["target_version"] == 0
     assert reverted["new_version"] == 2
+    # The single-file revert now lands under its own origin='revert' commit.
+    assert isinstance(reverted["commit_id"], int)
+    assert mcp_server.get_commit(reverted["commit_id"])["ok"] is True
 
     # An unknown version is an error, not a crash.
     assert mcp_server.revert_tags(file_id, 99)["ok"] is False
@@ -213,3 +225,52 @@ def test_list_commits_and_get_commit(music_dir: Path) -> None:
     assert got["commit"]["message"] == "reclassify"
 
     assert mcp_server.get_commit(9999)["ok"] is False
+
+
+def test_revert_commit_roundtrip(music_dir: Path) -> None:
+    file_id = _scanned_track_id(music_dir)  # genre Electronic
+    mcp_server.stage_tags(file_id, {"genre": ["Synthwave"]})
+    committed = mcp_server.commit_tags()
+    target = committed["commit_id"]
+    assert isinstance(target, int)
+    assert read_tags_via_disk(music_dir) == ["Synthwave"]
+
+    reverted = mcp_server.revert_commit(target)
+    assert reverted["ok"] is True
+    assert reverted["reverted_from"] == target
+    assert reverted["reverted"] == 1
+    assert reverted["dry_run"] is False
+    assert isinstance(reverted["commit_id"], int)
+    assert reverted["commit_id"] != target
+    # The whole commit was undone: the file is back to its pre-commit genre.
+    assert read_tags_via_disk(music_dir) == ["Electronic"]
+
+    # The new revert commit is itself a tracked, applied commit.
+    new_commit = mcp_server.get_commit(reverted["commit_id"])
+    assert new_commit["ok"] is True
+    assert new_commit["commit"]["status"] == "applied"
+    assert new_commit["commit"]["reverted_from"] == target
+
+
+def test_revert_commit_dry_run_touches_nothing(music_dir: Path) -> None:
+    file_id = _scanned_track_id(music_dir)
+    mcp_server.stage_tags(file_id, {"genre": ["Synthwave"]})
+    target = mcp_server.commit_tags()["commit_id"]
+    assert isinstance(target, int)
+
+    preview = mcp_server.revert_commit(target, dry_run=True)
+    assert preview["ok"] is True
+    assert preview["dry_run"] is True
+    assert preview["commit_id"] is None
+    assert preview["reverted"] == 1
+    outcomes = preview["outcomes"]
+    assert isinstance(outcomes, list)
+    assert outcomes[0]["status"] == "reverted"
+    # Disk and history are untouched by a dry run.
+    assert read_tags_via_disk(music_dir) == ["Synthwave"]
+
+
+def test_revert_commit_unknown_id_returns_error() -> None:
+    payload = mcp_server.revert_commit(9999)
+    assert payload["ok"] is False
+    assert "error" in payload

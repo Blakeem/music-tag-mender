@@ -7,15 +7,23 @@ tracked & revertible). Engine-first: all logic lives in `tagmend.engine`; the CL
 MCP server are thin wrappers. **Read `PLAN.md` for the full design** — this file is
 just how to work in the repo.
 
-Current status: **M1 read path + M3 write-path core shipped.** The git-like
-stage → commit → history → revert engine is built and tested: a domain-neutral commit
-core (`engine/commits.py` — the `commits` table, the `RevisionDomain` seam, the
-crash-safe `run_commit` loop, **resume-free** recovery), the tags domain
-(`engine/staging.py` — `stage_tags`/`unstage_tags`/`diff_tags`/`commit_tags`, v0 baseline
-captured at stage time), plus `versioning.py` (revert/history) and the full tags MCP
-family + discovery (`list_files`/`get_file`) + commit inspection (`list_commits`/
-`get_commit`). Schema is **v5** (staged tables carry no `commit_id`). **Next: M2 Last.fm**
-(`lastfm.py`/`classify.py` are stubs); M6 organize/moves (`moves.py`) is a paper sketch.
+Current status: **M1 read path + M3 write-path core + M2 genre pipeline shipped.**
+The git-like stage → commit → history → revert engine is built and tested: a
+domain-neutral commit core (`engine/commits.py` — the `commits` table, the
+`RevisionDomain` seam, the crash-safe `run_commit` loop, **resume-free** recovery),
+the tags domain (`engine/staging.py` — `stage_tags`/`unstage_tags`/`diff_tags`/
+`commit_tags`, v0 baseline captured at stage time), plus `versioning.py`
+(revert/history) and the full tags MCP family + discovery + commit inspection. M2's
+genre side is live: `lastfm.py` (cached/paced artist+album top-tags), `classify.py`
+(vocab/overlay + `resolve_genres`), `genres.py` (`stage_genres` + the
+`file_genre_status` workflow: `no_match`/`manual`/pending-by-absence). M3.5 shipped
+too: `revert_commit` group undo (skip+report, empty-staging guard, dry-run; every
+revert — even per-file `revert_tags` — is now its own `origin='revert'` commit) and
+genre-status visibility (`list_files(genre_status=...)` filter + `library_stats`
+genre counts via `store.derived_genre_status`, the mirror of `genres._select`).
+18 MCP tools total. Schema is **v6**. **Next: M4** artist-name normalization
+(`artist.getCorrection` is NOT built yet) + review loop. M6 organize/moves
+(`moves.py`) is a paper sketch (its DDL ships in v6; logic deferred).
 
 ## Python
 
@@ -101,20 +109,22 @@ src/tagmend/
   log.py            shared logger (use everywhere)
   config.py         settings.json (platformdirs) + typed Settings
   cli.py            Typer CLI (thin)
-  mcp_server.py     FastMCP server (thin) — 13 tools
+  mcp_server.py     FastMCP server (thin) — 18 tools
   engine/
     db.py           SQLite connection (WAL)
-    schema.py       all DDL + PRAGMA user_version (v5)
+    schema.py       all DDL + PRAGMA user_version (v6)
     scan.py         filesystem discovery + signatures
     doctor.py       health_check / readiness + interrupted-commit report
-    store.py        pure data access: files/file_tags + tag_revisions[_staged]
+    store.py        pure data access: files/file_tags + tag_revisions[_staged] + genre status
     library.py      scan orchestration (3 modes) + stats + list_files/get_file
     tags.py         mutagen read/write of the managed tag set
     versioning.py   tag-revision baseline/append + revert + history
     commits.py      domain-neutral commit core: commits table + RevisionDomain + run_commit
     staging.py      tags domain (TagDomain) + stage/diff/commit_tags orchestration
-    lastfm.py classify.py   # STUBS — M2 (Last.fm + classification)
-    moves.py                # STUB + PathDomain paper sketch — M6 (organize/moves)
+    lastfm.py       Last.fm top-tags client: lastfm_cache + pacing (getCorrection → M4)
+    classify.py     genre vocab/overlay loader + fold-key index + resolve_genres
+    genres.py       stage_genres orchestration + file_genre_status workflow
+    moves.py        STUB + PathDomain paper sketch — M6 (organize/moves)
 tests/              pytest; conftest isolates config + builds temp libraries (make_track)
 ```
 

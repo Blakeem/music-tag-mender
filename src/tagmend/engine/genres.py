@@ -152,6 +152,10 @@ def _select(
     Mutates *tally* with the skip counts. A candidate is processable when it is not
     already done (staged / committed auto revision), is not sticky ``manual``, and has no
     non-stale ``no_match`` for its current identity.
+
+    The user-facing mirror of this classification is
+    :func:`tagmend.engine.store.derived_genre_status` (the ``list_files`` filter and the
+    stats counts) — keep the two in sync when the predicates change.
     """
     processable: list[_Candidate] = []
     for fid in candidate_ids:

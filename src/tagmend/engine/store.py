@@ -243,6 +243,7 @@ def compute_stats(conn: sqlite3.Connection) -> dict[str, object]:
         "unprocessed": unprocessed,
         "total_tag_values": total_tag_values,
         "by_ext": by_ext,
+        "genre": genre_status_counts(conn),
     }
 
 
@@ -355,6 +356,19 @@ def get_revision(conn: sqlite3.Connection, file_id: int, version: int) -> Revisi
     )
     row = cursor.fetchone()
     return None if row is None else _row_to_revision(tuple(row))
+
+
+def revisions_for_commit(conn: sqlite3.Connection, commit_id: int) -> list[Revision]:
+    """Return every revision row created by *commit_id*, in ``file_id`` order.
+
+    The commit's per-file change set — what :func:`tagmend.engine.versioning.revert_commit`
+    classifies and undoes. Baselines (``commit_id`` NULL) never appear here.
+    """
+    cursor = conn.execute(
+        f"SELECT {_REVISION_COLUMNS} FROM tag_revisions WHERE commit_id = ? ORDER BY file_id",  # noqa: S608
+        (commit_id,),
+    )
+    return [_row_to_revision(tuple(row)) for row in cursor.fetchall()]
 
 
 def max_version(conn: sqlite3.Connection, file_id: int) -> int | None:
@@ -598,6 +612,17 @@ def is_staged(conn: sqlite3.Connection, file_id: int) -> bool:
     return bool(row[0])
 
 
+def any_staged(conn: sqlite3.Connection) -> bool:
+    """Return whether ANY file has a pending change in ``tag_revisions_staged``.
+
+    The clean-staging-area guard for commit-level revert: rolling back with work still
+    staged would interleave a revert with half-staged intent, so the revert refuses
+    (git's "commit or stash first").
+    """
+    row = conn.execute("SELECT EXISTS(SELECT 1 FROM tag_revisions_staged)").fetchone()
+    return bool(row[0])
+
+
 def has_auto_revision(conn: sqlite3.Connection, file_id: int) -> bool:
     """Return whether *file_id* has a committed ``origin='auto'`` revision."""
     row = conn.execute(
@@ -605,6 +630,67 @@ def has_auto_revision(conn: sqlite3.Connection, file_id: int) -> bool:
         (file_id,),
     ).fetchone()
     return bool(row[0])
+
+
+# The five user-facing genre workflow states. Two are stored (`no_match`/`manual`,
+# rows in file_genre_status), three are derived (`staged`/`done` from the revision
+# tables, `pending` = none of the above). Single source of truth for the
+# ``list_files(genre_status=...)`` filter and the stats counts.
+GENRE_WORKFLOW_STATUSES: Final = frozenset({"pending", "no_match", "manual", "staged", "done"})
+
+
+def derived_genre_status(conn: sqlite3.Connection, file_id: int) -> str:
+    """Return *file_id*'s genre workflow status: staged | done | no_match | manual | pending.
+
+    THE canonical derivation, composed from the same predicates
+    :func:`tagmend.engine.genres._select` skips on (keep the two in sync): a staged
+    change wins, then a committed ``origin='auto'`` revision (``done``), then a stored
+    ``file_genre_status`` row, else ``pending``. Reports the STORED status even when
+    it is stale (identity changed since) — ``stage_genres`` still retries stale
+    ``no_match`` rows; the listing surfaces the recorded decision so a human can
+    judge it. Files with no artist tag count as ``pending`` (unprocessable until
+    tagged, but not terminal).
+    """
+    if is_staged(conn, file_id):
+        return "staged"
+    if has_auto_revision(conn, file_id):
+        return "done"
+    decision = get_genre_status(conn, file_id)
+    if decision is not None:
+        return decision.status
+    return "pending"
+
+
+def genre_status_counts(conn: sqlite3.Connection) -> dict[str, int]:
+    """Return file counts per genre workflow status, all five keys always present.
+
+    One SQL pass over every tracked file. The ``CASE`` mirrors
+    :func:`derived_genre_status` exactly (a test cross-checks the two — keep them in
+    lockstep when either changes).
+    """
+    counts = dict.fromkeys(sorted(GENRE_WORKFLOW_STATUSES), 0)
+    cursor = conn.execute(
+        """
+        SELECT
+          CASE
+            WHEN EXISTS (
+              SELECT 1 FROM tag_revisions_staged s WHERE s.file_id = f.id
+            ) THEN 'staged'
+            WHEN EXISTS (
+              SELECT 1 FROM tag_revisions r WHERE r.file_id = f.id AND r.origin = 'auto'
+            ) THEN 'done'
+            WHEN g.status IS NOT NULL THEN g.status
+            ELSE 'pending'
+          END AS workflow_status,
+          COUNT(*)
+        FROM files f
+        LEFT JOIN file_genre_status g ON g.file_id = f.id
+        GROUP BY workflow_status
+        """,
+    )
+    for row in cursor.fetchall():
+        counts[str(row[0])] = _as_int(row[1])
+    return counts
 
 
 def distinct_artists(conn: sqlite3.Connection) -> list[tuple[str, int]]:

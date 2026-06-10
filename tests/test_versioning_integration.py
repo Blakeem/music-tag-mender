@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 from conftest import make_track
-from tagmend.engine import store, versioning
+from tagmend.engine import commits, store, versioning
 from tagmend.engine.db import connect
 from tagmend.engine.library import scan_library
 from tagmend.engine.schema import apply_schema
@@ -97,6 +97,15 @@ def _revisions(settings: Settings, file_id: int) -> list[store.Revision]:
         conn.close()
 
 
+def _commit(settings: Settings, commit_id: int) -> commits.Commit | None:
+    conn = connect(settings.db_path)
+    try:
+        apply_schema(conn)
+        return commits.get_commit(conn, commit_id)
+    finally:
+        conn.close()
+
+
 @pytest.mark.parametrize("suffix", _FORMATS)
 def test_revert_restores_file_and_live_snapshot(
     engine_settings: Settings,
@@ -115,8 +124,8 @@ def test_revert_restores_file_and_live_snapshot(
     # The edit really changed the bytes on disk.
     assert read_tags(track).tags["genre"] == ["Synthwave"]
 
-    new_version = versioning.revert(engine_settings, file_id, 0)
-    assert new_version == 2
+    result = versioning.revert(engine_settings, file_id, 0)
+    assert result.new_version == 2
 
     reverted = read_tags(track).tags
     assert reverted["genre"] == ["Electronic"]
@@ -129,6 +138,13 @@ def test_revert_restores_file_and_live_snapshot(
     assert revisions[-1].origin == "revert"
     assert revisions[-1].reverted_from == 0
     assert revisions[-1].managed_tags == {"genre": ["Electronic"]}
+
+    # The revert is recorded under its own origin='revert' commit (not NULL).
+    assert revisions[-1].commit_id == result.commit_id
+    commit = _commit(engine_settings, result.commit_id)
+    assert commit is not None
+    assert commit.origin == "revert"
+    assert commit.status == "applied"
 
 
 def test_revert_a_revert_rolls_back_and_forward(
@@ -145,11 +161,11 @@ def test_revert_a_revert_rolls_back_and_forward(
     _edit(engine_settings, track, file_id, {"genre": ["Synthwave"]})  # v1
 
     back = versioning.revert(engine_settings, file_id, 0)  # back to Electronic
-    assert back == 2
+    assert back.new_version == 2
     assert read_tags(track).tags["genre"] == ["Electronic"]
 
     forward = versioning.revert(engine_settings, file_id, 1)  # forward to Synthwave
-    assert forward == 3
+    assert forward.new_version == 3
     assert read_tags(track).tags["genre"] == ["Synthwave"]
 
     revisions = _revisions(engine_settings, file_id)
@@ -169,7 +185,7 @@ def test_revert_with_no_change_still_appends(
     _baseline(engine_settings, file_id, {"genre": ["Electronic"]})
 
     # Reverting to v0 while already at v0 content still records an audited revert row.
-    assert versioning.revert(engine_settings, file_id, 0) == 1
+    assert versioning.revert(engine_settings, file_id, 0).new_version == 1
     revisions = _revisions(engine_settings, file_id)
     assert revisions[-1].origin == "revert"
     assert revisions[-1].diff == {}
@@ -195,6 +211,21 @@ def test_revert_missing_file_raises(engine_settings: Settings, music_dir: Path) 
     scan_library(engine_settings)  # flags the file missing
 
     with pytest.raises(ValueError, match="missing file"):
+        versioning.revert(engine_settings, file_id, 0)
+
+
+def test_revert_with_staged_change_raises(engine_settings: Settings, music_dir: Path) -> None:
+    """A pending staged change blocks a single-file revert (commit or unstage first)."""
+    from tagmend.engine import staging  # noqa: PLC0415 - local import keeps module imports lean
+
+    track = make_track(music_dir / "t.mp3", {"genre": ["Electronic"]})
+    scan_library(engine_settings)
+    file_id = _file_id(engine_settings, music_dir, track.name)
+    _baseline(engine_settings, file_id, {"genre": ["Electronic"]})
+
+    staging.stage_tags(engine_settings, file_id=file_id, managed_tags={"genre": ["Synthwave"]})
+
+    with pytest.raises(ValueError, match="staged change"):
         versioning.revert(engine_settings, file_id, 0)
 
 

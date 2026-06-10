@@ -64,6 +64,30 @@ def _file_row(settings: Settings, folder: Path, filename: str) -> store.FileRow:
         conn.close()
 
 
+def _set_no_match(
+    settings: Settings,
+    file_id: int,
+    *,
+    source_artist: str | None,
+    source_album: str | None = None,
+) -> None:
+    """Persist a terminal ``no_match`` genre decision for *file_id*."""
+    conn = connect(settings.db_path)
+    try:
+        apply_schema(conn)
+        store.set_genre_status(
+            conn,
+            file_id=file_id,
+            status="no_match",
+            source_artist=source_artist,
+            source_album=source_album,
+            now="2026-06-09T00:00:00+00:00",
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def test_list_files_returns_views_with_managed_tags(
     engine_settings: Settings,
     music_dir: Path,
@@ -261,3 +285,94 @@ def test_scan_requires_music_path(tmp_path: Path) -> None:
 def test_scan_rejects_nonexistent_path(engine_settings: Settings, tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="does not exist"):
         scan_library(engine_settings, path=tmp_path / "does-not-exist")
+
+
+# --- genre_status filter + new FileView fields --------------------------------------
+
+
+def test_plain_file_defaults_to_pending_with_no_sources(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    _populate(music_dir, 1)
+    scan_library(engine_settings)
+
+    view = list_files(engine_settings)[0]
+    assert view.genre_status == "pending"
+    assert view.genre_source_artist is None
+    assert view.genre_source_album is None
+
+
+def test_list_files_filters_to_no_match_with_sources(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    tracks = _populate(music_dir, _N)
+    scan_library(engine_settings)
+
+    # Flag only the middle track as no_match, recorded against its identity.
+    target = _file_row(engine_settings, music_dir, tracks[1].name)
+    _set_no_match(
+        engine_settings,
+        target.id,
+        source_artist="Artist 1",
+        source_album="Some Album",
+    )
+
+    views = list_files(engine_settings, genre_status="no_match")
+
+    assert [v.file_id for v in views] == [target.id]
+    only = views[0]
+    assert only.genre_status == "no_match"
+    assert only.genre_source_artist == "Artist 1"
+    assert only.genre_source_album == "Some Album"
+
+
+def test_list_files_filter_limit_counts_matching_lowest_ids(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    # Five tracks; flag tracks 0, 2, 3 as no_match (track 1, 4 are pending non-matches).
+    tracks = _populate(music_dir, 5)
+    scan_library(engine_settings)
+    matching_ids: list[int] = []
+    for index in (0, 2, 3):
+        row = _file_row(engine_settings, music_dir, tracks[index].name)
+        _set_no_match(engine_settings, row.id, source_artist=f"Artist {index}")
+        matching_ids.append(row.id)
+
+    # limit=2 returns exactly the two lowest-id MATCHING files; non-matches (track 1)
+    # do not consume the cap.
+    views = list_files(engine_settings, genre_status="no_match", limit=2)
+
+    assert [v.file_id for v in views] == sorted(matching_ids)[:2]
+    assert all(v.genre_status == "no_match" for v in views)
+
+
+def test_list_files_unknown_genre_status_raises(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    _populate(music_dir, 1)
+    scan_library(engine_settings)
+    with pytest.raises(ValueError, match="unknown genre_status"):
+        list_files(engine_settings, genre_status="bogus")
+
+
+def test_library_stats_includes_genre_block(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    tracks = _populate(music_dir, _N)
+    scan_library(engine_settings)
+    row = _file_row(engine_settings, music_dir, tracks[0].name)
+    _set_no_match(engine_settings, row.id, source_artist="Artist 0")
+
+    stats = library_stats(engine_settings)
+
+    assert "genre" in stats
+    genre = stats["genre"]
+    assert isinstance(genre, dict)
+    assert set(genre) == store.GENRE_WORKFLOW_STATUSES
+    assert genre["no_match"] == 1
+    assert genre["pending"] == _N - 1

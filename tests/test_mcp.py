@@ -77,6 +77,29 @@ def test_real_call_tool_roundtrip(music_dir: Path) -> None:
     assert payload["added"] == _N
 
 
+def _enum_values(schema: object) -> list[object]:
+    """Extract a JSON-Schema ``enum`` list, unwrapping an ``anyOf`` optional wrapper.
+
+    A ``Literal[...] | None`` parameter is encoded as ``anyOf: [{enum: [...]}, {null}]``
+    rather than a top-level ``enum`` key (which is how a non-optional Literal with a
+    default, like ``mode``, is encoded).
+    """
+    assert isinstance(schema, dict)
+    if "enum" in schema:
+        enum = schema["enum"]
+        assert isinstance(enum, list)
+        return enum
+    any_of = schema.get("anyOf")
+    assert isinstance(any_of, list)
+    for branch in any_of:
+        if isinstance(branch, dict) and "enum" in branch:
+            enum = branch["enum"]
+            assert isinstance(enum, list)
+            return enum
+    message = f"no enum found in schema: {schema!r}"
+    raise AssertionError(message)
+
+
 def test_list_tools_exposes_expected_tools_and_schema() -> None:
     tools = asyncio.run(mcp_server.mcp.list_tools())
     names = {tool.name for tool in tools}
@@ -102,6 +125,11 @@ def test_list_tools_exposes_expected_tools_and_schema() -> None:
     scan_tool = next(tool for tool in tools if tool.name == "scan_library")
     mode_schema = scan_tool.inputSchema["properties"]["mode"]
     assert mode_schema["enum"] == ["incremental", "full", "presence"]
+
+    list_tool = next(tool for tool in tools if tool.name == "list_files")
+    genre_status_schema = list_tool.inputSchema["properties"]["genre_status"]
+    enum_values = _enum_values(genre_status_schema)
+    assert set(enum_values) == {"pending", "no_match", "manual", "staged", "done"}
 
 
 def read_tags_via_disk(music_dir: Path, filename: str = "track.mp3") -> list[str]:
@@ -174,12 +202,72 @@ def test_list_files_and_get_file(music_dir: Path) -> None:
     assert len(files) == 1
     assert files[0]["file_id"] == file_id
     assert files[0]["managed_tags"]["genre"] == ["Electronic"]
+    # New genre-status fields ride along on every file dict.
+    assert files[0]["genre_status"] == "pending"
+    assert files[0]["genre_source_artist"] is None
+    assert files[0]["genre_source_album"] is None
 
     got = mcp_server.get_file(file_id)
     assert got["ok"] is True
     assert got["file"]["file_id"] == file_id
+    assert got["file"]["genre_status"] == "pending"
 
     assert mcp_server.get_file(9999)["ok"] is False
+
+
+def _set_no_match(file_id: int, *, source_artist: str, source_album: str | None = None) -> None:
+    """Persist a terminal ``no_match`` genre decision in the isolated ledger."""
+    conn = connect(load_settings().db_path)
+    try:
+        store.set_genre_status(
+            conn,
+            file_id=file_id,
+            status="no_match",
+            source_artist=source_artist,
+            source_album=source_album,
+            now="2026-06-09T00:00:00+00:00",
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_list_files_genre_status_worklist_has_sources(music_dir: Path) -> None:
+    file_id = _scanned_track_id(music_dir)
+    _set_no_match(file_id, source_artist="Obscure Band", source_album="Demos")
+
+    listed = mcp_server.list_files(genre_status="no_match")
+
+    assert listed["ok"] is True
+    files = listed["files"]
+    assert isinstance(files, list)
+    assert len(files) == 1
+    entry = files[0]
+    assert entry["file_id"] == file_id
+    assert entry["genre_status"] == "no_match"
+    assert entry["genre_source_artist"] == "Obscure Band"
+    assert entry["genre_source_album"] == "Demos"
+
+
+def test_list_files_bad_genre_status_returns_error(music_dir: Path) -> None:
+    _scanned_track_id(music_dir)
+    # The Literal annotation is not enforced at runtime; the engine ValueError is caught.
+    payload = mcp_server.list_files(genre_status="bogus")
+    assert payload["ok"] is False
+    assert "error" in payload
+
+
+def test_library_stats_includes_genre_block(music_dir: Path) -> None:
+    file_id = _scanned_track_id(music_dir)
+    _set_no_match(file_id, source_artist="Obscure Band")
+
+    stats = mcp_server.library_stats()
+
+    assert stats["ok"] is True
+    genre = stats["genre"]
+    assert isinstance(genre, dict)
+    assert set(genre) == store.GENRE_WORKFLOW_STATUSES
+    assert genre["no_match"] == 1
 
 
 def test_history_and_revert_roundtrip(music_dir: Path) -> None:

@@ -22,7 +22,7 @@ from conftest import make_track
 from tagmend.engine import genres, staging, store, versioning
 from tagmend.engine.db import connect
 from tagmend.engine.lastfm import Tag
-from tagmend.engine.library import ScanMode, scan_library
+from tagmend.engine.library import ScanMode, list_files, scan_library
 from tagmend.engine.schema import apply_schema
 from tagmend.engine.tags import read_tags, write_managed_tags
 
@@ -382,3 +382,75 @@ def test_list_artists_reports_distinct_values_with_counts(
     rows = genres.list_artists(engine_settings)
     counts = {row.artist: row.file_count for row in rows}
     assert counts == {"Daft Punk": 2, "Justice": 1}
+
+
+# --- genre-status visibility: end-to-end coherence -----------------------------------
+
+
+def _status_of(settings: Settings, file_id: int) -> str:
+    """Read back the derived genre status surfaced by ``list_files`` for one file."""
+    view = next(v for v in list_files(settings) if v.file_id == file_id)
+    return view.genre_status
+
+
+def test_listing_status_tracks_stage_then_commit_and_no_match_source(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    matched = make_track(music_dir / "matched.mp3", {"artist": ["Daft Punk"], "genre": ["Old"]})
+    unknown = make_track(music_dir / "unknown.mp3", {"artist": ["Obscure Band"], "genre": ["Old"]})
+    scan_library(engine_settings)
+    matched_id = _file_id(engine_settings, music_dir, matched.name)
+    unknown_id = _file_id(engine_settings, music_dir, unknown.name)
+
+    fake = FakeTagSource({"Daft Punk": _DAFT_PUNK_TAGS, "Obscure Band": None})
+    genres.stage_genres(engine_settings, client=fake)
+
+    # The matched file lists as 'staged' before commit; the no-match file as 'no_match'
+    # carrying the artist its lookup was recorded against.
+    assert _status_of(engine_settings, matched_id) == "staged"
+    no_match_view = next(v for v in list_files(engine_settings) if v.file_id == unknown_id)
+    assert no_match_view.genre_status == "no_match"
+    assert no_match_view.genre_source_artist == "Obscure Band"
+
+    # After committing the staged change, the matched file derives 'done'.
+    staging.commit_tags(engine_settings, origin="auto")
+    assert _status_of(engine_settings, matched_id) == "done"
+    # The no-match file is unaffected by the commit.
+    assert _status_of(engine_settings, unknown_id) == "no_match"
+
+
+def test_no_match_listing_is_pinned_while_stage_genres_reprocesses_stale(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    """Staleness pin: a stored no_match keeps listing as 'no_match' (recorded decision),
+
+    even after the on-disk artist is fixed and rescanned — while a fresh
+    ``stage_genres`` run reprocesses the now-stale file rather than skipping it.
+    """
+    track = make_track(music_dir / "t.mp3", {"artist": ["Wrong Name"], "genre": ["Old"]})
+    scan_library(engine_settings)
+    file_id = _file_id(engine_settings, music_dir, track.name)
+
+    fake = FakeTagSource({"Wrong Name": None, "Daft Punk": _DAFT_PUNK_TAGS})
+    genres.stage_genres(engine_settings, client=fake)
+    assert _status_of(engine_settings, file_id) == "no_match"
+
+    # Fix the artist on disk and rescan so the snapshot identity changes.
+    write_managed_tags(track, {"artist": ["Daft Punk"], "genre": ["Old"]})
+    scan_library(engine_settings, mode=ScanMode.FULL)
+
+    # Pinned behavior: the listing STILL reports the stored 'no_match' decision, now
+    # against the stale "Wrong Name" identity.
+    stale_view = next(v for v in list_files(engine_settings) if v.file_id == file_id)
+    assert stale_view.genre_status == "no_match"
+    assert stale_view.genre_source_artist == "Wrong Name"
+
+    # A fresh stage_genres run, however, reprocesses the stale file (does not skip it).
+    result = genres.stage_genres(engine_settings, client=fake)
+    assert result.processed == 1
+    assert result.staged == 1
+    assert result.skipped["no_match"] == 0
+    # And now it lists as 'staged'.
+    assert _status_of(engine_settings, file_id) == "staged"

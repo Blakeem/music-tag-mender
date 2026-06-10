@@ -234,3 +234,194 @@ def test_files_in_scope_by_file_ids_keeps_existing_in_order(
 def test_files_in_scope_empty_file_ids_returns_empty(db_conn: sqlite3.Connection) -> None:
     _seed_library(db_conn)
     assert store.files_in_scope(db_conn, file_ids=[]) == []
+
+
+# --- derived_genre_status precedence matrix -----------------------------------------
+
+
+def _set_status(
+    conn: sqlite3.Connection,
+    file_id: int,
+    status: str,
+    *,
+    source_artist: str | None = None,
+    source_album: str | None = None,
+) -> None:
+    """Write a terminal ``file_genre_status`` row for *file_id*."""
+    store.set_genre_status(
+        conn,
+        file_id=file_id,
+        status=status,
+        source_artist=source_artist,
+        source_album=source_album,
+        now=_NOW,
+    )
+
+
+def _stage(conn: sqlite3.Connection, file_id: int) -> None:
+    """Stage a pending genre change for *file_id* (puts it in the staging area)."""
+    store.upsert_staged_tag(
+        conn,
+        file_id=file_id,
+        managed_tags={"genre": ["Rock"]},
+        origin="auto",
+        now=_NOW,
+    )
+
+
+def _commit_auto(conn: sqlite3.Connection, file_id: int) -> None:
+    """Append a committed ``origin='auto'`` revision for *file_id* (derives 'done')."""
+    store.insert_revision(
+        conn,
+        file_id=file_id,
+        version=0,
+        origin="auto",
+        managed_tags={"genre": ["Rock"]},
+        diff={},
+        now=_NOW,
+    )
+
+
+def test_derived_status_pending_when_nothing(db_conn: sqlite3.Connection) -> None:
+    file_id = _insert(db_conn)
+    assert store.derived_genre_status(db_conn, file_id) == "pending"
+
+
+def test_derived_status_no_match_row(db_conn: sqlite3.Connection) -> None:
+    file_id = _insert(db_conn)
+    _set_status(db_conn, file_id, "no_match", source_artist="A")
+    assert store.derived_genre_status(db_conn, file_id) == "no_match"
+
+
+def test_derived_status_manual_row(db_conn: sqlite3.Connection) -> None:
+    file_id = _insert(db_conn)
+    _set_status(db_conn, file_id, "manual")
+    assert store.derived_genre_status(db_conn, file_id) == "manual"
+
+
+def test_derived_status_staged(db_conn: sqlite3.Connection) -> None:
+    file_id = _insert(db_conn)
+    _stage(db_conn, file_id)
+    assert store.derived_genre_status(db_conn, file_id) == "staged"
+
+
+def test_derived_status_done_from_auto_revision(db_conn: sqlite3.Connection) -> None:
+    file_id = _insert(db_conn)
+    _commit_auto(db_conn, file_id)
+    assert store.derived_genre_status(db_conn, file_id) == "done"
+
+
+def test_derived_status_staged_beats_done(db_conn: sqlite3.Connection) -> None:
+    file_id = _insert(db_conn)
+    _commit_auto(db_conn, file_id)
+    _stage(db_conn, file_id)
+    assert store.derived_genre_status(db_conn, file_id) == "staged"
+
+
+def test_derived_status_staged_beats_manual(db_conn: sqlite3.Connection) -> None:
+    file_id = _insert(db_conn)
+    _set_status(db_conn, file_id, "manual")
+    _stage(db_conn, file_id)
+    assert store.derived_genre_status(db_conn, file_id) == "staged"
+
+
+def test_derived_status_staged_beats_no_match(db_conn: sqlite3.Connection) -> None:
+    file_id = _insert(db_conn)
+    _set_status(db_conn, file_id, "no_match", source_artist="A")
+    _stage(db_conn, file_id)
+    assert store.derived_genre_status(db_conn, file_id) == "staged"
+
+
+def test_derived_status_done_beats_manual(db_conn: sqlite3.Connection) -> None:
+    file_id = _insert(db_conn)
+    _set_status(db_conn, file_id, "manual")
+    _commit_auto(db_conn, file_id)
+    assert store.derived_genre_status(db_conn, file_id) == "done"
+
+
+def test_derived_status_done_beats_no_match(db_conn: sqlite3.Connection) -> None:
+    file_id = _insert(db_conn)
+    _set_status(db_conn, file_id, "no_match", source_artist="A")
+    _commit_auto(db_conn, file_id)
+    assert store.derived_genre_status(db_conn, file_id) == "done"
+
+
+# --- genre_status_counts ------------------------------------------------------------
+
+
+def _seed_status_matrix(conn: sqlite3.Connection) -> dict[str, int]:
+    """Seed one file in each of the five workflow states. Returns name -> file id."""
+    pending = _insert(conn, filename="pending.mp3")
+
+    no_match = _insert(conn, filename="no_match.mp3")
+    _set_status(conn, no_match, "no_match", source_artist="A")
+
+    manual = _insert(conn, filename="manual.mp3")
+    _set_status(conn, manual, "manual")
+
+    staged = _insert(conn, filename="staged.mp3")
+    _stage(conn, staged)
+
+    done = _insert(conn, filename="done.mp3")
+    _commit_auto(conn, done)
+
+    return {
+        "pending": pending,
+        "no_match": no_match,
+        "manual": manual,
+        "staged": staged,
+        "done": done,
+    }
+
+
+def test_genre_status_counts_all_five_keys_present_when_empty(
+    db_conn: sqlite3.Connection,
+) -> None:
+    counts = store.genre_status_counts(db_conn)
+    assert set(counts) == store.GENRE_WORKFLOW_STATUSES
+    assert all(value == 0 for value in counts.values())
+
+
+def test_genre_status_counts_matrix(db_conn: sqlite3.Connection) -> None:
+    _seed_status_matrix(db_conn)
+    counts = store.genre_status_counts(db_conn)
+    assert counts == {
+        "pending": 1,
+        "no_match": 1,
+        "manual": 1,
+        "staged": 1,
+        "done": 1,
+    }
+
+
+def test_genre_status_counts_sql_vs_python_drift_guard(
+    db_conn: sqlite3.Connection,
+) -> None:
+    """SQL-vs-Python drift guard: the CASE query must bucket exactly as derived_genre_status.
+
+    Recompute the counts in Python by calling ``derived_genre_status`` per file and
+    assert dict equality with the single-pass SQL ``genre_status_counts`` result; any
+    divergence between the two implementations fails here.
+    """
+    ids = _seed_status_matrix(db_conn)
+    # Add a couple of duplicates so the counts are not all 1 (catches mis-bucketing).
+    extra_pending = _insert(db_conn, filename="pending2.mp3")
+    extra_done = _insert(db_conn, filename="done2.mp3")
+    _commit_auto(db_conn, extra_done)
+    all_ids = [*ids.values(), extra_pending, extra_done]
+
+    expected = dict.fromkeys(store.GENRE_WORKFLOW_STATUSES, 0)
+    for file_id in all_ids:
+        expected[store.derived_genre_status(db_conn, file_id)] += 1
+
+    assert store.genre_status_counts(db_conn) == expected
+
+
+# --- compute_stats genre block ------------------------------------------------------
+
+
+def test_compute_stats_includes_genre_block(db_conn: sqlite3.Connection) -> None:
+    _seed_status_matrix(db_conn)
+    stats = store.compute_stats(db_conn)
+    assert "genre" in stats
+    assert stats["genre"] == store.genre_status_counts(db_conn)

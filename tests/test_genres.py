@@ -231,6 +231,65 @@ def test_already_staged_file_is_skipped_as_done(
     assert second.skipped["done"] == 1
 
 
+def test_genre_pipeline_is_field_aware_artist_only_change_stays_processable(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    """An artist-only auto/staged change must NOT mark a file genre-``done``.
+
+    Regression for the field-awareness fix in ``genres._select``: a committed
+    ``origin='auto'`` revision that changed only ``artist`` (or a staged change that
+    touches only ``artist``) must leave the file genre-processable — not bucketed into
+    ``skipped['done']`` — and must agree with ``derived_genre_status == 'pending'`` so the
+    status view and ``stage_genres`` can no longer disagree.
+    """
+    make_track(music_dir / "committed.mp3", {"artist": ["Daft Punk"], "genre": ["Old"]})
+    make_track(music_dir / "staged.mp3", {"artist": ["daft punk"], "genre": ["Old"]})
+    scan_library(engine_settings)
+
+    committed_id = _file_id(engine_settings, music_dir, "committed.mp3")
+    staged_id = _file_id(engine_settings, music_dir, "staged.mp3")
+
+    conn = connect(engine_settings.db_path)
+    try:
+        apply_schema(conn)
+        # An artist-ONLY committed auto revision (genre untouched).
+        store.insert_revision(
+            conn,
+            file_id=committed_id,
+            version=1,
+            origin="auto",
+            managed_tags={"artist": ["Daft Punk"], "genre": ["Old"]},
+            diff={"artist": {"from": ["daft punk"], "to": ["Daft Punk"]}},
+            now="2026-06-08T00:00:00+00:00",
+        )
+        # An artist-ONLY staged change: canonicalize the artist while PRESERVING the
+        # current genre value, so only the ``artist`` field differs from disk.
+        store.upsert_staged_tag(
+            conn,
+            file_id=staged_id,
+            managed_tags={"artist": ["Daft Punk"], "genre": ["Old"]},
+            origin="auto",
+            now="2026-06-08T00:00:00+00:00",
+        )
+        conn.commit()
+
+        # The status view agrees: an artist-only change is genre-PENDING, not done.
+        assert store.derived_genre_status(conn, committed_id) == "pending"
+        assert store.derived_genre_status(conn, staged_id) == "pending"
+    finally:
+        conn.close()
+
+    fake = FakeTagSource({"Daft Punk": _DAFT_PUNK_TAGS})
+    result = genres.stage_genres(engine_settings, client=fake)
+
+    # Neither file is skipped as done; the committed one is processed + genre-staged.
+    # (The staged-id already has a staged genre? No — its staged row is artist-only, so it
+    # is also processable.) Both are processed; none land in skipped['done'].
+    assert result.skipped["done"] == 0
+    assert result.processed == 2
+
+
 # --- no_match + staleness ------------------------------------------------------------
 
 

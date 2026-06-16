@@ -24,9 +24,19 @@ genre counts via `store.derived_genre_status`, the mirror of `genres._select`).
 M4 phase 1 shipped too: `artists.py` (`resolve_artists` — cascade-stages the
 `artist.getCorrection` canonical name + MBID across `artist`/`albumartist`, with
 feat/sentinel/empty + per-file multi-value guards, dry-run, and the empty-staging
-precondition; results cache in the existing `lastfm_cache`, no new table).
-19 MCP tools total. Schema is **v6**. **Next: M4** review loop. M6 organize/moves
-(`moves.py`) is a paper sketch (its DDL ships in v6; logic deferred).
+precondition; results cache in the existing `lastfm_cache`). M4 phase 2 shipped: the
+artist-axis twin of the genre-status workflow — a sticky per-file `file_artist_status`
+(`manual` exclusion only; **no** `no_match` state) that `resolve_artists` always skips
+(`skipped_manual`/`manual_files`); `set_artist_status`/`reset_artist_status` (scope by
+file or by a value matched across BOTH `artist` and `albumartist`);
+`list_files(artist_status=...)` + a `library_stats['artist']` block. Both axes'
+`staged`/`done` are now **field-aware** (`store.has_staged_change_for` /
+`has_auto_change_for`, the latter via SQLite JSON1 `json_extract` on the committed
+`diff`): genre keys on `genre`, artist on `artist`/`albumartist`, so the two columns are
+independent (a genre-only commit no longer reads as artist-`done`, and vice versa).
+21 MCP tools total. Schema is **v7** (additive: adds `file_artist_status`; a v6 ledger
+upgrades in place). **Next: M4** review loop. M6 organize/moves (`moves.py`) is a paper
+sketch (its DDL ships in v6; logic deferred).
 
 ## Python
 
@@ -112,13 +122,13 @@ src/tagmend/
   log.py            shared logger (use everywhere)
   config.py         settings.json (platformdirs) + typed Settings
   cli.py            Typer CLI (thin)
-  mcp_server.py     FastMCP server (thin) — 19 tools
+  mcp_server.py     FastMCP server (thin) — 21 tools
   engine/
     db.py           SQLite connection (WAL)
-    schema.py       all DDL + PRAGMA user_version (v6)
+    schema.py       all DDL + PRAGMA user_version (v7)
     scan.py         filesystem discovery + signatures
     doctor.py       health_check / readiness + interrupted-commit report
-    store.py        pure data access: files/file_tags + tag_revisions[_staged] + genre status
+    store.py        pure data access: files/file_tags + tag_revisions[_staged] + genre/artist status
     library.py      scan orchestration (3 modes) + stats + list_files/get_file
     tags.py         mutagen read/write of the managed tag set
     versioning.py   tag-revision baseline/append + revert + history
@@ -127,7 +137,7 @@ src/tagmend/
     lastfm.py       Last.fm top-tags client: lastfm_cache + pacing (getCorrection → M4)
     classify.py     genre vocab/overlay loader + fold-key index + resolve_genres
     genres.py       stage_genres orchestration + file_genre_status workflow
-    artists.py      resolve_artists: getCorrection cascade-stage of artist/albumartist + MBID
+    artists.py      resolve_artists + set/reset_artist_status: getCorrection cascade-stage + file_artist_status workflow
     moves.py        STUB + PathDomain paper sketch — M6 (organize/moves)
 tests/              pytest; conftest isolates config + builds temp libraries (make_track)
 ```

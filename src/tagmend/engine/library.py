@@ -49,6 +49,9 @@ class FileView:
     genre_status: str = "pending"
     genre_source_artist: str | None = None  # identity a no_match/manual was recorded against
     genre_source_album: str | None = None
+    artist_status: str = "pending"
+    artist_source_artist: str | None = None  # values a manual exclusion was recorded against
+    artist_source_albumartist: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         """JSON-serializable form for the MCP tool."""
@@ -62,19 +65,27 @@ class FileView:
             "genre_status": self.genre_status,
             "genre_source_artist": self.genre_source_artist,
             "genre_source_album": self.genre_source_album,
+            "artist_status": self.artist_status,
+            "artist_source_artist": self.artist_source_artist,
+            "artist_source_albumartist": self.artist_source_albumartist,
         }
 
 
 def _to_view(conn: sqlite3.Connection, row: store.FileRow) -> FileView:
     """Build a :class:`FileView` from a file row, reading its managed-tag subset.
 
-    Also resolves the file's genre workflow status; for a stored ``no_match``/``manual``
-    decision, the source identity it was recorded against rides along so a reviewer can
-    compare it with the current ``managed_tags`` and judge staleness.
+    Also resolves the file's genre and artist workflow statuses (each FIELD-AWARE on its
+    own tag). For a stored ``no_match``/``manual`` decision the source values it was
+    recorded against ride along so a reviewer can compare them with the current
+    ``managed_tags`` and judge staleness.
     """
     genre_status = store.derived_genre_status(conn, row.id)
-    decision = store.get_genre_status(conn, row.id)
-    has_stored_status = decision is not None and genre_status == decision.status
+    genre_decision = store.get_genre_status(conn, row.id)
+    has_stored_genre = genre_decision is not None and genre_status == genre_decision.status
+
+    artist_status = store.derived_artist_status(conn, row.id)
+    artist_decision = store.get_artist_status(conn, row.id)
+    has_stored_artist = artist_decision is not None and artist_status == artist_decision.status
     return FileView(
         file_id=row.id,
         folder=row.folder,
@@ -83,8 +94,19 @@ def _to_view(conn: sqlite3.Connection, row: store.FileRow) -> FileView:
         is_missing=row.is_missing,
         managed_tags=versioning.managed_subset(store.get_tags(conn, row.id)),
         genre_status=genre_status,
-        genre_source_artist=decision.source_artist if has_stored_status and decision else None,
-        genre_source_album=decision.source_album if has_stored_status and decision else None,
+        genre_source_artist=genre_decision.source_artist
+        if has_stored_genre and genre_decision
+        else None,
+        genre_source_album=genre_decision.source_album
+        if has_stored_genre and genre_decision
+        else None,
+        artist_status=artist_status,
+        artist_source_artist=artist_decision.source_artist
+        if has_stored_artist and artist_decision
+        else None,
+        artist_source_albumartist=artist_decision.source_albumartist
+        if has_stored_artist and artist_decision
+        else None,
     )
 
 
@@ -94,15 +116,18 @@ def list_files(
     root: Path | None = None,
     limit: int | None = None,
     genre_status: str | None = None,
+    artist_status: str | None = None,
 ) -> list[FileView]:
     """Return tracked files (id order) with their managed tags, for discovery.
 
     Optionally limited to files under *root*, filtered to one genre workflow status
-    (``pending`` | ``no_match`` | ``manual`` | ``staged`` | ``done``), and/or capped at
-    *limit* rows. ``genre_status="no_match"`` is the "fix by hand" worklist. Without a
-    filter the cap is applied before reading tags, so a large library stays cheap to
-    browse; with a filter, all candidate rows are examined and the cap applies to the
-    *matching* files. Raises :class:`ValueError` for an unknown status. Read-only.
+    (``pending`` | ``no_match`` | ``manual`` | ``staged`` | ``done``) and/or one artist
+    workflow status (``pending`` | ``manual`` | ``staged`` | ``done``), and/or capped at
+    *limit* rows. ``genre_status="no_match"`` is the "fix by hand" worklist. With NEITHER
+    status filter the cap is applied before reading tags, so a large library stays cheap to
+    browse; with either filter, all candidate rows are examined, BOTH filters are applied,
+    and the cap counts the *matching* files. Raises :class:`ValueError` for an unknown
+    status. Read-only.
     """
     if genre_status is not None and genre_status not in store.GENRE_WORKFLOW_STATUSES:
         message = (
@@ -110,6 +135,14 @@ def list_files(
             f"(expected one of {sorted(store.GENRE_WORKFLOW_STATUSES)})"
         )
         raise ValueError(message)
+    if artist_status is not None and artist_status not in store.ARTIST_WORKFLOW_STATUSES:
+        message = (
+            f"unknown artist_status: {artist_status!r} "
+            f"(expected one of {sorted(store.ARTIST_WORKFLOW_STATUSES)})"
+        )
+        raise ValueError(message)
+
+    filtered = genre_status is not None or artist_status is not None
 
     connection = db.connect(settings.db_path)
     try:
@@ -117,18 +150,25 @@ def list_files(
         rows = (
             store.tracked_files_under(connection, root)
             if root is not None
-            else store.list_files(connection, limit=limit if genre_status is None else None)
+            else store.list_files(connection, limit=None if filtered else limit)
         )
 
-        if genre_status is None:
+        if not filtered:
             if root is not None and limit is not None:
                 rows = rows[:limit]
             return [_to_view(connection, row) for row in rows]
 
-        # Status filter: the cap counts MATCHING files, so examine rows until it fills.
+        # Status filter(s): the cap counts MATCHING files, so examine rows until it fills.
+        # When both are set, a file must satisfy BOTH to match.
         views: list[FileView] = []
         for row in rows:
-            if store.derived_genre_status(connection, row.id) != genre_status:
+            if genre_status is not None and store.derived_genre_status(connection, row.id) != (
+                genre_status
+            ):
+                continue
+            if artist_status is not None and store.derived_artist_status(connection, row.id) != (
+                artist_status
+            ):
                 continue
             views.append(_to_view(connection, row))
             if limit is not None and len(views) >= limit:

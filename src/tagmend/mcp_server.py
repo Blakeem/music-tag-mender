@@ -188,6 +188,7 @@ def list_files(
     path: str | None = None,
     limit: int | None = None,
     genre_status: Literal["pending", "no_match", "manual", "staged", "done"] | None = None,
+    artist_status: Literal["pending", "manual", "staged", "done"] | None = None,
 ) -> dict[str, object]:
     """List tracked files with their current managed tags (to discover file ids).
 
@@ -210,10 +211,16 @@ def list_files(
             *matching* files; without it, it is applied before reading tags.
         genre_status: Return only files in this genre workflow state
             (``pending`` | ``no_match`` | ``manual`` | ``staged`` | ``done``).
+        artist_status: Return only files in this artist workflow state
+            (``pending`` | ``manual`` | ``staged`` | ``done``). Combined with
+            ``genre_status``, a file must match BOTH. The two axes are independent:
+            ``staged``/``done`` are field-aware (genre keys on ``genre``; artist on
+            ``artist``/``albumartist``).
 
     Returns:
         ``{"ok": True, "files": [{file_id, folder, filename, ext, is_missing,
-        managed_tags, genre_status, genre_source_artist, genre_source_album}, ...]}``,
+        managed_tags, genre_status, genre_source_artist, genre_source_album,
+        artist_status, artist_source_artist, artist_source_albumartist}, ...]}``,
         or ``{"ok": False, "error": ...}`` on a bad request.
     """
     try:
@@ -222,6 +229,7 @@ def list_files(
             root=Path(path) if path is not None else None,
             limit=limit,
             genre_status=genre_status,
+            artist_status=artist_status,
         )
     except ValueError as exc:
         return {"ok": False, "error": str(exc)}
@@ -233,7 +241,8 @@ def get_file(file_id: int) -> dict[str, object]:
     """Return one tracked file with its current managed tags, by stable ``file_id``.
 
     Returns ``{"ok": True, "file": {file_id, folder, filename, ext, is_missing,
-    managed_tags, genre_status, genre_source_artist, genre_source_album}}``, or
+    managed_tags, genre_status, genre_source_artist, genre_source_album, artist_status,
+    artist_source_artist, artist_source_albumartist}}``, or
     ``{"ok": False, "error": ...}`` if the id is unknown.
     """
     view = library.get_file_view(load_settings(), file_id)
@@ -539,6 +548,68 @@ def reset_genre_status(
         load_settings(),
         file_ids=file_ids,
         artist=artist,
+    )
+    return {"ok": True, "affected": affected}
+
+
+@mcp.tool()
+def set_artist_status(
+    status: Literal["manual", "pending"],
+    file_ids: list[int] | None = None,
+    value: str | None = None,
+) -> dict[str, object]:
+    """Exclude files from artist-name normalization (``manual``) or re-queue them (``pending``).
+
+    ``manual`` marks the in-scope files as a deliberate human/LLM choice: ``resolve_artists``
+    always skips them (sticky — no staleness re-check) until you reset. ``pending`` removes
+    any status row, re-queuing them.
+
+    Scope is ``file_ids`` when given, else every file carrying ``value`` as its ``artist``
+    OR ``albumartist`` tag (so excluding ``"Miami Nights 84"`` catches it on either field).
+
+    Args:
+        status: ``manual`` to exclude, ``pending`` to re-queue.
+        file_ids: Limit to these file ids.
+        value: Limit to files carrying this value as ``artist`` or ``albumartist`` (used
+            when ``file_ids`` is omitted).
+
+    Returns:
+        ``{"ok": True, "affected": <count>}``, or ``{"ok": False, "error": ...}``.
+    """
+    try:
+        affected = artists.set_artist_status(
+            load_settings(),
+            file_ids=file_ids,
+            value=value,
+            status=status,
+        )
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    return {"ok": True, "affected": affected}
+
+
+@mcp.tool()
+def reset_artist_status(
+    file_ids: list[int] | None = None,
+    value: str | None = None,
+) -> dict[str, object]:
+    """Clear any artist status row for in-scope files, returning them to ``pending``.
+
+    Removes the ``manual`` exclusion so ``resolve_artists`` will reconsider the files on
+    its next run.
+
+    Args:
+        file_ids: Limit to these file ids.
+        value: Limit to files carrying this value as ``artist`` or ``albumartist`` (used
+            when ``file_ids`` is omitted).
+
+    Returns:
+        ``{"ok": True, "affected": <count>}``.
+    """
+    affected = artists.reset_artist_status(
+        load_settings(),
+        file_ids=file_ids,
+        value=value,
     )
     return {"ok": True, "affected": affected}
 

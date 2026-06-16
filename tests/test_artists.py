@@ -23,6 +23,7 @@ from conftest import make_track
 from tagmend.engine import artists, staging, store, versioning
 from tagmend.engine.db import connect
 from tagmend.engine.lastfm import ArtistCorrection
+from tagmend.engine.library import list_files as library_list
 from tagmend.engine.library import scan_library
 from tagmend.engine.schema import apply_schema
 from tagmend.engine.tags import read_tags
@@ -361,6 +362,123 @@ def test_limit_caps_values_and_reports_pending(
 
 
 # --- (11) revert round-trip across all four formats ----------------------------------
+
+
+# --- (12) sticky manual exclusion: skipped by resolve_artists ------------------------
+
+
+def test_manual_excluded_file_is_skipped_and_reported(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    excluded = make_track(music_dir / "excluded.mp3", {"artist": ["Miami Nights '84"]})
+    kept = make_track(music_dir / "kept.mp3", {"artist": ["Miami Nights '84"]})
+    scan_library(engine_settings)
+    excluded_id = _file_id(engine_settings, music_dir, excluded.name)
+    kept_id = _file_id(engine_settings, music_dir, kept.name)
+
+    affected = artists.set_artist_status(
+        engine_settings,
+        file_ids=[excluded_id],
+        status="manual",
+    )
+    assert affected == 1
+
+    fake = FakeCorrectionSource(
+        {"Miami Nights '84": ArtistCorrection("Miami Nights 1984", None)},
+    )
+    result = artists.resolve_artists(engine_settings, client=fake)
+
+    assert result.skipped_manual == 1
+    assert result.manual_files == [excluded_id]
+    # The non-excluded file with the same data still stages.
+    assert result.staged_files == 1
+    staged_ids = {v.file_id for v in staging.diff_tags(engine_settings)}
+    assert staged_ids == {kept_id}
+
+
+def test_set_artist_status_by_value_matches_albumartist(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    # The value appears only as ``albumartist`` (artist is already canonical).
+    track = make_track(
+        music_dir / "comp.mp3",
+        {"artist": ["DJ Canonical"], "albumartist": ["Miami Nights 84"]},
+    )
+    scan_library(engine_settings)
+    file_id = _file_id(engine_settings, music_dir, track.name)
+
+    affected = artists.set_artist_status(
+        engine_settings,
+        value="Miami Nights 84",
+        status="manual",
+    )
+    assert affected == 1
+
+    view = next(v for v in library_list(engine_settings) if v.file_id == file_id)
+    assert view.artist_status == "manual"
+    assert view.artist_source_albumartist == "Miami Nights 84"
+
+
+def test_manual_is_sticky_across_rerun(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    track = make_track(music_dir / "t.mp3", {"artist": ["Miami Nights '84"]})
+    scan_library(engine_settings)
+    file_id = _file_id(engine_settings, music_dir, track.name)
+    artists.set_artist_status(engine_settings, file_ids=[file_id], status="manual")
+
+    fake = FakeCorrectionSource(
+        {"Miami Nights '84": ArtistCorrection("Miami Nights 1984", None)},
+    )
+    first = artists.resolve_artists(engine_settings, client=fake)
+    second = artists.resolve_artists(engine_settings, client=fake)
+    assert first.skipped_manual == 1
+    assert second.skipped_manual == 1
+    assert len(staging.diff_tags(engine_settings)) == 0
+
+
+def test_reset_artist_status_requeues(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    track = make_track(music_dir / "t.mp3", {"artist": ["Miami Nights '84"]})
+    scan_library(engine_settings)
+    file_id = _file_id(engine_settings, music_dir, track.name)
+    artists.set_artist_status(engine_settings, file_ids=[file_id], status="manual")
+
+    assert artists.reset_artist_status(engine_settings, file_ids=[file_id]) == 1
+
+    fake = FakeCorrectionSource(
+        {"Miami Nights '84": ArtistCorrection("Miami Nights 1984", None)},
+    )
+    result = artists.resolve_artists(engine_settings, client=fake)
+    assert result.skipped_manual == 0
+    assert result.staged_files == 1
+
+
+def test_reset_artist_status_by_value_matches_albumartist(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    track = make_track(
+        music_dir / "comp.mp3",
+        {"artist": ["DJ Canonical"], "albumartist": ["Miami Nights 84"]},
+    )
+    scan_library(engine_settings)
+    file_id = _file_id(engine_settings, music_dir, track.name)
+    artists.set_artist_status(engine_settings, value="Miami Nights 84", status="manual")
+
+    assert artists.reset_artist_status(engine_settings, value="Miami Nights 84") == 1
+    view = next(v for v in library_list(engine_settings) if v.file_id == file_id)
+    assert view.artist_status == "pending"
+
+
+def test_set_artist_status_rejects_unknown_status(engine_settings: Settings) -> None:
+    with pytest.raises(ValueError, match="invalid status"):
+        artists.set_artist_status(engine_settings, file_ids=[1], status="no_match")
 
 
 @pytest.mark.parametrize("suffix", _FORMATS)

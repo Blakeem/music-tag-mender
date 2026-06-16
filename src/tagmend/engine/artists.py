@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Final
 
 from tagmend.engine import db, schema, staging, store, versioning
@@ -56,6 +57,16 @@ _SENTINELS: Final = frozenset({"various artists", "various", "va"})
 # The feat./ft./featuring family — a word-boundary, case-insensitive match anywhere in the
 # value means it is a multi-artist credit we must not rewrite as a single canonical name.
 _FEAT_RE: Final = re.compile(r"\b(?:feat|ft|featuring)\b\.?", re.IGNORECASE)
+
+# The two states ``set_artist_status`` is allowed to drive: ``manual`` writes a sticky
+# exclusion row; ``pending`` deletes it (re-queue). There is no engine-owned ``no_match``
+# on this axis.
+_USER_STATUSES: Final = frozenset({"manual", "pending"})
+
+
+def _utc_now() -> str:
+    """Return the current time as an ISO-8601 UTC string (the engine's timestamp form)."""
+    return datetime.now(UTC).isoformat()
 
 
 def _is_feat(value: str) -> bool:
@@ -85,12 +96,14 @@ class ResolveArtistsResult:
     corrected_values: int
     skipped_multi_artist: int
     skipped_sentinel: int
+    skipped_manual: int
     no_correction: int
     errors: int
     pending_remaining: int
     more: bool
     mappings: list[dict[str, str | None]]
     multi_artist_files: list[int]
+    manual_files: list[int]
     no_correction_values: list[str]
     error_values: list[dict[str, str]]
     summary: str
@@ -103,12 +116,14 @@ class ResolveArtistsResult:
             "corrected_values": self.corrected_values,
             "skipped_multi_artist": self.skipped_multi_artist,
             "skipped_sentinel": self.skipped_sentinel,
+            "skipped_manual": self.skipped_manual,
             "no_correction": self.no_correction,
             "errors": self.errors,
             "pending_remaining": self.pending_remaining,
             "more": self.more,
             "mappings": [dict(m) for m in self.mappings],
             "multi_artist_files": list(self.multi_artist_files),
+            "manual_files": list(self.manual_files),
             "no_correction_values": list(self.no_correction_values),
             "error_values": [dict(e) for e in self.error_values],
             "summary": self.summary,
@@ -122,7 +137,9 @@ class _Tally:
     staged_files: int = 0
     skipped_multi_artist: int = 0
     skipped_sentinel: int = 0
+    skipped_manual: int = 0
     multi_artist_files: list[int] = field(default_factory=list)
+    manual_files: list[int] = field(default_factory=list)
     no_correction_values: list[str] = field(default_factory=list)
     error_values: list[dict[str, str]] = field(default_factory=list)
     # value -> correction (only those whose canonical form actually differs).
@@ -170,13 +187,14 @@ def resolve_artists(  # noqa: PLR0913 - cohesive keyword-only scope + injection 
             message = "commit or unstage pending changes first"
             raise ValueError(message)
 
-        candidate_ids = store.files_in_scope(
+        scoped_ids = store.files_in_scope(
             connection,
             artist=artist,
             file_ids=file_ids,
         )
 
         tally = _Tally()
+        candidate_ids = _drop_manual_excluded(connection, scoped_ids, tally)
         values = _distinct_values(connection, candidate_ids, tally)
 
         to_process = values[: limit if limit is not None else len(values)]
@@ -194,6 +212,31 @@ def resolve_artists(  # noqa: PLR0913 - cohesive keyword-only scope + injection 
         processed=len(to_process),
         pending_remaining=pending_remaining,
     )
+
+
+# --- manual-exclusion filter ---------------------------------------------------------
+
+
+def _drop_manual_excluded(
+    conn: sqlite3.Connection,
+    candidate_ids: list[int],
+    tally: _Tally,
+) -> list[int]:
+    """Drop sticky ``manual`` files from scope, recording them in *tally*.
+
+    A ``manual`` file is ALWAYS skipped (no staleness re-check): its values are neither
+    looked up nor staged. The mirror of the user-facing
+    :func:`tagmend.engine.store.derived_artist_status` ``manual`` state.
+    """
+    kept: list[int] = []
+    for fid in candidate_ids:
+        decision = store.get_artist_status(conn, fid)
+        if decision is not None and decision.status == "manual":
+            tally.skipped_manual += 1
+            tally.manual_files.append(fid)
+            continue
+        kept.append(fid)
+    return kept
 
 
 # --- distinct-value scan -------------------------------------------------------------
@@ -388,12 +431,14 @@ def _build_result(
         corrected_values=len(tally.corrections),
         skipped_multi_artist=tally.skipped_multi_artist,
         skipped_sentinel=tally.skipped_sentinel,
+        skipped_manual=tally.skipped_manual,
         no_correction=len(tally.no_correction_values),
         errors=len(tally.error_values),
         pending_remaining=pending_remaining,
         more=more,
         mappings=mappings,
         multi_artist_files=list(tally.multi_artist_files),
+        manual_files=list(tally.manual_files),
         no_correction_values=list(tally.no_correction_values),
         error_values=list(tally.error_values),
         summary=summary,
@@ -411,7 +456,8 @@ def _summarize(
         f"Processed {processed} value(s): {len(tally.corrections)} corrected, "
         f"staged {tally.staged_files} file(s).",
         f"Skipped multi-artist {tally.skipped_multi_artist}, "
-        f"sentinel/feat/empty {tally.skipped_sentinel}; "
+        f"sentinel/feat/empty {tally.skipped_sentinel}, "
+        f"manual {tally.skipped_manual}; "
         f"no correction {len(tally.no_correction_values)}.",
     ]
     if pending_remaining > 0:
@@ -421,3 +467,99 @@ def _summarize(
             f"{len(tally.error_values)} value(s) errored and stay pending — re-run to retry.",
         )
     return " ".join(parts)
+
+
+# --- status tools --------------------------------------------------------------------
+
+
+def _artist_scope(
+    conn: sqlite3.Connection,
+    *,
+    file_ids: list[int] | None,
+    value: str | None,
+) -> list[int]:
+    """Resolve the in-scope file ids for the artist status tools, in ascending id order.
+
+    *file_ids* (when given) win; otherwise *value* matches every file carrying it as
+    ``artist`` OR ``albumartist`` (the union across both name fields). With neither given,
+    the scope is empty (the tools require an explicit target).
+    """
+    if file_ids is not None:
+        return store.files_in_scope(conn, file_ids=file_ids)
+    if value is None:
+        return []
+    matched = set(store.files_by_tag_value(conn, "artist", value))
+    matched.update(store.files_by_tag_value(conn, "albumartist", value))
+    return sorted(matched)
+
+
+def set_artist_status(
+    settings: Settings,
+    *,
+    file_ids: list[int] | None = None,
+    value: str | None = None,
+    status: str,
+) -> int:
+    """Set ``manual`` (exclude) or ``pending`` (re-queue) for every file in scope.
+
+    Scope is *file_ids* when given, else every file carrying *value* as ``artist`` OR
+    ``albumartist``. ``manual`` writes a sticky row (recording the file's current
+    ``artist``/``albumartist`` for audit) so :func:`resolve_artists` always skips it;
+    ``pending`` deletes any row, re-queuing the file. Returns the number of files affected.
+    Raises :class:`ValueError` for an unknown *status*. Owns its transaction.
+    """
+    if status not in _USER_STATUSES:
+        message = f"invalid status: {status!r} (expected manual|pending)"
+        raise ValueError(message)
+
+    connection = db.connect(settings.db_path)
+    try:
+        schema.apply_schema(connection)
+        scoped = _artist_scope(connection, file_ids=file_ids, value=value)
+        now = _utc_now()
+        for fid in scoped:
+            if status == "manual":
+                tags = store.get_tags(connection, fid)
+                artist_values = tags.get("artist", [])
+                albumartist_values = tags.get("albumartist", [])
+                store.set_artist_status(
+                    connection,
+                    file_id=fid,
+                    status="manual",
+                    source_artist=artist_values[0] if artist_values else None,
+                    source_albumartist=albumartist_values[0] if albumartist_values else None,
+                    now=now,
+                )
+            else:
+                store.delete_artist_status(connection, fid)
+        connection.commit()
+    finally:
+        connection.close()
+
+    logger.info("set artist status=%s for %d file(s)", status, len(scoped))
+    return len(scoped)
+
+
+def reset_artist_status(
+    settings: Settings,
+    *,
+    file_ids: list[int] | None = None,
+    value: str | None = None,
+) -> int:
+    """Delete the artist status row for every file in scope (back to ``pending``).
+
+    Same value-across-both-fields scoping as :func:`set_artist_status`. Returns the number
+    of files affected. Owns its transaction.
+    """
+    connection = db.connect(settings.db_path)
+    try:
+        schema.apply_schema(connection)
+        scoped = _artist_scope(connection, file_ids=file_ids, value=value)
+        for fid in scoped:
+            store.delete_artist_status(connection, fid)
+        connection.commit()
+    finally:
+        connection.close()
+
+    logger.info("reset artist status for %d file(s)", len(scoped))
+    return len(scoped)

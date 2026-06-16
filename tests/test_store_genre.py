@@ -270,14 +270,18 @@ def _stage(conn: sqlite3.Connection, file_id: int) -> None:
 
 
 def _commit_auto(conn: sqlite3.Connection, file_id: int) -> None:
-    """Append a committed ``origin='auto'`` revision for *file_id* (derives 'done')."""
+    """Append a committed ``origin='auto'`` GENRE revision for *file_id* (derives 'done').
+
+    The ``diff`` records a ``genre`` change so the field-aware ``derived_genre_status``
+    reads this as genre-``done``.
+    """
     store.insert_revision(
         conn,
         file_id=file_id,
         version=0,
         origin="auto",
         managed_tags={"genre": ["Rock"]},
-        diff={},
+        diff={"genre": {"from": [], "to": ["Rock"]}},
         now=_NOW,
     )
 
@@ -425,3 +429,189 @@ def test_compute_stats_includes_genre_block(db_conn: sqlite3.Connection) -> None
     stats = store.compute_stats(db_conn)
     assert "genre" in stats
     assert stats["genre"] == store.genre_status_counts(db_conn)
+
+
+# --- field-aware staged/done predicates ---------------------------------------------
+
+
+def _commit_auto_field(
+    conn: sqlite3.Connection,
+    file_id: int,
+    field_name: str,
+) -> None:
+    """Append a committed ``auto`` revision whose ``diff`` changed only *field_name*."""
+    store.insert_revision(
+        conn,
+        file_id=file_id,
+        version=0,
+        origin="auto",
+        managed_tags={field_name: ["X"]},
+        diff={field_name: {"from": [], "to": ["X"]}},
+        now=_NOW,
+    )
+
+
+def _stage_field(conn: sqlite3.Connection, file_id: int, field_name: str) -> None:
+    """Stage a pending change that alters only *field_name* (current tags are empty)."""
+    store.upsert_staged_tag(
+        conn,
+        file_id=file_id,
+        managed_tags={field_name: ["X"]},
+        origin="auto",
+        now=_NOW,
+    )
+
+
+def test_has_auto_change_for_is_field_specific(db_conn: sqlite3.Connection) -> None:
+    file_id = _insert(db_conn)
+    _commit_auto_field(db_conn, file_id, "genre")
+    assert store.has_auto_change_for(db_conn, file_id, ("genre",)) is True
+    assert store.has_auto_change_for(db_conn, file_id, ("artist", "albumartist")) is False
+
+
+def test_has_staged_change_for_is_field_specific(db_conn: sqlite3.Connection) -> None:
+    file_id = _insert(db_conn)
+    _stage_field(db_conn, file_id, "artist")
+    assert store.has_staged_change_for(db_conn, file_id, ("artist", "albumartist")) is True
+    assert store.has_staged_change_for(db_conn, file_id, ("genre",)) is False
+
+
+def test_field_aware_split_done(db_conn: sqlite3.Connection) -> None:
+    """A genre-only auto commit reads as genre-done but artist-pending, and vice versa."""
+    genre_file = _insert(db_conn, filename="g.mp3")
+    _commit_auto_field(db_conn, genre_file, "genre")
+    assert store.derived_genre_status(db_conn, genre_file) == "done"
+    assert store.derived_artist_status(db_conn, genre_file) == "pending"
+
+    artist_file = _insert(db_conn, filename="a.mp3")
+    _commit_auto_field(db_conn, artist_file, "artist")
+    assert store.derived_artist_status(db_conn, artist_file) == "done"
+    assert store.derived_genre_status(db_conn, artist_file) == "pending"
+
+
+def test_field_aware_split_staged(db_conn: sqlite3.Connection) -> None:
+    """A genre-only staged change reads as genre-staged but artist-pending, and vice versa."""
+    genre_file = _insert(db_conn, filename="g.mp3")
+    _stage_field(db_conn, genre_file, "genre")
+    assert store.derived_genre_status(db_conn, genre_file) == "staged"
+    assert store.derived_artist_status(db_conn, genre_file) == "pending"
+
+    artist_file = _insert(db_conn, filename="a.mp3")
+    _stage_field(db_conn, artist_file, "albumartist")
+    assert store.derived_artist_status(db_conn, artist_file) == "staged"
+    assert store.derived_genre_status(db_conn, artist_file) == "pending"
+
+
+# --- file_artist_status (sticky manual exclusion) -----------------------------------
+
+
+def test_artist_status_absent_returns_none(db_conn: sqlite3.Connection) -> None:
+    file_id = _insert(db_conn)
+    assert store.get_artist_status(db_conn, file_id) is None
+
+
+def test_artist_status_set_get_delete_round_trip(db_conn: sqlite3.Connection) -> None:
+    file_id = _insert(db_conn)
+    store.set_artist_status(
+        db_conn,
+        file_id=file_id,
+        status="manual",
+        source_artist="Miami Nights 84",
+        source_albumartist="VA",
+        now=_NOW,
+    )
+    row = store.get_artist_status(db_conn, file_id)
+    assert row is not None
+    assert row.status == "manual"
+    assert row.source_artist == "Miami Nights 84"
+    assert row.source_albumartist == "VA"
+
+    store.delete_artist_status(db_conn, file_id)
+    assert store.get_artist_status(db_conn, file_id) is None
+    store.delete_artist_status(db_conn, file_id)  # idempotent no-op
+
+
+def test_derived_artist_status_manual_below_staged_and_done(
+    db_conn: sqlite3.Connection,
+) -> None:
+    file_id = _insert(db_conn)
+    store.set_artist_status(
+        db_conn,
+        file_id=file_id,
+        status="manual",
+        source_artist="A",
+        source_albumartist=None,
+        now=_NOW,
+    )
+    assert store.derived_artist_status(db_conn, file_id) == "manual"
+
+    _commit_auto_field(db_conn, file_id, "artist")
+    assert store.derived_artist_status(db_conn, file_id) == "done"
+
+    _stage_field(db_conn, file_id, "albumartist")
+    assert store.derived_artist_status(db_conn, file_id) == "staged"
+
+
+# --- artist_status_counts + compute_stats artist block ------------------------------
+
+
+def _seed_artist_matrix(conn: sqlite3.Connection) -> dict[str, int]:
+    """Seed one file in each of the four artist workflow states. Returns name -> id."""
+    pending = _insert(conn, filename="ap.mp3")
+
+    manual = _insert(conn, filename="am.mp3")
+    store.set_artist_status(
+        conn,
+        file_id=manual,
+        status="manual",
+        source_artist="A",
+        source_albumartist=None,
+        now=_NOW,
+    )
+
+    staged = _insert(conn, filename="as.mp3")
+    _stage_field(conn, staged, "artist")
+
+    done = _insert(conn, filename="ad.mp3")
+    _commit_auto_field(conn, done, "albumartist")
+
+    return {"pending": pending, "manual": manual, "staged": staged, "done": done}
+
+
+def test_artist_status_counts_all_keys_present_when_empty(
+    db_conn: sqlite3.Connection,
+) -> None:
+    counts = store.artist_status_counts(db_conn)
+    assert set(counts) == store.ARTIST_WORKFLOW_STATUSES
+    assert all(value == 0 for value in counts.values())
+
+
+def test_artist_status_counts_matrix(db_conn: sqlite3.Connection) -> None:
+    _seed_artist_matrix(db_conn)
+    assert store.artist_status_counts(db_conn) == {
+        "pending": 1,
+        "manual": 1,
+        "staged": 1,
+        "done": 1,
+    }
+
+
+def test_artist_status_counts_match_per_file_derivation(
+    db_conn: sqlite3.Connection,
+) -> None:
+    ids = _seed_artist_matrix(db_conn)
+    extra_done = _insert(db_conn, filename="ad2.mp3")
+    _commit_auto_field(db_conn, extra_done, "artist")
+    all_ids = [*ids.values(), extra_done]
+
+    expected = dict.fromkeys(store.ARTIST_WORKFLOW_STATUSES, 0)
+    for file_id in all_ids:
+        expected[store.derived_artist_status(db_conn, file_id)] += 1
+    assert store.artist_status_counts(db_conn) == expected
+
+
+def test_compute_stats_includes_artist_block(db_conn: sqlite3.Connection) -> None:
+    _seed_artist_matrix(db_conn)
+    stats = store.compute_stats(db_conn)
+    assert "artist" in stats
+    assert stats["artist"] == store.artist_status_counts(db_conn)

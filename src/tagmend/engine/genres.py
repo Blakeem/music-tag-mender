@@ -165,7 +165,11 @@ def _select(
             tally.skipped_no_artist += 1
             continue
 
-        if store.is_staged(conn, fid) or store.has_auto_revision(conn, fid):
+        if store.has_staged_change_for(conn, fid, ("genre",)) or store.has_auto_change_for(
+            conn,
+            fid,
+            ("genre",),
+        ):
             tally.skipped_done += 1
             continue
 

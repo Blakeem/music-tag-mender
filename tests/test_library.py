@@ -12,7 +12,7 @@ import pytest
 
 from conftest import make_track
 from tagmend.config import Settings
-from tagmend.engine import store
+from tagmend.engine import artists, store
 from tagmend.engine.db import connect
 from tagmend.engine.library import (
     ScanMode,
@@ -376,3 +376,75 @@ def test_library_stats_includes_genre_block(
     assert set(genre) == store.GENRE_WORKFLOW_STATUSES
     assert genre["no_match"] == 1
     assert genre["pending"] == _N - 1
+
+
+# --- artist_status filter + composition + new FileView fields -----------------------
+
+
+def test_list_files_filters_to_artist_manual_with_genre_status_none(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    tracks = _populate(music_dir, _N)
+    scan_library(engine_settings)
+
+    # Exclude exactly the middle track on the artist axis.
+    target = _file_row(engine_settings, music_dir, tracks[1].name)
+    artists.set_artist_status(engine_settings, file_ids=[target.id], status="manual")
+
+    # genre_status defaults to None; only the artist filter applies.
+    views = list_files(engine_settings, artist_status="manual")
+
+    assert [v.file_id for v in views] == [target.id]
+    only = views[0]
+    assert only.artist_status == "manual"
+    assert only.genre_status == "pending"  # axes are independent
+
+
+def test_list_files_unknown_artist_status_raises(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    _populate(music_dir, 1)
+    scan_library(engine_settings)
+    with pytest.raises(ValueError, match="unknown artist_status"):
+        list_files(engine_settings, artist_status="bogus")
+
+
+def test_list_files_composes_both_status_filters(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    tracks = _populate(music_dir, _N)
+    scan_library(engine_settings)
+
+    # Track 0: artist-manual only. Track 1: genre-no_match only. Track 2: BOTH.
+    row0 = _file_row(engine_settings, music_dir, tracks[0].name)
+    row1 = _file_row(engine_settings, music_dir, tracks[1].name)
+    row2 = _file_row(engine_settings, music_dir, tracks[2].name)
+    artists.set_artist_status(engine_settings, file_ids=[row0.id, row2.id], status="manual")
+    _set_no_match(engine_settings, row1.id, source_artist="Artist 1")
+    _set_no_match(engine_settings, row2.id, source_artist="Artist 2")
+
+    # Both filters set → a file must satisfy BOTH; only track 2 qualifies.
+    views = list_files(engine_settings, genre_status="no_match", artist_status="manual")
+    assert [v.file_id for v in views] == [row2.id]
+
+
+def test_library_stats_includes_artist_block(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    tracks = _populate(music_dir, _N)
+    scan_library(engine_settings)
+    row = _file_row(engine_settings, music_dir, tracks[0].name)
+    artists.set_artist_status(engine_settings, file_ids=[row.id], status="manual")
+
+    stats = library_stats(engine_settings)
+
+    assert "artist" in stats
+    artist = stats["artist"]
+    assert isinstance(artist, dict)
+    assert set(artist) == store.ARTIST_WORKFLOW_STATUSES
+    assert artist["manual"] == 1
+    assert artist["pending"] == _N - 1

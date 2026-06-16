@@ -34,6 +34,12 @@ The M2 Last.fm genre path adds two side tables (PLAN — Last.fm genre tagging, 
 * ``file_genre_status`` — stores ONLY the terminal/negative per-file decisions
   (``'no_match'`` / ``'manual'``). "Done" is *derived* elsewhere from the staged/committed
   revision tables, so there is deliberately no ``'tagged'`` state to desync.
+
+The M4 artist normalization path adds one more side table (schema v7, purely additive):
+
+* ``file_artist_status`` — the artist-axis twin of ``file_genre_status``, storing ONLY the
+  sticky ``'manual'`` exclusion (no ``'no_match'`` state on this axis). "Done"/"staged" are
+  *derived* field-awarely from the revision tables (keyed on ``artist``/``albumartist``).
 """
 
 from __future__ import annotations
@@ -47,7 +53,7 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
-SCHEMA_VERSION: Final = 6
+SCHEMA_VERSION: Final = 7
 
 _FILES_DDL: Final = """
 CREATE TABLE IF NOT EXISTS files (
@@ -195,6 +201,22 @@ CREATE TABLE IF NOT EXISTS file_genre_status (
 )
 """
 
+# Per-file sticky artist-name exclusion (the artist-axis twin of ``file_genre_status``).
+# Stores ONLY the ``'manual'`` decision (the artist model has no ``'no_match'`` state):
+# a user/LLM excludes a file so :func:`tagmend.engine.artists.resolve_artists` always
+# skips it. "Done"/"staged" are DERIVED elsewhere from the field-aware revision tables, so
+# there is no state here to desync. ``source_artist``/``source_albumartist`` record the
+# values the exclusion was taken against, for audit. See PLAN — artist normalization.
+_FILE_ARTIST_STATUS_DDL: Final = """
+CREATE TABLE IF NOT EXISTS file_artist_status (
+  file_id             INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
+  status              TEXT NOT NULL,
+  source_artist       TEXT,
+  source_albumartist  TEXT,
+  updated_at          TEXT NOT NULL
+)
+"""
+
 
 def apply_schema(connection: sqlite3.Connection) -> None:
     """Create all tables (idempotently) and stamp ``PRAGMA user_version``.
@@ -228,4 +250,5 @@ def apply_schema(connection: sqlite3.Connection) -> None:
     connection.execute(_PATH_REVISIONS_STAGED_DDL)
     connection.execute(_LASTFM_CACHE_DDL)
     connection.execute(_FILE_GENRE_STATUS_DDL)
+    connection.execute(_FILE_ARTIST_STATUS_DDL)
     connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")

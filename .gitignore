@@ -7,6 +7,9 @@ music/
 # runs (see the M2 plan). Also copyrighted — NEVER commit.
 music-raw-backup/
 
+# Scratch workspace for the claude-code-feature-workflow experiment — local only.
+claude-code-feature-workflow/
+
 # Local SQLite ledger if a dev ever points it at the repo root
 *.sqlite3
 *.sqlite3-wal

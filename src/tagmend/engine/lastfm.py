@@ -56,6 +56,14 @@ class Tag:
     weight: int
 
 
+@dataclass(frozen=True, slots=True)
+class ArtistCorrection:
+    """A canonical artist name from ``artist.getCorrection``, with its MBID when known."""
+
+    name: str
+    mbid: str | None
+
+
 class LastfmError(RuntimeError):
     """A Last.fm lookup failed transiently (HTTP non-2xx, or a non-"not found" error).
 
@@ -80,6 +88,18 @@ class TagSource(Protocol):
 
     def album_top_tags(self, artist: str, album: str) -> list[Tag] | None:
         """Return the album's top tags, or ``None`` if the album is not found."""
+
+
+class CorrectionSource(Protocol):
+    """The artist-name correction lookup the orchestrator depends on (fakeable in tests).
+
+    Returns an :class:`ArtistCorrection` (the canonical name + optional MBID) when Last.fm
+    has a correction — possibly equal to the input — and ``None`` when the artist has no
+    correction (genuinely absent / ``error 6`` / no ``corrections`` object).
+    """
+
+    def artist_correction(self, name: str) -> ArtistCorrection | None:
+        """Return the canonical artist name for *name*, or ``None`` if uncorrectable."""
 
 
 class LastfmClient:
@@ -157,6 +177,26 @@ class LastfmClient:
         """
         return self._top_tags("album.gettoptags", {"artist": artist, "album": album})
 
+    def artist_correction(self, name: str) -> ArtistCorrection | None:
+        """Return the canonical name (+ MBID) for *name*, or ``None`` if uncorrectable.
+
+        Caches like :meth:`artist_top_tags`: a found correction is positive-cached and a
+        no-correction (``error 6`` or an absent/empty ``corrections`` object on an HTTP 200)
+        is negative-cached, both so re-runs are free. Any other error code / HTTP non-2xx
+        raises :class:`LastfmError` and caches nothing (retryable). A correction equal to
+        the input is a valid found result.
+        """
+        request_key = _request_key("artist.getcorrection", {"artist": name})
+
+        cached = get_cached_tags(self._conn, request_key)
+        if cached is not None:
+            found, pairs = cached
+            if not found:
+                return None
+            return _decode_correction(pairs)
+
+        return self._fetch_and_cache_correction(name, request_key)
+
     # --- internals -------------------------------------------------------------------
 
     def _top_tags(self, method: str, identity: dict[str, str]) -> list[Tag] | None:
@@ -200,6 +240,42 @@ class LastfmClient:
         # Output: cache the found result eagerly, then return it.
         self._store(request_key, found=True, tags=[(t.name, t.weight) for t in tags])
         return tags
+
+    def _fetch_and_cache_correction(
+        self,
+        name: str,
+        request_key: str,
+    ) -> ArtistCorrection | None:
+        """Fetch ``artist.getcorrection`` over the network (paced), then cache eagerly.
+
+        ``error 6`` *or* an absent/empty ``corrections`` object (HTTP 200, no error) is a
+        no-correction → negative-cached → ``None``. Any other error / HTTP non-2xx raises
+        :class:`LastfmError` and caches nothing.
+        """
+        # Input: one paced network request.
+        body = self._request("artist.getcorrection", {"artist": name})
+
+        # Process: distinguish "no correction" (cacheable) from transient errors (not).
+        error = body.get("error")
+        if error is not None:
+            if error == _ERROR_NOT_FOUND:
+                self._store(request_key, found=False, tags=[])
+                return None
+            message = f"Last.fm error {error}: {body.get('message', 'unknown')}"
+            raise LastfmError(message)
+
+        correction = _parse_correction(body)
+        if correction is None:
+            self._store(request_key, found=False, tags=[])
+            return None
+
+        # Output: positive-cache the canonical name + MBID as two weight-0 pairs.
+        self._store(
+            request_key,
+            found=True,
+            tags=[(correction.name, 0), (correction.mbid or "", 0)],
+        )
+        return correction
 
     def _request(self, method: str, identity: dict[str, str]) -> dict[str, object]:
         """Pace, then perform one Last.fm GET, returning the decoded JSON object.
@@ -281,6 +357,37 @@ def _parse_top_tags(body: dict[str, object]) -> list[Tag]:
             continue
         tags.append(Tag(name=str(entry["name"]), weight=int(entry["count"])))
     return tags
+
+
+def _parse_correction(body: dict[str, object]) -> ArtistCorrection | None:
+    """Parse ``corrections.correction.artist.{name,mbid}`` into an :class:`ArtistCorrection`.
+
+    Every intermediate key is guarded: ``corrections`` may be an empty string or absent (a
+    no-correction → ``None``), and ``correction``/``artist`` may be missing or non-dict.
+    A missing/empty ``name`` is treated as no correction; ``mbid`` is optional.
+    """
+    corrections = body.get("corrections")
+    if not isinstance(corrections, dict):
+        return None
+    correction = corrections.get("correction")
+    if not isinstance(correction, dict):
+        return None
+    artist = correction.get("artist")
+    if not isinstance(artist, dict):
+        return None
+    raw_name = artist.get("name")
+    if not isinstance(raw_name, str) or not raw_name:
+        return None
+    raw_mbid = artist.get("mbid")
+    mbid = raw_mbid if isinstance(raw_mbid, str) and raw_mbid else None
+    return ArtistCorrection(name=raw_name, mbid=mbid)
+
+
+def _decode_correction(pairs: list[tuple[str, int]]) -> ArtistCorrection:
+    """Rebuild an :class:`ArtistCorrection` from its cached ``[(name,0),(mbid,0)]`` pairs."""
+    name = pairs[0][0]
+    mbid = pairs[1][0] if len(pairs) > 1 else ""
+    return ArtistCorrection(name=name, mbid=mbid or None)
 
 
 def _utc_now() -> str:

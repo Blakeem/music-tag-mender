@@ -21,8 +21,11 @@ too: `revert_commit` group undo (skip+report, empty-staging guard, dry-run; ever
 revert — even per-file `revert_tags` — is now its own `origin='revert'` commit) and
 genre-status visibility (`list_files(genre_status=...)` filter + `library_stats`
 genre counts via `store.derived_genre_status`, the mirror of `genres._select`).
-18 MCP tools total. Schema is **v6**. **Next: M4** artist-name normalization
-(`artist.getCorrection` is NOT built yet) + review loop. M6 organize/moves
+M4 phase 1 shipped too: `artists.py` (`resolve_artists` — cascade-stages the
+`artist.getCorrection` canonical name + MBID across `artist`/`albumartist`, with
+feat/sentinel/empty + per-file multi-value guards, dry-run, and the empty-staging
+precondition; results cache in the existing `lastfm_cache`, no new table).
+19 MCP tools total. Schema is **v6**. **Next: M4** review loop. M6 organize/moves
 (`moves.py`) is a paper sketch (its DDL ships in v6; logic deferred).
 
 ## Python
@@ -109,7 +112,7 @@ src/tagmend/
   log.py            shared logger (use everywhere)
   config.py         settings.json (platformdirs) + typed Settings
   cli.py            Typer CLI (thin)
-  mcp_server.py     FastMCP server (thin) — 18 tools
+  mcp_server.py     FastMCP server (thin) — 19 tools
   engine/
     db.py           SQLite connection (WAL)
     schema.py       all DDL + PRAGMA user_version (v6)
@@ -124,6 +127,7 @@ src/tagmend/
     lastfm.py       Last.fm top-tags client: lastfm_cache + pacing (getCorrection → M4)
     classify.py     genre vocab/overlay loader + fold-key index + resolve_genres
     genres.py       stage_genres orchestration + file_genre_status workflow
+    artists.py      resolve_artists: getCorrection cascade-stage of artist/albumartist + MBID
     moves.py        STUB + PathDomain paper sketch — M6 (organize/moves)
 tests/              pytest; conftest isolates config + builds temp libraries (make_track)
 ```

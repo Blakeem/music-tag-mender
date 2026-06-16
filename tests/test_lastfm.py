@@ -13,7 +13,13 @@ from typing import TYPE_CHECKING
 import httpx
 import pytest
 
-from tagmend.engine.lastfm import LastfmClient, LastfmError, Tag, _request_key
+from tagmend.engine.lastfm import (
+    ArtistCorrection,
+    LastfmClient,
+    LastfmError,
+    Tag,
+    _request_key,
+)
 from tagmend.engine.store import get_cached_tags
 
 if TYPE_CHECKING:
@@ -128,6 +134,101 @@ def test_album_top_tags_found(db_conn: sqlite3.Connection) -> None:
         result = client.album_top_tags("Daft Punk", "Random Access Memories")
     assert result == [Tag("electronic", 87), Tag("disco", 43), Tag("funk", 32)]
     assert len(calls) == 1
+
+
+# --- artist.getCorrection ------------------------------------------------------------
+
+
+def _correction(name: str, mbid: str | None = None) -> dict[str, object]:
+    """Build a found ``corrections`` body with one correction's name (+ optional mbid)."""
+    artist: dict[str, object] = {"name": name}
+    if mbid is not None:
+        artist["mbid"] = mbid
+    return {"corrections": {"correction": {"artist": artist}}}
+
+
+def test_artist_correction_parses_name_and_mbid_and_caches(db_conn: sqlite3.Connection) -> None:
+    body = _correction("Miami Nights 1984", "abc-123")
+    client, calls = _client(db_conn, [_json_response(body)])
+    with client:
+        first = client.artist_correction("Miami Nights '84")
+        assert first == ArtistCorrection(name="Miami Nights 1984", mbid="abc-123")
+        # Second call is served from cache — the transport is NOT hit again.
+        second = client.artist_correction("Miami Nights '84")
+    assert second == first
+    assert len(calls) == 1
+
+
+def test_artist_correction_without_mbid(db_conn: sqlite3.Connection) -> None:
+    body = _correction("Canonical Name")  # no mbid key
+    client, _calls = _client(db_conn, [_json_response(body)])
+    with client:
+        result = client.artist_correction("canonical name")
+    assert result == ArtistCorrection(name="Canonical Name", mbid=None)
+
+
+def test_artist_correction_equal_to_input_is_a_found_result(db_conn: sqlite3.Connection) -> None:
+    body = _correction("Daft Punk")
+    client, _calls = _client(db_conn, [_json_response(body)])
+    with client:
+        result = client.artist_correction("Daft Punk")
+    assert result == ArtistCorrection(name="Daft Punk", mbid=None)
+
+
+def test_artist_correction_error_6_is_none_and_negative_cached(db_conn: sqlite3.Connection) -> None:
+    body = {"error": 6, "message": "The artist you supplied could not be found"}
+    client, calls = _client(db_conn, [_json_response(body)])
+    with client:
+        first = client.artist_correction("No Such Artist")
+        assert first is None
+        second = client.artist_correction("No Such Artist")
+    assert second is None
+    assert len(calls) == 1  # negative-cached: no second network hit
+    key = _request_key("artist.getcorrection", {"artist": "No Such Artist"})
+    assert get_cached_tags(db_conn, key) == (False, [])
+
+
+def test_artist_correction_empty_corrections_is_none_and_negative_cached(
+    db_conn: sqlite3.Connection,
+) -> None:
+    # Last.fm returns an empty-string ``corrections`` on HTTP 200 when there's no match.
+    body: dict[str, object] = {"corrections": ""}
+    client, calls = _client(db_conn, [_json_response(body)])
+    with client:
+        first = client.artist_correction("Plain")
+        assert first is None
+        second = client.artist_correction("Plain")
+    assert second is None
+    assert len(calls) == 1
+    key = _request_key("artist.getcorrection", {"artist": "Plain"})
+    assert get_cached_tags(db_conn, key) == (False, [])
+
+
+def test_artist_correction_absent_corrections_is_none(db_conn: sqlite3.Connection) -> None:
+    body: dict[str, object] = {}  # no ``corrections`` key at all
+    client, _calls = _client(db_conn, [_json_response(body)])
+    with client:
+        result = client.artist_correction("Missing")
+    assert result is None
+
+
+def test_artist_correction_non_six_error_raises_and_does_not_cache(
+    db_conn: sqlite3.Connection,
+) -> None:
+    body = {"error": 10, "message": "Invalid API key"}
+    client, _calls = _client(db_conn, [_json_response(body)])
+    with client, pytest.raises(LastfmError):
+        client.artist_correction("Anybody")
+    key = _request_key("artist.getcorrection", {"artist": "Anybody"})
+    assert get_cached_tags(db_conn, key) is None
+
+
+def test_artist_correction_http_500_raises_and_does_not_cache(db_conn: sqlite3.Connection) -> None:
+    client, _calls = _client(db_conn, [_json_response({}, status_code=500)])
+    with client, pytest.raises(LastfmError):
+        client.artist_correction("Anybody")
+    key = _request_key("artist.getcorrection", {"artist": "Anybody"})
+    assert get_cached_tags(db_conn, key) is None
 
 
 # --- transient errors are raised and NOT cached --------------------------------------

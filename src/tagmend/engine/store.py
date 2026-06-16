@@ -707,6 +707,34 @@ def distinct_artists(conn: sqlite3.Connection) -> list[tuple[str, int]]:
     return [(str(row[0]), _as_int(row[1])) for row in cursor.fetchall()]
 
 
+def distinct_albumartists(conn: sqlite3.Connection) -> list[tuple[str, int]]:
+    """Return each distinct ``albumartist`` tag value with its file count, ordered by value."""
+    cursor = conn.execute(
+        """
+        SELECT value, COUNT(DISTINCT file_id)
+        FROM file_tags
+        WHERE name = 'albumartist'
+        GROUP BY value
+        ORDER BY value
+        """,
+    )
+    return [(str(row[0]), _as_int(row[1])) for row in cursor.fetchall()]
+
+
+def files_by_tag_value(conn: sqlite3.Connection, name: str, value: str) -> list[int]:
+    """Return file ids carrying *value* under the *name* tag, in ascending id order."""
+    cursor = conn.execute(
+        """
+        SELECT DISTINCT file_id
+        FROM file_tags
+        WHERE name = ? AND value = ?
+        ORDER BY file_id
+        """,
+        (name, value),
+    )
+    return [_as_int(row[0]) for row in cursor.fetchall()]
+
+
 def files_in_scope(
     conn: sqlite3.Connection,
     *,

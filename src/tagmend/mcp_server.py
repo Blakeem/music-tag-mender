@@ -13,7 +13,7 @@ from typing import Literal
 from mcp.server.fastmcp import FastMCP
 
 from tagmend.config import load_settings
-from tagmend.engine import commits, genres, library, staging, versioning
+from tagmend.engine import artists, commits, genres, library, staging, versioning
 from tagmend.engine.doctor import run_health_check
 from tagmend.engine.library import ScanMode
 from tagmend.log import get_logger
@@ -416,6 +416,56 @@ def stage_genres(
             album=album,
             file_ids=file_ids,
             limit=limit,
+        )
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    return {"ok": True, **result.to_dict()}
+
+
+@mcp.tool()
+def resolve_artists(
+    artist: str | None = None,
+    file_ids: list[int] | None = None,
+    limit: int | None = None,
+    dry_run: bool = False,  # noqa: FBT001, FBT002 - MCP tool surface, not a Python API
+) -> dict[str, object]:
+    """Normalize artist names via Last.fm getCorrection and stage the result (writes no disk).
+
+    For each distinct ``artist``/``albumartist`` value in scope this looks up the canonical
+    name on Last.fm and, where it differs, cascade-stages the corrected name across every
+    file carrying that value (rewriting ``artist`` and/or ``albumartist``, exact-match only)
+    plus the correction's ``musicbrainz_artistid`` — as an ``auto`` change replacing ONLY
+    those fields (every other managed tag, incl. ``genre``, is preserved). Review with
+    ``diff_tags`` and apply with ``commit_tags``; ``revert_commit``/``revert_tags`` undo it.
+
+    It deliberately **skips** (and reports) values in the ``feat``/``ft``/``featuring``
+    family, compilation sentinels (``various artists``/``various``/``va``), and empty
+    values; and any file whose ``artist``/``albumartist`` is multi-value. Values already
+    canonical, or with no Last.fm correction, stage nothing (the latter reported under
+    ``no_correction``). A transient Last.fm error leaves that value pending under
+    ``error_values`` so a re-run retries it.
+
+    Args:
+        artist: Limit to files whose ``artist`` tag equals this value.
+        file_ids: Limit to these specific file ids (overrides ``artist``).
+        limit: Max distinct values to process this call. Remaining values are reported via
+            ``pending_remaining`` / ``more`` — call again to continue.
+        dry_run: Preview the ``value → canonical`` mappings + would-stage count without
+            staging anything (works from cache, no precondition).
+
+    Returns:
+        ``{"ok": True, processed, staged_files, corrected_values, skipped_multi_artist,
+        skipped_sentinel, no_correction, errors, pending_remaining, more, mappings,
+        multi_artist_files, no_correction_values, error_values, summary}``, or
+        ``{"ok": False, "error": ...}`` (e.g. pending changes, or no API key configured).
+    """
+    try:
+        result = artists.resolve_artists(
+            load_settings(),
+            artist=artist,
+            file_ids=file_ids,
+            limit=limit,
+            dry_run=dry_run,
         )
     except ValueError as exc:
         return {"ok": False, "error": str(exc)}

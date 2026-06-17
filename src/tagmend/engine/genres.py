@@ -29,7 +29,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Final
 
-from tagmend.engine import classify, db, schema, staging, store, versioning
+from tagmend.engine import axis, classify, db, schema, staging, store, versioning
 from tagmend.engine.lastfm import LastfmClient, LastfmError
 from tagmend.log import get_logger
 
@@ -157,6 +157,7 @@ def _select(
     :func:`tagmend.engine.store.derived_genre_status` (the ``list_files`` filter and the
     stats counts) — keep the two in sync when the predicates change.
     """
+    genre_fields = axis.GENRE_AXIS.fields
     processable: list[_Candidate] = []
     for fid in candidate_ids:
         identity = _identity(store.get_tags(conn, fid))
@@ -165,31 +166,42 @@ def _select(
             tally.skipped_no_artist += 1
             continue
 
-        if store.has_staged_change_for(conn, fid, ("genre",)) or store.has_auto_change_for(
+        if store.has_staged_change_for(conn, fid, genre_fields) or store.has_auto_change_for(
             conn,
             fid,
-            ("genre",),
+            genre_fields,
         ):
             tally.skipped_done += 1
             continue
 
         decision = store.get_genre_status(conn, fid)
-        if decision is not None:
+        if decision is not None and _decision_blocks(decision, identity):
             if decision.status == "manual":
                 tally.skipped_manual += 1
-                continue
-            if decision.status == "no_match" and not _is_stale(decision, identity):
+            else:  # a non-stale 'no_match'
                 tally.skipped_no_match += 1
-                continue
-            # A stale no_match (identity changed) falls through and is reprocessed.
+            continue
+        # A stale no_match (identity changed) does not block and is reprocessed.
 
         processable.append(_Candidate(file_id=fid, identity=identity))
     return processable
 
 
-def _is_stale(decision: store.GenreStatusRow, identity: _Identity) -> bool:
-    """Return whether a ``no_match`` decision is stale (its source identity changed)."""
-    return decision.source_artist != identity.artist or decision.source_album != identity.album
+def _decision_blocks(decision: store.GenreStatusRow, identity: _Identity) -> bool:
+    """Whether a stored genre decision still blocks processing for the current identity.
+
+    The shared genre staleness/sticky rule (``manual`` always blocks; ``no_match`` blocks
+    only while NOT stale) lives on the axis, so this skip path and the user-facing
+    :func:`tagmend.engine.store.derived_genre_status` can never drift.
+    """
+    return axis.GENRE_AXIS.decision_blocks(
+        axis.StatusRow(
+            status=decision.status,
+            source_primary=decision.source_artist,
+            source_secondary=decision.source_album,
+        ),
+        axis.Identity(primary=identity.artist, secondary=identity.album),
+    )
 
 
 # --- staging orchestration -----------------------------------------------------------

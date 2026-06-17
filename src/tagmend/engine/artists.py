@@ -35,7 +35,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Final
 
-from tagmend.engine import db, schema, staging, store, versioning
+from tagmend.engine import axis, db, schema, staging, store, versioning
 from tagmend.engine.lastfm import LastfmClient, LastfmError
 from tagmend.log import get_logger
 
@@ -47,9 +47,11 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
-# The two name fields this normalizer rewrites (exact-match only). ``musicbrainz_artistid``
-# rides along on a changed file but is never the trigger for a change on its own.
-_NAME_FIELDS: Final = ("artist", "albumartist")
+# The two name fields this normalizer rewrites (exact-match only) — the artist axis's
+# field set, the single source of truth shared with the status derivation.
+# ``musicbrainz_artistid`` rides along on a changed file but is never the trigger for a
+# change on its own.
+_NAME_FIELDS: Final = axis.ARTIST_AXIS.fields
 
 # Compilation sentinels (fold-cased): never a real artist to correct.
 _SENTINELS: Final = frozenset({"various artists", "various", "va"})
@@ -231,12 +233,29 @@ def _drop_manual_excluded(
     kept: list[int] = []
     for fid in candidate_ids:
         decision = store.get_artist_status(conn, fid)
-        if decision is not None and decision.status == "manual":
+        if decision is not None and _decision_blocks(decision):
             tally.skipped_manual += 1
             tally.manual_files.append(fid)
             continue
         kept.append(fid)
     return kept
+
+
+def _decision_blocks(decision: store.ArtistStatusRow) -> bool:
+    """Whether a stored artist decision still blocks processing (sticky ``manual``).
+
+    The shared sticky rule lives on the axis, so this skip path and the user-facing
+    :func:`tagmend.engine.store.derived_artist_status` can never drift. The artist axis has
+    no staleness re-check, so the current identity is irrelevant.
+    """
+    return axis.ARTIST_AXIS.decision_blocks(
+        axis.StatusRow(
+            status=decision.status,
+            source_primary=decision.source_artist,
+            source_secondary=decision.source_albumartist,
+        ),
+        axis.Identity(primary=None, secondary=None),
+    )
 
 
 # --- distinct-value scan -------------------------------------------------------------

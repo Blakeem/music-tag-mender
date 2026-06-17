@@ -18,11 +18,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, SupportsInt, cast
 
+from tagmend.engine import axis
 from tagmend.log import get_logger
 
 if TYPE_CHECKING:
     import sqlite3
-    from collections.abc import Callable
 
 logger = get_logger(__name__)
 
@@ -544,7 +544,13 @@ def _parse_tag_pairs(raw: str) -> list[tuple[str, int]]:
     return [(str(name), _as_int(weight)) for name, weight in parsed]
 
 
-# --- file_genre_status (terminal/negative decisions; PLAN — Status model) -----------
+# --- file_<axis>_status (per-file workflow decisions; PLAN — Status model) -----------
+#
+# The genre/artist status machinery is ONE parameterized concept; the per-axis config and
+# the status-row CRUD live in :mod:`tagmend.engine.axis`. The named wrappers below keep the
+# historic ``*_genre_status`` / ``*_artist_status`` call sites and their row types
+# (``GenreStatusRow`` / ``ArtistStatusRow``, each surfacing its own source-column names) so
+# the rest of the engine, the MCP layer, and the tests are unchanged.
 
 
 @dataclass(frozen=True, slots=True)
@@ -556,20 +562,19 @@ class GenreStatusRow:
     source_album: str | None
 
 
+def _genre_row(decision: axis.StatusRow) -> GenreStatusRow:
+    """Adapt a generic axis :class:`~tagmend.engine.axis.StatusRow` to the genre-named row."""
+    return GenreStatusRow(
+        status=decision.status,
+        source_artist=decision.source_primary,
+        source_album=decision.source_secondary,
+    )
+
+
 def get_genre_status(conn: sqlite3.Connection, file_id: int) -> GenreStatusRow | None:
     """Return *file_id*'s terminal genre decision, or ``None`` if it has none."""
-    cursor = conn.execute(
-        "SELECT status, source_artist, source_album FROM file_genre_status WHERE file_id = ?",
-        (file_id,),
-    )
-    row = cursor.fetchone()
-    if row is None:
-        return None
-    return GenreStatusRow(
-        status=str(row[0]),
-        source_artist=None if row[1] is None else str(row[1]),
-        source_album=None if row[2] is None else str(row[2]),
-    )
+    decision = axis.get_status(conn, axis.GENRE_AXIS, file_id)
+    return None if decision is None else _genre_row(decision)
 
 
 def set_genre_status(  # noqa: PLR0913 - cohesive keyword-only status payload
@@ -586,20 +591,20 @@ def set_genre_status(  # noqa: PLR0913 - cohesive keyword-only status payload
     ``source_artist``/``source_album`` record what the decision was computed against, so
     a later tag change can mark a ``'no_match'`` stale and re-processable.
     """
-    conn.execute(
-        """
-        INSERT OR REPLACE INTO file_genre_status (
-            file_id, status, source_artist, source_album, updated_at
-        )
-        VALUES (?, ?, ?, ?, ?)
-        """,
-        (file_id, status, source_artist, source_album, now),
+    axis.set_status(
+        conn,
+        axis.GENRE_AXIS,
+        file_id=file_id,
+        status=status,
+        source_primary=source_artist,
+        source_secondary=source_album,
+        now=now,
     )
 
 
 def delete_genre_status(conn: sqlite3.Connection, file_id: int) -> None:
     """Remove *file_id*'s terminal genre decision (no-op if none)."""
-    conn.execute("DELETE FROM file_genre_status WHERE file_id = ?", (file_id,))
+    axis.delete_status(conn, axis.GENRE_AXIS, file_id)
 
 
 # --- "done" derivation + scope selection (PLAN — Selection set) ---------------------
@@ -678,37 +683,43 @@ def has_staged_change_for(
     return any(staged.managed_tags.get(name, []) != current.get(name, []) for name in fields)
 
 
-# The five user-facing genre workflow states. Two are stored (`no_match`/`manual`,
-# rows in file_genre_status), three are derived (`staged`/`done` from the revision
-# tables, `pending` = none of the above). Single source of truth for the
+# The five user-facing genre workflow states (re-exported from the genre axis): two are
+# stored (`no_match`/`manual`, rows in file_genre_status), two are derived (`staged`/`done`
+# from the revision tables), `pending` = none of the above. Single source of truth for the
 # ``list_files(genre_status=...)`` filter and the stats counts.
-GENRE_WORKFLOW_STATUSES: Final = frozenset({"pending", "no_match", "manual", "staged", "done"})
+GENRE_WORKFLOW_STATUSES: Final = axis.GENRE_AXIS.workflow_statuses
 
-# The managed-tag field the genre axis keys its field-aware staged/done derivation on.
-_GENRE_FIELDS: Final = ("genre",)
+
+def derived_status(conn: sqlite3.Connection, axis_: axis.Axis, file_id: int) -> str:
+    """Return *file_id*'s workflow status on *axis_*: staged | done | <stored> | pending.
+
+    THE canonical derivation for any axis, composed from the same predicates the skip path
+    (:func:`tagmend.engine.genres._select` / :func:`tagmend.engine.artists._drop_manual_excluded`)
+    uses: a staged change to one of the axis's *fields* wins (``staged``), then a committed
+    ``origin='auto'`` revision whose ``diff`` changed one of those fields (``done``), then a
+    stored ``file_<axis>_status`` decision, else ``pending``. The staged/done checks are
+    FIELD-AWARE (keyed on the axis's ``fields``), so a genre-only change does not read as
+    artist-``done`` and vice versa. Reports the STORED status even when it is stale (genre's
+    ``no_match`` staleness re-check still lets ``stage_genres`` retry it; the listing surfaces
+    the recorded decision so a human can judge it). Files with no source identity count as
+    ``pending`` (unprocessable until tagged, not terminal).
+    """
+    if has_staged_change_for(conn, file_id, axis_.fields):
+        return "staged"
+    if has_auto_change_for(conn, file_id, axis_.fields):
+        return "done"
+    decision = axis.get_status(conn, axis_, file_id)
+    if decision is not None:
+        return decision.status
+    return "pending"
 
 
 def derived_genre_status(conn: sqlite3.Connection, file_id: int) -> str:
     """Return *file_id*'s genre workflow status: staged | done | no_match | manual | pending.
 
-    THE canonical derivation, composed from the same predicates
-    :func:`tagmend.engine.genres._select` skips on (keep the two in sync): a staged change
-    *to ``genre``* wins, then a committed ``origin='auto'`` revision whose ``diff`` changed
-    ``genre`` (``done``), then a stored ``file_genre_status`` row, else ``pending``. The
-    staged/done checks are FIELD-AWARE (keyed on the ``genre`` tag), so an artist-only
-    staged/committed change does not read as genre-``done``. Reports the STORED status even
-    when it is stale (identity changed since) — ``stage_genres`` still retries stale
-    ``no_match`` rows; the listing surfaces the recorded decision so a human can judge it.
-    Files with no artist tag count as ``pending`` (unprocessable until tagged, not terminal).
+    Thin wrapper over :func:`derived_status` for the genre axis. See it for the full rule.
     """
-    if has_staged_change_for(conn, file_id, _GENRE_FIELDS):
-        return "staged"
-    if has_auto_change_for(conn, file_id, _GENRE_FIELDS):
-        return "done"
-    decision = get_genre_status(conn, file_id)
-    if decision is not None:
-        return decision.status
-    return "pending"
+    return derived_status(conn, axis.GENRE_AXIS, file_id)
 
 
 def genre_status_counts(conn: sqlite3.Connection) -> dict[str, int]:
@@ -717,33 +728,29 @@ def genre_status_counts(conn: sqlite3.Connection) -> dict[str, int]:
     One pass over every tracked file via :func:`derived_genre_status` (the single source
     of truth), so the counts and the per-file status can never drift.
     """
-    return _status_counts(conn, GENRE_WORKFLOW_STATUSES, derived_genre_status)
+    return status_counts(conn, axis.GENRE_AXIS)
 
 
-def _status_counts(
-    conn: sqlite3.Connection,
-    statuses: frozenset[str],
-    derive: Callable[[sqlite3.Connection, int], str],
-) -> dict[str, int]:
-    """Tally *derive* over every tracked file id; all *statuses* keys always present."""
-    counts = dict.fromkeys(sorted(statuses), 0)
+def status_counts(conn: sqlite3.Connection, axis_: axis.Axis) -> dict[str, int]:
+    """Tally :func:`derived_status` over every tracked file id for *axis_*.
+
+    All of the axis's workflow-status keys are always present (zero-filled), so the counts
+    and the per-file status can never drift.
+    """
+    counts = dict.fromkeys(sorted(axis_.workflow_statuses), 0)
     for row in conn.execute("SELECT id FROM files"):
-        counts[derive(conn, _as_int(row[0]))] += 1
+        counts[derived_status(conn, axis_, _as_int(row[0]))] += 1
     return counts
 
 
 # --- file_artist_status (sticky manual exclusion; artist-axis twin of genre) ---------
 
-# The two managed-tag fields the artist axis keys its field-aware staged/done derivation
-# on (and the value-scoped status tools match a value across both of).
-_ARTIST_FIELDS: Final = ("artist", "albumartist")
-
-# The four artist workflow states. One is stored (``manual`` — a row in
-# ``file_artist_status``), two are derived (``staged``/``done`` field-awarely from the
-# revision tables), and ``pending`` = none of the above. There is no ``no_match`` state on
-# this axis. Single source of truth for the ``list_files(artist_status=...)`` filter and
-# the stats counts.
-ARTIST_WORKFLOW_STATUSES: Final = frozenset({"pending", "manual", "staged", "done"})
+# The four artist workflow states (re-exported from the artist axis). One is stored
+# (``manual`` — a row in ``file_artist_status``), two are derived (``staged``/``done``
+# field-awarely from the revision tables), and ``pending`` = none of the above. There is no
+# ``no_match`` state on this axis. Single source of truth for the
+# ``list_files(artist_status=...)`` filter and the stats counts.
+ARTIST_WORKFLOW_STATUSES: Final = axis.ARTIST_AXIS.workflow_statuses
 
 
 @dataclass(frozen=True, slots=True)
@@ -755,21 +762,19 @@ class ArtistStatusRow:
     source_albumartist: str | None
 
 
+def _artist_row(decision: axis.StatusRow) -> ArtistStatusRow:
+    """Adapt a generic axis :class:`~tagmend.engine.axis.StatusRow` to the artist-named row."""
+    return ArtistStatusRow(
+        status=decision.status,
+        source_artist=decision.source_primary,
+        source_albumartist=decision.source_secondary,
+    )
+
+
 def get_artist_status(conn: sqlite3.Connection, file_id: int) -> ArtistStatusRow | None:
     """Return *file_id*'s stored artist decision, or ``None`` if it has none."""
-    cursor = conn.execute(
-        "SELECT status, source_artist, source_albumartist "
-        "FROM file_artist_status WHERE file_id = ?",
-        (file_id,),
-    )
-    row = cursor.fetchone()
-    if row is None:
-        return None
-    return ArtistStatusRow(
-        status=str(row[0]),
-        source_artist=None if row[1] is None else str(row[1]),
-        source_albumartist=None if row[2] is None else str(row[2]),
-    )
+    decision = axis.get_status(conn, axis.ARTIST_AXIS, file_id)
+    return None if decision is None else _artist_row(decision)
 
 
 def set_artist_status(  # noqa: PLR0913 - cohesive keyword-only status payload
@@ -786,40 +791,30 @@ def set_artist_status(  # noqa: PLR0913 - cohesive keyword-only status payload
     ``source_artist``/``source_albumartist`` record the values the exclusion was taken
     against, for audit.
     """
-    conn.execute(
-        """
-        INSERT OR REPLACE INTO file_artist_status (
-            file_id, status, source_artist, source_albumartist, updated_at
-        )
-        VALUES (?, ?, ?, ?, ?)
-        """,
-        (file_id, status, source_artist, source_albumartist, now),
+    axis.set_status(
+        conn,
+        axis.ARTIST_AXIS,
+        file_id=file_id,
+        status=status,
+        source_primary=source_artist,
+        source_secondary=source_albumartist,
+        now=now,
     )
 
 
 def delete_artist_status(conn: sqlite3.Connection, file_id: int) -> None:
     """Remove *file_id*'s stored artist decision (no-op if none)."""
-    conn.execute("DELETE FROM file_artist_status WHERE file_id = ?", (file_id,))
+    axis.delete_status(conn, axis.ARTIST_AXIS, file_id)
 
 
 def derived_artist_status(conn: sqlite3.Connection, file_id: int) -> str:
     """Return *file_id*'s artist workflow status: staged | done | manual | pending.
 
-    The artist-axis twin of :func:`derived_genre_status`, FIELD-AWARE on
-    ``artist``/``albumartist``: a staged change to either name field wins, then a committed
-    ``origin='auto'`` revision whose ``diff`` changed either field (``done``), then a stored
-    ``file_artist_status`` ``manual`` row, else ``pending``. There is no ``no_match`` state
-    on this axis. ``manual`` is sticky — always skipped by ``resolve_artists``, no staleness
-    re-check — but it ranks below an actual staged/committed name change.
+    Thin wrapper over :func:`derived_status` for the artist axis. There is no ``no_match``
+    state on this axis; ``manual`` is sticky (always skipped by ``resolve_artists``) but
+    ranks below an actual staged/committed name change.
     """
-    if has_staged_change_for(conn, file_id, _ARTIST_FIELDS):
-        return "staged"
-    if has_auto_change_for(conn, file_id, _ARTIST_FIELDS):
-        return "done"
-    decision = get_artist_status(conn, file_id)
-    if decision is not None:
-        return decision.status
-    return "pending"
+    return derived_status(conn, axis.ARTIST_AXIS, file_id)
 
 
 def artist_status_counts(conn: sqlite3.Connection) -> dict[str, int]:
@@ -828,7 +823,7 @@ def artist_status_counts(conn: sqlite3.Connection) -> dict[str, int]:
     One pass over every tracked file via :func:`derived_artist_status` (the single source
     of truth), so the counts and the per-file status can never drift.
     """
-    return _status_counts(conn, ARTIST_WORKFLOW_STATUSES, derived_artist_status)
+    return status_counts(conn, axis.ARTIST_AXIS)
 
 
 def distinct_artists(conn: sqlite3.Connection) -> list[tuple[str, int]]:

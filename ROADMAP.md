@@ -73,17 +73,24 @@ There are **three** distinct levels. Conflating them is the main naming hazard:
       must be byte-for-byte identical after the refactor. No schema-version bump if no table
       changes. All four quality gates green.
 
-### A2. Album axis (name + year)
-- [ ] New axis on the `tags` domain: add `album` and the year field (`date`; confirm the mutagen
-      "easy" key) — and `musicbrainz_albumid` for enrichment — to `MANAGED_TAGS`. Add
-      `file_album_status` (schema bump), `derived_album_status`, `resolve_albums`, the
-      `list_files(album_status=…)` filter, the `library_stats` `album` block, and MCP tools — all
-      via the A1 `Axis` abstraction (one row of config + a resolver, ideally).
-- [ ] **Resolver design (open):** album name/year correction has no clean `getCorrection`
-      equivalent. The **existing folder name is a strong hint** (it's already in the `files`
-      snapshot) and can seed an LLM proposal *without* us managing the path. Spec the album
-      resolver in `PLAN.md` before building (authorities: Last.fm `album.getInfo`, MusicBrainz
-      release; folder-name hint; LLM review layer).
+### A2. Album axis — v1: original-year blank-fill via MusicBrainz (decided 2026-06-17)
+Research (`docs/grounding-methods.md`) settled the approach: **MusicBrainz is the album authority** —
+Last.fm has no reliable release year and **no `album.getCorrection`**. The **original** year lives in
+`originaldate`/`originalyear` (MB release-group `first-release-date`, live-verified *Paranoid* = 1970),
+distinct from a reissue's `date` (the edition year Windows shows). v1 is **additive blank-fill only**:
+never overwrite an existing value, never touch `date`. Matches how Picard/beets handle original date.
+- [ ] Minimal **MusicBrainz client** — release-group search + lookup; reuse the `lastfm_cache`-style
+      cache + 1 req/s pacing + a descriptive `User-Agent` (no API key). See `docs/musicbrainz-api.md`.
+- [ ] New **`file_album_status`** axis via the A1 `Axis` abstraction (grouped by album identity, like
+      genre): `derived_album_status`, `list_files(album_status=…)`, `library_stats` `album` block,
+      set/reset MCP tools, sticky `manual` + `no_match`.
+- [ ] **`resolve_albums`** — fill `originaldate`/`originalyear` **where blank** from MB
+      `first-release-date`; never touch `date`. Add `originaldate`, `originalyear`,
+      `musicbrainz_albumid` (+ `musicbrainz_releasegroupid`?) to `MANAGED_TAGS` (verify mutagen-easy
+      `originalyear` key support across formats). No-op on already-tagged files (the Black Sabbath set).
+- **Follow-ups (separate features):** album-**name** blank-fill (sibling inference → folder parse →
+  MB-by-track) and the shared **folder-parsing primitive** (reusable for artist + unknown-artist
+  discovery). See `docs/grounding-methods.md` for the tiered grounding design.
 
 ### A3. Song axis (title + track number)
 - [ ] New axis: add `title` and `tracknumber` (+ `musicbrainz_trackid`) to `MANAGED_TAGS`;

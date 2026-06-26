@@ -246,6 +246,7 @@ def compute_stats(conn: sqlite3.Connection) -> dict[str, object]:
         "by_ext": by_ext,
         "genre": genre_status_counts(conn),
         "artist": artist_status_counts(conn),
+        "album": album_status_counts(conn),
     }
 
 
@@ -544,6 +545,85 @@ def _parse_tag_pairs(raw: str) -> list[tuple[str, int]]:
     return [(str(name), _as_int(weight)) for name, weight in parsed]
 
 
+# --- musicbrainz_cache (persistent release-group lookup cache; PLAN — album axis) ----
+
+
+@dataclass(frozen=True, slots=True)
+class MBAlbumRow:
+    """One cached MusicBrainz release-group lookup (a found album's resolved fields)."""
+
+    album_title: str | None
+    original_date: str | None
+    release_mbid: str | None
+    release_group_id: str | None
+
+
+def get_cached_mb_album(
+    conn: sqlite3.Connection,
+    request_key: str,
+) -> tuple[bool, MBAlbumRow] | None:
+    """Return the cached MusicBrainz lookup for *request_key*, or ``None`` on a cache miss.
+
+    ``None`` distinguishes a never-cached key from a cached negative result. A hit is
+    ``(found, row)``: ``found=False`` is the negative-cache sentinel (no usable Album
+    release group), while ``found=True`` carries the resolved fields on *row*.
+    """
+    cursor = conn.execute(
+        """
+        SELECT found, album_title, original_date, release_mbid, release_group_id
+        FROM musicbrainz_cache WHERE request_key = ?
+        """,
+        (request_key,),
+    )
+    row = cursor.fetchone()
+    if row is None:
+        return None
+    found = bool(row[0])
+    album = MBAlbumRow(
+        album_title=None if row[1] is None else str(row[1]),
+        original_date=None if row[2] is None else str(row[2]),
+        release_mbid=None if row[3] is None else str(row[3]),
+        release_group_id=None if row[4] is None else str(row[4]),
+    )
+    return (found, album)
+
+
+def put_cached_mb_album(  # noqa: PLR0913 - cohesive keyword-only cache payload
+    conn: sqlite3.Connection,
+    *,
+    request_key: str,
+    found: bool,
+    album_title: str | None,
+    original_date: str | None,
+    release_mbid: str | None,
+    release_group_id: str | None,
+    now: str,
+) -> None:
+    """Insert or replace the cached MusicBrainz lookup for *request_key*.
+
+    A re-fetch overwrites any prior cached value. Pass ``found=False`` with the resolved
+    columns ``None`` to negative-cache (no usable Album release group).
+    """
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO musicbrainz_cache (
+            request_key, found, album_title, original_date,
+            release_mbid, release_group_id, fetched_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            request_key,
+            1 if found else 0,
+            album_title,
+            original_date,
+            release_mbid,
+            release_group_id,
+            now,
+        ),
+    )
+
+
 # --- file_<axis>_status (per-file workflow decisions; PLAN — Status model) -----------
 #
 # The genre/artist status machinery is ONE parameterized concept; the per-axis config and
@@ -824,6 +904,87 @@ def artist_status_counts(conn: sqlite3.Connection) -> dict[str, int]:
     of truth), so the counts and the per-file status can never drift.
     """
     return status_counts(conn, axis.ARTIST_AXIS)
+
+
+# --- file_album_status (terminal album decisions; album-axis twin of genre) ----------
+
+# The five album workflow states (re-exported from the album axis). Two are stored
+# (``no_match``/``manual`` — rows in ``file_album_status``), two are derived
+# (``staged``/``done`` field-awarely on ``originaldate``), ``pending`` = none of the above.
+# Single source of truth for the ``list_files(album_status=...)`` filter and the stats.
+ALBUM_WORKFLOW_STATUSES: Final = axis.ALBUM_AXIS.workflow_statuses
+
+
+@dataclass(frozen=True, slots=True)
+class AlbumStatusRow:
+    """One row from ``file_album_status`` (a ``'no_match'`` / ``'manual'`` decision)."""
+
+    status: str
+    source_artist: str | None
+    source_album: str | None
+
+
+def _album_row(decision: axis.StatusRow) -> AlbumStatusRow:
+    """Adapt a generic axis :class:`~tagmend.engine.axis.StatusRow` to the album-named row."""
+    return AlbumStatusRow(
+        status=decision.status,
+        source_artist=decision.source_primary,
+        source_album=decision.source_secondary,
+    )
+
+
+def get_album_status(conn: sqlite3.Connection, file_id: int) -> AlbumStatusRow | None:
+    """Return *file_id*'s terminal album decision, or ``None`` if it has none."""
+    decision = axis.get_status(conn, axis.ALBUM_AXIS, file_id)
+    return None if decision is None else _album_row(decision)
+
+
+def set_album_status(  # noqa: PLR0913 - cohesive keyword-only status payload
+    conn: sqlite3.Connection,
+    *,
+    file_id: int,
+    status: str,
+    source_artist: str | None,
+    source_album: str | None,
+    now: str,
+) -> None:
+    """Insert or replace *file_id*'s terminal album decision.
+
+    ``source_artist``/``source_album`` record the resolved identity
+    (``albumartist``-else-``artist`` + ``album``) the decision was computed against, so a
+    later tag change can mark a ``'no_match'`` stale and re-processable.
+    """
+    axis.set_status(
+        conn,
+        axis.ALBUM_AXIS,
+        file_id=file_id,
+        status=status,
+        source_primary=source_artist,
+        source_secondary=source_album,
+        now=now,
+    )
+
+
+def delete_album_status(conn: sqlite3.Connection, file_id: int) -> None:
+    """Remove *file_id*'s terminal album decision (no-op if none)."""
+    axis.delete_status(conn, axis.ALBUM_AXIS, file_id)
+
+
+def derived_album_status(conn: sqlite3.Connection, file_id: int) -> str:
+    """Return *file_id*'s album workflow status: staged | done | no_match | manual | pending.
+
+    Thin wrapper over :func:`derived_status` for the album axis (keyed on ``originaldate``).
+    """
+    return derived_status(conn, axis.ALBUM_AXIS, file_id)
+
+
+def album_status_counts(conn: sqlite3.Connection) -> dict[str, int]:
+    """Return file counts per album workflow status, all five keys always present.
+
+    One pass over every tracked file via :func:`derived_album_status` (the single source
+    of truth), so the counts and the per-file status can never drift.
+    """
+    return status_counts(conn, axis.ALBUM_AXIS)
 
 
 def distinct_artists(conn: sqlite3.Connection) -> list[tuple[str, int]]:

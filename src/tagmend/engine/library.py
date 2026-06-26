@@ -52,6 +52,9 @@ class FileView:
     artist_status: str = "pending"
     artist_source_artist: str | None = None  # values a manual exclusion was recorded against
     artist_source_albumartist: str | None = None
+    album_status: str = "pending"
+    album_source_artist: str | None = None  # identity a no_match/manual was recorded against
+    album_source_album: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         """JSON-serializable form for the MCP tool."""
@@ -68,6 +71,9 @@ class FileView:
             "artist_status": self.artist_status,
             "artist_source_artist": self.artist_source_artist,
             "artist_source_albumartist": self.artist_source_albumartist,
+            "album_status": self.album_status,
+            "album_source_artist": self.album_source_artist,
+            "album_source_album": self.album_source_album,
         }
 
 
@@ -86,6 +92,10 @@ def _to_view(conn: sqlite3.Connection, row: store.FileRow) -> FileView:
     artist_status = store.derived_artist_status(conn, row.id)
     artist_decision = store.get_artist_status(conn, row.id)
     has_stored_artist = artist_decision is not None and artist_status == artist_decision.status
+
+    album_status = store.derived_album_status(conn, row.id)
+    album_decision = store.get_album_status(conn, row.id)
+    has_stored_album = album_decision is not None and album_status == album_decision.status
     return FileView(
         file_id=row.id,
         folder=row.folder,
@@ -107,27 +117,58 @@ def _to_view(conn: sqlite3.Connection, row: store.FileRow) -> FileView:
         artist_source_albumartist=artist_decision.source_albumartist
         if has_stored_artist and artist_decision
         else None,
+        album_status=album_status,
+        album_source_artist=album_decision.source_artist
+        if has_stored_album and album_decision
+        else None,
+        album_source_album=album_decision.source_album
+        if has_stored_album and album_decision
+        else None,
     )
 
 
-def list_files(
+def _row_matches_status(
+    conn: sqlite3.Connection,
+    file_id: int,
+    *,
+    genre_status: str | None,
+    artist_status: str | None,
+    album_status: str | None,
+) -> bool:
+    """Return whether *file_id* satisfies every requested workflow-status filter.
+
+    Each non-``None`` filter must match the file's derived status on that axis (the axes are
+    independent and field-aware); a ``None`` filter is ignored.
+    """
+    if genre_status is not None and store.derived_genre_status(conn, file_id) != genre_status:
+        return False
+    if artist_status is not None and store.derived_artist_status(conn, file_id) != artist_status:
+        return False
+    return not (
+        album_status is not None and store.derived_album_status(conn, file_id) != album_status
+    )
+
+
+def list_files(  # noqa: PLR0913 - cohesive keyword-only discovery filters
     settings: Settings,
     *,
     root: Path | None = None,
     limit: int | None = None,
     genre_status: str | None = None,
     artist_status: str | None = None,
+    album_status: str | None = None,
 ) -> list[FileView]:
     """Return tracked files (id order) with their managed tags, for discovery.
 
     Optionally limited to files under *root*, filtered to one genre workflow status
-    (``pending`` | ``no_match`` | ``manual`` | ``staged`` | ``done``) and/or one artist
-    workflow status (``pending`` | ``manual`` | ``staged`` | ``done``), and/or capped at
-    *limit* rows. ``genre_status="no_match"`` is the "fix by hand" worklist. With NEITHER
+    (``pending`` | ``no_match`` | ``manual`` | ``staged`` | ``done``), one artist workflow
+    status (``pending`` | ``manual`` | ``staged`` | ``done``), and/or one album workflow
+    status (``pending`` | ``no_match`` | ``manual`` | ``staged`` | ``done``), and/or capped
+    at *limit* rows. ``genre_status="no_match"`` is the "fix by hand" worklist. With NO
     status filter the cap is applied before reading tags, so a large library stays cheap to
-    browse; with either filter, all candidate rows are examined, BOTH filters are applied,
-    and the cap counts the *matching* files. Raises :class:`ValueError` for an unknown
-    status. Read-only.
+    browse; with any filter, all candidate rows are examined, ALL filters are applied, and
+    the cap counts the *matching* files. Raises :class:`ValueError` for an unknown status.
+    Read-only.
     """
     if genre_status is not None and genre_status not in store.GENRE_WORKFLOW_STATUSES:
         message = (
@@ -141,8 +182,14 @@ def list_files(
             f"(expected one of {sorted(store.ARTIST_WORKFLOW_STATUSES)})"
         )
         raise ValueError(message)
+    if album_status is not None and album_status not in store.ALBUM_WORKFLOW_STATUSES:
+        message = (
+            f"unknown album_status: {album_status!r} "
+            f"(expected one of {sorted(store.ALBUM_WORKFLOW_STATUSES)})"
+        )
+        raise ValueError(message)
 
-    filtered = genre_status is not None or artist_status is not None
+    filtered = genre_status is not None or artist_status is not None or album_status is not None
 
     connection = db.connect(settings.db_path)
     try:
@@ -159,15 +206,15 @@ def list_files(
             return [_to_view(connection, row) for row in rows]
 
         # Status filter(s): the cap counts MATCHING files, so examine rows until it fills.
-        # When both are set, a file must satisfy BOTH to match.
+        # When several are set, a file must satisfy ALL to match.
         views: list[FileView] = []
         for row in rows:
-            if genre_status is not None and store.derived_genre_status(connection, row.id) != (
-                genre_status
-            ):
-                continue
-            if artist_status is not None and store.derived_artist_status(connection, row.id) != (
-                artist_status
+            if not _row_matches_status(
+                connection,
+                row.id,
+                genre_status=genre_status,
+                artist_status=artist_status,
+                album_status=album_status,
             ):
                 continue
             views.append(_to_view(connection, row))

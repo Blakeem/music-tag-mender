@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final
 
 import mutagen
+from mutagen.easymp4 import EasyMP4Tags
 
 from tagmend.log import get_logger
 
@@ -24,6 +25,13 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 logger = get_logger(__name__)
+
+# ``originaldate`` (the original/first-release year) is native on ID3 (``TDOR``) and Vorbis
+# (``ORIGINALDATE``) via mutagen's easy mode, but MP4 has no built-in easy mapping. Register
+# it ONCE at module load so read and write agree on the iTunes freeform atom
+# ``----:com.apple.iTunes:ORIGINALDATE`` — never ``©day`` (that is ``date``, the reissue
+# year). Registration is idempotent; importing this module is the single place it happens.
+EasyMP4Tags.RegisterFreeformKey("originaldate", "ORIGINALDATE")  # type: ignore[no-untyped-call]
 
 # Raw (already-lowercased) key -> canonical key. Kept deliberately small.
 _ALIASES: Final[dict[str, str]] = {
@@ -35,8 +43,10 @@ _ALIASES: Final[dict[str, str]] = {
 # small means snapshots stay tiny and a write/revert can never damage unrelated
 # metadata (title, track, art). ``artist`` is included so revert can restore it; the
 # classify/write layer (M2/M4) decides whether to *modify* it (PLAN.md §11 "cautious").
+# ``originaldate`` (the album axis, M-album) is the original/first-release year, written
+# blank-fill only and kept distinct from ``date`` (the reissue year, never managed here).
 MANAGED_TAGS: Final[frozenset[str]] = frozenset(
-    {"genre", "albumartist", "artist", "musicbrainz_artistid"},
+    {"genre", "albumartist", "artist", "musicbrainz_artistid", "originaldate"},
 )
 
 

@@ -13,7 +13,7 @@ from typing import Literal
 from mcp.server.fastmcp import FastMCP
 
 from tagmend.config import load_settings
-from tagmend.engine import artists, commits, genres, library, staging, versioning
+from tagmend.engine import albums, artists, commits, genres, library, staging, versioning
 from tagmend.engine.doctor import run_health_check
 from tagmend.engine.library import ScanMode
 from tagmend.log import get_logger
@@ -189,6 +189,7 @@ def list_files(
     limit: int | None = None,
     genre_status: Literal["pending", "no_match", "manual", "staged", "done"] | None = None,
     artist_status: Literal["pending", "manual", "staged", "done"] | None = None,
+    album_status: Literal["pending", "no_match", "manual", "staged", "done"] | None = None,
 ) -> dict[str, object]:
     """List tracked files with their current managed tags (to discover file ids).
 
@@ -213,14 +214,20 @@ def list_files(
             (``pending`` | ``no_match`` | ``manual`` | ``staged`` | ``done``).
         artist_status: Return only files in this artist workflow state
             (``pending`` | ``manual`` | ``staged`` | ``done``). Combined with
-            ``genre_status``, a file must match BOTH. The two axes are independent:
+            ``genre_status``, a file must match BOTH. The axes are independent:
             ``staged``/``done`` are field-aware (genre keys on ``genre``; artist on
-            ``artist``/``albumartist``).
+            ``artist``/``albumartist``; album on ``originaldate``).
+        album_status: Return only files in this album workflow state
+            (``pending`` | ``no_match`` | ``manual`` | ``staged`` | ``done``). Combined with
+            the other filters, a file must match ALL. ``album_source_artist`` /
+            ``album_source_album`` carry the resolved identity a stored decision was taken
+            against.
 
     Returns:
         ``{"ok": True, "files": [{file_id, folder, filename, ext, is_missing,
         managed_tags, genre_status, genre_source_artist, genre_source_album,
-        artist_status, artist_source_artist, artist_source_albumartist}, ...]}``,
+        artist_status, artist_source_artist, artist_source_albumartist, album_status,
+        album_source_artist, album_source_album}, ...]}``,
         or ``{"ok": False, "error": ...}`` on a bad request.
     """
     try:
@@ -230,6 +237,7 @@ def list_files(
             limit=limit,
             genre_status=genre_status,
             artist_status=artist_status,
+            album_status=album_status,
         )
     except ValueError as exc:
         return {"ok": False, "error": str(exc)}
@@ -607,6 +615,129 @@ def reset_artist_status(
         ``{"ok": True, "affected": <count>}``.
     """
     affected = artists.reset_artist_status(
+        load_settings(),
+        file_ids=file_ids,
+        value=value,
+    )
+    return {"ok": True, "affected": affected}
+
+
+@mcp.tool()
+def resolve_albums(
+    album: str | None = None,
+    file_ids: list[int] | None = None,
+    limit: int | None = None,
+    dry_run: bool = False,  # noqa: FBT001, FBT002 - MCP tool surface, not a Python API
+) -> dict[str, object]:
+    """Blank-fill the original release year (``originaldate``) from MusicBrainz (writes no disk).
+
+    For each in-scope album group ``(albumartist-else-artist, album)`` this looks up the
+    original first-release year on MusicBrainz (a release group's ``first-release-date``,
+    e.g. *Paranoid* = 1970 — distinct from the reissue ``date``) and stages it into
+    ``originaldate`` on every group file whose ``originaldate`` is currently **blank**, as an
+    ``auto`` change replacing ONLY that field (every other managed tag preserved). It never
+    overwrites an existing ``originaldate`` and never touches ``date``. Review with
+    ``diff_tags`` and apply with ``commit_tags``; ``revert_commit``/``revert_tags`` undo it.
+
+    It deliberately **skips** files that already have an ``originaldate``
+    (``skipped_present``), files with no ``album`` (``skipped_no_album``), files with no
+    artist (``skipped_no_artist``), and ``manual`` exclusions (``skipped_manual``). A group
+    MusicBrainz has no usable Album release group for is recorded ``no_match`` (re-opened if
+    the artist or album changes). A transient MusicBrainz error leaves that group pending.
+
+    Args:
+        album: Limit to files whose ``album`` tag equals this value.
+        file_ids: Limit to these specific file ids (overrides ``album``).
+        limit: Max album groups to process this call (default ``album_stage_limit``).
+            Remaining groups are reported via ``pending_remaining`` / ``more``.
+        dry_run: Preview the album → original-year mappings + would-stage count without
+            staging anything (works from cache, no precondition).
+
+    Returns:
+        ``{"ok": True, processed, staged_files, no_match, skipped_present, skipped_no_album,
+        skipped_no_artist, skipped_manual, pending_remaining, more, mappings, summary}``, or
+        ``{"ok": False, "error": ...}`` (e.g. pending changes).
+    """
+    try:
+        result = albums.resolve_albums(
+            load_settings(),
+            album=album,
+            file_ids=file_ids,
+            limit=limit,
+            dry_run=dry_run,
+        )
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    return {"ok": True, **result.to_dict()}
+
+
+@mcp.tool()
+def list_albums() -> dict[str, object]:
+    """List distinct album groups with file counts + status (to scope ``resolve_albums``).
+
+    Groups files by ``(albumartist-else-artist, album)`` and reports each group's file count
+    and derived album workflow status. Returns ``{"ok": True, "albums": [{artist, album,
+    file_count, album_status}, ...]}`` in ``(artist, album)`` order. Run ``scan_library``
+    first to populate the snapshot.
+    """
+    rows = albums.list_albums(load_settings())
+    return {"ok": True, "albums": [row.to_dict() for row in rows]}
+
+
+@mcp.tool()
+def set_album_status(
+    status: Literal["manual", "pending"],
+    file_ids: list[int] | None = None,
+    value: str | None = None,
+) -> dict[str, object]:
+    """Exclude files from album-year fill (``manual``) or re-queue them (``pending``).
+
+    ``manual`` marks the in-scope files as a deliberate human/LLM choice: ``resolve_albums``
+    skips them until you reset. ``pending`` removes any status row, re-queuing them.
+
+    Scope is ``file_ids`` when given, else every file carrying ``value`` as its ``album``
+    tag.
+
+    Args:
+        status: ``manual`` to exclude, ``pending`` to re-queue.
+        file_ids: Limit to these file ids.
+        value: Limit to files whose ``album`` tag equals this value (used when ``file_ids``
+            is omitted).
+
+    Returns:
+        ``{"ok": True, "affected": <count>}``, or ``{"ok": False, "error": ...}``.
+    """
+    try:
+        affected = albums.set_album_status(
+            load_settings(),
+            file_ids=file_ids,
+            value=value,
+            status=status,
+        )
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    return {"ok": True, "affected": affected}
+
+
+@mcp.tool()
+def reset_album_status(
+    file_ids: list[int] | None = None,
+    value: str | None = None,
+) -> dict[str, object]:
+    """Clear any album status row for in-scope files, returning them to ``pending``.
+
+    Removes both ``no_match`` and ``manual`` decisions so ``resolve_albums`` will reconsider
+    the files on its next run.
+
+    Args:
+        file_ids: Limit to these file ids.
+        value: Limit to files whose ``album`` tag equals this value (used when ``file_ids``
+            is omitted).
+
+    Returns:
+        ``{"ok": True, "affected": <count>}``.
+    """
+    affected = albums.reset_album_status(
         load_settings(),
         file_ids=file_ids,
         value=value,

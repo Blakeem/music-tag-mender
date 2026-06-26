@@ -1,7 +1,7 @@
 # TagMend — ROADMAP (forward-looking)
 
-> Updated **2026-06-16**. This file lists only what **remains**. Everything shipped through
-> **M4** has been removed so the list is purely forward-looking. `PLAN.md` is the design of
+> Updated **2026-06-26**. This file lists only what **remains**. Everything shipped through
+> **A2** has been removed so the list is purely forward-looking. `PLAN.md` is the design of
 > record; this is the punch-list of what's left.
 >
 > **Direction (2026-06-16):** finish the **metadata** mission first — it's the whole point of
@@ -43,54 +43,37 @@ There are **three** distinct levels. Conflating them is the main naming hazard:
 - **M4 — artist **axis** + review state (DONE).** `resolve_artists`, sticky per-file artist
   exclusion, per-axis visibility (`list_files(artist_status=…)`, `library_stats` `artist`
   block), **field-aware** `done`/`staged` so genre and artist read independently.
-- **Schema v7. 21 MCP tools.** Both shipped axes (genre + artist) have working auto + manual
-  exclusion pipelines with full revert. The review loop is: `resolve_*(dry_run)` → exclude what
-  you don't want → `resolve_*` (real) → review the staged diff → `commit_tags`.
+- **A1 — Axis abstraction refactor (DONE).** One parameterized `Axis` (`engine/axis.py`):
+  `GENRE_AXIS`/`ARTIST_AXIS`/`ALBUM_AXIS` are data, not copied modules. The two asymmetries are
+  preserved in each axis's `decision_blocks` predicate (genre/album have `no_match`+staleness;
+  artist's `manual` is sticky) and `source_columns`. Generic `get/set/delete/derived_status`.
+- **A2 — Album axis (DONE).** Minimal MusicBrainz release-group client (`engine/musicbrainz.py`,
+  cached in `musicbrainz_cache`, 1 req/s, descriptive User-Agent, no key) + `resolve_albums`
+  (`engine/albums.py`): blank-fill `originaldate` from MB `first-release-date` **only where
+  blank**, never overwriting, never touching `date`. Sticky `manual` + engine-owned `no_match`,
+  `list_albums`, `list_files(album_status=…)`, `library_stats` `album` block, set/reset tools.
+  **Scope note:** v1 writes **only `originaldate`** — `originalyear` and the MusicBrainz IDs
+  (`musicbrainz_albumid`/`releasegroupid`) are deliberately **not** added to `MANAGED_TAGS` (the
+  release-group MBID is cached but never written to files).
+- **Schema v8. 25 MCP tools.** Three shipped axes (genre + artist + album) have working auto +
+  manual exclusion pipelines with full revert. The review loop is: `resolve_*(dry_run)` → exclude
+  what you don't want → `resolve_*` (real) → review the staged diff → `commit_tags`.
+- **NOTE (2026-06-26):** the A1 + A2 work above is **complete and all four gates pass**
+  (392 tests, ruff, mypy) but is currently **uncommitted** in the working tree — commit it before
+  starting A3.
 
 ---
 
 ## Phase A — finish the metadata axes (the actual goal)
 
-### A1. Generalize the per-axis machinery (refactor — first, and the workflow smoke test)
-- [ ] Today genre and artist each carry a near-duplicate copy of the *same* status machinery.
-      Adding album + song by copy-paste would make **four** copies. First, unify the pattern
-      into **one parameterized `Axis` concept** so album/song slot in as data, not modules.
-      **Additive, no DB rename** — `tags` stays `tags`, the `file_genre_status` /
-      `file_artist_status` tables keep their names.
-- [ ] The `Axis` must carry, per axis: `name`, `fields`, allowed user-statuses, workflow-statuses,
-      and its **source-identity shape**. Preserve the two real asymmetries — **genre has a
-      `no_match` state; artist does not**, and the `source_*` columns differ
-      (`file_genre_status`: `source_artist`+`source_album`; `file_artist_status`:
-      `source_artist`+`source_albumartist`).
-- [ ] Collapse the duplicated surface behind the `Axis`:
-      - `store.py`: `_<AXIS>_FIELDS`, `<AXIS>_WORKFLOW_STATUSES`, `<Axis>StatusRow`,
-        `get/set/delete_<axis>_status`, `derived_<axis>_status`, `<axis>_status_counts`.
-      - `genres.py`/`artists.py`: the `_select` skip predicate + `set/reset_<axis>_status`.
-      - `library.py`: the `list_files(<axis>_status=…)` filter, the `get_file` status fields,
-        the `library_stats` per-axis block.
-      - `mcp_server.py`: the `set_/reset_<axis>_status` tools.
-- [ ] **Behavior-preserving:** genre and artist outputs (statuses, counts, tool responses, revert)
-      must be byte-for-byte identical after the refactor. No schema-version bump if no table
-      changes. All four quality gates green.
-
-### A2. Album axis — v1: original-year blank-fill via MusicBrainz (decided 2026-06-17)
-Research (`docs/grounding-methods.md`) settled the approach: **MusicBrainz is the album authority** —
-Last.fm has no reliable release year and **no `album.getCorrection`**. The **original** year lives in
-`originaldate`/`originalyear` (MB release-group `first-release-date`, live-verified *Paranoid* = 1970),
-distinct from a reissue's `date` (the edition year Windows shows). v1 is **additive blank-fill only**:
-never overwrite an existing value, never touch `date`. Matches how Picard/beets handle original date.
-- [ ] Minimal **MusicBrainz client** — release-group search + lookup; reuse the `lastfm_cache`-style
-      cache + 1 req/s pacing + a descriptive `User-Agent` (no API key). See `docs/musicbrainz-api.md`.
-- [ ] New **`file_album_status`** axis via the A1 `Axis` abstraction (grouped by album identity, like
-      genre): `derived_album_status`, `list_files(album_status=…)`, `library_stats` `album` block,
-      set/reset MCP tools, sticky `manual` + `no_match`.
-- [ ] **`resolve_albums`** — fill `originaldate`/`originalyear` **where blank** from MB
-      `first-release-date`; never touch `date`. Add `originaldate`, `originalyear`,
-      `musicbrainz_albumid` (+ `musicbrainz_releasegroupid`?) to `MANAGED_TAGS` (verify mutagen-easy
-      `originalyear` key support across formats). No-op on already-tagged files (the Black Sabbath set).
-- **Follow-ups (separate features):** album-**name** blank-fill (sibling inference → folder parse →
-  MB-by-track) and the shared **folder-parsing primitive** (reusable for artist + unknown-artist
-  discovery). See `docs/grounding-methods.md` for the tiered grounding design.
+> **A1 (Axis abstraction) and A2 (Album axis) are DONE** — see "Where we are" above.
+> A3 (song axis) is the only remaining metadata axis; A4 is a small readiness add-on.
+>
+> **Carried-forward follow-ups from A2 (separate, lower-priority features):** album-**name**
+> blank-fill (sibling inference → folder parse → MB-by-track) and the shared **folder-parsing
+> primitive** (reusable for artist + unknown-artist discovery). See `docs/grounding-methods.md`
+> for the tiered grounding design. Also: A2 v1 writes only `originaldate` — if the MusicBrainz
+> IDs or `originalyear` are wanted on-file later, revisit `MANAGED_TAGS`.
 
 ### A3. Song axis (title + track number)
 - [ ] New axis: add `title` and `tracknumber` (+ `musicbrainz_trackid`) to `MANAGED_TAGS`;

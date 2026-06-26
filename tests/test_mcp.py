@@ -118,6 +118,10 @@ def test_list_tools_exposes_expected_tools_and_schema() -> None:
         "revert_commit",
         "list_commits",
         "get_commit",
+        "resolve_albums",
+        "list_albums",
+        "set_album_status",
+        "reset_album_status",
     } <= names
     # Retired names must be gone.
     assert names.isdisjoint({"unstage", "list_pending", "resume_commits"})
@@ -130,6 +134,15 @@ def test_list_tools_exposes_expected_tools_and_schema() -> None:
     genre_status_schema = list_tool.inputSchema["properties"]["genre_status"]
     enum_values = _enum_values(genre_status_schema)
     assert set(enum_values) == {"pending", "no_match", "manual", "staged", "done"}
+
+    album_status_schema = list_tool.inputSchema["properties"]["album_status"]
+    assert set(_enum_values(album_status_schema)) == {
+        "pending",
+        "no_match",
+        "manual",
+        "staged",
+        "done",
+    }
 
 
 def read_tags_via_disk(music_dir: Path, filename: str = "track.mp3") -> list[str]:
@@ -268,6 +281,51 @@ def test_library_stats_includes_genre_block(music_dir: Path) -> None:
     assert isinstance(genre, dict)
     assert set(genre) == store.GENRE_WORKFLOW_STATUSES
     assert genre["no_match"] == 1
+
+
+def test_album_status_tools_and_list_albums(music_dir: Path) -> None:
+    track = make_track(music_dir / "p.mp3", {"artist": ["Black Sabbath"], "album": ["Paranoid"]})
+    mcp_server.scan_library(path=str(music_dir))
+    conn = connect(load_settings().db_path)
+    try:
+        row = store.get_file(conn, str(music_dir), track.name)
+        assert row is not None
+        file_id = row.id
+    finally:
+        conn.close()
+
+    # set_album_status manual → list_files filters → reset re-queues.
+    assert mcp_server.set_album_status("manual", file_ids=[file_id]) == {"ok": True, "affected": 1}
+    listed = mcp_server.list_files(album_status="manual")
+    assert listed["ok"] is True
+    files = listed["files"]
+    assert isinstance(files, list)
+    assert files[0]["file_id"] == file_id
+    assert files[0]["album_status"] == "manual"
+
+    assert mcp_server.reset_album_status(file_ids=[file_id]) == {"ok": True, "affected": 1}
+
+    albums_payload = mcp_server.list_albums()
+    assert albums_payload["ok"] is True
+    rows = albums_payload["albums"]
+    assert isinstance(rows, list)
+    assert any(r["album"] == "Paranoid" for r in rows)
+
+
+def test_set_album_status_rejects_unknown_status(music_dir: Path) -> None:
+    _scanned_track_id(music_dir)
+    payload = mcp_server.set_album_status("no_match", file_ids=[1])
+    assert payload["ok"] is False
+    assert "error" in payload
+
+
+def test_library_stats_includes_album_block(music_dir: Path) -> None:
+    _scanned_track_id(music_dir)
+    stats = mcp_server.library_stats()
+    assert stats["ok"] is True
+    album = stats["album"]
+    assert isinstance(album, dict)
+    assert set(album) == store.ALBUM_WORKFLOW_STATUSES
 
 
 def test_history_and_revert_roundtrip(music_dir: Path) -> None:

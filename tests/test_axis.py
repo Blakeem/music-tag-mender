@@ -11,6 +11,7 @@ no temp library, no audio files.
 from __future__ import annotations
 
 from tagmend.engine.axis import (
+    ALBUM_AXIS,
     ARTIST_AXIS,
     GENRE_AXIS,
     Identity,
@@ -259,3 +260,77 @@ def test_artist_non_manual_does_not_block_even_when_identity_unchanged() -> None
     identity_diff = Identity(primary="Z", secondary="W")
     assert ARTIST_AXIS.decision_blocks(decision, identity_match) is False
     assert ARTIST_AXIS.decision_blocks(decision, identity_diff) is False
+
+
+# ---------------------------------------------------------------------------
+# Album axis: config invariants (a near-clone of the genre axis)
+# ---------------------------------------------------------------------------
+
+
+def test_album_axis_name() -> None:
+    assert ALBUM_AXIS.name == "album"
+
+
+def test_album_axis_fields() -> None:
+    assert ALBUM_AXIS.fields == ("originaldate",)
+
+
+def test_album_axis_status_table() -> None:
+    assert ALBUM_AXIS.status_table == "file_album_status"
+
+
+def test_album_axis_source_columns() -> None:
+    assert ALBUM_AXIS.source_columns == ("source_artist", "source_album")
+
+
+def test_album_axis_workflow_statuses_exact_set() -> None:
+    assert ALBUM_AXIS.workflow_statuses == frozenset(
+        {"pending", "no_match", "manual", "staged", "done"}
+    )
+
+
+def test_album_axis_workflow_statuses_cardinality() -> None:
+    assert len(ALBUM_AXIS.workflow_statuses) == 5
+
+
+def test_no_match_in_album_workflow_statuses() -> None:
+    assert "no_match" in ALBUM_AXIS.workflow_statuses
+
+
+# ---------------------------------------------------------------------------
+# Album decision_blocks: manual sticky; no_match stale on either identity field
+# ---------------------------------------------------------------------------
+
+
+def test_album_manual_blocks_regardless_of_identity() -> None:
+    decision = StatusRow(status="manual", source_primary="Old", source_secondary="Old")
+    assert ALBUM_AXIS.decision_blocks(decision, Identity(primary="New", secondary="New")) is True
+
+
+def test_album_no_match_blocks_when_identity_unchanged() -> None:
+    decision = StatusRow(
+        status="no_match",
+        source_primary="Black Sabbath",
+        source_secondary="Paranoid",
+    )
+    identity = Identity(primary="Black Sabbath", secondary="Paranoid")
+    assert ALBUM_AXIS.decision_blocks(decision, identity) is True
+
+
+def test_album_no_match_stale_when_primary_changed() -> None:
+    # Artist (or album-artist fallback) changed → stale → does NOT block.
+    decision = StatusRow(status="no_match", source_primary="Old Artist", source_secondary="Album")
+    identity = Identity(primary="New Artist", secondary="Album")
+    assert ALBUM_AXIS.decision_blocks(decision, identity) is False
+
+
+def test_album_no_match_stale_when_secondary_changed() -> None:
+    # Album changed → stale → does NOT block.
+    decision = StatusRow(status="no_match", source_primary="Artist", source_secondary="Old Album")
+    identity = Identity(primary="Artist", secondary="New Album")
+    assert ALBUM_AXIS.decision_blocks(decision, identity) is False
+
+
+def test_album_pending_does_not_block() -> None:
+    decision = StatusRow(status="pending", source_primary="A", source_secondary="B")
+    assert ALBUM_AXIS.decision_blocks(decision, Identity(primary="A", secondary="B")) is False

@@ -40,6 +40,17 @@ The M4 artist normalization path adds one more side table (schema v7, purely add
 * ``file_artist_status`` — the artist-axis twin of ``file_genre_status``, storing ONLY the
   sticky ``'manual'`` exclusion (no ``'no_match'`` state on this axis). "Done"/"staged" are
   *derived* field-awarely from the revision tables (keyed on ``artist``/``albumartist``).
+
+The album original-year path adds two more side tables (schema v8, purely additive — a v7
+ledger upgrades in place with no data loss):
+
+* ``file_album_status`` — the album-axis twin of ``file_genre_status`` (same identity:
+  ``(albumartist-else-artist, album)`` → ``source_artist``/``source_album``), storing the
+  ``'no_match'`` / ``'manual'`` decisions; "done"/"staged" are *derived* field-awarely
+  (keyed on ``originaldate``).
+* ``musicbrainz_cache`` — a persistent cache of MusicBrainz release-group lookups keyed by a
+  request hash. ``found`` is the negative-cache sentinel (0 = no usable Album release group),
+  mirroring ``lastfm_cache``.
 """
 
 from __future__ import annotations
@@ -53,7 +64,7 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
-SCHEMA_VERSION: Final = 7
+SCHEMA_VERSION: Final = 8
 
 _FILES_DDL: Final = """
 CREATE TABLE IF NOT EXISTS files (
@@ -217,6 +228,39 @@ CREATE TABLE IF NOT EXISTS file_artist_status (
 )
 """
 
+# Per-file terminal/negative album decisions (the album-axis twin of ``file_genre_status``,
+# identical shape). Stores ONLY ``'no_match'`` (no usable MusicBrainz Album release group)
+# and ``'manual'`` (user/LLM excluded it). "Done"/"staged" are DERIVED elsewhere from the
+# field-aware revision tables (keyed on ``originaldate``), so there is no state here to
+# desync. ``source_artist``/``source_album`` record the resolved identity
+# (``albumartist``-else-``artist`` + ``album``) the decision was taken against, so a later
+# tag change makes a ``'no_match'`` stale and re-processable. See PLAN — album axis.
+_FILE_ALBUM_STATUS_DDL: Final = """
+CREATE TABLE IF NOT EXISTS file_album_status (
+  file_id       INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
+  status        TEXT NOT NULL,
+  source_artist TEXT,
+  source_album  TEXT,
+  updated_at    TEXT NOT NULL
+)
+"""
+
+# Persistent cache of MusicBrainz release-group lookups, keyed by a request hash (so it
+# survives MCP restarts), mirroring ``lastfm_cache``. ``found`` is the negative-cache
+# sentinel (0 = no usable Album release group; 1 = found). The found columns hold the
+# selected release group's original ``first-release-date`` and ids. See PLAN — album axis.
+_MUSICBRAINZ_CACHE_DDL: Final = """
+CREATE TABLE IF NOT EXISTS musicbrainz_cache (
+  request_key      TEXT PRIMARY KEY,
+  found            INTEGER NOT NULL,
+  album_title      TEXT,
+  original_date    TEXT,
+  release_mbid     TEXT,
+  release_group_id TEXT,
+  fetched_at       TEXT NOT NULL
+)
+"""
+
 
 def apply_schema(connection: sqlite3.Connection) -> None:
     """Create all tables (idempotently) and stamp ``PRAGMA user_version``.
@@ -251,4 +295,6 @@ def apply_schema(connection: sqlite3.Connection) -> None:
     connection.execute(_LASTFM_CACHE_DDL)
     connection.execute(_FILE_GENRE_STATUS_DDL)
     connection.execute(_FILE_ARTIST_STATUS_DDL)
+    connection.execute(_FILE_ALBUM_STATUS_DDL)
+    connection.execute(_MUSICBRAINZ_CACHE_DDL)
     connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")

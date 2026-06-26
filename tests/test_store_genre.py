@@ -615,3 +615,136 @@ def test_compute_stats_includes_artist_block(db_conn: sqlite3.Connection) -> Non
     stats = store.compute_stats(db_conn)
     assert "artist" in stats
     assert stats["artist"] == store.artist_status_counts(db_conn)
+
+
+# --- file_album_status (album-axis twin of genre) -----------------------------------
+
+
+def test_album_status_set_get_delete_round_trip(db_conn: sqlite3.Connection) -> None:
+    file_id = _insert(db_conn)
+    store.set_album_status(
+        db_conn,
+        file_id=file_id,
+        status="no_match",
+        source_artist="Black Sabbath",
+        source_album="Paranoid",
+        now=_NOW,
+    )
+    row = store.get_album_status(db_conn, file_id)
+    assert row is not None
+    assert row.status == "no_match"
+    assert row.source_artist == "Black Sabbath"
+    assert row.source_album == "Paranoid"
+
+    store.delete_album_status(db_conn, file_id)
+    assert store.get_album_status(db_conn, file_id) is None
+    store.delete_album_status(db_conn, file_id)  # idempotent no-op
+
+
+def test_derived_album_status_across_all_five_states(db_conn: sqlite3.Connection) -> None:
+    pending = _insert(db_conn, filename="alp.mp3")
+    assert store.derived_album_status(db_conn, pending) == "pending"
+
+    no_match = _insert(db_conn, filename="alnm.mp3")
+    store.set_album_status(
+        db_conn,
+        file_id=no_match,
+        status="no_match",
+        source_artist="A",
+        source_album="B",
+        now=_NOW,
+    )
+    assert store.derived_album_status(db_conn, no_match) == "no_match"
+
+    manual = _insert(db_conn, filename="alm.mp3")
+    store.set_album_status(
+        db_conn,
+        file_id=manual,
+        status="manual",
+        source_artist=None,
+        source_album=None,
+        now=_NOW,
+    )
+    assert store.derived_album_status(db_conn, manual) == "manual"
+
+    staged = _insert(db_conn, filename="als.mp3")
+    _stage_field(db_conn, staged, "originaldate")
+    assert store.derived_album_status(db_conn, staged) == "staged"
+
+    done = _insert(db_conn, filename="ald.mp3")
+    _commit_auto_field(db_conn, done, "originaldate")
+    assert store.derived_album_status(db_conn, done) == "done"
+
+
+def test_album_status_counts_match_per_file_derivation(db_conn: sqlite3.Connection) -> None:
+    pending = _insert(db_conn, filename="p.mp3")
+    no_match = _insert(db_conn, filename="nm.mp3")
+    store.set_album_status(
+        db_conn,
+        file_id=no_match,
+        status="no_match",
+        source_artist="A",
+        source_album="B",
+        now=_NOW,
+    )
+    done = _insert(db_conn, filename="d.mp3")
+    _commit_auto_field(db_conn, done, "originaldate")
+
+    expected = dict.fromkeys(store.ALBUM_WORKFLOW_STATUSES, 0)
+    for file_id in (pending, no_match, done):
+        expected[store.derived_album_status(db_conn, file_id)] += 1
+    assert store.album_status_counts(db_conn) == expected
+
+
+def test_compute_stats_includes_album_block(db_conn: sqlite3.Connection) -> None:
+    file_id = _insert(db_conn)
+    _commit_auto_field(db_conn, file_id, "originaldate")
+    stats = store.compute_stats(db_conn)
+    assert "album" in stats
+    assert stats["album"] == store.album_status_counts(db_conn)
+
+
+# --- musicbrainz_cache --------------------------------------------------------------
+
+
+def test_mb_cache_miss_returns_none(db_conn: sqlite3.Connection) -> None:
+    assert store.get_cached_mb_album(db_conn, "missing") is None
+
+
+def test_mb_cache_negative_round_trip(db_conn: sqlite3.Connection) -> None:
+    store.put_cached_mb_album(
+        db_conn,
+        request_key="k",
+        found=False,
+        album_title=None,
+        original_date=None,
+        release_mbid=None,
+        release_group_id=None,
+        now=_NOW,
+    )
+    cached = store.get_cached_mb_album(db_conn, "k")
+    assert cached is not None
+    found, row = cached
+    assert found is False
+    assert row.original_date is None
+
+
+def test_mb_cache_found_round_trip(db_conn: sqlite3.Connection) -> None:
+    store.put_cached_mb_album(
+        db_conn,
+        request_key="k",
+        found=True,
+        album_title="Paranoid",
+        original_date="1970",
+        release_mbid="rel-1",
+        release_group_id="rg-1",
+        now=_NOW,
+    )
+    cached = store.get_cached_mb_album(db_conn, "k")
+    assert cached is not None
+    found, row = cached
+    assert found is True
+    assert row.album_title == "Paranoid"
+    assert row.original_date == "1970"
+    assert row.release_mbid == "rel-1"
+    assert row.release_group_id == "rg-1"

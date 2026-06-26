@@ -124,6 +124,24 @@ def _artist_decision_blocks(decision: StatusRow, _identity: Identity) -> bool:
     return decision.status == "manual"
 
 
+def _album_decision_blocks(decision: StatusRow, identity: Identity) -> bool:
+    """Album rule (same as genre): ``manual`` always blocks; ``no_match`` blocks unless stale.
+
+    Identity is ``(albumartist-else-artist, album)``; a stored ``no_match`` whose recorded
+    identity no longer matches the file's current one is *stale* and falls through to be
+    reprocessed. Because the primary is the resolved lookup artist, a change to either the
+    artist (or album-artist fallback) OR the album re-opens the decision.
+    """
+    if decision.status == "manual":
+        return True
+    if decision.status == "no_match":
+        return (
+            decision.source_primary == identity.primary
+            and decision.source_secondary == identity.secondary
+        )
+    return False
+
+
 # --- the two axes --------------------------------------------------------------------
 
 GENRE_AXIS: Final = Axis(
@@ -146,6 +164,19 @@ ARTIST_AXIS: Final = Axis(
     # `pending` = none of the above. There is NO `no_match` state on this axis.
     workflow_statuses=frozenset({"pending", "manual", "staged", "done"}),
     decision_blocks=_artist_decision_blocks,
+)
+
+ALBUM_AXIS: Final = Axis(
+    name="album",
+    fields=("originaldate",),
+    status_table="file_album_status",
+    # The SAME identity genre uses: primary = the resolved lookup artist
+    # (albumartist-else-artist), secondary = album.
+    source_columns=("source_artist", "source_album"),
+    # Five album states (a near-clone of genre): two stored (`no_match`/`manual`), two
+    # derived (`staged`/`done`), `pending` = none of the above.
+    workflow_statuses=frozenset({"pending", "no_match", "manual", "staged", "done"}),
+    decision_blocks=_album_decision_blocks,
 )
 
 

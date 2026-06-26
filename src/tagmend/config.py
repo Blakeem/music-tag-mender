@@ -34,6 +34,9 @@ _KNOWN_KEYS: Final[frozenset[str]] = frozenset(
         "genre_use_album_tags",
         "lastfm_rate_per_sec",
         "genre_stage_limit",
+        "musicbrainz_rate_per_sec",
+        "musicbrainz_user_agent",
+        "album_stage_limit",
     },
 )
 
@@ -42,6 +45,12 @@ _GENRE_MIN_WEIGHT_DEFAULT: Final = 2
 _GENRE_MAX_COUNT_DEFAULT: Final = 4
 _LASTFM_RATE_PER_SEC_DEFAULT: Final = 1.0
 _GENRE_STAGE_LIMIT_DEFAULT: Final = 300
+
+# Defaults for the album-axis MusicBrainz settings. MusicBrainz's published rate limit is
+# ~1 request/second and it REQUIRES a descriptive User-Agent identifying the application.
+_MUSICBRAINZ_RATE_PER_SEC_DEFAULT: Final = 1.0
+_MUSICBRAINZ_USER_AGENT_DEFAULT: Final = "TagMend/0.1 ( blakeem@gmail.com )"
+_ALBUM_STAGE_LIMIT_DEFAULT: Final = 300
 
 # Tokens (case-insensitive) that mean "no limit" for ``genre_max_count``.
 _NONE_TOKENS: Final[frozenset[str]] = frozenset({"", "0", "none", "null"})
@@ -90,6 +99,11 @@ class Settings:
     genre_use_album_tags: bool = True
     lastfm_rate_per_sec: float = _LASTFM_RATE_PER_SEC_DEFAULT
     genre_stage_limit: int = _GENRE_STAGE_LIMIT_DEFAULT
+    # Album-axis MusicBrainz settings carry defaults so direct construction (tests,
+    # fixtures) needn't restate them; ``load_settings`` always passes the coerced values.
+    musicbrainz_rate_per_sec: float = _MUSICBRAINZ_RATE_PER_SEC_DEFAULT
+    musicbrainz_user_agent: str = _MUSICBRAINZ_USER_AGENT_DEFAULT
+    album_stage_limit: int = _ALBUM_STAGE_LIMIT_DEFAULT
 
 
 def load_settings() -> Settings:
@@ -128,6 +142,18 @@ def load_settings() -> Settings:
             "genre_stage_limit",
             _resolve_raw("genre_stage_limit", raw),
             _GENRE_STAGE_LIMIT_DEFAULT,
+        ),
+        musicbrainz_rate_per_sec=_coerce_float(
+            "musicbrainz_rate_per_sec",
+            _resolve_raw("musicbrainz_rate_per_sec", raw),
+            _MUSICBRAINZ_RATE_PER_SEC_DEFAULT,
+        ),
+        musicbrainz_user_agent=_resolve_raw("musicbrainz_user_agent", raw)
+        or _MUSICBRAINZ_USER_AGENT_DEFAULT,
+        album_stage_limit=_coerce_int(
+            "album_stage_limit",
+            _resolve_raw("album_stage_limit", raw),
+            _ALBUM_STAGE_LIMIT_DEFAULT,
         ),
     )
 

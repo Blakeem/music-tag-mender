@@ -447,4 +447,102 @@ def test_library_stats_includes_artist_block(
     assert isinstance(artist, dict)
     assert set(artist) == store.ARTIST_WORKFLOW_STATUSES
     assert artist["manual"] == 1
-    assert artist["pending"] == _N - 1
+
+
+# --- album_status filter + composition + new FileView fields ------------------------
+
+
+def _set_album_no_match(
+    settings: Settings,
+    file_id: int,
+    *,
+    source_artist: str,
+    source_album: str,
+) -> None:
+    """Persist a terminal ``no_match`` album decision in the isolated ledger."""
+    conn = connect(settings.db_path)
+    try:
+        apply_schema(conn)
+        store.set_album_status(
+            conn,
+            file_id=file_id,
+            status="no_match",
+            source_artist=source_artist,
+            source_album=source_album,
+            now="2026-06-17T00:00:00+00:00",
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_list_files_filters_to_album_no_match_with_sources(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    tracks = _populate(music_dir, _N)
+    scan_library(engine_settings)
+
+    target = _file_row(engine_settings, music_dir, tracks[1].name)
+    _set_album_no_match(
+        engine_settings,
+        target.id,
+        source_artist="Artist 1",
+        source_album="Some Album",
+    )
+
+    views = list_files(engine_settings, album_status="no_match")
+
+    assert [v.file_id for v in views] == [target.id]
+    only = views[0]
+    assert only.album_status == "no_match"
+    assert only.album_source_artist == "Artist 1"
+    assert only.album_source_album == "Some Album"
+
+
+def test_list_files_unknown_album_status_raises(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    _populate(music_dir, 1)
+    scan_library(engine_settings)
+    with pytest.raises(ValueError, match="unknown album_status"):
+        list_files(engine_settings, album_status="bogus")
+
+
+def test_list_files_composes_album_with_other_filters(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    tracks = _populate(music_dir, _N)
+    scan_library(engine_settings)
+
+    # Track 0: album-no_match only. Track 2: album-no_match AND artist-manual.
+    row0 = _file_row(engine_settings, music_dir, tracks[0].name)
+    row2 = _file_row(engine_settings, music_dir, tracks[2].name)
+    _set_album_no_match(engine_settings, row0.id, source_artist="A0", source_album="X")
+    _set_album_no_match(engine_settings, row2.id, source_artist="A2", source_album="Y")
+    artists.set_artist_status(engine_settings, file_ids=[row2.id], status="manual")
+
+    # Both filters set → only track 2 satisfies BOTH.
+    views = list_files(engine_settings, album_status="no_match", artist_status="manual")
+    assert [v.file_id for v in views] == [row2.id]
+
+
+def test_library_stats_includes_album_block(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    tracks = _populate(music_dir, _N)
+    scan_library(engine_settings)
+    row = _file_row(engine_settings, music_dir, tracks[0].name)
+    _set_album_no_match(engine_settings, row.id, source_artist="Artist 0", source_album="Alb")
+
+    stats = library_stats(engine_settings)
+
+    assert "album" in stats
+    album = stats["album"]
+    assert isinstance(album, dict)
+    assert set(album) == store.ALBUM_WORKFLOW_STATUSES
+    assert album["no_match"] == 1
+    assert album["pending"] == _N - 1

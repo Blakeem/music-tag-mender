@@ -7,9 +7,13 @@ from typing import TYPE_CHECKING
 import mutagen
 import pytest
 from mutagen.flac import FLAC
+from mutagen.mp4 import MP4
 
 from conftest import make_track
-from tagmend.engine.tags import read_tags
+
+# Import tags so its module-load RegisterFreeformKey runs before make_track writes any
+# ``originaldate`` via raw mutagen easy mode (the M4A freeform atom must be registered).
+from tagmend.engine.tags import MANAGED_TAGS, read_tags, write_managed_tags
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -47,6 +51,38 @@ def test_round_trips_canonical_tags(tmp_path: Path, suffix: str) -> None:
 def test_untagged_file_reads_empty(tmp_path: Path, suffix: str) -> None:
     track = make_track(tmp_path / f"empty{suffix}")
     assert read_tags(track).tags == {}
+
+
+def test_originaldate_is_managed() -> None:
+    assert "originaldate" in MANAGED_TAGS
+
+
+@pytest.mark.parametrize("suffix", _ALL_FORMATS)
+def test_originaldate_round_trips_and_leaves_date_untouched(
+    tmp_path: Path,
+    suffix: str,
+) -> None:
+    # The reissue ``date`` is written first; the album axis must fill ``originaldate``
+    # without disturbing it (the M4A freeform-atom path is the critical guard).
+    track = make_track(tmp_path / f"track{suffix}", {"date": ["2015"]})
+    write_managed_tags(
+        track,
+        {"originaldate": ["1970"], "genre": ["Heavy Metal"]},
+    )
+
+    tags = read_tags(track).tags
+    assert tags["originaldate"] == ["1970"]
+    assert tags["date"] == ["2015"]  # the reissue year is preserved
+
+
+def test_originaldate_writes_to_freeform_atom_on_m4a(tmp_path: Path) -> None:
+    track = make_track(tmp_path / "track.m4a", {"date": ["2015"]})
+    write_managed_tags(track, {"originaldate": ["1970"]})
+
+    raw = MP4(track)  # type: ignore[no-untyped-call]
+    # originaldate lands in the iTunes freeform atom, never in the ©day (date) atom.
+    assert "----:com.apple.iTunes:ORIGINALDATE" in raw
+    assert raw["©day"] == ["2015"]
 
 
 def test_alias_band_maps_to_albumartist(tmp_path: Path) -> None:

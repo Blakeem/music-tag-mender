@@ -75,11 +75,14 @@ There are **three** distinct levels. Conflating them is the main naming hazard:
 > for the tiered grounding design. Also: A2 v1 writes only `originaldate` — if the MusicBrainz
 > IDs or `originalyear` are wanted on-file later, revisit `MANAGED_TAGS`.
 
-### A3. Song axis (title + track number)
-- [ ] New axis: add `title` and `tracknumber` (+ `musicbrainz_trackid`) to `MANAGED_TAGS`;
-      `file_song_status`, `derived_song_status`, `resolve_songs`, filter/stats/tools — again via
-      the `Axis` abstraction. Track-list verification (does the album's track set line up?) is the
-      hardest correctness question; spec it in `PLAN.md` first.
+### A3. Song axis (title + track number) — DROPPED FROM PHASE A; deferred past the CLI (2026-06-26)
+The metadata axes the library actually needs — **genre, artist, album** — are all shipped. A live
+audit of the real 720-file library (2026-06-26) found **0 missing/blank titles and 0 missing/blank
+track numbers**; no generic `"Track NN"` or numeric placeholders. The only version of a song axis that
+resembles the album code (blank-fill a missing title by track position) would be a **no-op** here, and
+the version that adds real value — **correcting a *wrong* title** — can't be done from text metadata at
+all (the tags lie; there's nothing to compare against). That requires **acoustic fingerprinting**, a
+new capability class. So the song axis is **deferred to after the CLI surface** — see *Deferred* below.
 
 ### A4. Live Last.fm readiness check (small — slot in anywhere)
 - [ ] Add a Last.fm connectivity ping to `doctor` (one cheap `artist.getTopTags` call) so a long
@@ -97,10 +100,11 @@ There are **three** distinct levels. Conflating them is the main naming hazard:
       insurance beyond the managed-tag v0 baseline. *(User action, not code.)*
 
 ### B2. First full-library run over all metadata axes
-- [ ] Drive genre + artist + album + song over the full ~130 GB / 256-artist library via MCP,
+- [ ] Drive genre + artist + album over the full ~130 GB / 256-artist library via MCP,
       chunked with `limit`, reviewing staged diffs before each commit. **This is the goal:** clean
       metadata so Navidrome tag-search works. Followed by a deliberate **review/testing break**
-      before any filesystem work begins.
+      before any filesystem work begins. *(Song/title is out of scope — see A3; titles + track
+      numbers are already complete library-wide.)*
 
 ---
 
@@ -115,6 +119,24 @@ There are **three** distinct levels. Conflating them is the main naming hazard:
 - **CLI surface** — deliberately **last**; all tools are MCP-first. Eventual pass exposes the
   axis verbs (`resolve-*`, `set-*-status`, `diff`/`commit`, `revert`/`revert-commit`,
   `list --*-status …`).
+- **Song axis (title) via acoustic fingerprinting — *after* the CLI surface, add only if needed.**
+  Sequenced here deliberately (decision 2026-06-26): the current library needs none of it (0 missing
+  titles / track numbers across 720 files), and it's a bigger lift than the text-lookup axes. Unlike
+  genre/artist (Last.fm) and album (MusicBrainz text search), a *wrong* title can't be detected from
+  metadata — it needs the audio itself. The approach mirrors **MusicBrainz Picard's "Scan"**:
+  - **fpcalc / Chromaprint** (the open-source, **LGPL-2.1+** fingerprinting tool; cross-platform
+    prebuilt binaries for Windows/macOS/Linux, statically linked with FFmpeg so one self-contained
+    exe decodes mp3/flac/m4a/ogg). Called as a **subprocess**, so the LGPL imposes no obligations on
+    our code. Likely via the MIT-licensed **`pyacoustid`** wrapper (the beets stack).
+  - **AcoustID web service** (free application **API key**, like `lastfm_api_key`): submit
+    `fpcalc`'s fingerprint+duration → get MusicBrainz **recording IDs** → canonical title/track.
+  - New axis via the existing `Axis` abstraction: `title` (+ `tracknumber`?, `musicbrainz_recordingid`?)
+    in `MANAGED_TAGS`, `file_song_status`, `resolve_songs`, filter/stats/tools. **Spec the
+    track/recording reconciliation in `PLAN.md` first** (a fingerprint can match multiple recordings —
+    score and pick; track-set line-up is the hard correctness question).
+  - **New deps it introduces** that the text axes don't: an **external binary** on the user's PATH
+    (can't pure-pip it; needs a `doctor` check) + a **second API key**. Re-verify current fpcalc
+    release + AcoustID API details at build time rather than trusting today's notes.
 - **M5 — Polish:** genre vocabulary tuning, album-level genre override, README, packaging
   (`uv tool install` / `uvx tagmend mcp` / `pipx`).
 

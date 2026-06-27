@@ -21,6 +21,7 @@ from typing import Final
 
 import platformdirs
 
+from tagmend import __version__
 from tagmend.log import get_logger
 
 _APP_NAME: Final = "tagmend"
@@ -37,7 +38,7 @@ _KNOWN_KEYS: Final[frozenset[str]] = frozenset(
         "lastfm_rate_per_sec",
         "genre_stage_limit",
         "musicbrainz_rate_per_sec",
-        "musicbrainz_user_agent",
+        "musicbrainz_contact",
         "album_stage_limit",
     },
 )
@@ -49,9 +50,12 @@ _LASTFM_RATE_PER_SEC_DEFAULT: Final = 1.0
 _GENRE_STAGE_LIMIT_DEFAULT: Final = 300
 
 # Defaults for the album-axis MusicBrainz settings. MusicBrainz's published rate limit is
-# ~1 request/second and it REQUIRES a descriptive User-Agent identifying the application.
+# ~1 request/second and it REQUIRES a descriptive User-Agent identifying the application
+# plus a contact (an email or URL). We compose ``TagMend/<live-version> ( <contact> )`` at
+# request time so the version never drifts; only the contact is user-configurable, and it
+# defaults to the public project URL rather than a personal address.
 _MUSICBRAINZ_RATE_PER_SEC_DEFAULT: Final = 1.0
-_MUSICBRAINZ_USER_AGENT_DEFAULT: Final = "TagMend/0.1 ( blakeem@gmail.com )"
+_MUSICBRAINZ_CONTACT_DEFAULT: Final = "https://github.com/Blakeem/music-tag-mender"
 _ALBUM_STAGE_LIMIT_DEFAULT: Final = 300
 
 # Tokens (case-insensitive) that mean "no limit" for ``genre_max_count``.
@@ -90,6 +94,14 @@ def default_db_path() -> Path:
     return data_dir() / _DB_FILENAME
 
 
+def build_user_agent(contact: str) -> str:
+    """Compose the MusicBrainz ``User-Agent`` from the live app version + *contact*.
+
+    MusicBrainz requires ``App/Version ( contact )``; *contact* is an email or URL.
+    """
+    return f"TagMend/{__version__} ( {contact} )"
+
+
 @dataclass(frozen=True, slots=True)
 class Settings:
     """Resolved, typed settings with file + env overrides already applied."""
@@ -107,8 +119,17 @@ class Settings:
     # Album-axis MusicBrainz settings carry defaults so direct construction (tests,
     # fixtures) needn't restate them; ``load_settings`` always passes the coerced values.
     musicbrainz_rate_per_sec: float = _MUSICBRAINZ_RATE_PER_SEC_DEFAULT
-    musicbrainz_user_agent: str = _MUSICBRAINZ_USER_AGENT_DEFAULT
+    musicbrainz_contact: str = _MUSICBRAINZ_CONTACT_DEFAULT
     album_stage_limit: int = _ALBUM_STAGE_LIMIT_DEFAULT
+
+    @property
+    def musicbrainz_user_agent(self) -> str:
+        """The MusicBrainz ``User-Agent`` header: app name + live version + contact.
+
+        Composed at read time so the version tracks ``tagmend.__version__`` and never
+        drifts the way a stored string would; only the contact half is configurable.
+        """
+        return build_user_agent(self.musicbrainz_contact)
 
 
 def load_settings() -> Settings:
@@ -153,8 +174,8 @@ def load_settings() -> Settings:
             _resolve_raw("musicbrainz_rate_per_sec", raw),
             _MUSICBRAINZ_RATE_PER_SEC_DEFAULT,
         ),
-        musicbrainz_user_agent=_resolve_raw("musicbrainz_user_agent", raw)
-        or _MUSICBRAINZ_USER_AGENT_DEFAULT,
+        musicbrainz_contact=_resolve_raw("musicbrainz_contact", raw)
+        or _MUSICBRAINZ_CONTACT_DEFAULT,
         album_stage_limit=_coerce_int(
             "album_stage_limit",
             _resolve_raw("album_stage_limit", raw),

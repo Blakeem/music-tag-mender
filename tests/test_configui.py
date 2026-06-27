@@ -73,6 +73,15 @@ def test_build_seed_unset_key_has_no_placeholder() -> None:
     assert seed["has_lastfm_api_key"] is False
 
 
+def test_build_seed_exposes_musicbrainz_contact() -> None:
+    seed = configui.build_seed(_settings(musicbrainz_contact="me@example.com"))
+    values = seed["values"]
+    assert isinstance(values, dict)
+    # The form edits the raw contact, not the composed (version-bearing) user agent.
+    assert values["musicbrainz_contact"] == "me@example.com"
+    assert "musicbrainz_user_agent" not in values
+
+
 # --- validate_and_normalize ----------------------------------------------------------
 
 

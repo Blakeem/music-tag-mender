@@ -113,7 +113,7 @@ def build_seed(settings: Settings) -> dict[str, object]:
         "lastfm_rate_per_sec": str(settings.lastfm_rate_per_sec),
         "genre_stage_limit": str(settings.genre_stage_limit),
         "musicbrainz_rate_per_sec": str(settings.musicbrainz_rate_per_sec),
-        "musicbrainz_user_agent": settings.musicbrainz_user_agent,
+        "musicbrainz_contact": settings.musicbrainz_contact,
         "album_stage_limit": str(settings.album_stage_limit),
     }
     has_key = settings.lastfm_api_key is not None

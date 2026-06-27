@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from tagmend import config
+from tagmend import __version__, config
 
 # Config/data dirs are isolated by the autouse `_isolate_config` fixture in conftest.
 
@@ -96,6 +96,23 @@ def test_env_overrides_file(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> 
     monkeypatch.setenv("TAGMEND_MUSIC_PATH", str(tmp_path / "from_env"))
     settings = config.load_settings()
     assert settings.music_path == tmp_path / "from_env"
+
+
+def test_musicbrainz_contact_defaults_to_project_url() -> None:
+    # The default contact is the public repo URL, never a personal address.
+    assert config.load_settings().musicbrainz_contact == config._MUSICBRAINZ_CONTACT_DEFAULT
+    assert "@" not in config._MUSICBRAINZ_CONTACT_DEFAULT
+
+
+def test_musicbrainz_user_agent_composes_live_version_and_contact() -> None:
+    config.set_setting("musicbrainz_contact", "me@example.com")
+    settings = config.load_settings()
+    # The version is supplied by the app, not stored, so it can never drift.
+    assert settings.musicbrainz_user_agent == f"TagMend/{__version__} ( me@example.com )"
+
+
+def test_build_user_agent_uses_live_version() -> None:
+    assert config.build_user_agent("x") == f"TagMend/{__version__} ( x )"
 
 
 def test_set_settings_batch_merges() -> None:

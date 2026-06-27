@@ -8,6 +8,6 @@
   "lastfm_api_key": "0000000000000000000000000000000a",
   "lastfm_rate_per_sec": "1.0",
   "music_path": "/path/to/your/music",
-  "musicbrainz_rate_per_sec": "1.0",
-  "musicbrainz_user_agent": "TagMend/0.1 ( you@example.com )"
+  "musicbrainz_contact": "https://github.com/Blakeem/music-tag-mender",
+  "musicbrainz_rate_per_sec": "1.0"
 }

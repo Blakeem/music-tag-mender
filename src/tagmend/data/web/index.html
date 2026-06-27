@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="csrf-token" content="__CSRF_TOKEN__" />
+    <title>TagMend — Settings</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="card">
+      <h1>TagMend Settings</h1>
+      <p class="hint">
+        Edits are written to <code>settings.json</code> and apply on the next tool call.
+      </p>
+
+      <form id="settings-form">
+        <fieldset>
+          <legend>Essential</legend>
+          <div id="essential" class="fields"></div>
+          <button type="button" id="test-key" class="secondary">Test Last.fm key</button>
+          <span id="test-result" class="result"></span>
+        </fieldset>
+
+        <details>
+          <summary>Advanced</summary>
+          <div id="advanced" class="fields"></div>
+        </details>
+
+        <div class="actions">
+          <button type="submit" id="save">Save</button>
+          <span id="save-result" class="result"></span>
+        </div>
+      </form>
+    </main>
+    <script src="/app.js"></script>
+  </body>
+</html>

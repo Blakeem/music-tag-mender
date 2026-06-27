@@ -74,7 +74,13 @@ def _isolate_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """Redirect config/data dirs into a temp location and clear env overrides."""
     monkeypatch.setattr(config, "config_dir", lambda: tmp_path / "config")
     monkeypatch.setattr(config, "data_dir", lambda: tmp_path / "data")
-    for var in ("TAGMEND_MUSIC_PATH", "TAGMEND_LASTFM_API_KEY", "TAGMEND_DB_PATH"):
+    for var in (
+        "TAGMEND_MUSIC_PATH",
+        "TAGMEND_LASTFM_API_KEY",
+        "TAGMEND_DB_PATH",
+        "TAGMEND_NO_BROWSER",
+        "TAGMEND_NO_CONFIG_UI",
+    ):
         monkeypatch.delenv(var, raising=False)
 
 

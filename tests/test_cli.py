@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
+import pytest
 from typer.testing import CliRunner
 
 from conftest import make_track
@@ -11,6 +12,7 @@ from tagmend import __version__
 from tagmend.cli import app
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from pathlib import Path
 
 runner = CliRunner()
@@ -33,6 +35,19 @@ def test_config_path() -> None:
     result = runner.invoke(app, ["config-path"])
     assert result.exit_code == 0
     assert "settings.json" in result.stdout
+
+
+def test_config_command_prints_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    # run_blocking would otherwise serve forever; stub it and replay the on_start callback.
+    def fake_run_blocking(**kwargs: object) -> None:
+        on_start = cast("Callable[[str], None] | None", kwargs.get("on_start"))
+        if on_start is not None:
+            on_start("http://127.0.0.1:54321/")
+
+    monkeypatch.setattr("tagmend.cli.configui.run_blocking", fake_run_blocking)
+    result = runner.invoke(app, ["config"])
+    assert result.exit_code == 0
+    assert "http://127.0.0.1:54321/" in result.stdout
 
 
 def test_doctor_ok_with_music_path_override(temp_library: Path) -> None:

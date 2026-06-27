@@ -13,6 +13,8 @@ from __future__ import annotations
 import json
 import os
 import stat
+import tempfile
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
@@ -59,6 +61,9 @@ _NONE_TOKENS: Final[frozenset[str]] = frozenset({"", "0", "none", "null"})
 _FALSE_TOKENS: Final[frozenset[str]] = frozenset({"false", "0", "no", "off"})
 
 logger = get_logger(__name__)
+
+# Serializes concurrent writers (the CLI, the config web UI) so a merge never loses data.
+_WRITE_LOCK: Final = threading.Lock()
 
 
 def config_dir() -> Path:
@@ -216,23 +221,65 @@ def _coerce_bool(value: str | None, *, default: bool) -> bool:
 
 
 def set_setting(key: str, value: str) -> Path:
-    """Persist a single key into ``settings.json`` and return the file path."""
-    if key not in _KNOWN_KEYS:
+    """Persist a single key into ``settings.json`` and return the file path.
+
+    Thin wrapper over :func:`set_settings` so both the single- and batch-key writers share
+    one atomic, lock-guarded merge path.
+    """
+    return set_settings({key: value})
+
+
+def set_settings(mapping: dict[str, str]) -> Path:
+    """Merge a batch of keys into ``settings.json`` atomically and return the file path.
+
+    Every key must be in ``_KNOWN_KEYS`` (a ``ValueError`` lists any unknowns). The given
+    *mapping* is **merged** over the current on-disk values — never a wholesale replace, so
+    keys absent from *mapping* are preserved. The write is serialized by a module-level lock
+    and is atomic (temp file, fsync, restrict permissions, then rename) so a concurrent
+    writer or a mid-write crash can never leave a partial file.
+    """
+    # Input: reject unknown keys before touching disk.
+    unknown = sorted(key for key in mapping if key not in _KNOWN_KEYS)
+    if unknown:
         known = ", ".join(sorted(_KNOWN_KEYS))
-        message = f"unknown setting {key!r}; known keys: {known}"
+        message = f"unknown setting {', '.join(unknown)}; known keys: {known}"
         raise ValueError(message)
 
     path = settings_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
 
-    current = _read_raw_settings()
-    current[key] = value
-    serialized = json.dumps(current, indent=2, sort_keys=True) + "\n"
-    path.write_text(serialized, encoding="utf-8")
-    _restrict_permissions(path)
+    # Process + Output: merge under the lock, then write atomically.
+    with _WRITE_LOCK:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        current = _read_raw_settings()
+        current.update(mapping)
+        serialized = json.dumps(current, indent=2, sort_keys=True) + "\n"
+        _atomic_write(path, serialized)
 
-    logger.info("saved setting %r to %s", key, path)
+    logger.info("saved %d setting(s) to %s", len(mapping), path)
     return path
+
+
+def _atomic_write(path: Path, text: str) -> None:
+    """Write *text* to *path* atomically: temp file → fsync → restrict perms → rename.
+
+    The temp file lives in the destination directory so the final ``replace`` is an atomic
+    rename on the same filesystem. On any failure the temp file is removed, so a crash never
+    leaves a half-written ``settings.json`` behind.
+    """
+    fd, temp_name = tempfile.mkstemp(dir=str(path.parent), prefix=".settings-", suffix=".tmp")
+    temp = Path(temp_name)
+    succeeded = False
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        _restrict_permissions(temp)
+        temp.replace(path)
+        succeeded = True
+    finally:
+        if not succeeded:
+            temp.unlink(missing_ok=True)
 
 
 def _env_override(key: str) -> str | None:

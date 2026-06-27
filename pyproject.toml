@@ -55,8 +55,8 @@ Repository = "https://github.com/blakeem/music-tag-mender"
 packages = ["src/tagmend"]
 
 [tool.hatch.build]
-# Ship the default genre vocabulary alongside the package.
-artifacts = ["src/tagmend/data/*.yml"]
+# Ship the default genre vocabulary + the config web UI assets alongside the package.
+artifacts = ["src/tagmend/data/*.yml", "src/tagmend/data/web/**/*"]
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Ruff — VERY strict. We opt into the entire rule set and then carve out only the

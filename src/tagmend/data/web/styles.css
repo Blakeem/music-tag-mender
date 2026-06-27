@@ -1,0 +1,123 @@
+:root {
+  color-scheme: light dark;
+  --accent: #3b82f6;
+}
+
+body {
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  margin: 0;
+  padding: 2rem 1rem;
+  background: #0f1115;
+  color: #e6e8ec;
+  display: flex;
+  justify-content: center;
+}
+
+.card {
+  width: 100%;
+  max-width: 640px;
+  background: #181b22;
+  border: 1px solid #2a2f3a;
+  border-radius: 12px;
+  padding: 1.5rem 1.75rem 2rem;
+}
+
+h1 {
+  margin: 0 0 0.25rem;
+  font-size: 1.4rem;
+}
+
+.hint {
+  margin: 0 0 1.25rem;
+  color: #9aa3b2;
+  font-size: 0.9rem;
+}
+
+code {
+  background: #11141a;
+  padding: 0.1rem 0.3rem;
+  border-radius: 4px;
+}
+
+fieldset {
+  border: 1px solid #2a2f3a;
+  border-radius: 8px;
+  margin: 0 0 1rem;
+  padding: 1rem;
+}
+
+legend {
+  padding: 0 0.4rem;
+  font-weight: 600;
+}
+
+details {
+  margin: 0 0 1rem;
+}
+
+summary {
+  cursor: pointer;
+  font-weight: 600;
+  padding: 0.5rem 0;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  margin-bottom: 0.85rem;
+}
+
+.field label {
+  font-size: 0.85rem;
+  margin-bottom: 0.25rem;
+  color: #c2c8d2;
+}
+
+.field input[type="text"] {
+  background: #0f1115;
+  border: 1px solid #2a2f3a;
+  border-radius: 6px;
+  color: inherit;
+  padding: 0.5rem 0.6rem;
+  font: inherit;
+}
+
+.field.checkbox {
+  flex-direction: row;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+button {
+  background: var(--accent);
+  border: none;
+  border-radius: 6px;
+  color: white;
+  cursor: pointer;
+  font: inherit;
+  font-weight: 600;
+  padding: 0.55rem 1.1rem;
+}
+
+button.secondary {
+  background: #2a2f3a;
+}
+
+.actions {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin-top: 0.5rem;
+}
+
+.result {
+  font-size: 0.85rem;
+}
+
+.result.ok {
+  color: #4ade80;
+}
+
+.result.err {
+  color: #f87171;
+}

@@ -7,11 +7,13 @@ Contains no business logic: each tool marshals arguments, calls into
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Literal
 
 from mcp.server.fastmcp import FastMCP
 
+from tagmend import configui
 from tagmend.config import load_settings
 from tagmend.engine import albums, artists, commits, genres, library, staging, versioning
 from tagmend.engine.doctor import run_health_check
@@ -745,7 +747,27 @@ def reset_album_status(
     return {"ok": True, "affected": affected}
 
 
+def _maybe_launch_config_ui() -> None:
+    """Auto-launch the config UI when settings are incomplete (best-effort, never fatal).
+
+    Skipped when ``TAGMEND_NO_CONFIG_UI`` is set or when both core settings are present. A
+    launch failure is logged to stderr and swallowed so it can never break ``mcp.run()``;
+    stdout stays reserved for the JSON-RPC channel.
+    """
+    if os.environ.get("TAGMEND_NO_CONFIG_UI"):
+        return
+    if not configui.decide_launch(load_settings()):
+        return
+    try:
+        url = configui.launch_background()
+    except Exception:
+        logger.exception("could not launch the config UI")
+        return
+    logger.warning("settings incomplete; configure TagMend at %s", url)
+
+
 def run() -> None:
     """Run the MCP server over stdio (blocking)."""
     logger.info("starting TagMend MCP server (stdio)")
+    _maybe_launch_config_ui()
     mcp.run()

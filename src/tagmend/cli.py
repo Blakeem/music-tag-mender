@@ -5,6 +5,7 @@ A thin Typer frontend over :mod:`tagmend.engine`. Subcommands:
 * ``tagmend doctor``       — readiness check (settings, music folder, ledger).
 * ``tagmend scan``         — scan the library into the snapshot (read-only).
 * ``tagmend stats``        — show library-wide snapshot counts.
+* ``tagmend config``       — launch the local config web UI.
 * ``tagmend config-set``   — write a value into ``settings.json``.
 * ``tagmend config-path``  — print the settings file location.
 * ``tagmend mcp``          — run the MCP server over stdio.
@@ -19,7 +20,7 @@ from typing import Annotated
 
 import typer
 
-from tagmend import __version__, config, mcp_server
+from tagmend import __version__, config, configui, mcp_server
 from tagmend.engine import library
 from tagmend.engine.doctor import run_health_check
 from tagmend.engine.library import ScanMode
@@ -119,6 +120,12 @@ def stats() -> None:
             typer.echo(f"  {ext or '(none)'}: {count}")
 
     typer.echo(f"total tag values: {summary['total_tag_values']}")
+
+
+@app.command(name="config")
+def config_ui() -> None:
+    """Launch the local config web UI (serves until Ctrl-C)."""
+    configui.run_blocking(on_start=lambda url: typer.echo(f"TagMend config UI: {url}"))
 
 
 @app.command(name="config-set")

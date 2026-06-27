@@ -96,3 +96,28 @@ def test_env_overrides_file(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> 
     monkeypatch.setenv("TAGMEND_MUSIC_PATH", str(tmp_path / "from_env"))
     settings = config.load_settings()
     assert settings.music_path == tmp_path / "from_env"
+
+
+def test_set_settings_batch_merges() -> None:
+    config.set_setting("music_path", "/keep/me")
+    config.set_settings({"genre_min_weight": "7", "genre_stage_limit": "11"})
+    # A later batch must preserve untouched keys (merge, not replace).
+    config.set_settings({"genre_max_count": "2"})
+
+    settings = config.load_settings()
+    assert str(settings.music_path) == str(Path("/keep/me"))
+    assert settings.genre_min_weight == 7
+    assert settings.genre_stage_limit == 11
+    assert settings.genre_max_count == 2
+
+
+def test_set_settings_rejects_unknown_key() -> None:
+    with pytest.raises(ValueError, match="unknown setting"):
+        config.set_settings({"music_path": "/ok", "bogus": "x"})
+
+
+def test_set_settings_writes_atomically_without_leftover_temp() -> None:
+    config.set_settings({"genre_min_weight": "3"})
+    leftovers = list(config.config_dir().glob(".settings-*"))
+    assert leftovers == []
+    assert config.settings_path().exists()

@@ -15,7 +15,16 @@ from mcp.server.fastmcp import FastMCP
 
 from tagmend import configui
 from tagmend.config import load_settings
-from tagmend.engine import albums, artists, commits, genres, library, staging, versioning
+from tagmend.engine import (
+    albums,
+    artists,
+    commits,
+    genres,
+    library,
+    mismatch,
+    staging,
+    versioning,
+)
 from tagmend.engine.doctor import run_health_check
 from tagmend.engine.library import ScanMode
 from tagmend.log import get_logger
@@ -259,6 +268,45 @@ def get_file(file_id: int) -> dict[str, object]:
     if view is None:
         return {"ok": False, "error": f"unknown file_id={file_id}"}
     return {"ok": True, "file": view.to_dict()}
+
+
+@mcp.tool()
+def detect_mismatches(
+    tier: Literal["high", "medium", "low"] | None = None,
+    limit: int | None = None,
+) -> dict[str, object]:
+    """Detect files whose identity tags disagree with their folder path (read-only report).
+
+    Flags the fingerprint of a MusicBrainz Picard release mis-match: files stamped with the
+    WRONG ``albumartist`` (with an ``artist`` fallback for files that have none) while their
+    folder path kept the truth — e.g. Ozzy's *Down to Earth* files tagged as *Jem*. Pure read
+    over the snapshot: writes nothing, stages nothing, no network. Run ``scan_library`` first.
+
+    Each file is classified by ``albumartist``-vs-path bidirectional containment into a
+    confidence tier: ``high`` (path disagreement in a folder with mixed albumartists),
+    ``medium`` (path disagreement in a uniformly mis-stamped folder), or ``low`` (a
+    folder-consistency fallback, a non-album/singles folder, or the artist fallback).
+    Various-Artists/soundtrack albumartists are excluded. A library-wide reliability guard
+    suppresses the ``high``/``medium`` path tiers (emitting only the naming-agnostic ``low``
+    tier) when the path likely does not encode artist — reported via ``path_signal_suppressed``
+    and ``disagreement_rate``.
+
+    Args:
+        tier: Return only rows in this tier (``high`` | ``medium`` | ``low``). The
+            ``high``/``medium``/``low``/``flagged`` counts still describe the whole library.
+        limit: Cap the number of rows returned (the counts are unaffected).
+
+    Returns:
+        ``{"ok": True, rows, total_files, flagged, high, medium, low, disagreement_rate,
+        path_signal_suppressed, summary}`` — each row is ``{file_id, folder, filename, field,
+        tag_value, path_artist, tier, reason}`` — or ``{"ok": False, "error": ...}`` (e.g. no
+        music path configured).
+    """
+    try:
+        report = mismatch.detect_mismatches(load_settings(), tier=tier, limit=limit)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    return {"ok": True, **report.to_dict()}
 
 
 @mcp.tool()

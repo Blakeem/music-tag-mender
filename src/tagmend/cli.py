@@ -5,6 +5,7 @@ A thin Typer frontend over :mod:`tagmend.engine`. Subcommands:
 * ``tagmend doctor``       — readiness check (settings, music folder, ledger).
 * ``tagmend scan``         — scan the library into the snapshot (read-only).
 * ``tagmend stats``        — show library-wide snapshot counts.
+* ``tagmend detect``       — list files whose tags disagree with their path (read-only).
 * ``tagmend config``       — launch the local config web UI.
 * ``tagmend config-set``   — write a value into ``settings.json``.
 * ``tagmend config-path``  — print the settings file location.
@@ -21,7 +22,7 @@ from typing import Annotated
 import typer
 
 from tagmend import __version__, config, configui, mcp_server
-from tagmend.engine import library
+from tagmend.engine import library, mismatch
 from tagmend.engine.doctor import run_health_check
 from tagmend.engine.library import ScanMode
 from tagmend.log import get_logger, set_level
@@ -120,6 +121,33 @@ def stats() -> None:
             typer.echo(f"  {ext or '(none)'}: {count}")
 
     typer.echo(f"total tag values: {summary['total_tag_values']}")
+
+
+@app.command()
+def detect(
+    tier: Annotated[
+        str | None,
+        typer.Option(help="Only show this tier: high | medium | low."),
+    ] = None,
+    limit: Annotated[
+        int | None,
+        typer.Option(help="Cap the number of rows shown."),
+    ] = None,
+) -> None:
+    """List files whose albumartist/artist tag disagrees with their folder path (read-only)."""
+    settings = config.load_settings()
+    try:
+        report = mismatch.detect_mismatches(settings, tier=tier, limit=limit)
+    except ValueError as exc:
+        typer.echo(str(exc))
+        raise typer.Exit(code=1) from exc
+
+    typer.echo(report.summary)
+    for row in report.rows:
+        typer.echo(
+            f"  [{row.tier.upper():6}] {row.field}={row.tag_value!r} "
+            f"path={row.path_artist!r}  {row.folder}\\{row.filename}",
+        )
 
 
 @app.command(name="config")

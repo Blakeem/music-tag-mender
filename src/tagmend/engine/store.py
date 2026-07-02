@@ -1015,6 +1015,32 @@ def distinct_albumartists(conn: sqlite3.Connection) -> list[tuple[str, int]]:
     return [(str(row[0]), _as_int(row[1])) for row in cursor.fetchall()]
 
 
+def load_tag_values(
+    conn: sqlite3.Connection,
+    names: tuple[str, ...],
+) -> dict[int, dict[str, str]]:
+    """Return ``{file_id: {name: value}}`` for the ordinal-0 value of each requested tag.
+
+    One ``SELECT`` over ``file_tags`` filtered to *names* at ``ordinal = 0`` (each tag's
+    primary value), so a caller needing a few scalar fields across the whole library avoids
+    the N+1 :func:`get_tags` loop. A file missing every requested tag is simply absent from
+    the result; a file with only some carries only those. Mirrors the read-only, aggregate
+    style of :func:`distinct_albumartists`.
+    """
+    if not names:
+        return {}
+    placeholders = ",".join("?" for _ in names)
+    cursor = conn.execute(
+        "SELECT file_id, name, value FROM file_tags "  # noqa: S608 - '?' bind markers only
+        f"WHERE name IN ({placeholders}) AND ordinal = 0",
+        names,
+    )
+    result: dict[int, dict[str, str]] = {}
+    for row in cursor.fetchall():
+        result.setdefault(_as_int(row[0]), {})[str(row[1])] = str(row[2])
+    return result
+
+
 def files_by_tag_value(conn: sqlite3.Connection, name: str, value: str) -> list[int]:
     """Return file ids carrying *value* under the *name* tag, in ascending id order."""
     cursor = conn.execute(

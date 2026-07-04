@@ -1,11 +1,17 @@
-"""Mislabeled-file DETECTION: albumartist-vs-path disagreement, confidence-tiered.
+"""Mislabeled-file detection + disposition: albumartist-vs-path disagreement, tiered.
 
-A **read-only** report that flags files whose ``albumartist`` (with an ``artist`` fallback)
-disagrees with the file's folder path — the fingerprint of a MusicBrainz Picard release
-mis-match that stamped the WRONG identity tags onto files whose filenames/paths kept the
-truth (e.g. Ozzy's *Down to Earth* files tagged as *Jem*). It writes nothing, stages
-nothing, and never hits the network — a pure read over the existing ``files``/``file_tags``
-snapshot.
+Flags files whose ``albumartist`` (with an ``artist`` fallback) disagrees with the file's
+folder path — the fingerprint of a MusicBrainz Picard release mis-match that stamped the
+WRONG identity tags onto files whose filenames/paths kept the truth (e.g. Ozzy's *Down to
+Earth* files tagged as *Jem*). **The detector proper stays read-only** — it writes nothing,
+stages nothing, and never hits the network, a pure read over the existing
+``files``/``file_tags`` snapshot. The two disposition verbs
+(:func:`set_mismatch_status` / :func:`reset_mismatch_status`) are the module's ONLY writers,
+and they touch only the ``file_mismatch_status`` rows (never a tag): a sticky per-file
+disposition (``legit_ignore`` false-positive / ``misfiled_deferred``) that
+:func:`detect_mismatches` then honours by dropping that file's flagged row while it stays
+fresh (the disposition goes stale, and the file re-surfaces, once its snapshotted identity
+tag changes).
 
 The chosen design (see ``aipg/workflows/decide/runs/detect-mislabeled-tags/decision-r1.md``):
 
@@ -31,21 +37,34 @@ from __future__ import annotations
 
 import re
 import unicodedata
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
-from tagmend.engine import db, schema, store
+from tagmend.engine import axis, db, schema, store
 from tagmend.log import get_logger
 
 if TYPE_CHECKING:
+    import sqlite3
+
     from tagmend.config import Settings
 
 logger = get_logger(__name__)
 
 # The two scalar fields the detector reads per file (ordinal-0 value of each).
 _DETECT_FIELDS: Final = ("albumartist", "artist")
+
+# The dispositions :func:`set_mismatch_status` may write. ``pending`` deletes the row
+# (re-queue). There is no ``staged``/``done`` on this axis — an accepted fix needs no row.
+_USER_MISMATCH_STATUSES: Final = frozenset({"legit_ignore", "misfiled_deferred", "pending"})
+
+
+def _utc_now() -> str:
+    """Return the current time as an ISO-8601 UTC string (the engine's timestamp form)."""
+    return datetime.now(UTC).isoformat()
+
 
 # Library-wide path-disagreement rate above which the path signal is deemed unreliable
 # (the path likely does not encode artist) and the HIGH/MEDIUM path tiers are suppressed in
@@ -258,12 +277,45 @@ class MismatchRow:
 
 
 @dataclass(frozen=True, slots=True)
+class MismatchGroup:
+    """One folder's flagged files collapsed into a compact group (the ``group=True`` view)."""
+
+    folder: str
+    path_artist: str | None
+    file_count: int  # tracked files in the folder (flagged or not)
+    flagged: int  # flagged (post-filter) files in the folder
+    tag_values: dict[str, int]  # disagreeing tag value -> count over flagged rows
+    tiers: dict[str, int]  # tier -> count over flagged rows
+    fields: list[str]  # the disagreeing field names present (sorted)
+    file_ids: list[int]  # every flagged file id in the folder, sorted
+    suppressed: dict[str, int]  # disposition status -> count silenced in this folder
+
+    def to_dict(self) -> dict[str, object]:
+        """JSON-serializable form for the MCP tool."""
+        return {
+            "folder": self.folder,
+            "path_artist": self.path_artist,
+            "file_count": self.file_count,
+            "flagged": self.flagged,
+            "tag_values": self.tag_values,
+            "tiers": self.tiers,
+            "fields": self.fields,
+            "file_ids": self.file_ids,
+            "suppressed": self.suppressed,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class MismatchReport:
     """Immutable summary of one :func:`detect_mismatches` run, JSON-ready for the MCP tool.
 
     ``rows`` is the (tier-filtered, capped) worklist; the ``high``/``medium``/``low``/
-    ``flagged`` counts always describe the WHOLE library so a filtered view still shows the
-    full picture.
+    ``flagged`` counts describe the whole library MINUS files silenced by a fresh disposition
+    (so a filtered view still shows the full picture of what remains actionable). ``suppressed``
+    is a disposition-status → count map of the flagged rows a fresh disposition silenced
+    (``{}`` when none), so silencing is always visible. ``groups`` is populated only in the
+    ``group=True`` view (``rows`` is then empty); ``suppressed_by_folder`` is internal plumbing
+    for that view and is not serialized.
     """
 
     rows: list[MismatchRow]
@@ -275,11 +327,15 @@ class MismatchReport:
     disagreement_rate: float
     path_signal_suppressed: bool
     summary: str
+    suppressed: dict[str, int] = field(default_factory=dict)
+    groups: list[MismatchGroup] = field(default_factory=list)
+    suppressed_by_folder: dict[str, dict[str, int]] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, object]:
         """JSON-serializable form for the MCP tool."""
         return {
             "rows": [row.to_dict() for row in self.rows],
+            "groups": [group.to_dict() for group in self.groups],
             "total_files": self.total_files,
             "flagged": self.flagged,
             "high": self.high,
@@ -287,6 +343,7 @@ class MismatchReport:
             "low": self.low,
             "disagreement_rate": self.disagreement_rate,
             "path_signal_suppressed": self.path_signal_suppressed,
+            "suppressed": self.suppressed,
             "summary": self.summary,
         }
 
@@ -410,12 +467,62 @@ def _classify_file(
     return None
 
 
-def _classify(files: list[_FileInput], music_path: Path) -> MismatchReport:
+def _disposition_blocks(disposition: store.MismatchStatusRow, f: _FileInput) -> bool:
+    """Whether *f*'s stored disposition is still fresh (its snapshotted tag is unchanged).
+
+    Delegates to :data:`tagmend.engine.axis.MISMATCH_AXIS`'s predicate, so this skip path and
+    the user-facing :func:`tagmend.engine.store.derived_mismatch_status` share one rule. The
+    identity is built from the SAME cleaned first values the detector already loaded, so no
+    per-file query is needed.
+    """
+    return axis.MISMATCH_AXIS.decision_blocks(
+        axis.StatusRow(
+            status=disposition.status,
+            source_primary=disposition.source_field,
+            source_secondary=disposition.source_value,
+        ),
+        axis.Identity(primary=f.albumartist, secondary=f.artist),
+    )
+
+
+def _apply_skip_filter(
+    rows: list[MismatchRow],
+    files_by_id: dict[int, _FileInput],
+    dispositions: dict[int, store.MismatchStatusRow],
+) -> tuple[list[MismatchRow], dict[str, int], dict[str, dict[str, int]]]:
+    """Drop every flagged row whose file has a FRESH disposition; tally what was silenced.
+
+    Returns ``(kept_rows, suppressed_by_status, suppressed_by_folder)``. A stale disposition
+    (its snapshotted tag has since changed) does not silence, so the row re-surfaces.
+    """
+    kept: list[MismatchRow] = []
+    suppressed: dict[str, int] = {}
+    by_folder: dict[str, dict[str, int]] = {}
+    for row in rows:
+        disposition = dispositions.get(row.file_id)
+        if disposition is not None and _disposition_blocks(disposition, files_by_id[row.file_id]):
+            suppressed[disposition.status] = suppressed.get(disposition.status, 0) + 1
+            folder_counts = by_folder.setdefault(row.folder, {})
+            folder_counts[disposition.status] = folder_counts.get(disposition.status, 0) + 1
+            continue
+        kept.append(row)
+    return kept, suppressed, by_folder
+
+
+def _classify(
+    files: list[_FileInput],
+    music_path: Path,
+    *,
+    dispositions: dict[int, store.MismatchStatusRow] | None = None,
+) -> MismatchReport:
     """Classify constructed file inputs into a full :class:`MismatchReport` (pure core).
 
     Assumes each input's ``albumartist``/``artist`` is already cleaned (``None`` or a
-    non-empty string). Produces every flagged row and the library-wide tier counts + guard
-    diagnostics; tier/limit narrowing is applied later by :func:`detect_mismatches`.
+    non-empty string). Produces every flagged row over ALL files (the folder stats +
+    reliability guard are computed over every file), then applies the disposition skip-filter
+    so a fresh ``legit_ignore``/``misfiled_deferred`` silences its file's row (reported in the
+    report's ``suppressed`` map). tier/limit/group narrowing is applied later by
+    :func:`detect_mismatches`.
     """
     stats = _folder_stats(files)
     analyses = [_analyze(f, music_path) for f in files]
@@ -427,17 +534,33 @@ def _classify(files: list[_FileInput], music_path: Path) -> MismatchReport:
         if row is not None:
             rows.append(row)
     rows.sort(key=lambda r: (_TIER_RANK[Tier(r.tier)], r.file_id))
-    return _assemble_report(rows, total_files=len(files), rate=rate, suppressed=suppressed)
+
+    files_by_id = {f.file_id: f for f in files}
+    kept, suppressed_dispositions, suppressed_by_folder = _apply_skip_filter(
+        rows,
+        files_by_id,
+        dispositions or {},
+    )
+    return _assemble_report(
+        kept,
+        total_files=len(files),
+        rate=rate,
+        suppressed=suppressed,
+        suppressed_dispositions=suppressed_dispositions,
+        suppressed_by_folder=suppressed_by_folder,
+    )
 
 
-def _assemble_report(
+def _assemble_report(  # noqa: PLR0913 - cohesive keyword-only report payload
     rows: list[MismatchRow],
     *,
     total_files: int,
     rate: float,
     suppressed: bool,
+    suppressed_dispositions: dict[str, int],
+    suppressed_by_folder: dict[str, dict[str, int]],
 ) -> MismatchReport:
-    """Freeze the flagged rows + counts + guard diagnostics into a :class:`MismatchReport`."""
+    """Freeze the kept rows + post-filter counts + guard diagnostics into a report."""
     high = sum(1 for r in rows if r.tier == Tier.HIGH)
     medium = sum(1 for r in rows if r.tier == Tier.MEDIUM)
     low = sum(1 for r in rows if r.tier == Tier.LOW)
@@ -447,6 +570,7 @@ def _assemble_report(
         low=low,
         total_files=total_files,
         suppressed=suppressed,
+        suppressed_count=sum(suppressed_dispositions.values()),
     )
     return MismatchReport(
         rows=rows,
@@ -458,22 +582,32 @@ def _assemble_report(
         disagreement_rate=rate,
         path_signal_suppressed=suppressed,
         summary=summary,
+        suppressed=suppressed_dispositions,
+        groups=[],
+        suppressed_by_folder=suppressed_by_folder,
     )
 
 
-def _summarize(
+def _summarize(  # noqa: PLR0913 - cohesive keyword-only summary inputs
     *,
     high: int,
     medium: int,
     low: int,
     total_files: int,
     suppressed: bool,
+    suppressed_count: int,
 ) -> str:
-    """Build a short, plain human summary of the run."""
+    """Build a short, plain human summary of the run.
+
+    The ``suppressed_count`` clause is appended ONLY when a disposition silenced something, so
+    with zero disposition rows the summary is byte-for-byte identical to the pre-disposition
+    detector.
+    """
     note = " (path signal suppressed: folder-consistency only)" if suppressed else ""
+    silenced = f" ({suppressed_count} silenced by disposition)" if suppressed_count else ""
     return (
         f"Flagged {high + medium + low} of {total_files} file(s): "
-        f"{high} high, {medium} medium, {low} low{note}."
+        f"{high} high, {medium} medium, {low} low{note}.{silenced}"
     )
 
 
@@ -500,22 +634,93 @@ def _limit_report(report: MismatchReport, *, tier: str | None, limit: int | None
     return replace(report, rows=rows)
 
 
+def _expand_folder(
+    report: MismatchReport,
+    folder: str,
+    *,
+    tier: str | None,
+    limit: int | None,
+) -> MismatchReport:
+    """Return the flat rows of EXACTLY *folder* (path equality, never LIKE), tier/limit applied."""
+    rows = [r for r in report.rows if r.folder == folder]
+    return _limit_report(replace(report, rows=rows), tier=tier, limit=limit)
+
+
+def _build_groups(
+    rows: list[MismatchRow],
+    stats: _FolderStats,
+    suppressed_by_folder: dict[str, dict[str, int]],
+) -> list[MismatchGroup]:
+    """Collapse flagged *rows* into one :class:`MismatchGroup` per folder (folder-sorted)."""
+    by_folder: dict[str, list[MismatchRow]] = {}
+    for row in rows:
+        by_folder.setdefault(row.folder, []).append(row)
+    groups: list[MismatchGroup] = []
+    for folder in sorted(by_folder):
+        folder_rows = by_folder[folder]
+        tag_values: dict[str, int] = {}
+        tiers: dict[str, int] = {}
+        fields: set[str] = set()
+        for r in folder_rows:
+            tag_values[r.tag_value] = tag_values.get(r.tag_value, 0) + 1
+            tiers[r.tier] = tiers.get(r.tier, 0) + 1
+            fields.add(r.field)
+        groups.append(
+            MismatchGroup(
+                folder=folder,
+                path_artist=folder_rows[0].path_artist,
+                file_count=stats.file_count.get(folder, 0),
+                flagged=len(folder_rows),
+                tag_values=tag_values,
+                tiers=tiers,
+                fields=sorted(fields),
+                file_ids=sorted(r.file_id for r in folder_rows),
+                suppressed=dict(suppressed_by_folder.get(folder, {})),
+            ),
+        )
+    return groups
+
+
+def _grouped_report(
+    report: MismatchReport,
+    stats: _FolderStats,
+    *,
+    tier: str | None,
+    limit: int | None,
+) -> MismatchReport:
+    """Build the grouped view: tier filters rows, group by folder, then *limit* caps groups."""
+    rows = report.rows if tier is None else [r for r in report.rows if r.tier == tier]
+    groups = _build_groups(rows, stats, report.suppressed_by_folder)
+    if limit is not None:
+        groups = groups[:limit]
+    return replace(report, rows=[], groups=groups)
+
+
 def detect_mismatches(
     settings: Settings,
     *,
     tier: str | None = None,
     limit: int | None = None,
+    group: bool = False,
+    folder: str | None = None,
 ) -> MismatchReport:
     """Detect files whose ``albumartist``/``artist`` tag disagrees with their folder path.
 
-    A pure, read-only scan over the ``files``/``file_tags`` snapshot: no tag writes, nothing
-    staged, no network. Every non-missing tracked file is classified into a HIGH/MEDIUM/LOW
-    confidence tier (or left unflagged); the library-wide path-disagreement rate drives a
-    reliability guard that suppresses the HIGH/MEDIUM path tiers when the path likely does not
-    encode artist (``path_signal_suppressed``). *tier* narrows the returned ``rows`` to one
-    tier (``high`` | ``medium`` | ``low``) and *limit* caps them; the report's counts always
-    describe the whole library. Raises :class:`ValueError` when no music path is configured
-    (mirrors :func:`tagmend.engine.library.scan_library`) or for an unknown *tier*.
+    A read-only scan over the ``files``/``file_tags`` snapshot: no tag writes, nothing staged,
+    no network. Every non-missing tracked file is classified into a HIGH/MEDIUM/LOW confidence
+    tier (or left unflagged); the library-wide path-disagreement rate drives a reliability
+    guard that suppresses the HIGH/MEDIUM path tiers when the path likely does not encode
+    artist (``path_signal_suppressed``). Files with a still-fresh disposition (set via
+    :func:`set_mismatch_status`) are dropped from the flagged rows and reported in the report's
+    ``suppressed`` map.
+
+    *tier* narrows the returned ``rows`` to one tier (``high`` | ``medium`` | ``low``); *limit*
+    caps rows (or groups, in the grouped view); the counts always describe the whole library
+    minus fresh dispositions. *group* returns one compact :class:`MismatchGroup` per folder
+    (``rows`` then empty); *folder* returns the flat rows of exactly that folder (exact path
+    equality, never a prefix/LIKE match) and takes precedence over *group*. Raises
+    :class:`ValueError` when no music path is configured (mirrors
+    :func:`tagmend.engine.library.scan_library`) or for an unknown *tier*.
     """
     if settings.music_path is None:
         message = "music_path not configured — run `tagmend config-set music_path <dir>`"
@@ -530,6 +735,7 @@ def detect_mismatches(
         schema.apply_schema(connection)
         file_rows = store.list_files(connection)
         tag_values = store.load_tag_values(connection, _DETECT_FIELDS)
+        dispositions = store.load_mismatch_statuses(connection)
         files = [
             _FileInput(
                 file_id=row.id,
@@ -544,9 +750,10 @@ def detect_mismatches(
     finally:
         connection.close()
 
-    report = _classify(files, music_path)
+    report = _classify(files, music_path, dispositions=dispositions)
     logger.info(
-        "detect complete: total=%d flagged=%d high=%d medium=%d low=%d rate=%.3f suppressed=%s",
+        "detect complete: total=%d flagged=%d high=%d medium=%d low=%d rate=%.3f "
+        "suppressed_path=%s silenced=%d",
         report.total_files,
         report.flagged,
         report.high,
@@ -554,5 +761,129 @@ def detect_mismatches(
         report.low,
         report.disagreement_rate,
         report.path_signal_suppressed,
+        sum(report.suppressed.values()),
     )
+
+    if folder is not None:
+        return _expand_folder(report, folder, tier=tier, limit=limit)
+    if group:
+        return _grouped_report(report, _folder_stats(files), tier=tier, limit=limit)
     return _limit_report(report, tier=tier, limit=limit)
+
+
+# --- disposition verbs (the module's only writers; status rows only, never tags) -----
+
+
+def _snapshot_source(tags: dict[str, list[str]]) -> tuple[str | None, str | None]:
+    """Snapshot the disagreeing tag by detect priority: albumartist-if-present, else artist.
+
+    Returns ``(source_field, source_value)`` using the SAME cleaning the detector applies, so
+    the freshness re-check compares like with like. Both ``None`` when the file has neither a
+    non-blank ``albumartist`` nor ``artist``.
+    """
+    albumartist = _first_clean(tags, "albumartist")
+    if albumartist is not None:
+        return "albumartist", albumartist
+    artist = _first_clean(tags, "artist")
+    if artist is not None:
+        return "artist", artist
+    return None, None
+
+
+def _first_clean(tags: dict[str, list[str]], name: str) -> str | None:
+    """Return the cleaned ordinal-0 value of *name*, or ``None`` when absent/blank."""
+    values = tags.get(name, [])
+    return _clean(values[0]) if values else None
+
+
+def _mismatch_scope(
+    conn: sqlite3.Connection,
+    *,
+    file_ids: list[int] | None,
+    value: str | None,
+) -> list[int]:
+    """Resolve the in-scope file ids for the disposition verbs, in ascending id order.
+
+    *file_ids* (when given) win; otherwise *value* matches every file carrying it as
+    ``artist`` OR ``albumartist`` (the union across both name fields, mirroring
+    :func:`tagmend.engine.artists._artist_scope`). With neither given the scope is empty.
+    """
+    if file_ids is not None:
+        return store.files_in_scope(conn, file_ids=file_ids)
+    if value is None:
+        return []
+    matched = set(store.files_by_tag_value(conn, "artist", value))
+    matched.update(store.files_by_tag_value(conn, "albumartist", value))
+    return sorted(matched)
+
+
+def set_mismatch_status(
+    settings: Settings,
+    *,
+    file_ids: list[int] | None = None,
+    value: str | None = None,
+    status: str,
+) -> int:
+    """Set a sticky mismatch disposition (or clear it with ``pending``) for every file in scope.
+
+    ``legit_ignore`` silences a false positive; ``misfiled_deferred`` defers a genuinely
+    misfiled file — both snapshot the file's current disagreeing tag (``source_field`` /
+    ``source_value``) so a later tag change makes the disposition stale and the file
+    re-surfaces on the next detect. ``pending`` deletes any row (re-queue). Scope is
+    *file_ids* when given, else every file carrying *value* as ``artist`` OR ``albumartist``.
+    Returns the number of files affected. Raises :class:`ValueError` for an unknown *status*.
+    Owns its transaction; writes only ``file_mismatch_status`` rows.
+    """
+    if status not in _USER_MISMATCH_STATUSES:
+        message = f"invalid status: {status!r} (expected legit_ignore|misfiled_deferred|pending)"
+        raise ValueError(message)
+
+    connection = db.connect(settings.db_path)
+    try:
+        schema.apply_schema(connection)
+        scoped = _mismatch_scope(connection, file_ids=file_ids, value=value)
+        now = _utc_now()
+        for fid in scoped:
+            if status == "pending":
+                store.delete_mismatch_status(connection, fid)
+            else:
+                source_field, source_value = _snapshot_source(store.get_tags(connection, fid))
+                store.set_mismatch_status(
+                    connection,
+                    file_id=fid,
+                    status=status,
+                    source_field=source_field,
+                    source_value=source_value,
+                    now=now,
+                )
+        connection.commit()
+    finally:
+        connection.close()
+
+    logger.info("set mismatch status=%s for %d file(s)", status, len(scoped))
+    return len(scoped)
+
+
+def reset_mismatch_status(
+    settings: Settings,
+    *,
+    file_ids: list[int] | None = None,
+    value: str | None = None,
+) -> int:
+    """Delete the mismatch disposition for every file in scope (back to ``pending``).
+
+    Same value-across-both-fields scoping as :func:`set_mismatch_status`. Returns the number
+    of files affected. Owns its transaction.
+    """
+    connection = db.connect(settings.db_path)
+    try:
+        schema.apply_schema(connection)
+        scoped = _mismatch_scope(connection, file_ids=file_ids, value=value)
+        for fid in scoped:
+            store.delete_mismatch_status(connection, fid)
+        connection.commit()
+    finally:
+        connection.close()
+
+    logger.info("reset mismatch status for %d file(s)", len(scoped))
+    return len(scoped)

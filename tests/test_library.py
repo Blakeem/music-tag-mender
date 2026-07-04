@@ -12,7 +12,7 @@ import pytest
 
 from conftest import make_track
 from tagmend.config import Settings
-from tagmend.engine import artists, store
+from tagmend.engine import artists, mismatch, store
 from tagmend.engine.db import connect
 from tagmend.engine.library import (
     ScanMode,
@@ -546,3 +546,88 @@ def test_library_stats_includes_album_block(
     assert set(album) == store.ALBUM_WORKFLOW_STATUSES
     assert album["no_match"] == 1
     assert album["pending"] == _N - 1
+
+
+# --- mismatch_status filter + new FileView fields -----------------------------------
+
+
+def test_plain_file_defaults_to_pending_mismatch(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    _populate(music_dir, 1)
+    scan_library(engine_settings)
+
+    view = list_files(engine_settings)[0]
+    assert view.mismatch_status == "pending"
+    assert view.mismatch_source_field is None
+    assert view.mismatch_source_value is None
+
+
+def test_list_files_filters_to_mismatch_status_with_sources(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    tracks = _populate(music_dir, _N)
+    scan_library(engine_settings)
+
+    # _populate gives each track an artist but no albumartist, so the disposition snapshots
+    # the artist field/value.
+    target = _file_row(engine_settings, music_dir, tracks[1].name)
+    mismatch.set_mismatch_status(engine_settings, file_ids=[target.id], status="legit_ignore")
+
+    views = list_files(engine_settings, mismatch_status="legit_ignore")
+
+    assert [v.file_id for v in views] == [target.id]
+    only = views[0]
+    assert only.mismatch_status == "legit_ignore"
+    assert only.mismatch_source_field == "artist"
+    assert only.mismatch_source_value == "Artist 1"
+
+
+def test_list_files_unknown_mismatch_status_raises(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    _populate(music_dir, 1)
+    scan_library(engine_settings)
+    with pytest.raises(ValueError, match="unknown mismatch_status"):
+        list_files(engine_settings, mismatch_status="bogus")
+
+
+def test_list_files_composes_mismatch_with_other_filters(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    tracks = _populate(music_dir, _N)
+    scan_library(engine_settings)
+
+    row0 = _file_row(engine_settings, music_dir, tracks[0].name)
+    row2 = _file_row(engine_settings, music_dir, tracks[2].name)
+    mismatch.set_mismatch_status(
+        engine_settings, file_ids=[row0.id, row2.id], status="legit_ignore"
+    )
+    artists.set_artist_status(engine_settings, file_ids=[row2.id], status="manual")
+
+    # Both filters set -> only track 2 satisfies BOTH.
+    views = list_files(engine_settings, mismatch_status="legit_ignore", artist_status="manual")
+    assert [v.file_id for v in views] == [row2.id]
+
+
+def test_library_stats_includes_mismatch_block(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    tracks = _populate(music_dir, _N)
+    scan_library(engine_settings)
+    row = _file_row(engine_settings, music_dir, tracks[0].name)
+    mismatch.set_mismatch_status(engine_settings, file_ids=[row.id], status="misfiled_deferred")
+
+    stats = library_stats(engine_settings)
+
+    assert "mismatch" in stats
+    block = stats["mismatch"]
+    assert isinstance(block, dict)
+    assert set(block) == store.MISMATCH_WORKFLOW_STATUSES
+    assert block["misfiled_deferred"] == 1
+    assert block["pending"] == _N - 1

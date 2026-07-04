@@ -142,6 +142,29 @@ def _album_decision_blocks(decision: StatusRow, identity: Identity) -> bool:
     return False
 
 
+def _mismatch_decision_blocks(decision: StatusRow, identity: Identity) -> bool:
+    """Mismatch rule: a disposition blocks iff its snapshotted value still matches the tag.
+
+    Unlike the other three axes, the mismatch axis stores the disagreeing tag positionally:
+    ``source_primary`` is the FIELD NAME the disagreement was recorded on
+    (``'albumartist'``/``'artist'``) and ``source_secondary`` is that field's VALUE at
+    decision time. *identity* carries the file's CURRENT first ``albumartist`` (``primary``)
+    and ``artist`` (``secondary``). A disposition still blocks (silences the file) only while
+    the snapshotted value equals the current value of its own source field; any change to that
+    field — including the tag being removed (current becomes ``None``) — makes the disposition
+    *stale* so the file re-surfaces. A ``None`` source field (a file that had neither tag)
+    compares its snapshot against ``None``. Both ``legit_ignore`` and ``misfiled_deferred``
+    follow this one rule (there is no sticky/staleness split on this axis).
+    """
+    if decision.source_primary == "albumartist":
+        current = identity.primary
+    elif decision.source_primary == "artist":
+        current = identity.secondary
+    else:
+        current = None
+    return decision.source_secondary == current
+
+
 # --- the two axes --------------------------------------------------------------------
 
 GENRE_AXIS: Final = Axis(
@@ -177,6 +200,25 @@ ALBUM_AXIS: Final = Axis(
     # derived (`staged`/`done`), `pending` = none of the above.
     workflow_statuses=frozenset({"pending", "no_match", "manual", "staged", "done"}),
     decision_blocks=_album_decision_blocks,
+)
+
+MISMATCH_AXIS: Final = Axis(
+    name="mismatch",
+    # The two identity fields the detector reads. They are recorded here so
+    # ``_mismatch_decision_blocks`` names the detect fields in one place — but this axis has
+    # NO `staged`/`done` derivation, so ``fields`` deliberately never feeds
+    # ``has_staged_change_for``/``has_auto_change_for``. Mismatch status is stored-or-pending
+    # (see :func:`tagmend.engine.store.derived_mismatch_status`); routing it through the
+    # field-aware `derived_status` would collide with the ARTIST axis (same two fields).
+    fields=("albumartist", "artist"),
+    status_table="file_mismatch_status",
+    # Positional: source_primary = the disagreeing FIELD NAME; source_secondary = its VALUE.
+    source_columns=("source_field", "source_value"),
+    # Three mismatch states: two stored dispositions (`legit_ignore`/`misfiled_deferred`) and
+    # `pending` = no row. There are NO `staged`/`done` states on this axis (an accepted fix
+    # needs no row — the tag simply agrees with the path).
+    workflow_statuses=frozenset({"pending", "legit_ignore", "misfiled_deferred"}),
+    decision_blocks=_mismatch_decision_blocks,
 )
 
 

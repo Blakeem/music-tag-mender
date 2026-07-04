@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Literal
+from typing import Literal, cast
 
 from mcp.server.fastmcp import FastMCP
 
@@ -136,6 +136,67 @@ def stage_tags(
     return {"ok": True}
 
 
+def _parse_batch_entries(
+    entries: list[dict[str, object]],
+) -> list[tuple[int, dict[str, list[str]]]]:
+    """Marshal MCP ``[{file_id, tags}, ...]`` into the engine's ``(file_id, tags)`` list.
+
+    Raises :class:`ValueError` (named by position) on a malformed entry, so the tool can turn
+    it into an ``{"ok": False, "error": ...}`` envelope like the rest of the surface.
+    """
+    parsed: list[tuple[int, dict[str, list[str]]]] = []
+    for index, entry in enumerate(entries):
+        file_id = entry.get("file_id")
+        tags = entry.get("tags")
+        if not isinstance(file_id, int) or isinstance(file_id, bool):
+            message = f"entry {index}: file_id must be an integer"
+            raise ValueError(message)  # noqa: TRY004 - ValueError feeds the {"ok": False} envelope
+        if not isinstance(tags, dict):
+            message = f"entry {index} (file_id={file_id}): tags must be an object"
+            raise ValueError(message)  # noqa: TRY004 - ValueError feeds the {"ok": False} envelope
+        for name, raw_values in tags.items():
+            if not isinstance(raw_values, list) or not all(isinstance(v, str) for v in raw_values):
+                message = (
+                    f"entry {index} (file_id={file_id}): tags[{name!r}] must be a list of strings"
+                )
+                raise ValueError(message)
+        parsed.append((file_id, cast("dict[str, list[str]]", tags)))
+    return parsed
+
+
+@mcp.tool()
+def stage_tags_batch(
+    entries: list[dict[str, object]],
+    note: str | None = None,
+) -> dict[str, object]:
+    """Stage managed-tag changes for MANY files in one atomic, all-or-nothing call (no disk write).
+
+    The batch counterpart of ``stage_tags`` for the mismatch-fix flow: pass one entry per file
+    and every change is staged in a single transaction. If ANY entry is invalid (an unmanaged
+    tag key, an unknown/missing file, or a duplicate ``file_id`` in the batch) the whole batch
+    is rejected and NOTHING is staged. Each entry's ``tags`` is merged onto that file's current
+    managed tags exactly like ``stage_tags`` (omitted keys preserved; ``{"key": []}`` deletes).
+    A subsequent ``commit_tags(path=<folder>)`` groups the batch into ONE revertible commit.
+
+    ``tracknumber``/``discnumber`` are staged verbatim — supply the full ``"n/total"`` string
+    (e.g. ``"3/12"``); this tool never parses or renumbers them.
+
+    Args:
+        entries: A list of ``{"file_id": <int>, "tags": {name: [values], ...}}`` objects.
+        note: Optional free-text note stored with each eventual revision.
+
+    Returns:
+        ``{"ok": True, "staged": <count>, "file_ids": [...]}`` on success, or
+        ``{"ok": False, "error": ...}`` on a bad request (nothing staged).
+    """
+    try:
+        parsed = _parse_batch_entries(entries)
+        staged = staging.stage_tags_batch(load_settings(), entries=parsed, note=note)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    return {"ok": True, "staged": len(staged), "file_ids": staged}
+
+
 @mcp.tool()
 def unstage_tags(file_id: int) -> dict[str, object]:
     """Remove a pending staged change for one file.
@@ -202,12 +263,39 @@ def commit_tags(message: str | None = None, path: str | None = None) -> dict[str
 
 
 @mcp.tool()
-def list_files(
+def repend_axes(commit_id: int) -> dict[str, object]:
+    """Re-open the derived axes after a manual identity fix (call this AFTER committing one).
+
+    The post-fix coherence step for the mismatch-fix flow. When you correct a file's identity
+    (``albumartist``/``artist``/``album``…) and commit it, that file's previously auto-resolved
+    genre and original year now describe the OLD identity, and any sticky artist exclusion was
+    tied to the old name. For every file the given commit actually changed, this voids the
+    stale auto-resolved ``genre``/``originaldate`` (so ``stage_genres``/``resolve_albums`` will
+    re-pend them) and clears any ``file_artist_status`` row — without mutating history.
+
+    Call it with a ``manual`` (or ``revert``) commit id from ``commit_tags`` / ``list_commits``.
+    An ``auto`` commit is refused (voiding fresh auto work is a foot-gun). A later fresh auto
+    commit reads ``done`` again.
+
+    Returns:
+        ``{"ok": True, "commit_id": ..., "files": <count>, "artist_status_cleared": <count>}``,
+        or ``{"ok": False, "error": ...}`` if the commit id is unknown or is an ``auto`` commit.
+    """
+    try:
+        result = staging.repend_axes(load_settings(), commit_id=commit_id)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    return {"ok": True, **result.to_dict()}
+
+
+@mcp.tool()
+def list_files(  # noqa: PLR0913 - cohesive MCP discovery filters
     path: str | None = None,
     limit: int | None = None,
     genre_status: Literal["pending", "no_match", "manual", "staged", "done"] | None = None,
     artist_status: Literal["pending", "manual", "staged", "done"] | None = None,
     album_status: Literal["pending", "no_match", "manual", "staged", "done"] | None = None,
+    mismatch_status: Literal["pending", "legit_ignore", "misfiled_deferred"] | None = None,
 ) -> dict[str, object]:
     """List tracked files with their current managed tags (to discover file ids).
 
@@ -241,12 +329,17 @@ def list_files(
             the other filters, a file must match ALL. ``album_source_artist`` /
             ``album_source_album`` carry the resolved identity a stored decision was taken
             against.
+        mismatch_status: Return only files with this mismatch disposition
+            (``pending`` | ``legit_ignore`` | ``misfiled_deferred``). Combined with the other
+            filters, a file must match ALL. ``mismatch_source_field`` / ``mismatch_source_value``
+            carry the disagreeing tag a stored disposition was recorded against.
 
     Returns:
         ``{"ok": True, "files": [{file_id, folder, filename, ext, is_missing,
         managed_tags, genre_status, genre_source_artist, genre_source_album,
         artist_status, artist_source_artist, artist_source_albumartist, album_status,
-        album_source_artist, album_source_album}, ...]}``,
+        album_source_artist, album_source_album, mismatch_status, mismatch_source_field,
+        mismatch_source_value}, ...]}``,
         or ``{"ok": False, "error": ...}`` on a bad request.
     """
     try:
@@ -257,6 +350,7 @@ def list_files(
             genre_status=genre_status,
             artist_status=artist_status,
             album_status=album_status,
+            mismatch_status=mismatch_status,
         )
     except ValueError as exc:
         return {"ok": False, "error": str(exc)}
@@ -282,6 +376,8 @@ def get_file(file_id: int) -> dict[str, object]:
 def detect_mismatches(
     tier: Literal["high", "medium", "low"] | None = None,
     limit: int | None = None,
+    group: bool = False,  # noqa: FBT001, FBT002 - MCP tool surface, not a Python API
+    folder: str | None = None,
 ) -> dict[str, object]:
     """Detect files whose identity tags disagree with their folder path (read-only report).
 
@@ -289,6 +385,14 @@ def detect_mismatches(
     WRONG ``albumartist`` (with an ``artist`` fallback for files that have none) while their
     folder path kept the truth — e.g. Ozzy's *Down to Earth* files tagged as *Jem*. Pure read
     over the snapshot: writes nothing, stages nothing, no network. Run ``scan_library`` first.
+
+    Recommended workflow: start with ``group=true`` for a compact one-line-per-folder overview
+    (cheap on a big library), then expand a single folder with ``folder="<exact folder path>"``
+    to see its flagged rows, research the correct identity, and fix them with ``stage_tags_batch``
+    → ``commit_tags(path=<folder>)`` → ``repend_axes``. Silence a false positive or defer a
+    misfiled file with ``set_mismatch_status`` — such files are dropped from the flagged rows and
+    reported under ``suppressed`` (a disposition-status → count map) so nothing is hidden
+    silently; the disposition goes stale (and the file re-surfaces) if its identity tag changes.
 
     Each file is classified by ``albumartist``-vs-path bidirectional containment into a
     confidence tier: ``high`` (path disagreement in a folder with mixed albumartists),
@@ -300,18 +404,30 @@ def detect_mismatches(
     and ``disagreement_rate``.
 
     Args:
-        tier: Return only rows in this tier (``high`` | ``medium`` | ``low``). The
+        tier: Return only rows/groups in this tier (``high`` | ``medium`` | ``low``). The
             ``high``/``medium``/``low``/``flagged`` counts still describe the whole library.
-        limit: Cap the number of rows returned (the counts are unaffected).
+        limit: Cap the number of rows returned (or groups, with ``group=true``); counts
+            unaffected.
+        group: Return one compact group per folder instead of flat rows (``rows`` is then
+            empty; each group carries ``folder``, ``path_artist``, ``file_count``, ``flagged``,
+            ``tag_values``, ``tiers``, ``fields``, ``file_ids``, ``suppressed``).
+        folder: Return the flat rows of exactly this folder (exact path equality, never a
+            prefix match). Takes precedence over ``group``.
 
     Returns:
-        ``{"ok": True, rows, total_files, flagged, high, medium, low, disagreement_rate,
-        path_signal_suppressed, summary}`` — each row is ``{file_id, folder, filename, field,
-        tag_value, path_artist, tier, reason}`` — or ``{"ok": False, "error": ...}`` (e.g. no
-        music path configured).
+        ``{"ok": True, rows, groups, total_files, flagged, high, medium, low,
+        disagreement_rate, path_signal_suppressed, suppressed, summary}`` — each row is
+        ``{file_id, folder, filename, field, tag_value, path_artist, tier, reason}`` — or
+        ``{"ok": False, "error": ...}`` (e.g. no music path configured).
     """
     try:
-        report = mismatch.detect_mismatches(load_settings(), tier=tier, limit=limit)
+        report = mismatch.detect_mismatches(
+            load_settings(),
+            tier=tier,
+            limit=limit,
+            group=group,
+            folder=folder,
+        )
     except ValueError as exc:
         return {"ok": False, "error": str(exc)}
     return {"ok": True, **report.to_dict()}
@@ -673,6 +789,72 @@ def reset_artist_status(
         ``{"ok": True, "affected": <count>}``.
     """
     affected = artists.reset_artist_status(
+        load_settings(),
+        file_ids=file_ids,
+        value=value,
+    )
+    return {"ok": True, "affected": affected}
+
+
+@mcp.tool()
+def set_mismatch_status(
+    status: Literal["legit_ignore", "misfiled_deferred", "pending"],
+    file_ids: list[int] | None = None,
+    value: str | None = None,
+) -> dict[str, object]:
+    """Silence a mismatch false positive or defer a misfiled file (or clear with ``pending``).
+
+    For files ``detect_mismatches`` flags, record a sticky disposition so the detector stops
+    surfacing them: ``legit_ignore`` for a false positive (a legit remix/guest/alias), or
+    ``misfiled_deferred`` for a genuinely misfiled file you want to handle later. Both snapshot
+    the file's current disagreeing tag, so the disposition goes stale — and the file
+    re-surfaces — if that tag later changes. ``pending`` removes any disposition (re-queue). An
+    accepted fix needs NO disposition: once you correct the tag so it agrees with the path, the
+    detector stops flagging it on its own.
+
+    Scope is ``file_ids`` when given, else every file carrying ``value`` as its ``artist`` OR
+    ``albumartist`` tag (so silencing ``"Jem"`` catches it on either field).
+
+    Args:
+        status: ``legit_ignore`` | ``misfiled_deferred`` to disposition, ``pending`` to clear.
+        file_ids: Limit to these file ids.
+        value: Limit to files carrying this value as ``artist`` or ``albumartist`` (used when
+            ``file_ids`` is omitted).
+
+    Returns:
+        ``{"ok": True, "affected": <count>}``, or ``{"ok": False, "error": ...}``.
+    """
+    try:
+        affected = mismatch.set_mismatch_status(
+            load_settings(),
+            file_ids=file_ids,
+            value=value,
+            status=status,
+        )
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    return {"ok": True, "affected": affected}
+
+
+@mcp.tool()
+def reset_mismatch_status(
+    file_ids: list[int] | None = None,
+    value: str | None = None,
+) -> dict[str, object]:
+    """Clear any mismatch disposition for in-scope files, returning them to ``pending``.
+
+    Removes the ``legit_ignore``/``misfiled_deferred`` disposition so ``detect_mismatches`` will
+    surface the files again.
+
+    Args:
+        file_ids: Limit to these file ids.
+        value: Limit to files carrying this value as ``artist`` or ``albumartist`` (used when
+            ``file_ids`` is omitted).
+
+    Returns:
+        ``{"ok": True, "affected": <count>}``.
+    """
+    affected = mismatch.reset_mismatch_status(
         load_settings(),
         file_ids=file_ids,
         value=value,

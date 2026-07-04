@@ -34,7 +34,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from tagmend.engine import commits, db, schema, store, versioning
+from tagmend.engine import axis, commits, db, schema, store, versioning
 from tagmend.engine.tags import MANAGED_TAGS, read_tags, write_managed_tags
 from tagmend.log import get_logger
 
@@ -174,6 +174,58 @@ class TagDomain:
         """Tags have no per-file filesystem follow-up."""
 
 
+def _stage_one(  # noqa: PLR0913 - cohesive keyword-only per-file staging payload
+    conn: sqlite3.Connection,
+    *,
+    file_id: int,
+    managed_tags: dict[str, list[str]],
+    origin: str,
+    note: str | None,
+    now: str,
+) -> None:
+    """Validate + stage one file's change on an OPEN connection (no commit). Never drifts.
+
+    The shared per-file core of :func:`stage_tags` and :func:`stage_tags_batch`: rejects
+    unmanaged keys, rejects an unknown or missing *file_id*, lazily captures the version-0
+    baseline, merges *managed_tags* onto the file's current managed subset (P0 — omitted keys
+    are preserved), and upserts the staged row. Raises :class:`ValueError` naming *file_id* on
+    any invalid input; leaves the transaction for the caller to commit or roll back.
+    """
+    unmanaged = sorted(set(managed_tags) - MANAGED_TAGS)
+    if unmanaged:
+        message = f"cannot stage non-managed tag(s) for file_id={file_id}: {', '.join(unmanaged)}"
+        raise ValueError(message)
+
+    file_row = store.get_file_by_id(conn, file_id)
+    if file_row is None:
+        message = f"unknown file_id={file_id}"
+        raise ValueError(message)
+    if file_row.is_missing:
+        message = f"cannot stage a missing file (file_id={file_id})"
+        raise ValueError(message)
+
+    current = store.get_tags(conn, file_id)
+
+    # Capture v0 now (resume-free model): freeze the true original before any commit.
+    if store.max_version(conn, file_id) is None:
+        versioning.ensure_baseline(conn, file_id, managed_tags=current, now=now)
+
+    # No accidental deletion (P0): merge onto the current managed subset so omitted managed
+    # keys are preserved through the commit's delete-on-absent write. The caller's values
+    # win; an explicit empty list still deletes a field.
+    target = versioning.managed_subset(current)
+    target.update(managed_tags)
+
+    store.upsert_staged_tag(
+        conn,
+        file_id=file_id,
+        managed_tags=target,
+        origin=origin,
+        now=now,
+        note=note,
+    )
+
+
 def stage_tags(
     settings: Settings,
     *,
@@ -184,8 +236,8 @@ def stage_tags(
 ) -> None:
     """Record the desired target managed tags for *file_id* (replacing any pending one).
 
-    Validates *origin* (``auto``/``manual``), that every key is a managed tag, and that
-    the file is known and not flagged missing — failing before any row is written. Also
+    Validates *origin* (``auto``/``manual``) then, via the shared :func:`_stage_one` core,
+    that every key is a managed tag and the file is known and not flagged missing. Also
     captures the version-0 baseline now (from the current snapshot) if the file has none,
     so a later crash-then-rescan can never record the wrong original. Nothing on disk
     changes and no further history is recorded until :func:`commit_tags`. Owns its
@@ -199,57 +251,75 @@ def stage_tags(
     that target). An explicit empty list still deletes a field, and the resolve flows —
     which already stage ``managed_subset(current) | {field}`` — are unaffected.
     """
-    # Input / validation (cheap checks first, before opening the ledger).
     if origin not in _STAGED_ORIGINS:
         message = f"invalid staged origin: {origin!r} (expected auto|manual)"
         raise ValueError(message)
-    unmanaged = sorted(set(managed_tags) - MANAGED_TAGS)
-    if unmanaged:
-        message = f"cannot stage non-managed tag(s): {', '.join(unmanaged)}"
-        raise ValueError(message)
 
-    # Process
     connection = db.connect(settings.db_path)
     try:
         schema.apply_schema(connection)
-        file_row = store.get_file_by_id(connection, file_id)
-        if file_row is None:
-            message = f"unknown file_id={file_id}"
-            raise ValueError(message)
-        if file_row.is_missing:
-            message = f"cannot stage a missing file (file_id={file_id})"
-            raise ValueError(message)
-
-        current = store.get_tags(connection, file_id)
-
-        # Capture v0 now (resume-free model): freeze the true original before any commit.
-        if store.max_version(connection, file_id) is None:
-            versioning.ensure_baseline(
-                connection,
-                file_id,
-                managed_tags=current,
-                now=_utc_now(),
-            )
-
-        # No accidental deletion (P0): merge onto the current managed subset so omitted
-        # managed keys are preserved through the commit's delete-on-absent write. The
-        # caller's values win; an explicit empty list still deletes a field.
-        target = versioning.managed_subset(current)
-        target.update(managed_tags)
-
-        store.upsert_staged_tag(
+        _stage_one(
             connection,
             file_id=file_id,
-            managed_tags=target,
+            managed_tags=managed_tags,
             origin=origin,
-            now=_utc_now(),
             note=note,
+            now=_utc_now(),
         )
         connection.commit()
     finally:
         connection.close()
 
     logger.info("staged tags for file_id=%d (origin=%s)", file_id, origin)
+
+
+def stage_tags_batch(
+    settings: Settings,
+    *,
+    entries: list[tuple[int, dict[str, list[str]]]],
+    note: str | None = None,
+) -> list[int]:
+    """Stage N files' managed-tag changes in ONE connection / ONE transaction (all-or-nothing).
+
+    *entries* is a list of ``(file_id, managed_tags)`` items. Each is validated and staged
+    through the SAME :func:`_stage_one` core as :func:`stage_tags` (unmanaged-key rejection,
+    unknown/missing-file rejection, lazy v0 baseline, merge-onto-current-subset), so single
+    and batch can never drift. The ``origin`` is hardcoded ``"manual"`` (this flow never
+    auto-stages — no origin parameter is exposed). A duplicate ``file_id`` in one batch, or any
+    invalid entry, raises :class:`ValueError` naming the offending id and NOTHING is staged
+    (the shared transaction is rolled back on close). A later :func:`commit_tags` groups the
+    whole batch into ONE revertible commit. Returns the staged file ids in input order.
+
+    ``tracknumber``/``discnumber`` values are staged VERBATIM (callers supply the full
+    ``"n/total"`` strings); this helper never parses or computes them.
+    """
+    seen: set[int] = set()
+    for file_id, _ in entries:
+        if file_id in seen:
+            message = f"duplicate file_id={file_id} in batch"
+            raise ValueError(message)
+        seen.add(file_id)
+
+    connection = db.connect(settings.db_path)
+    try:
+        schema.apply_schema(connection)
+        now = _utc_now()
+        for file_id, managed_tags in entries:
+            _stage_one(
+                connection,
+                file_id=file_id,
+                managed_tags=managed_tags,
+                origin="manual",
+                note=note,
+                now=now,
+            )
+        connection.commit()
+    finally:
+        connection.close()
+
+    staged_ids = [file_id for file_id, _ in entries]
+    logger.info("staged batch of %d file(s)", len(staged_ids))
+    return staged_ids
 
 
 def unstage_tags(settings: Settings, *, file_id: int) -> bool:
@@ -378,3 +448,82 @@ def commit_tags(
         result.missing,
     )
     return result
+
+
+@dataclass(frozen=True, slots=True)
+class RependResult:
+    """Immutable summary of one :func:`repend_axes` call, JSON-ready for the MCP tool."""
+
+    commit_id: int
+    files: int
+    artist_status_cleared: int
+
+    def to_dict(self) -> dict[str, object]:
+        """JSON-serializable form for the MCP tool."""
+        return {
+            "commit_id": self.commit_id,
+            "files": self.files,
+            "artist_status_cleared": self.artist_status_cleared,
+        }
+
+
+def repend_axes(settings: Settings, *, commit_id: int) -> RependResult:
+    """Re-open the derived axes for every file a manual identity-fix commit changed (NN7).
+
+    The explicit post-fix coherence step: after committing a manual identity fix (the
+    mismatch-fix flow), the file's stale auto-resolved genre/year no longer describe its NEW
+    identity, and any sticky ``file_artist_status`` was tied to the OLD name. For every DISTINCT
+    file with a ``tag_revisions`` row in *commit_id* this, in ONE transaction:
+
+    * voids the derived-axis fields (:data:`tagmend.engine.axis.GENRE_AXIS.fields` +
+      :data:`~tagmend.engine.axis.ALBUM_AXIS.fields`) via
+      :func:`tagmend.engine.store.void_auto_changes`, so ``derived_genre_status`` /
+      ``derived_album_status`` flip ``done`` → ``pending`` and the axes re-pend (a LATER fresh
+      auto commit reads ``done`` again — the Run-1 watermark semantics); and
+    * deletes any :func:`tagmend.engine.store.delete_artist_status` row.
+
+    Noop/missing files have no revision row in the commit and are correctly untouched. Raises
+    :class:`ValueError` for an unknown *commit_id* or a commit with ``origin='auto'`` (voiding
+    fresh auto work is a foot-gun); ``manual``/``revert`` commits are allowed. Returns the
+    affected file count and how many artist rows were cleared. Owns its transaction; never
+    touches the ``commits`` table or the append-only ``tag_revisions`` history.
+    """
+    void_fields = axis.GENRE_AXIS.fields + axis.ALBUM_AXIS.fields
+
+    connection = db.connect(settings.db_path)
+    try:
+        schema.apply_schema(connection)
+
+        commit = commits.get_commit(connection, commit_id)
+        if commit is None:
+            message = f"unknown commit_id={commit_id}"
+            raise ValueError(message)
+        if commit.origin == "auto":
+            message = (
+                f"cannot repend an auto commit (commit_id={commit_id}); "
+                "repend targets manual identity-fix commits"
+            )
+            raise ValueError(message)
+
+        file_ids = sorted({r.file_id for r in store.revisions_for_commit(connection, commit_id)})
+        artist_cleared = 0
+        for fid in file_ids:
+            store.void_auto_changes(connection, fid, void_fields)
+            if store.get_artist_status(connection, fid) is not None:
+                artist_cleared += 1
+                store.delete_artist_status(connection, fid)
+        connection.commit()
+    finally:
+        connection.close()
+
+    logger.info(
+        "repend commit %d: %d file(s) re-pended, %d artist status row(s) cleared",
+        commit_id,
+        len(file_ids),
+        artist_cleared,
+    )
+    return RependResult(
+        commit_id=commit_id,
+        files=len(file_ids),
+        artist_status_cleared=artist_cleared,
+    )

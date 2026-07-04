@@ -114,7 +114,7 @@ Edits apply on the next tool call; every command and MCP tool re-reads `settings
 
 ## Tools
 
-The MCP server exposes 26 tools. All tag edits are staged in memory and only written to disk on `commit_tags`, and everything is revertible.
+The MCP server exposes 30 tools. All tag edits are staged in memory and only written to disk on `commit_tags`, and everything is revertible.
 
 ### Core & Library
 
@@ -132,6 +132,7 @@ The MCP server exposes 26 tools. All tag edits are staged in memory and only wri
 | Tool | Description |
 |------|-------------|
 | `stage_tags` | Stage a managed-tag change for one file (the git "index"); writes nothing to disk |
+| `stage_tags_batch` | Stage managed-tag changes for many files in one atomic, all-or-nothing call |
 | `unstage_tags` | Remove a pending staged change for one file |
 | `diff_tags` | Show staged-but-uncommitted changes, enriched with the current to target diff |
 | `commit_tags` | Apply all staged tag changes to disk as one revertible commit |
@@ -171,6 +172,16 @@ The MCP server exposes 26 tools. All tag edits are staged in memory and only wri
 | `resolve_albums` | Blank-fill the original release year (`originaldate`) from MusicBrainz (no disk write) |
 | `set_album_status` | Exclude files from album-year fill (`manual`) or re-queue them (`pending`) |
 | `reset_album_status` | Clear any album status row for in-scope files, returning them to `pending` |
+
+### Mismatch fixing
+
+Use `detect_mismatches` (above) to find files whose identity tags disagree with their folder path, then drive the fix through the staging engine (`stage_tags_batch` → `commit_tags` → `repend_axes`) and disposition the false positives.
+
+| Tool | Description |
+|------|-------------|
+| `set_mismatch_status` | Silence a mismatch false positive (`legit_ignore`) or defer a misfiled file (`misfiled_deferred`), or clear with `pending` |
+| `reset_mismatch_status` | Clear any mismatch disposition for in-scope files, returning them to `pending` |
+| `repend_axes` | After committing a manual identity fix, re-open the file's derived genre/year axes and clear its stale artist status |
 
 ## Development
 

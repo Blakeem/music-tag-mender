@@ -55,6 +55,9 @@ class FileView:
     album_status: str = "pending"
     album_source_artist: str | None = None  # identity a no_match/manual was recorded against
     album_source_album: str | None = None
+    mismatch_status: str = "pending"
+    mismatch_source_field: str | None = None  # which tag a disposition was recorded against
+    mismatch_source_value: str | None = None  # that tag's value at decision time
 
     def to_dict(self) -> dict[str, object]:
         """JSON-serializable form for the MCP tool."""
@@ -74,6 +77,9 @@ class FileView:
             "album_status": self.album_status,
             "album_source_artist": self.album_source_artist,
             "album_source_album": self.album_source_album,
+            "mismatch_status": self.mismatch_status,
+            "mismatch_source_field": self.mismatch_source_field,
+            "mismatch_source_value": self.mismatch_source_value,
         }
 
 
@@ -96,6 +102,12 @@ def _to_view(conn: sqlite3.Connection, row: store.FileRow) -> FileView:
     album_status = store.derived_album_status(conn, row.id)
     album_decision = store.get_album_status(conn, row.id)
     has_stored_album = album_decision is not None and album_status == album_decision.status
+
+    mismatch_status = store.derived_mismatch_status(conn, row.id)
+    mismatch_decision = store.get_mismatch_status(conn, row.id)
+    has_stored_mismatch = (
+        mismatch_decision is not None and mismatch_status == mismatch_decision.status
+    )
     return FileView(
         file_id=row.id,
         folder=row.folder,
@@ -124,16 +136,24 @@ def _to_view(conn: sqlite3.Connection, row: store.FileRow) -> FileView:
         album_source_album=album_decision.source_album
         if has_stored_album and album_decision
         else None,
+        mismatch_status=mismatch_status,
+        mismatch_source_field=mismatch_decision.source_field
+        if has_stored_mismatch and mismatch_decision
+        else None,
+        mismatch_source_value=mismatch_decision.source_value
+        if has_stored_mismatch and mismatch_decision
+        else None,
     )
 
 
-def _row_matches_status(
+def _row_matches_status(  # noqa: PLR0913 - cohesive keyword-only status filters
     conn: sqlite3.Connection,
     file_id: int,
     *,
     genre_status: str | None,
     artist_status: str | None,
     album_status: str | None,
+    mismatch_status: str | None,
 ) -> bool:
     """Return whether *file_id* satisfies every requested workflow-status filter.
 
@@ -144,8 +164,11 @@ def _row_matches_status(
         return False
     if artist_status is not None and store.derived_artist_status(conn, file_id) != artist_status:
         return False
+    if album_status is not None and store.derived_album_status(conn, file_id) != album_status:
+        return False
     return not (
-        album_status is not None and store.derived_album_status(conn, file_id) != album_status
+        mismatch_status is not None
+        and store.derived_mismatch_status(conn, file_id) != mismatch_status
     )
 
 
@@ -157,18 +180,19 @@ def list_files(  # noqa: PLR0913 - cohesive keyword-only discovery filters
     genre_status: str | None = None,
     artist_status: str | None = None,
     album_status: str | None = None,
+    mismatch_status: str | None = None,
 ) -> list[FileView]:
     """Return tracked files (id order) with their managed tags, for discovery.
 
     Optionally limited to files under *root*, filtered to one genre workflow status
     (``pending`` | ``no_match`` | ``manual`` | ``staged`` | ``done``), one artist workflow
-    status (``pending`` | ``manual`` | ``staged`` | ``done``), and/or one album workflow
-    status (``pending`` | ``no_match`` | ``manual`` | ``staged`` | ``done``), and/or capped
-    at *limit* rows. ``genre_status="no_match"`` is the "fix by hand" worklist. With NO
-    status filter the cap is applied before reading tags, so a large library stays cheap to
-    browse; with any filter, all candidate rows are examined, ALL filters are applied, and
-    the cap counts the *matching* files. Raises :class:`ValueError` for an unknown status.
-    Read-only.
+    status (``pending`` | ``manual`` | ``staged`` | ``done``), one album workflow status
+    (``pending`` | ``no_match`` | ``manual`` | ``staged`` | ``done``), one mismatch disposition
+    (``pending`` | ``legit_ignore`` | ``misfiled_deferred``), and/or capped at *limit* rows.
+    ``genre_status="no_match"`` is the "fix by hand" worklist. With NO status filter the cap is
+    applied before reading tags, so a large library stays cheap to browse; with any filter, all
+    candidate rows are examined, ALL filters are applied, and the cap counts the *matching*
+    files. Raises :class:`ValueError` for an unknown status. Read-only.
     """
     if genre_status is not None and genre_status not in store.GENRE_WORKFLOW_STATUSES:
         message = (
@@ -188,8 +212,19 @@ def list_files(  # noqa: PLR0913 - cohesive keyword-only discovery filters
             f"(expected one of {sorted(store.ALBUM_WORKFLOW_STATUSES)})"
         )
         raise ValueError(message)
+    if mismatch_status is not None and mismatch_status not in store.MISMATCH_WORKFLOW_STATUSES:
+        message = (
+            f"unknown mismatch_status: {mismatch_status!r} "
+            f"(expected one of {sorted(store.MISMATCH_WORKFLOW_STATUSES)})"
+        )
+        raise ValueError(message)
 
-    filtered = genre_status is not None or artist_status is not None or album_status is not None
+    filtered = (
+        genre_status is not None
+        or artist_status is not None
+        or album_status is not None
+        or mismatch_status is not None
+    )
 
     connection = db.connect(settings.db_path)
     try:
@@ -215,6 +250,7 @@ def list_files(  # noqa: PLR0913 - cohesive keyword-only discovery filters
                 genre_status=genre_status,
                 artist_status=artist_status,
                 album_status=album_status,
+                mismatch_status=mismatch_status,
             ):
                 continue
             views.append(_to_view(connection, row))

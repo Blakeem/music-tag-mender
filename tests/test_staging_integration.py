@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 from conftest import make_track
-from tagmend.engine import commits, staging, store, versioning
+from tagmend.engine import artists, commits, staging, store, versioning
 from tagmend.engine.db import connect
 from tagmend.engine.library import ScanMode, scan_library
 from tagmend.engine.schema import apply_schema
@@ -453,3 +453,208 @@ def test_explicit_empty_list_still_deletes_a_managed_field(
     on_disk = read_tags(track).tags
     assert on_disk.get("album") is None  # explicitly cleared
     assert on_disk.get("genre") == ["Rock"]  # untouched managed field preserved
+
+
+# --- stage_tags_batch (atomic multi-file staging) -----------------------------------
+
+
+def test_stage_tags_batch_stages_all_and_commits_as_one(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    a = make_track(music_dir / "a.mp3", {"genre": ["Pop"], "title": ["A"]})
+    b = make_track(music_dir / "b.flac", {"genre": ["Pop"], "title": ["B"]})
+    scan_library(engine_settings)
+    a_id = _file_id(engine_settings, music_dir, a.name)
+    b_id = _file_id(engine_settings, music_dir, b.name)
+
+    staged = staging.stage_tags_batch(
+        engine_settings,
+        entries=[(a_id, {"albumartist": ["Ozzy"]}), (b_id, {"albumartist": ["Ozzy"]})],
+    )
+    assert staged == [a_id, b_id]
+    assert _staged(engine_settings, a_id) is not None
+    assert _staged(engine_settings, b_id) is not None
+
+    result = staging.commit_tags(engine_settings, root=music_dir)
+    assert result.committed == 2
+    # Both files landed under ONE commit; the merge preserved each file's title.
+    assert _revisions(engine_settings, a_id)[-1].commit_id == result.commit_id
+    assert _revisions(engine_settings, b_id)[-1].commit_id == result.commit_id
+    assert read_tags(a).tags["albumartist"] == ["Ozzy"]
+    assert read_tags(a).tags["title"] == ["A"]  # omitted managed key preserved
+
+
+def test_stage_tags_batch_rolls_back_on_any_invalid_entry(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    a = make_track(music_dir / "a.mp3", {"genre": ["Pop"]})
+    scan_library(engine_settings)
+    a_id = _file_id(engine_settings, music_dir, a.name)
+
+    # The second entry names an unknown file id -> the whole batch rolls back.
+    with pytest.raises(ValueError, match="unknown file_id=9999"):
+        staging.stage_tags_batch(
+            engine_settings,
+            entries=[(a_id, {"albumartist": ["Ozzy"]}), (9999, {"albumartist": ["Ozzy"]})],
+        )
+    # NOTHING staged: the valid first entry was rolled back too.
+    assert _staged(engine_settings, a_id) is None
+
+
+def test_stage_tags_batch_rejects_unmanaged_key_atomically(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    a = make_track(music_dir / "a.mp3", {"genre": ["Pop"]})
+    b = make_track(music_dir / "b.flac", {"genre": ["Pop"]})
+    scan_library(engine_settings)
+    a_id = _file_id(engine_settings, music_dir, a.name)
+    b_id = _file_id(engine_settings, music_dir, b.name)
+
+    with pytest.raises(ValueError, match="non-managed"):
+        staging.stage_tags_batch(
+            engine_settings,
+            entries=[(a_id, {"genre": ["Rock"]}), (b_id, {"composer": ["Nope"]})],
+        )
+    assert _staged(engine_settings, a_id) is None
+    assert _staged(engine_settings, b_id) is None
+
+
+def test_stage_tags_batch_rejects_duplicate_file_id(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    a = make_track(music_dir / "a.mp3", {"genre": ["Pop"]})
+    scan_library(engine_settings)
+    a_id = _file_id(engine_settings, music_dir, a.name)
+
+    with pytest.raises(ValueError, match="duplicate file_id"):
+        staging.stage_tags_batch(
+            engine_settings,
+            entries=[(a_id, {"genre": ["Rock"]}), (a_id, {"genre": ["Metal"]})],
+        )
+    assert _staged(engine_settings, a_id) is None
+
+
+# --- repend_axes (NN7: re-open derived axes after a manual identity fix) -------------
+
+
+def _auto_genre_year(
+    engine_settings: Settings,
+    file_id: int,
+    *,
+    genre: str = "Metal",
+    year: str = "2001",
+) -> None:
+    """Commit an auto genre+year change so the file reads genre-done and album-done."""
+    staging.stage_tags(
+        engine_settings,
+        file_id=file_id,
+        managed_tags={"genre": [genre], "originaldate": [year]},
+        origin="auto",
+    )
+    staging.commit_tags(engine_settings, origin="auto")
+
+
+def _derived(engine_settings: Settings, file_id: int) -> tuple[str, str]:
+    conn = connect(engine_settings.db_path)
+    try:
+        return (
+            store.derived_genre_status(conn, file_id),
+            store.derived_album_status(conn, file_id),
+        )
+    finally:
+        conn.close()
+
+
+def test_repend_axes_flips_done_to_pending_and_stays_repend_safe(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    track = make_track(music_dir / "t.mp3", {"genre": ["Pop"], "albumartist": ["Jem"]})
+    scan_library(engine_settings)
+    file_id = _file_id(engine_settings, music_dir, track.name)
+
+    _auto_genre_year(engine_settings, file_id)
+    assert _derived(engine_settings, file_id) == ("done", "done")
+
+    # A manual identity fix, committed as its own commit.
+    staging.stage_tags(engine_settings, file_id=file_id, managed_tags={"albumartist": ["Ozzy"]})
+    fix = staging.commit_tags(engine_settings)
+    assert fix.commit_id is not None
+
+    repend = staging.repend_axes(engine_settings, commit_id=fix.commit_id)
+    assert repend.files == 1
+    assert _derived(engine_settings, file_id) == ("pending", "pending")
+
+    # Re-pend-safe: a LATER fresh auto commit (a real change, above the watermark) reads done.
+    _auto_genre_year(engine_settings, file_id, genre="Ambient", year="2002")
+    assert _derived(engine_settings, file_id) == ("done", "done")
+
+
+def test_repend_axes_clears_artist_status(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    track = make_track(music_dir / "t.mp3", {"genre": ["Pop"], "albumartist": ["Jem"]})
+    scan_library(engine_settings)
+    file_id = _file_id(engine_settings, music_dir, track.name)
+
+    artists.set_artist_status(engine_settings, file_ids=[file_id], status="manual")
+    staging.stage_tags(engine_settings, file_id=file_id, managed_tags={"albumartist": ["Ozzy"]})
+    fix = staging.commit_tags(engine_settings)
+    assert fix.commit_id is not None
+
+    repend = staging.repend_axes(engine_settings, commit_id=fix.commit_id)
+    assert repend.artist_status_cleared == 1
+    conn = connect(engine_settings.db_path)
+    try:
+        assert store.get_artist_status(conn, file_id) is None
+    finally:
+        conn.close()
+
+
+def test_repend_axes_rejects_auto_and_unknown_commit(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    track = make_track(music_dir / "t.mp3", {"genre": ["Pop"]})
+    scan_library(engine_settings)
+    file_id = _file_id(engine_settings, music_dir, track.name)
+
+    staging.stage_tags(
+        engine_settings,
+        file_id=file_id,
+        managed_tags={"genre": ["Rock"]},
+        origin="auto",
+    )
+    auto = staging.commit_tags(engine_settings, origin="auto")
+    assert auto.commit_id is not None
+
+    with pytest.raises(ValueError, match="auto commit"):
+        staging.repend_axes(engine_settings, commit_id=auto.commit_id)
+    with pytest.raises(ValueError, match="unknown commit_id"):
+        staging.repend_axes(engine_settings, commit_id=9999)
+
+
+def test_repend_axes_ignores_noop_files(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    # A no-op commit (target == current) leaves no revision row, so repend touches nobody.
+    track = make_track(music_dir / "t.mp3", {"genre": ["Rock"]})
+    scan_library(engine_settings)
+    file_id = _file_id(engine_settings, music_dir, track.name)
+    _auto_genre_year(engine_settings, file_id)  # genre done at Metal
+
+    staging.stage_tags(engine_settings, file_id=file_id, managed_tags={"genre": ["Metal"]})
+    noop = staging.commit_tags(engine_settings)
+    assert noop.commit_id is not None
+    assert noop.noop == 1
+
+    repend = staging.repend_axes(engine_settings, commit_id=noop.commit_id)
+    assert repend.files == 0  # the noop file has no revision in this commit
+    # Genre stays done because nothing was voided.
+    assert _derived(engine_settings, file_id) == ("done", "done")

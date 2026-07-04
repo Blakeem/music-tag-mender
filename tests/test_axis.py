@@ -14,6 +14,7 @@ from tagmend.engine.axis import (
     ALBUM_AXIS,
     ARTIST_AXIS,
     GENRE_AXIS,
+    MISMATCH_AXIS,
     Identity,
     StatusRow,
 )
@@ -334,3 +335,102 @@ def test_album_no_match_stale_when_secondary_changed() -> None:
 def test_album_pending_does_not_block() -> None:
     decision = StatusRow(status="pending", source_primary="A", source_secondary="B")
     assert ALBUM_AXIS.decision_blocks(decision, Identity(primary="A", secondary="B")) is False
+
+
+# ---------------------------------------------------------------------------
+# Mismatch axis: config invariants (positional source: field name + value)
+# ---------------------------------------------------------------------------
+
+
+def test_mismatch_axis_name() -> None:
+    assert MISMATCH_AXIS.name == "mismatch"
+
+
+def test_mismatch_axis_fields() -> None:
+    # The detect fields — recorded but NEVER used for staged/done derivation on this axis.
+    assert MISMATCH_AXIS.fields == ("albumartist", "artist")
+
+
+def test_mismatch_axis_status_table() -> None:
+    assert MISMATCH_AXIS.status_table == "file_mismatch_status"
+
+
+def test_mismatch_axis_source_columns() -> None:
+    assert MISMATCH_AXIS.source_columns == ("source_field", "source_value")
+
+
+def test_mismatch_axis_workflow_statuses_exact_set() -> None:
+    assert MISMATCH_AXIS.workflow_statuses == frozenset(
+        {"pending", "legit_ignore", "misfiled_deferred"}
+    )
+
+
+def test_mismatch_axis_workflow_statuses_cardinality() -> None:
+    assert len(MISMATCH_AXIS.workflow_statuses) == 3
+
+
+def test_mismatch_has_no_no_match_or_staged_done_states() -> None:
+    assert "no_match" not in MISMATCH_AXIS.workflow_statuses
+    assert "staged" not in MISMATCH_AXIS.workflow_statuses
+    assert "done" not in MISMATCH_AXIS.workflow_statuses
+
+
+# ---------------------------------------------------------------------------
+# Mismatch decision_blocks: blocks iff the snapshotted value still matches its field
+# ---------------------------------------------------------------------------
+# source_primary = the FIELD NAME ('albumartist'|'artist'); source_secondary = its snapshot.
+# identity.primary = current first albumartist; identity.secondary = current first artist.
+
+
+def test_mismatch_albumartist_blocks_when_value_unchanged() -> None:
+    decision = StatusRow(
+        status="legit_ignore", source_primary="albumartist", source_secondary="Jem"
+    )
+    identity = Identity(primary="Jem", secondary="Ozzy Osbourne")
+    assert MISMATCH_AXIS.decision_blocks(decision, identity) is True
+
+
+def test_mismatch_albumartist_stale_when_value_changed() -> None:
+    decision = StatusRow(
+        status="legit_ignore", source_primary="albumartist", source_secondary="Jem"
+    )
+    identity = Identity(primary="Ozzy Osbourne", secondary="Ozzy Osbourne")
+    assert MISMATCH_AXIS.decision_blocks(decision, identity) is False
+
+
+def test_mismatch_albumartist_stale_when_tag_removed() -> None:
+    # The albumartist tag was cleared (current is None) -> the snapshot no longer matches.
+    decision = StatusRow(
+        status="misfiled_deferred", source_primary="albumartist", source_secondary="Jem"
+    )
+    identity = Identity(primary=None, secondary="Ozzy Osbourne")
+    assert MISMATCH_AXIS.decision_blocks(decision, identity) is False
+
+
+def test_mismatch_artist_field_compares_against_secondary() -> None:
+    decision = StatusRow(status="misfiled_deferred", source_primary="artist", source_secondary="X")
+    # Its own field (artist) is compared against identity.secondary, not primary.
+    assert MISMATCH_AXIS.decision_blocks(decision, Identity(primary="Y", secondary="X")) is True
+    assert MISMATCH_AXIS.decision_blocks(decision, Identity(primary="X", secondary="Z")) is False
+
+
+def test_mismatch_misfiled_deferred_follows_the_same_rule() -> None:
+    fresh = StatusRow(
+        status="misfiled_deferred", source_primary="albumartist", source_secondary="Q"
+    )
+    assert MISMATCH_AXIS.decision_blocks(fresh, Identity(primary="Q", secondary=None)) is True
+    assert MISMATCH_AXIS.decision_blocks(fresh, Identity(primary="R", secondary=None)) is False
+
+
+def test_mismatch_null_source_field_blocks_only_when_snapshot_none() -> None:
+    # A file that had neither tag: field None, value None -> compares None == None -> blocks.
+    both_none = StatusRow(status="legit_ignore", source_primary=None, source_secondary=None)
+    assert MISMATCH_AXIS.decision_blocks(both_none, Identity(primary=None, secondary=None)) is True
+    assert MISMATCH_AXIS.decision_blocks(both_none, Identity(primary="A", secondary="B")) is True
+
+
+def test_mismatch_none_value_on_albumartist_field() -> None:
+    # source_field set but snapshot None: blocks only while current is also None.
+    decision = StatusRow(status="legit_ignore", source_primary="albumartist", source_secondary=None)
+    assert MISMATCH_AXIS.decision_blocks(decision, Identity(primary=None, secondary="X")) is True
+    assert MISMATCH_AXIS.decision_blocks(decision, Identity(primary="V", secondary="X")) is False

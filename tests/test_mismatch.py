@@ -19,7 +19,7 @@ from conftest import make_track
 from tagmend import config, mcp_server
 from tagmend.cli import app
 from tagmend.config import Settings
-from tagmend.engine import mismatch, store
+from tagmend.engine import artists, mismatch, staging, store, versioning
 from tagmend.engine.db import connect
 from tagmend.engine.library import scan_library
 from tagmend.engine.mismatch import detect_mismatches
@@ -363,3 +363,486 @@ def test_mcp_detect_tool_listed_and_callable(music_dir: Path) -> None:
     rows = payload["rows"]
     assert isinstance(rows, list)
     assert any(r["tag_value"] == "Jem" and r["tier"] == "high" for r in rows)
+
+
+# --- disposition skip-filter (pure classifier) --------------------------------------
+
+_OZZY_FOLDER = str(_MUSIC / "Ozzy Osbourne" / "(2001) Ozzy Osbourne - Down To Earth")
+
+
+def _disp(status: str, field: str | None, value: str | None) -> store.MismatchStatusRow:
+    return store.MismatchStatusRow(status=status, source_field=field, source_value=value)
+
+
+def test_zero_disposition_output_is_byte_compatible() -> None:
+    files = _all_classes_library()
+    base = mismatch._classify(files, _MUSIC)
+    explicit_empty = mismatch._classify(files, _MUSIC, dispositions={})
+
+    assert base.to_dict() == explicit_empty.to_dict()
+    # New fields present, empty, and the existing fields unchanged from the legacy detector.
+    assert base.suppressed == {}
+    assert base.groups == []
+    payload = base.to_dict()
+    assert payload["suppressed"] == {}
+    assert payload["groups"] == []
+    assert payload["flagged"] == 8
+    assert payload["high"] == 1
+    assert payload["low"] == 5
+
+
+def test_fresh_disposition_suppresses_row_and_reports_it() -> None:
+    files = _all_classes_library()
+    dispositions = {100: _disp("legit_ignore", "albumartist", "Jem")}
+
+    report = mismatch._classify(files, _MUSIC, dispositions=dispositions)
+
+    assert _find(report, 100) is None  # the HIGH Jem row is silenced
+    assert report.high == 0
+    assert report.flagged == 7  # was 8
+    assert report.suppressed == {"legit_ignore": 1}
+
+
+def test_stale_disposition_resurfaces() -> None:
+    files = _all_classes_library()
+    # Snapshot recorded "Old Name" but the file's current albumartist is "Jem" -> stale.
+    dispositions = {100: _disp("legit_ignore", "albumartist", "Old Name")}
+
+    report = mismatch._classify(files, _MUSIC, dispositions=dispositions)
+
+    jem = _find(report, 100)
+    assert jem is not None
+    assert jem.tier == "high"
+    assert report.suppressed == {}
+
+
+def test_both_disposition_statuses_suppress_when_fresh() -> None:
+    files = _all_classes_library()
+    dispositions = {
+        100: _disp("legit_ignore", "albumartist", "Jem"),
+        150: _disp("misfiled_deferred", "albumartist", "Future Islands"),
+    }
+
+    report = mismatch._classify(files, _MUSIC, dispositions=dispositions)
+
+    assert _find(report, 100) is None
+    assert _find(report, 150) is None
+    assert report.suppressed == {"legit_ignore": 1, "misfiled_deferred": 1}
+
+
+# --- grouped view -------------------------------------------------------------------
+
+
+def test_grouped_view_shape() -> None:
+    files = _all_classes_library()
+    report = mismatch._classify(files, _MUSIC)
+    grouped = mismatch._grouped_report(report, mismatch._folder_stats(files), tier=None, limit=None)
+
+    assert grouped.rows == []
+    assert grouped.groups  # non-empty
+
+    ozzy = next(g for g in grouped.groups if g.folder == _OZZY_FOLDER)
+    assert ozzy.path_artist == "Ozzy Osbourne"
+    assert ozzy.file_count == 2  # two tracked files in the folder
+    assert ozzy.flagged == 2  # Jem (HIGH) + clean sibling (LOW folder-consistency)
+    assert ozzy.file_ids == [100, 101]
+    assert ozzy.tiers == {"high": 1, "low": 1}
+    assert ozzy.fields == ["albumartist"]
+    assert ozzy.tag_values == {"Jem": 1, "Ozzy Osbourne": 1}
+    assert ozzy.suppressed == {}
+
+
+def test_grouped_view_reports_suppressed_per_folder() -> None:
+    files = _all_classes_library()
+    dispositions = {100: _disp("legit_ignore", "albumartist", "Jem")}
+    report = mismatch._classify(files, _MUSIC, dispositions=dispositions)
+    grouped = mismatch._grouped_report(report, mismatch._folder_stats(files), tier=None, limit=None)
+
+    ozzy = next(g for g in grouped.groups if g.folder == _OZZY_FOLDER)
+    assert ozzy.flagged == 1  # only the clean-sibling LOW row remains
+    assert ozzy.file_ids == [101]
+    assert ozzy.suppressed == {"legit_ignore": 1}
+
+
+def test_grouped_tier_filters_rows_before_grouping() -> None:
+    files = _all_classes_library()
+    report = mismatch._classify(files, _MUSIC)
+    grouped = mismatch._grouped_report(
+        report,
+        mismatch._folder_stats(files),
+        tier="high",
+        limit=None,
+    )
+    assert len(grouped.groups) == 1  # only the Ozzy folder holds a HIGH row
+    assert grouped.groups[0].folder == _OZZY_FOLDER
+    assert grouped.groups[0].tiers == {"high": 1}
+
+
+def test_grouped_limit_caps_groups() -> None:
+    files = _all_classes_library()
+    report = mismatch._classify(files, _MUSIC)
+    all_groups = mismatch._grouped_report(
+        report,
+        mismatch._folder_stats(files),
+        tier=None,
+        limit=None,
+    )
+    assert len(all_groups.groups) > 1
+    capped = mismatch._grouped_report(report, mismatch._folder_stats(files), tier=None, limit=1)
+    assert len(capped.groups) == 1
+
+
+# --- folder expansion (exact path equality, never a prefix/LIKE) --------------------
+
+
+def test_folder_expansion_is_exact_equality() -> None:
+    files = _all_classes_library()
+    report = mismatch._classify(files, _MUSIC)
+
+    expanded = mismatch._expand_folder(report, _OZZY_FOLDER, tier=None, limit=None)
+    assert {r.file_id for r in expanded.rows} == {100, 101}
+    assert expanded.groups == []
+
+    # A parent prefix must NOT match (equality, not substring/LIKE).
+    prefix = str(_MUSIC / "Ozzy Osbourne")
+    assert mismatch._expand_folder(report, prefix, tier=None, limit=None).rows == []
+
+
+# --- disposition verbs + staleness (engine, real library) ---------------------------
+
+
+def test_set_and_reset_mismatch_status_via_detect(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    ozzy = _make_mislabeled_library(music_dir)
+    scan_library(engine_settings)
+    jem_id = _file_id(engine_settings, ozzy, "01 Gets Me Through.mp3")
+
+    assert _find(detect_mismatches(engine_settings), jem_id) is not None  # baseline flagged
+
+    affected = mismatch.set_mismatch_status(
+        engine_settings,
+        file_ids=[jem_id],
+        status="legit_ignore",
+    )
+    assert affected == 1
+    report = detect_mismatches(engine_settings)
+    assert _find(report, jem_id) is None  # silenced
+    assert report.suppressed == {"legit_ignore": 1}
+
+    assert mismatch.reset_mismatch_status(engine_settings, file_ids=[jem_id]) == 1
+    assert _find(detect_mismatches(engine_settings), jem_id) is not None  # re-surfaced
+
+
+def test_set_mismatch_status_by_value_matches_both_fields(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    ozzy = _make_mislabeled_library(music_dir)
+    scan_library(engine_settings)
+    jem_id = _file_id(engine_settings, ozzy, "01 Gets Me Through.mp3")
+
+    # "Jem" is the albumartist of the flagged file -> value scope catches it.
+    affected = mismatch.set_mismatch_status(engine_settings, value="Jem", status="legit_ignore")
+    assert affected == 1
+    assert _find(detect_mismatches(engine_settings), jem_id) is None
+
+
+def test_set_mismatch_status_rejects_unknown_status(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    _make_mislabeled_library(music_dir)
+    scan_library(engine_settings)
+    with pytest.raises(ValueError, match="invalid status"):
+        mismatch.set_mismatch_status(engine_settings, file_ids=[1], status="no_match")
+
+
+def test_disposition_goes_stale_when_albumartist_edited(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    ozzy = _make_mislabeled_library(music_dir)
+    scan_library(engine_settings)
+    jem_file = ozzy / "01 Gets Me Through.mp3"
+    jem_id = _file_id(engine_settings, ozzy, "01 Gets Me Through.mp3")
+
+    mismatch.set_mismatch_status(engine_settings, file_ids=[jem_id], status="legit_ignore")
+    assert _find(detect_mismatches(engine_settings), jem_id) is None  # silenced
+
+    # Edit the albumartist on disk (still disagreeing) + rescan -> snapshot changes -> stale.
+    make_track(jem_file, {"albumartist": ["Jem Griffiths"], "artist": ["Ozzy Osbourne"]})
+    scan_library(engine_settings)
+
+    resurfaced = _find(detect_mismatches(engine_settings), jem_id)
+    assert resurfaced is not None  # the stale disposition no longer silences it
+
+
+# --- end-to-end mismatch-fix flow (criterion 11) ------------------------------------
+
+
+def _make_fix_flow_library(music_dir: Path) -> dict[str, Path]:
+    """Mixed poisoned folder (2 Jem-stamped + 1 clean exemplar) + a container-FP single.
+
+    Ten clean single-artist folders keep the library-wide disagreement rate under the
+    reliability floor so the mis-stamped files surface as HIGH.
+    """
+    for index in range(10):
+        make_track(
+            music_dir / f"Clean{index}" / "01.mp3",
+            {"albumartist": [f"Clean{index}"], "artist": [f"Clean{index}"]},
+        )
+    poisoned = music_dir / "Ozzy Osbourne" / "(2001) Ozzy Osbourne - Down To Earth"
+    make_track(
+        poisoned / "01 Gets Me Through.mp3",
+        {"albumartist": ["Jem"], "artist": ["Ozzy Osbourne"], "genre": ["Pop"]},
+    )
+    make_track(
+        poisoned / "02 Facing Hell.mp3",
+        {"albumartist": ["Jem"], "artist": ["Ozzy Osbourne"], "genre": ["Pop"]},
+    )
+    make_track(
+        poisoned / "03 Dreamer.mp3",
+        {"albumartist": ["Ozzy Osbourne"], "artist": ["Ozzy Osbourne"], "genre": ["Rock"]},
+    )
+    # Container false positive: a legit remix single credited to another artist.
+    fp = music_dir / "Blue Stahli" / "Singles"
+    make_track(fp / "remix.mp3", {"albumartist": ["Celldweller"], "artist": ["Celldweller"]})
+    return {"poisoned": poisoned, "fp": fp}
+
+
+def test_mismatch_fix_flow_end_to_end(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    folders = _make_fix_flow_library(music_dir)
+    poisoned = folders["poisoned"]
+    scan_library(engine_settings)
+
+    jem1 = _file_id(engine_settings, poisoned, "01 Gets Me Through.mp3")
+    jem2 = _file_id(engine_settings, poisoned, "02 Facing Hell.mp3")
+    fp_id = _file_id(engine_settings, folders["fp"], "remix.mp3")
+
+    # Seed prior auto genre/year work + a sticky artist exclusion on the poisoned files, so
+    # repend has real derived-axis state to re-open.
+    for fid in (jem1, jem2):
+        staging.stage_tags(
+            engine_settings,
+            file_id=fid,
+            managed_tags={"genre": ["Metal"], "originaldate": ["2001"]},
+            origin="auto",
+        )
+    staging.commit_tags(engine_settings, origin="auto")
+    artists.set_artist_status(engine_settings, file_ids=[jem1, jem2], status="manual")
+    assert _derived(engine_settings, jem1) == ("done", "done", "manual")
+
+    # 1. detect flags the two Jem files (HIGH) and the container FP.
+    report = detect_mismatches(engine_settings)
+    assert {r.file_id for r in report.rows} >= {jem1, jem2, fp_id}
+    assert _find(report, jem1).tier == "high"  # type: ignore[union-attr]
+
+    # 2. silence the container FP -> suppressed + reported, not in rows.
+    assert (
+        mismatch.set_mismatch_status(engine_settings, file_ids=[fp_id], status="legit_ignore") == 1
+    )
+    silenced = detect_mismatches(engine_settings)
+    assert _find(silenced, fp_id) is None
+    assert silenced.suppressed == {"legit_ignore": 1}
+
+    # 3. batch-stage the corrected identity for the flagged files (one atomic call).
+    staged = staging.stage_tags_batch(
+        engine_settings,
+        entries=[
+            (jem1, {"albumartist": ["Ozzy Osbourne"]}),
+            (jem2, {"albumartist": ["Ozzy Osbourne"]}),
+        ],
+    )
+    assert staged == [jem1, jem2]
+
+    # 4. commit the folder as ONE revertible commit.
+    result = staging.commit_tags(engine_settings, root=poisoned)
+    assert result.committed == 2
+    commit_id = result.commit_id
+    assert commit_id is not None
+
+    # 5. repend the derived axes + clear the artist status for the fixed files.
+    repend = staging.repend_axes(engine_settings, commit_id=commit_id)
+    assert repend.files == 2
+    assert repend.artist_status_cleared == 2
+    # genre/album flip done -> pending; the artist status row is gone.
+    assert _derived(engine_settings, jem1) == ("pending", "pending", "pending")
+
+    # 6. detect no longer flags the poisoned folder (self-resolving accept, no row needed).
+    assert detect_mismatches(engine_settings, folder=str(poisoned)).rows == []
+
+    # 7. revert the whole commit -> the pre-fix albumartist is restored.
+    versioning.revert_commit(engine_settings, commit_id)
+    assert _read_albumartist(engine_settings, poisoned, "01 Gets Me Through.mp3") == ["Jem"]
+
+
+def _derived(settings: Settings, file_id: int) -> tuple[str, str, str]:
+    """Return ``(genre, album, artist)`` derived statuses for *file_id*."""
+    conn = connect(settings.db_path)
+    try:
+        return (
+            store.derived_genre_status(conn, file_id),
+            store.derived_album_status(conn, file_id),
+            store.derived_artist_status(conn, file_id),
+        )
+    finally:
+        conn.close()
+
+
+# --- MCP + CLI wiring for the new surface --------------------------------------------
+
+
+def test_mcp_new_mismatch_tools_listed() -> None:
+    tools = asyncio.run(mcp_server.mcp.list_tools())
+    names = {tool.name for tool in tools}
+    assert {
+        "stage_tags_batch",
+        "repend_axes",
+        "set_mismatch_status",
+        "reset_mismatch_status",
+    } <= names
+
+
+def test_mcp_set_and_reset_mismatch_status_envelopes(music_dir: Path) -> None:
+    config.set_setting("music_path", str(music_dir))
+    ozzy = _make_mislabeled_library(music_dir)
+    mcp_server.scan_library(path=str(music_dir))
+    jem_id = _file_id(config.load_settings(), ozzy, "01 Gets Me Through.mp3")
+
+    ok = mcp_server.set_mismatch_status("legit_ignore", file_ids=[jem_id])
+    assert ok == {"ok": True, "affected": 1}
+    payload = mcp_server.detect_mismatches()
+    assert payload["suppressed"] == {"legit_ignore": 1}
+
+    bad = mcp_server.set_mismatch_status("no_match", file_ids=[jem_id])
+    assert bad["ok"] is False
+    assert "error" in bad
+
+    assert mcp_server.reset_mismatch_status(file_ids=[jem_id]) == {"ok": True, "affected": 1}
+
+
+def test_mcp_detect_group_and_folder(music_dir: Path) -> None:
+    config.set_setting("music_path", str(music_dir))
+    ozzy = _make_mislabeled_library(music_dir)
+    mcp_server.scan_library(path=str(music_dir))
+
+    grouped = mcp_server.detect_mismatches(group=True)
+    assert grouped["ok"] is True
+    assert grouped["rows"] == []
+    groups = grouped["groups"]
+    assert isinstance(groups, list)
+    assert any(g["folder"] == str(ozzy) for g in groups)
+
+    expanded = mcp_server.detect_mismatches(folder=str(ozzy))
+    assert expanded["ok"] is True
+    assert expanded["groups"] == []
+    rows = expanded["rows"]
+    assert isinstance(rows, list)
+    assert all(r["folder"] == str(ozzy) for r in rows)
+
+
+def test_cli_detect_group_lists_folders(music_dir: Path) -> None:
+    config.set_setting("music_path", str(music_dir))
+    _make_mislabeled_library(music_dir)
+    assert runner.invoke(app, ["scan", str(music_dir)]).exit_code == 0
+
+    result = runner.invoke(app, ["detect", "--group"])
+    assert result.exit_code == 0
+    assert "Ozzy Osbourne" in result.stdout
+    assert "flagged" in result.stdout
+
+
+def test_mcp_stage_tags_batch_atomic_and_commits_once(music_dir: Path) -> None:
+    config.set_setting("music_path", str(music_dir))
+    a = make_track(music_dir / "a.mp3", {"genre": ["Pop"]})
+    b = make_track(music_dir / "b.mp3", {"genre": ["Pop"]})
+    mcp_server.scan_library(path=str(music_dir))
+    conn = connect(config.load_settings().db_path)
+    try:
+        a_id = store.get_file(conn, str(music_dir), a.name).id  # type: ignore[union-attr]
+        b_id = store.get_file(conn, str(music_dir), b.name).id  # type: ignore[union-attr]
+    finally:
+        conn.close()
+
+    payload = mcp_server.stage_tags_batch(
+        [
+            {"file_id": a_id, "tags": {"genre": ["Rock"]}},
+            {"file_id": b_id, "tags": {"genre": ["Metal"]}},
+        ],
+    )
+    assert payload == {"ok": True, "staged": 2, "file_ids": [a_id, b_id]}
+
+    committed = mcp_server.commit_tags()
+    assert committed["committed"] == 2
+    # Both files landed under ONE commit id.
+    conn = connect(config.load_settings().db_path)
+    try:
+        a_commit = store.get_revisions(conn, a_id)[-1].commit_id
+        b_commit = store.get_revisions(conn, b_id)[-1].commit_id
+    finally:
+        conn.close()
+    assert a_commit == b_commit is not None
+
+
+def test_mcp_stage_tags_batch_rejects_unknown_file(music_dir: Path) -> None:
+    config.set_setting("music_path", str(music_dir))
+    make_track(music_dir / "a.mp3", {"genre": ["Pop"]})
+    mcp_server.scan_library(path=str(music_dir))
+
+    payload = mcp_server.stage_tags_batch([{"file_id": 9999, "tags": {"genre": ["Rock"]}}])
+    assert payload["ok"] is False
+    assert "error" in payload
+
+
+def test_mcp_stage_tags_batch_rejects_bare_string_value(music_dir: Path) -> None:
+    """A tag value that is a bare string (not a list) is rejected before anything is staged.
+
+    Guards the mismatch-fix flow's most plausible caller mistake: ``{"albumartist": "Ozzy"}``
+    instead of ``{"albumartist": ["Ozzy"]}``. Without the boundary check ``list("Ozzy")`` would
+    split the string per character and silently corrupt the on-disk tag.
+    """
+    config.set_setting("music_path", str(music_dir))
+    a = make_track(music_dir / "a.mp3", {"genre": ["Pop"]})
+    mcp_server.scan_library(path=str(music_dir))
+    conn = connect(config.load_settings().db_path)
+    try:
+        a_id = store.get_file(conn, str(music_dir), a.name).id  # type: ignore[union-attr]
+    finally:
+        conn.close()
+
+    payload = mcp_server.stage_tags_batch([{"file_id": a_id, "tags": {"albumartist": "Ozzy"}}])
+    assert payload["ok"] is False
+    assert "must be a list of strings" in str(payload["error"])
+    # Nothing was staged: a follow-up commit has nothing to write.
+    assert mcp_server.commit_tags()["committed"] == 0
+
+
+def test_mcp_repend_axes_rejects_auto_commit(music_dir: Path) -> None:
+    config.set_setting("music_path", str(music_dir))
+    track = make_track(music_dir / "a.mp3", {"genre": ["Pop"]})
+    mcp_server.scan_library(path=str(music_dir))
+    conn = connect(config.load_settings().db_path)
+    try:
+        file_id = store.get_file(conn, str(music_dir), track.name).id  # type: ignore[union-attr]
+    finally:
+        conn.close()
+
+    staging.stage_tags(
+        config.load_settings(),
+        file_id=file_id,
+        managed_tags={"genre": ["Rock"]},
+        origin="auto",
+    )
+    auto_commit = staging.commit_tags(config.load_settings(), origin="auto").commit_id
+    assert auto_commit is not None
+
+    payload = mcp_server.repend_axes(auto_commit)
+    assert payload["ok"] is False
+    assert "auto" in str(payload["error"])
+
+    assert mcp_server.repend_axes(9999)["ok"] is False  # unknown commit id

@@ -34,9 +34,19 @@ file or by a value matched across BOTH `artist` and `albumartist`);
 `has_auto_change_for`, the latter via SQLite JSON1 `json_extract` on the committed
 `diff`): genre keys on `genre`, artist on `artist`/`albumartist`, so the two columns are
 independent (a genre-only commit no longer reads as artist-`done`, and vice versa).
-21 MCP tools total. Schema is **v7** (additive: adds `file_artist_status`; a v6 ledger
-upgrades in place). **Next: M4** review loop. M6 organize/moves (`moves.py`) is a paper
-sketch (its DDL ships in v6; logic deferred).
+The album axis (`albums.py`) shipped next (MusicBrainz `originaldate` blank-fill + sticky
+`manual`/engine `no_match`, `list_files(album_status=...)` + a `library_stats['album']`
+block). The **mismatch-fix** surface shipped last (decide run `fix-mismatches`, Run 2):
+`detect_mismatches` gained sticky per-file dispositions (`file_mismatch_status` —
+`legit_ignore`/`misfiled_deferred`, snapshot-and-go-stale), grouped output (`group=True`) +
+exact-folder expansion + a staleness-aware skip-filter; `set_mismatch_status`/
+`reset_mismatch_status`; `stage_tags_batch` (one atomic multi-file stage, always
+`origin="manual"`); and `repend_axes(commit_id)` — the first caller of
+`store.void_auto_changes`, re-opening a fixed file's derived genre/year axes + clearing its
+stale artist status. `list_files(mismatch_status=...)` + a `library_stats['mismatch']` block
+round it out. 30 MCP tools total. Schema is **v10** (additive: adds `file_mismatch_status`;
+a v9 ledger upgrades in place). M6 organize/moves (`moves.py`) is a paper sketch (its DDL
+ships in v6; logic deferred).
 
 ## Python
 
@@ -125,7 +135,7 @@ src/tagmend/
   mcp_server.py     FastMCP server (thin) — 21 tools
   engine/
     db.py           SQLite connection (WAL)
-    schema.py       all DDL + PRAGMA user_version (v7)
+    schema.py       all DDL + PRAGMA user_version (v10)
     scan.py         filesystem discovery + signatures
     doctor.py       health_check / readiness + interrupted-commit report
     store.py        pure data access: files/file_tags + tag_revisions[_staged] + genre/artist status

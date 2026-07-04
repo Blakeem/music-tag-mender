@@ -248,6 +248,7 @@ def compute_stats(conn: sqlite3.Connection) -> dict[str, object]:
         "genre": genre_status_counts(conn),
         "artist": artist_status_counts(conn),
         "album": album_status_counts(conn),
+        "mismatch": mismatch_status_counts(conn),
     }
 
 
@@ -1033,6 +1034,123 @@ def album_status_counts(conn: sqlite3.Connection) -> dict[str, int]:
     of truth), so the counts and the per-file status can never drift.
     """
     return status_counts(conn, axis.ALBUM_AXIS)
+
+
+# --- file_mismatch_status (per-file mismatch dispositions; mismatch-axis twin) --------
+
+# The three mismatch workflow states (re-exported from the mismatch axis). Two are stored
+# (``legit_ignore``/``misfiled_deferred`` — rows in ``file_mismatch_status``), and
+# ``pending`` = no row. There are NO ``staged``/``done`` states on this axis: an accepted fix
+# needs no row (the tag simply agrees with the path). Single source of truth for the
+# ``list_files(mismatch_status=...)`` filter and the stats counts.
+MISMATCH_WORKFLOW_STATUSES: Final = axis.MISMATCH_AXIS.workflow_statuses
+
+
+@dataclass(frozen=True, slots=True)
+class MismatchStatusRow:
+    """One row from ``file_mismatch_status`` (a sticky per-file disposition).
+
+    ``source_field`` is which identity tag disagreed (``'albumartist'``/``'artist'``) and
+    ``source_value`` is that tag's value at decision time — the staleness snapshot.
+    """
+
+    status: str
+    source_field: str | None
+    source_value: str | None
+
+
+def _mismatch_row(decision: axis.StatusRow) -> MismatchStatusRow:
+    """Adapt a generic axis :class:`~tagmend.engine.axis.StatusRow` to the mismatch-named row."""
+    return MismatchStatusRow(
+        status=decision.status,
+        source_field=decision.source_primary,
+        source_value=decision.source_secondary,
+    )
+
+
+def get_mismatch_status(conn: sqlite3.Connection, file_id: int) -> MismatchStatusRow | None:
+    """Return *file_id*'s stored mismatch disposition, or ``None`` if it has none."""
+    decision = axis.get_status(conn, axis.MISMATCH_AXIS, file_id)
+    return None if decision is None else _mismatch_row(decision)
+
+
+def set_mismatch_status(  # noqa: PLR0913 - cohesive keyword-only status payload
+    conn: sqlite3.Connection,
+    *,
+    file_id: int,
+    status: str,
+    source_field: str | None,
+    source_value: str | None,
+    now: str,
+) -> None:
+    """Insert or replace *file_id*'s stored mismatch disposition.
+
+    ``source_field``/``source_value`` record the disagreeing tag (which field + its value the
+    disposition was taken against), so a later tag change marks it stale and re-processable.
+    """
+    axis.set_status(
+        conn,
+        axis.MISMATCH_AXIS,
+        file_id=file_id,
+        status=status,
+        source_primary=source_field,
+        source_secondary=source_value,
+        now=now,
+    )
+
+
+def delete_mismatch_status(conn: sqlite3.Connection, file_id: int) -> None:
+    """Remove *file_id*'s stored mismatch disposition (no-op if none)."""
+    axis.delete_status(conn, axis.MISMATCH_AXIS, file_id)
+
+
+def load_mismatch_statuses(conn: sqlite3.Connection) -> dict[int, MismatchStatusRow]:
+    """Return every stored mismatch disposition keyed by ``file_id`` in ONE SELECT.
+
+    The bulk read the detector's skip-filter uses so it needs no per-file query.
+    """
+    cursor = conn.execute(
+        "SELECT file_id, status, source_field, source_value FROM file_mismatch_status",
+    )
+    result: dict[int, MismatchStatusRow] = {}
+    for row in cursor.fetchall():
+        result[_as_int(row[0])] = MismatchStatusRow(
+            status=str(row[1]),
+            source_field=None if row[2] is None else str(row[2]),
+            source_value=None if row[3] is None else str(row[3]),
+        )
+    return result
+
+
+def derived_mismatch_status(conn: sqlite3.Connection, file_id: int) -> str:
+    """Return *file_id*'s mismatch status: the stored disposition, else ``pending``.
+
+    Deliberately NOT routed through :func:`derived_status`: the mismatch axis has no
+    ``staged``/``done`` derivation, and its ``fields`` collide with the artist axis's, so a
+    staged artist change must never read as a mismatch state. Stored-or-pending, full stop.
+    """
+    decision = axis.get_status(conn, axis.MISMATCH_AXIS, file_id)
+    return "pending" if decision is None else decision.status
+
+
+def mismatch_status_counts(conn: sqlite3.Connection) -> dict[str, int]:
+    """Return file counts per mismatch workflow status, all three keys always present.
+
+    A SQL aggregate over ``file_mismatch_status`` (NOT the per-file ``derived_status`` loop
+    the other axes use — this axis has no staged/done derivation): stored statuses come from a
+    ``GROUP BY``, and ``pending`` = total files - rows.
+    """
+    counts = dict.fromkeys(sorted(axis.MISMATCH_AXIS.workflow_statuses), 0)
+    total_files = _scalar_int(conn, "SELECT COUNT(*) FROM files")
+    rows = 0
+    for row in conn.execute("SELECT status, COUNT(*) FROM file_mismatch_status GROUP BY status"):
+        status = str(row[0])
+        count = _as_int(row[1])
+        rows += count
+        if status in counts:
+            counts[status] = count
+    counts["pending"] = total_files - rows
+    return counts
 
 
 def distinct_artists(conn: sqlite3.Connection) -> list[tuple[str, int]]:

@@ -12,11 +12,11 @@ def _table_names(conn: sqlite3.Connection) -> set[str]:
     return {str(row[0]) for row in cursor.fetchall()}
 
 
-def test_apply_schema_stamps_version_9(db_conn: sqlite3.Connection) -> None:
-    # db_conn already applied the schema; confirm the stamped user_version is v9.
+def test_apply_schema_stamps_version_10(db_conn: sqlite3.Connection) -> None:
+    # db_conn already applied the schema; confirm the stamped user_version is v10.
     version = db_conn.execute("PRAGMA user_version").fetchone()[0]
-    assert version == 9
-    assert SCHEMA_VERSION == 9
+    assert version == 10
+    assert SCHEMA_VERSION == 10
 
 
 def test_apply_schema_creates_genre_tables(db_conn: sqlite3.Connection) -> None:
@@ -39,14 +39,49 @@ def test_apply_schema_creates_voided_auto_table(db_conn: sqlite3.Connection) -> 
     assert "voided_auto" in _table_names(db_conn)
 
 
+def test_apply_schema_creates_mismatch_status_table(db_conn: sqlite3.Connection) -> None:
+    assert "file_mismatch_status" in _table_names(db_conn)
+
+
+def test_file_mismatch_status_columns(db_conn: sqlite3.Connection) -> None:
+    cursor = db_conn.execute("PRAGMA table_info(file_mismatch_status)")
+    columns = {str(row[1]): (str(row[2]), bool(row[3]), bool(row[5])) for row in cursor.fetchall()}
+    # name -> (declared type, NOT NULL, is-primary-key)
+    assert columns["file_id"] == ("INTEGER", False, True)
+    assert columns["status"] == ("TEXT", True, False)
+    assert columns["source_field"] == ("TEXT", False, False)
+    assert columns["source_value"] == ("TEXT", False, False)
+    assert columns["updated_at"] == ("TEXT", True, False)
+
+
 def test_apply_schema_is_idempotent() -> None:
     conn = sqlite3.connect(":memory:")
     try:
         apply_schema(conn)
         apply_schema(conn)  # second application must not raise
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 9
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 10
     finally:
         conn.close()
+
+
+def test_file_mismatch_status_cascades_on_file_delete(db_conn: sqlite3.Connection) -> None:
+    file_id = _insert_file(db_conn)
+    db_conn.execute(
+        """
+        INSERT INTO file_mismatch_status
+          (file_id, status, source_field, source_value, updated_at)
+        VALUES (?, 'legit_ignore', 'albumartist', 'Jem', '2026-07-04T00:00:00+00:00')
+        """,
+        (file_id,),
+    )
+
+    db_conn.execute("DELETE FROM files WHERE id = ?", (file_id,))
+
+    remaining = db_conn.execute(
+        "SELECT COUNT(*) FROM file_mismatch_status WHERE file_id = ?",
+        (file_id,),
+    ).fetchone()
+    assert remaining[0] == 0
 
 
 def test_file_genre_status_cascades_on_file_delete(db_conn: sqlite3.Connection) -> None:

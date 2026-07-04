@@ -61,6 +61,18 @@ ledger upgrades in place with no data loss):
   ``MAX(version)`` here, and :func:`~tagmend.engine.store.has_auto_change_for` ignores auto
   revisions at or below the watermark, so the genre/originaldate re-pend. A LATER auto
   revision (``version`` above the watermark) counts again, so re-processing is safe.
+
+The mismatch-fix review surface adds one more side table (schema v10, purely additive — a v9
+ledger upgrades in place with no data loss):
+
+* ``file_mismatch_status`` — the 4th per-file status table (the mismatch-axis twin of the
+  three shipped status tables). Stores ONLY the sticky per-file dispositions
+  (``'legit_ignore'`` — a false positive to silence; ``'misfiled_deferred'`` — a misfiled
+  file deferred for later). An accepted fix needs NO row: once the tag agrees with the path,
+  the detector stops flagging it. ``source_field``/``source_value`` snapshot the disagreeing
+  tag (which of ``albumartist``/``artist`` + its value at decision time) so a later tag change
+  makes the disposition stale and the file re-surfaces. Unlike the other three axes this one
+  has NO ``staged``/``done`` derivation, so it never routes through ``derived_status``.
 """
 
 from __future__ import annotations
@@ -74,7 +86,7 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
-SCHEMA_VERSION: Final = 9
+SCHEMA_VERSION: Final = 10
 
 _FILES_DDL: Final = """
 CREATE TABLE IF NOT EXISTS files (
@@ -287,6 +299,23 @@ CREATE TABLE IF NOT EXISTS voided_auto (
 )
 """
 
+# Per-file mismatch disposition (the 4th per-file status table; the mismatch-axis twin of
+# ``file_genre_status``). Stores ONLY the sticky dispositions the detector honours:
+# ``'legit_ignore'`` (a false positive to silence) and ``'misfiled_deferred'`` (a misfiled
+# file deferred for later). An accepted fix needs NO row — once the tag agrees with the path
+# the detector stops flagging it. ``source_field`` (``'albumartist'``/``'artist'``) +
+# ``source_value`` snapshot the disagreeing tag at decision time, so a later tag change makes
+# the disposition stale and the file re-surfaces. See PLAN — mismatch-fix (review surface).
+_FILE_MISMATCH_STATUS_DDL: Final = """
+CREATE TABLE IF NOT EXISTS file_mismatch_status (
+  file_id       INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
+  status        TEXT NOT NULL,
+  source_field  TEXT,
+  source_value  TEXT,
+  updated_at    TEXT NOT NULL
+)
+"""
+
 
 def apply_schema(connection: sqlite3.Connection) -> None:
     """Create all tables (idempotently) and stamp ``PRAGMA user_version``.
@@ -324,4 +353,5 @@ def apply_schema(connection: sqlite3.Connection) -> None:
     connection.execute(_FILE_ALBUM_STATUS_DDL)
     connection.execute(_MUSICBRAINZ_CACHE_DDL)
     connection.execute(_VOIDED_AUTO_DDL)
+    connection.execute(_FILE_MISMATCH_STATUS_DDL)
     connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")

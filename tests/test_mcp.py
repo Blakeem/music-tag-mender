@@ -110,9 +110,11 @@ def test_list_tools_exposes_expected_tools_and_schema() -> None:
         "list_files",
         "get_file",
         "stage_tags",
+        "stage_tags_batch",
         "unstage_tags",
         "diff_tags",
         "commit_tags",
+        "repend_axes",
         "history_tags",
         "revert_tags",
         "revert_commit",
@@ -122,6 +124,8 @@ def test_list_tools_exposes_expected_tools_and_schema() -> None:
         "list_albums",
         "set_album_status",
         "reset_album_status",
+        "set_mismatch_status",
+        "reset_mismatch_status",
     } <= names
     # Retired names must be gone.
     assert names.isdisjoint({"unstage", "list_pending", "resume_commits"})
@@ -142,6 +146,13 @@ def test_list_tools_exposes_expected_tools_and_schema() -> None:
         "manual",
         "staged",
         "done",
+    }
+
+    mismatch_status_schema = list_tool.inputSchema["properties"]["mismatch_status"]
+    assert set(_enum_values(mismatch_status_schema)) == {
+        "pending",
+        "legit_ignore",
+        "misfiled_deferred",
     }
 
 

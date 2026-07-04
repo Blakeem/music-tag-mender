@@ -131,18 +131,38 @@ def detect(
     ] = None,
     limit: Annotated[
         int | None,
-        typer.Option(help="Cap the number of rows shown."),
+        typer.Option(help="Cap the number of rows (or groups, with --group) shown."),
+    ] = None,
+    *,
+    group: Annotated[
+        bool,
+        typer.Option("--group", help="Show one compact line per folder instead of flat rows."),
+    ] = False,
+    folder: Annotated[
+        str | None,
+        typer.Option(help="Expand exactly this folder's flat rows (exact path, never a prefix)."),
     ] = None,
 ) -> None:
     """List files whose albumartist/artist tag disagrees with their folder path (read-only)."""
     settings = config.load_settings()
     try:
-        report = mismatch.detect_mismatches(settings, tier=tier, limit=limit)
+        report = mismatch.detect_mismatches(
+            settings,
+            tier=tier,
+            limit=limit,
+            group=group,
+            folder=folder,
+        )
     except ValueError as exc:
         typer.echo(str(exc))
         raise typer.Exit(code=1) from exc
 
     typer.echo(report.summary)
+    for group_row in report.groups:
+        typer.echo(
+            f"  {group_row.flagged:3}/{group_row.file_count:<3} flagged  "
+            f"path={group_row.path_artist!r}  {group_row.folder}",
+        )
     for row in report.rows:
         typer.echo(
             f"  [{row.tier.upper():6}] {row.field}={row.tag_value!r} "

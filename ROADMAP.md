@@ -59,9 +59,17 @@ workflow axis — the mismatch-fix foundation (schema v9) widened it to the full
   It does not itself write the MusicBrainz IDs. (`MANAGED_TAGS` was later widened by the
   mismatch-fix foundation — see below — so `musicbrainz_albumid`/`releasegroupid` are now
   write/revert-covered, but the album resolve flow does not touch them.)
-- **Schema v9. 25 MCP tools.** Three shipped axes (genre + artist + album) have working auto +
+- **Schema v10. 30 MCP tools.** Three shipped axes (genre + artist + album) have working auto +
   manual exclusion pipelines with full revert. The review loop is: `resolve_*(dry_run)` → exclude
   what you don't want → `resolve_*` (real) → review the staged diff → `commit_tags`.
+- **Mismatch-fix surface (DONE — decide run `fix-mismatches`, Run 2).** `detect_mismatches` gained
+  sticky per-file dispositions (`file_mismatch_status`: `legit_ignore`/`misfiled_deferred`, which go
+  stale when the snapshotted identity tag changes), grouped output (`group=True`) + exact-folder
+  expansion + a staleness-aware skip-filter; `set_mismatch_status`/`reset_mismatch_status`;
+  `stage_tags_batch` (one atomic, all-or-nothing multi-file stage); and `repend_axes(commit_id)` —
+  the first caller of `store.void_auto_changes`, re-opening a fixed file's derived genre/year and
+  clearing its stale artist status. Fix loop: grouped detect → research → `stage_tags_batch` →
+  `commit_tags(root=folder)` → `repend_axes`, with `set_mismatch_status` for false positives.
 - **NOTE (2026-06-26):** the A1 + A2 work above is **complete and all four gates pass**
   (392 tests, ruff, mypy) but is currently **uncommitted** in the working tree — commit it before
   starting A3.

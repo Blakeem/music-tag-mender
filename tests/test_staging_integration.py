@@ -96,7 +96,7 @@ def test_commit_applies_and_records(
 ) -> None:
     track = make_track(
         music_dir / f"track{suffix}",
-        {"genre": ["Electronic"], "title": ["Song"]},
+        {"genre": ["Electronic"], "grouping": ["Song"]},
     )
 
     scan_library(engine_settings)
@@ -112,10 +112,10 @@ def test_commit_applies_and_records(
     assert result.noop == 0
     assert result.missing == 0
 
-    # The edit really changed the bytes on disk; the unmanaged tag is untouched.
+    # The edit really changed the bytes on disk; the unmanaged `grouping` tag is untouched.
     on_disk = read_tags(track).tags
     assert on_disk["genre"] == ["Synthwave"]
-    assert on_disk.get("title") == ["Song"]
+    assert on_disk.get("grouping") == ["Song"]
 
     revisions = _revisions(engine_settings, file_id)
     assert [r.version for r in revisions] == [0, 1]
@@ -329,7 +329,7 @@ def test_stage_tags_rejects_unmanaged_key(engine_settings: Settings, music_dir: 
     file_id = _file_id(engine_settings, music_dir, track.name)
 
     with pytest.raises(ValueError, match="non-managed"):
-        staging.stage_tags(engine_settings, file_id=file_id, managed_tags={"title": ["Nope"]})
+        staging.stage_tags(engine_settings, file_id=file_id, managed_tags={"composer": ["Nope"]})
 
 
 def test_stage_tags_rejects_unknown_file_id(engine_settings: Settings) -> None:
@@ -347,3 +347,109 @@ def test_stage_tags_rejects_bad_origin(engine_settings: Settings, music_dir: Pat
         staging.stage_tags(
             engine_settings, file_id=file_id, managed_tags={"genre": ["X"]}, origin="bogus"
         )
+
+
+# The full wrong-release "stamp" the mismatch-fix flow repairs, rich in the widened fields.
+# Valid year values so EasyID3 keeps them (it silently drops an unparseable date/TDRC).
+_RICH_STAMP: dict[str, list[str]] = {
+    "genre": ["Rock"],
+    "title": ["Right Title"],
+    "album": ["Right Album"],
+    "date": ["2001"],
+    "tracknumber": ["3/12"],
+    "discnumber": ["1/2"],
+    "artistsort": ["Osbourne, Ozzy"],
+    "albumartistsort": ["Osbourne, Ozzy"],
+    "musicbrainz_albumartistid": ["mb-aa"],
+    "musicbrainz_albumid": ["mb-al"],
+    "musicbrainz_releasegroupid": ["mb-rg"],
+    "musicbrainz_releasetrackid": ["mb-rt"],
+    "musicbrainz_trackid": ["mb-tr"],
+}
+
+
+@pytest.mark.parametrize("suffix", _FORMATS)
+def test_widened_fields_ride_through_commit_and_revert(
+    engine_settings: Settings,
+    music_dir: Path,
+    suffix: str,
+) -> None:
+    # A genre-only auto stage, built the way the resolve flows build it (the full managed
+    # subset of current tags | the changed field — genres.py:384 / albums.py:377), must
+    # carry every OTHER widened field through the commit un-deleted, record a diff touching
+    # ONLY $.genre (no spurious axis flips), and stay revertible via the v0 baseline the
+    # stage auto-captured for the new fields.
+    track = make_track(music_dir / f"track{suffix}", dict(_RICH_STAMP))
+    scan_library(engine_settings)
+    file_id = _file_id(engine_settings, music_dir, track.name)
+
+    current = versioning.managed_subset(read_tags(track).tags)
+    target = {**current, "genre": ["Synthwave"]}
+    staging.stage_tags(engine_settings, file_id=file_id, managed_tags=target, origin="auto")
+    result = staging.commit_tags(engine_settings, origin="auto")
+    assert result.committed == 1
+
+    # Every widened field survived the commit un-deleted; only genre changed on disk.
+    on_disk = read_tags(track).tags
+    for field, value in _RICH_STAMP.items():
+        expected = ["Synthwave"] if field == "genre" else value
+        assert on_disk.get(field) == expected, field
+
+    # The auto revision's diff is genre-only (unchanged fields ride along with zero diff).
+    committed = _revision(engine_settings, file_id, 1)
+    assert committed is not None
+    assert committed.diff == {"genre": {"from": ["Rock"], "to": ["Synthwave"]}}
+
+    # Revert to the v0 baseline restores genre; the widened fields (in the baseline) survive.
+    versioning.revert(engine_settings, file_id, 0)
+    reverted = read_tags(track).tags
+    for field, value in _RICH_STAMP.items():
+        assert reverted.get(field) == value, field
+
+
+@pytest.mark.parametrize("suffix", _FORMATS)
+def test_partial_stage_preserves_other_managed_fields(
+    engine_settings: Settings,
+    music_dir: Path,
+    suffix: str,
+) -> None:
+    # Staging ONLY genre through the RAW stage path (no resolve-flow subset build — the
+    # externally-reachable stage_tags/commit_tags surface) must merge onto the file's
+    # current managed tags, so commit does NOT delete the rest of the widened identity
+    # stamp (title/album/date/track/disc/sort/MB ids). Regression for the delete-on-absent
+    # footgun the widened MANAGED_TAGS would otherwise expose.
+    track = make_track(music_dir / f"track{suffix}", dict(_RICH_STAMP))
+    scan_library(engine_settings)
+    file_id = _file_id(engine_settings, music_dir, track.name)
+
+    staging.stage_tags(engine_settings, file_id=file_id, managed_tags={"genre": ["Synthwave"]})
+
+    # The merged target carries the whole subset; the diff still touches only genre.
+    view = next(v for v in staging.diff_tags(engine_settings) if v.file_id == file_id)
+    assert view.diff == {"genre": {"from": ["Rock"], "to": ["Synthwave"]}}
+
+    result = staging.commit_tags(engine_settings)
+    assert result.committed == 1
+
+    on_disk = read_tags(track).tags
+    for field, value in _RICH_STAMP.items():
+        expected = ["Synthwave"] if field == "genre" else value
+        assert on_disk.get(field) == expected, field
+
+
+def test_explicit_empty_list_still_deletes_a_managed_field(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    # The merge preserves OMITTED keys, but an explicit empty list is still an intentional
+    # delete (so revert-to-a-baseline-that-lacked-a-tag keeps working).
+    track = make_track(music_dir / "t.flac", {"genre": ["Rock"], "album": ["An Album"]})
+    scan_library(engine_settings)
+    file_id = _file_id(engine_settings, music_dir, track.name)
+
+    staging.stage_tags(engine_settings, file_id=file_id, managed_tags={"album": []})
+    staging.commit_tags(engine_settings)
+
+    on_disk = read_tags(track).tags
+    assert on_disk.get("album") is None  # explicitly cleared
+    assert on_disk.get("genre") == ["Rock"]  # untouched managed field preserved

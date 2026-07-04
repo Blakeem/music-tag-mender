@@ -190,6 +190,14 @@ def stage_tags(
     so a later crash-then-rescan can never record the wrong original. Nothing on disk
     changes and no further history is recorded until :func:`commit_tags`. Owns its
     transaction.
+
+    **No accidental deletion (P0).** *managed_tags* is merged *onto* the file's current
+    managed subset, so an omitted managed key means "leave it alone", not "delete it":
+    staging ``{"genre": [...]}`` on a file rich in title/album/track/MB-id fields cannot
+    wipe them at commit time (``commit_tags`` writes the staged target verbatim, and
+    :func:`tagmend.engine.tags.write_managed_tags` deletes every managed key *absent* from
+    that target). An explicit empty list still deletes a field, and the resolve flows —
+    which already stage ``managed_subset(current) | {field}`` — are unaffected.
     """
     # Input / validation (cheap checks first, before opening the ledger).
     if origin not in _STAGED_ORIGINS:
@@ -212,19 +220,27 @@ def stage_tags(
             message = f"cannot stage a missing file (file_id={file_id})"
             raise ValueError(message)
 
+        current = store.get_tags(connection, file_id)
+
         # Capture v0 now (resume-free model): freeze the true original before any commit.
         if store.max_version(connection, file_id) is None:
             versioning.ensure_baseline(
                 connection,
                 file_id,
-                managed_tags=store.get_tags(connection, file_id),
+                managed_tags=current,
                 now=_utc_now(),
             )
+
+        # No accidental deletion (P0): merge onto the current managed subset so omitted
+        # managed keys are preserved through the commit's delete-on-absent write. The
+        # caller's values win; an explicit empty list still deletes a field.
+        target = versioning.managed_subset(current)
+        target.update(managed_tags)
 
         store.upsert_staged_tag(
             connection,
             file_id=file_id,
-            managed_tags=managed_tags,
+            managed_tags=target,
             origin=origin,
             now=_utc_now(),
             note=note,

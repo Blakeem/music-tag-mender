@@ -33,21 +33,76 @@ logger = get_logger(__name__)
 # year). Registration is idempotent; importing this module is the single place it happens.
 EasyMP4Tags.RegisterFreeformKey("originaldate", "ORIGINALDATE")  # type: ignore[no-untyped-call]
 
+# The two MusicBrainz ids in :data:`MANAGED_TAGS` that EasyMP4 has no built-in mapping for
+# (the other four — album/albumartist/artist/track ids + album type — are native). Register
+# them here on the SAME iTunes freeform atom names Picard writes (verified against a real
+# Picard-tagged ``.m4a``: ``----:com.apple.iTunes:MusicBrainz Release Group Id`` /
+# ``MusicBrainz Release Track Id``), so read and write agree. EasyID3/Vorbis carry both
+# natively.
+EasyMP4Tags.RegisterFreeformKey(  # type: ignore[no-untyped-call]
+    "musicbrainz_releasegroupid",
+    "MusicBrainz Release Group Id",
+)
+EasyMP4Tags.RegisterFreeformKey(  # type: ignore[no-untyped-call]
+    "musicbrainz_releasetrackid",
+    "MusicBrainz Release Track Id",
+)
+
 # Raw (already-lowercased) key -> canonical key. Kept deliberately small.
 _ALIASES: Final[dict[str, str]] = {
     "album artist": "albumartist",
     "band": "albumartist",
 }
 
-# The deliberately narrow set of tags TagMend is allowed to write/revert. Keeping it
-# small means snapshots stay tiny and a write/revert can never damage unrelated
-# metadata (title, track, art). ``artist`` is included so revert can restore it; the
-# classify/write layer (M2/M4) decides whether to *modify* it (PLAN.md §11 "cautious").
-# ``originaldate`` (the album axis, M-album) is the original/first-release year, written
-# blank-fill only and kept distinct from ``date`` (the reissue year, never managed here).
-MANAGED_TAGS: Final[frozenset[str]] = frozenset(
-    {"genre", "albumartist", "artist", "musicbrainz_artistid", "originaldate"},
+# The five tags TagMend managed BEFORE the mismatch-fix widening. Every revision in history
+# — down to the oldest version-0 baselines captured under the original schema — governed
+# exactly these, so a snapshot that lacks one is a genuine "this tag was empty then" and
+# delete-on-revert is unconditionally safe for it. Kept as its own set so the revert path
+# (:func:`tagmend.engine.versioning._revert_target_tags`) can tell them apart from the
+# widened fields, whose absence from a PRE-widening snapshot means "not tracked yet", not
+# "delete".
+ORIGINAL_MANAGED_TAGS: Final[frozenset[str]] = frozenset(
+    {
+        "genre",
+        "albumartist",
+        "artist",
+        "musicbrainz_artistid",
+        "originaldate",
+    },
 )
+
+# The 13 identity/MusicBrainz fields the mismatch-fix flow adds: the full wrong-release
+# "stamp" a tagger (Picard) leaves when it matches a track against the wrong MusicBrainz
+# release — identity (``title``/``album``/``date``/``tracknumber``/``discnumber``/the two
+# sort names) plus the album type and the five remaining MB ids. EasyID3/Vorbis carry them
+# natively; EasyMP4 needs the two freeform registrations above.
+_WIDENED_MANAGED_TAGS: Final[frozenset[str]] = frozenset(
+    {
+        "title",
+        "album",
+        "date",
+        "tracknumber",
+        "discnumber",
+        "artistsort",
+        "albumartistsort",
+        "musicbrainz_albumtype",
+        "musicbrainz_albumartistid",
+        "musicbrainz_albumid",
+        "musicbrainz_releasegroupid",
+        "musicbrainz_releasetrackid",
+        "musicbrainz_trackid",
+    },
+)
+
+# The set of tags TagMend is allowed to write/revert (18 = the 5 original + 13 widened). A
+# CLOSED set: anything outside it (``comment``/``composer``/art…) is never read, written, or
+# deleted, and every key here MUST be provably writable on all four formats. The mismatch-fix
+# flow can repair a poisoned release in one commit and revert can restore every field it
+# governed — but reverting to a snapshot captured BEFORE the widening preserves the widened
+# fields instead of deleting them (see :func:`tagmend.engine.versioning._revert_target_tags`).
+# ``date`` (reissue year, MP4 ``©day``) and ``originaldate`` (original year, MP4 freeform) are
+# BOTH managed and kept distinct.
+MANAGED_TAGS: Final[frozenset[str]] = ORIGINAL_MANAGED_TAGS | _WIDENED_MANAGED_TAGS
 
 
 @dataclass(frozen=True, slots=True)

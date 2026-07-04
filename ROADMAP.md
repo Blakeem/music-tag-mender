@@ -28,6 +28,9 @@ There are **three** distinct levels. Conflating them is the main naming hazard:
 **Consequence:** adding album/song is **not** a rename and **not** a new domain — it is two more
 *axes* on the existing `tags` domain. The schema change is purely additive (a new
 `file_<axis>_status` table + a couple of new `MANAGED_TAGS` keys), exactly like artist (v7) was.
+(Note: `MANAGED_TAGS` membership is just write/revert **coverage** and is independent of having a
+workflow axis — the mismatch-fix foundation (schema v9) widened it to the full 18-field identity
+"stamp", including `title`/`tracknumber`, without adding a song axis.)
 
 > The old "review-one-at-a-time" tools (`approve_mapping`, `commit_artist`,
 > `list_pending_review`, `get_artist_candidate`, `review_stats`) are **not being built** — they
@@ -52,10 +55,11 @@ There are **three** distinct levels. Conflating them is the main naming hazard:
   (`engine/albums.py`): blank-fill `originaldate` from MB `first-release-date` **only where
   blank**, never overwriting, never touching `date`. Sticky `manual` + engine-owned `no_match`,
   `list_albums`, `list_files(album_status=…)`, `library_stats` `album` block, set/reset tools.
-  **Scope note:** v1 writes **only `originaldate`** — `originalyear` and the MusicBrainz IDs
-  (`musicbrainz_albumid`/`releasegroupid`) are deliberately **not** added to `MANAGED_TAGS` (the
-  release-group MBID is cached but never written to files).
-- **Schema v8. 25 MCP tools.** Three shipped axes (genre + artist + album) have working auto +
+  **Scope note:** the album axis *resolve* step still writes **only `originaldate`** (blank-fill).
+  It does not itself write the MusicBrainz IDs. (`MANAGED_TAGS` was later widened by the
+  mismatch-fix foundation — see below — so `musicbrainz_albumid`/`releasegroupid` are now
+  write/revert-covered, but the album resolve flow does not touch them.)
+- **Schema v9. 25 MCP tools.** Three shipped axes (genre + artist + album) have working auto +
   manual exclusion pipelines with full revert. The review loop is: `resolve_*(dry_run)` → exclude
   what you don't want → `resolve_*` (real) → review the staged diff → `commit_tags`.
 - **NOTE (2026-06-26):** the A1 + A2 work above is **complete and all four gates pass**
@@ -72,8 +76,11 @@ There are **three** distinct levels. Conflating them is the main naming hazard:
 > **Carried-forward follow-ups from A2 (separate, lower-priority features):** album-**name**
 > blank-fill (sibling inference → folder parse → MB-by-track) and the shared **folder-parsing
 > primitive** (reusable for artist + unknown-artist discovery). See `docs/grounding-methods.md`
-> for the tiered grounding design. Also: A2 v1 writes only `originaldate` — if the MusicBrainz
-> IDs or `originalyear` are wanted on-file later, revisit `MANAGED_TAGS`.
+> for the tiered grounding design. Also: A2's album *resolve* step writes only `originaldate`;
+> `MANAGED_TAGS` itself was widened by the mismatch-fix foundation (schema v9) to the full
+> 18-field wrong-release identity "stamp" — the six MusicBrainz IDs + title/album/date/track/
+> disc + sort names — for write/revert **coverage** (no new workflow axis). `originalyear`
+> stays out.
 
 ### A3. Song axis (title + track number) — DROPPED FROM PHASE A; deferred past the CLI (2026-06-26)
 The metadata axes the library actually needs — **genre, artist, album** — are all shipped. A live

@@ -12,11 +12,11 @@ def _table_names(conn: sqlite3.Connection) -> set[str]:
     return {str(row[0]) for row in cursor.fetchall()}
 
 
-def test_apply_schema_stamps_version_8(db_conn: sqlite3.Connection) -> None:
-    # db_conn already applied the schema; confirm the stamped user_version is v8.
+def test_apply_schema_stamps_version_9(db_conn: sqlite3.Connection) -> None:
+    # db_conn already applied the schema; confirm the stamped user_version is v9.
     version = db_conn.execute("PRAGMA user_version").fetchone()[0]
-    assert version == 8
-    assert SCHEMA_VERSION == 8
+    assert version == 9
+    assert SCHEMA_VERSION == 9
 
 
 def test_apply_schema_creates_genre_tables(db_conn: sqlite3.Connection) -> None:
@@ -35,12 +35,16 @@ def test_apply_schema_creates_album_tables(db_conn: sqlite3.Connection) -> None:
     assert "musicbrainz_cache" in tables
 
 
+def test_apply_schema_creates_voided_auto_table(db_conn: sqlite3.Connection) -> None:
+    assert "voided_auto" in _table_names(db_conn)
+
+
 def test_apply_schema_is_idempotent() -> None:
     conn = sqlite3.connect(":memory:")
     try:
         apply_schema(conn)
         apply_schema(conn)  # second application must not raise
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 8
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 9
     finally:
         conn.close()
 

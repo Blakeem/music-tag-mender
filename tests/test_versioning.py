@@ -56,13 +56,13 @@ def test_ensure_baseline_slices_to_managed_tags(db_conn: sqlite3.Connection) -> 
     versioning.ensure_baseline(
         db_conn,
         file_id,
-        managed_tags={"genre": ["Electronic"], "title": ["Song"], "tracknumber": ["1"]},
+        managed_tags={"genre": ["Electronic"], "composer": ["Bach"]},
         now=_NOW,
     )
 
     rev = store.get_revision(db_conn, file_id, 0)
     assert rev is not None
-    # Unmanaged keys (title, tracknumber) are dropped from the snapshot.
+    # Unmanaged keys (composer) are dropped from the snapshot.
     assert rev.managed_tags == {"genre": ["Electronic"]}
 
 
@@ -112,7 +112,7 @@ def test_append_revision_no_managed_change_returns_none(db_conn: sqlite3.Connect
     result = versioning.append_revision(
         db_conn,
         file_id,
-        managed_tags={"genre": ["Electronic"], "title": ["New Title"]},
+        managed_tags={"genre": ["Electronic"], "composer": ["New Composer"]},
         origin="manual",
         now=_LATER,
     )

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, SupportsInt, cast
 
@@ -730,9 +731,28 @@ def has_auto_change_for(
     ``json_extract`` whether the stored ``diff`` blob carries a ``{from, to}`` entry for
     any of *fields*. A genre-only auto commit therefore does not read as artist-done, and
     vice versa. *fields* must be non-empty.
+
+    Each field's predicate is guarded by THAT field's own ``voided_auto`` watermark
+    (correlated per field, since the artist axis passes two fields): an auto revision counts
+    only when its ``version`` is above the field's ``voided_through_version`` (``-1`` when
+    unvoided). So after :func:`void_auto_changes` a stale auto value re-pends, while a fresh
+    auto revision (a higher version) counts as done again.
     """
-    conditions = " OR ".join("json_extract(diff, ?) IS NOT NULL" for _ in fields)
-    paths = [f"$.{field_name}" for field_name in fields]
+    conditions = " OR ".join(
+        """(
+            json_extract(diff, ?) IS NOT NULL
+            AND version > COALESCE(
+              (SELECT voided_through_version FROM voided_auto
+               WHERE voided_auto.file_id = tag_revisions.file_id AND voided_auto.field = ?),
+              -1
+            )
+        )"""
+        for _ in fields
+    )
+    params: list[object] = []
+    for field_name in fields:
+        params.append(f"$.{field_name}")
+        params.append(field_name)
     row = conn.execute(
         f"""
         SELECT EXISTS(
@@ -740,9 +760,37 @@ def has_auto_change_for(
           WHERE file_id = ? AND origin = 'auto' AND ({conditions})
         )
         """,  # noqa: S608 - conditions is a fixed OR of literal predicates; values bound
-        (file_id, *paths),
+        (file_id, *params),
     ).fetchone()
     return bool(row[0])
+
+
+def void_auto_changes(
+    conn: sqlite3.Connection,
+    file_id: int,
+    fields: tuple[str, ...],
+) -> None:
+    """Void *file_id*'s auto-resolved *fields* at its current ``MAX(version)`` watermark.
+
+    The NN7 re-pend primitive: after a manual identity fix, stamp each of *fields* in
+    ``voided_auto`` with the file's current highest revision, so
+    :func:`has_auto_change_for` stops counting the now-stale auto revisions and the field
+    re-pends — WITHOUT mutating the append-only ``tag_revisions`` history. ``INSERT OR
+    REPLACE`` means a re-void moves the watermark forward. A no-op when the file has no
+    revisions yet (nothing to void). Does not commit.
+    """
+    current = max_version(conn, file_id)
+    if current is None:
+        return
+    now = datetime.now(UTC).isoformat()
+    conn.executemany(
+        """
+        INSERT OR REPLACE INTO voided_auto
+          (file_id, field, voided_through_version, voided_at)
+        VALUES (?, ?, ?, ?)
+        """,
+        [(file_id, field_name, current, now) for field_name in fields],
+    )
 
 
 def has_staged_change_for(

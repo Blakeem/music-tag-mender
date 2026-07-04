@@ -182,10 +182,44 @@ def test_stage_diff_commit_roundtrip(music_dir: Path) -> None:
     assert "resumed" not in committed
 
 
+def test_partial_stage_via_mcp_preserves_identity_stamp(music_dir: Path) -> None:
+    # The externally-reachable stage_tags/commit_tags tools must merge a single-field
+    # stage onto the file's current managed tags, so committing {"genre": [...]} never
+    # wipes the widened identity stamp (title/album/track/MB id).
+    track = make_track(
+        music_dir / "stamp.mp3",
+        {
+            "genre": ["Rock"],
+            "title": ["Right Title"],
+            "album": ["Right Album"],
+            "tracknumber": ["3/12"],
+            "musicbrainz_trackid": ["mb-tr"],
+        },
+    )
+    mcp_server.scan_library(path=str(music_dir))
+    conn = connect(load_settings().db_path)
+    try:
+        row = store.get_file(conn, str(music_dir), track.name)
+        assert row is not None
+        file_id = row.id
+    finally:
+        conn.close()
+
+    assert mcp_server.stage_tags(file_id, {"genre": ["Synthwave"]}) == {"ok": True}
+    assert mcp_server.commit_tags()["committed"] == 1
+
+    on_disk = read_tags(track).tags
+    assert on_disk["genre"] == ["Synthwave"]
+    assert on_disk.get("title") == ["Right Title"]
+    assert on_disk.get("album") == ["Right Album"]
+    assert on_disk.get("tracknumber") == ["3/12"]
+    assert on_disk.get("musicbrainz_trackid") == ["mb-tr"]
+
+
 def test_stage_tags_unmanaged_key_returns_error(music_dir: Path) -> None:
     file_id = _scanned_track_id(music_dir)
 
-    payload = mcp_server.stage_tags(file_id, {"title": ["Nope"]})
+    payload = mcp_server.stage_tags(file_id, {"composer": ["Nope"]})
 
     assert payload["ok"] is False
     assert "error" in payload

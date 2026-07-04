@@ -36,7 +36,12 @@ from typing import TYPE_CHECKING
 import mutagen
 
 from tagmend.engine import commits, db, schema, store
-from tagmend.engine.tags import MANAGED_TAGS, read_tags, write_managed_tags
+from tagmend.engine.tags import (
+    MANAGED_TAGS,
+    ORIGINAL_MANAGED_TAGS,
+    read_tags,
+    write_managed_tags,
+)
 from tagmend.log import get_logger
 
 if TYPE_CHECKING:
@@ -154,6 +159,37 @@ def append_revision(  # noqa: PLR0913 - cohesive revision-append inputs
     return version
 
 
+def _revert_target_tags(
+    path: Path,
+    snapshot: dict[str, list[str]],
+) -> dict[str, list[str]]:
+    """Return the managed-tag dict to write when reverting *path* to *snapshot*.
+
+    Guards the widened-:data:`~tagmend.engine.tags.MANAGED_TAGS` migration hazard.
+    :func:`~tagmend.engine.tags.write_managed_tags` deletes every managed key ABSENT from
+    the dict it is given, so writing a historical snapshot verbatim is only safe for the
+    keys that snapshot actually governed. Snapshots captured before the managed set grew
+    (every pre-widening baseline/commit) structurally lack the newer identity/MusicBrainz
+    fields, and their absence there means "not tracked when captured", not "delete" —
+    writing verbatim would silently strip title/album/track/disc/sort/MB-id tags the revert
+    was never asked to touch.
+
+    So the widened fields are taken from the file's CURRENT on-disk values wherever
+    *snapshot* omits them (preserve, never delete). The
+    :data:`~tagmend.engine.tags.ORIGINAL_MANAGED_TAGS` keep strict delete-on-revert: they
+    have been managed since version 0 of every file's history, so their absence is a genuine
+    "was empty then" and reverting must restore that emptiness (undo a later-added
+    genre/artist/…). This mirrors the merge-onto-current guard the staging path already
+    applies in :func:`tagmend.engine.staging.stage_tags`.
+    """
+    target = managed_subset(read_tags(path).tags)
+    target.update(snapshot)
+    for field in ORIGINAL_MANAGED_TAGS:
+        if field not in snapshot:
+            target.pop(field, None)
+    return target
+
+
 def _revert_file(
     conn: sqlite3.Connection,
     file_id: int,
@@ -188,9 +224,11 @@ def _revert_file(
         message = f"cannot revert a missing file (file_id={file_id})"
         raise ValueError(message)
 
-    # Disk write first, before any DB append: a write failure aborts with no row.
+    # Disk write first, before any DB append: a write failure aborts with no row. The
+    # snapshot is merged onto the file's current widened fields so reverting to a
+    # pre-widening revision cannot delete tags it never governed (see _revert_target_tags).
     path = Path(file_row.folder) / file_row.filename
-    write_managed_tags(path, target.managed_tags)
+    write_managed_tags(path, _revert_target_tags(path, target.managed_tags))
 
     # Refresh the live snapshot so file_tags reflects the actual on-disk state.
     now = _utc_now()

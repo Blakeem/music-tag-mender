@@ -51,6 +51,16 @@ ledger upgrades in place with no data loss):
 * ``musicbrainz_cache`` — a persistent cache of MusicBrainz release-group lookups keyed by a
   request hash. ``found`` is the negative-cache sentinel (0 = no usable Album release group),
   mirroring ``lastfm_cache``.
+
+The mismatch-fix re-pend path adds one more side table (schema v9, purely additive — a v8
+ledger upgrades in place with no data loss):
+
+* ``voided_auto`` — a per-``(file_id, field)`` watermark that "voids" stale auto-resolved
+  values without mutating the append-only history: after a manual identity fix,
+  :func:`tagmend.engine.store.void_auto_changes` stamps the field's current
+  ``MAX(version)`` here, and :func:`~tagmend.engine.store.has_auto_change_for` ignores auto
+  revisions at or below the watermark, so the genre/originaldate re-pend. A LATER auto
+  revision (``version`` above the watermark) counts again, so re-processing is safe.
 """
 
 from __future__ import annotations
@@ -64,7 +74,7 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
-SCHEMA_VERSION: Final = 8
+SCHEMA_VERSION: Final = 9
 
 _FILES_DDL: Final = """
 CREATE TABLE IF NOT EXISTS files (
@@ -261,6 +271,22 @@ CREATE TABLE IF NOT EXISTS musicbrainz_cache (
 )
 """
 
+# Per-``(file_id, field)`` watermark that voids stale auto-resolved values WITHOUT touching
+# the append-only ``tag_revisions`` history. ``voided_through_version`` records the field's
+# ``MAX(version)`` at the moment of a manual identity fix; ``has_auto_change_for`` then
+# ignores auto revisions whose ``version`` is at or below it, so the field re-pends. A later
+# auto revision (``version`` above the watermark) counts again — re-processing is safe. See
+# PLAN — mismatch-fix (NN7 re-pend primitive).
+_VOIDED_AUTO_DDL: Final = """
+CREATE TABLE IF NOT EXISTS voided_auto (
+  file_id               INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+  field                 TEXT NOT NULL,
+  voided_through_version INTEGER NOT NULL,
+  voided_at             TEXT NOT NULL,
+  PRIMARY KEY (file_id, field)
+)
+"""
+
 
 def apply_schema(connection: sqlite3.Connection) -> None:
     """Create all tables (idempotently) and stamp ``PRAGMA user_version``.
@@ -297,4 +323,5 @@ def apply_schema(connection: sqlite3.Connection) -> None:
     connection.execute(_FILE_ARTIST_STATUS_DDL)
     connection.execute(_FILE_ALBUM_STATUS_DDL)
     connection.execute(_MUSICBRAINZ_CACHE_DDL)
+    connection.execute(_VOIDED_AUTO_DDL)
     connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")

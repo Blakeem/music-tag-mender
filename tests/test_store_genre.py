@@ -748,3 +748,115 @@ def test_mb_cache_found_round_trip(db_conn: sqlite3.Connection) -> None:
     assert row.original_date == "1970"
     assert row.release_mbid == "rel-1"
     assert row.release_group_id == "rg-1"
+
+
+# --- voided_auto watermark (the NN7 re-pend primitive) ------------------------------
+
+
+def _commit_auto_field_at(
+    conn: sqlite3.Connection,
+    file_id: int,
+    field_name: str,
+    version: int,
+) -> None:
+    """Append a committed ``auto`` revision at *version* whose diff changed only *field_name*."""
+    store.insert_revision(
+        conn,
+        file_id=file_id,
+        version=version,
+        origin="auto",
+        managed_tags={field_name: ["X"]},
+        diff={field_name: {"from": [], "to": ["X"]}},
+        now=_NOW,
+    )
+
+
+def test_void_auto_changes_repends_the_voided_field(db_conn: sqlite3.Connection) -> None:
+    file_id = _insert(db_conn)
+    _commit_auto_field(db_conn, file_id, "genre")  # version 0, auto
+    assert store.has_auto_change_for(db_conn, file_id, ("genre",)) is True
+
+    store.void_auto_changes(db_conn, file_id, ("genre",))
+    # The stale auto genre no longer reads as done — it re-pends.
+    assert store.has_auto_change_for(db_conn, file_id, ("genre",)) is False
+
+
+def test_void_auto_changes_is_re_pend_safe_for_a_later_auto_commit(
+    db_conn: sqlite3.Connection,
+) -> None:
+    file_id = _insert(db_conn)
+    _commit_auto_field_at(db_conn, file_id, "genre", 0)
+    store.void_auto_changes(db_conn, file_id, ("genre",))  # watermark = 0
+    assert store.has_auto_change_for(db_conn, file_id, ("genre",)) is False
+
+    # A fresh auto revision ABOVE the watermark counts as done again.
+    _commit_auto_field_at(db_conn, file_id, "genre", 1)
+    assert store.has_auto_change_for(db_conn, file_id, ("genre",)) is True
+
+
+def test_void_auto_changes_isolates_other_files(db_conn: sqlite3.Connection) -> None:
+    one = _insert(db_conn, filename="one.mp3")
+    two = _insert(db_conn, filename="two.mp3")
+    _commit_auto_field(db_conn, one, "genre")
+    _commit_auto_field(db_conn, two, "genre")
+
+    store.void_auto_changes(db_conn, one, ("genre",))
+    assert store.has_auto_change_for(db_conn, one, ("genre",)) is False
+    assert store.has_auto_change_for(db_conn, two, ("genre",)) is True  # untouched
+
+
+def test_void_auto_changes_is_per_field_correlated(db_conn: sqlite3.Connection) -> None:
+    # The artist axis passes two fields — voiding one must not void the other (a single
+    # shared watermark subquery would be wrong).
+    file_id = _insert(db_conn)
+    _commit_auto_field_at(db_conn, file_id, "artist", 0)
+    _commit_auto_field_at(db_conn, file_id, "albumartist", 1)
+    assert store.has_auto_change_for(db_conn, file_id, ("artist", "albumartist")) is True
+
+    store.void_auto_changes(db_conn, file_id, ("artist",))  # watermark(artist) = MAX = 1
+    # albumartist (unvoided) still counts, so the two-field axis stays done...
+    assert store.has_auto_change_for(db_conn, file_id, ("artist", "albumartist")) is True
+    # ...but artist on its own re-pends.
+    assert store.has_auto_change_for(db_conn, file_id, ("artist",)) is False
+
+
+def test_void_auto_changes_re_void_moves_watermark_forward(
+    db_conn: sqlite3.Connection,
+) -> None:
+    file_id = _insert(db_conn)
+    _commit_auto_field_at(db_conn, file_id, "genre", 0)
+    store.void_auto_changes(db_conn, file_id, ("genre",))  # watermark = 0
+
+    _commit_auto_field_at(db_conn, file_id, "genre", 1)
+    assert store.has_auto_change_for(db_conn, file_id, ("genre",)) is True  # 1 > 0
+
+    # INSERT OR REPLACE: re-voiding advances the watermark to the new MAX, re-pending again.
+    store.void_auto_changes(db_conn, file_id, ("genre",))  # watermark = 1
+    assert store.has_auto_change_for(db_conn, file_id, ("genre",)) is False
+
+
+def test_void_auto_changes_is_a_noop_without_revisions(db_conn: sqlite3.Connection) -> None:
+    file_id = _insert(db_conn)
+    store.void_auto_changes(db_conn, file_id, ("genre",))  # no versions yet -> no-op
+
+    # No watermark was written, so a later auto commit still reads as done.
+    _commit_auto_field(db_conn, file_id, "genre")
+    assert store.has_auto_change_for(db_conn, file_id, ("genre",)) is True
+
+
+def test_void_flips_derived_genre_and_album_status(db_conn: sqlite3.Connection) -> None:
+    file_id = _insert(db_conn)
+    _commit_auto_field_at(db_conn, file_id, "genre", 0)  # genre done
+    _commit_auto_field_at(db_conn, file_id, "originaldate", 1)  # album done
+    assert store.derived_genre_status(db_conn, file_id) == "done"
+    assert store.derived_album_status(db_conn, file_id) == "done"
+
+    store.void_auto_changes(db_conn, file_id, ("genre", "originaldate"))
+    assert store.derived_genre_status(db_conn, file_id) == "pending"
+    assert store.derived_album_status(db_conn, file_id) == "pending"
+
+    # A fresh auto commit past the watermark returns both axes to done.
+    _commit_auto_field_at(db_conn, file_id, "genre", 2)
+    _commit_auto_field_at(db_conn, file_id, "originaldate", 3)
+    assert store.derived_genre_status(db_conn, file_id) == "done"
+    assert store.derived_album_status(db_conn, file_id) == "done"

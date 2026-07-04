@@ -62,12 +62,13 @@ def test_originaldate_round_trips_and_leaves_date_untouched(
     tmp_path: Path,
     suffix: str,
 ) -> None:
-    # The reissue ``date`` is written first; the album axis must fill ``originaldate``
-    # without disturbing it (the M4A freeform-atom path is the critical guard).
+    # ``date`` (the reissue year) and ``originaldate`` (the original year) are BOTH managed
+    # and independent: a write carrying both preserves both, distinct storage each format
+    # (the M4A ``©day`` vs ORIGINALDATE freeform split is the critical guard).
     track = make_track(tmp_path / f"track{suffix}", {"date": ["2015"]})
     write_managed_tags(
         track,
-        {"originaldate": ["1970"], "genre": ["Heavy Metal"]},
+        {"originaldate": ["1970"], "genre": ["Heavy Metal"], "date": ["2015"]},
     )
 
     tags = read_tags(track).tags
@@ -77,12 +78,109 @@ def test_originaldate_round_trips_and_leaves_date_untouched(
 
 def test_originaldate_writes_to_freeform_atom_on_m4a(tmp_path: Path) -> None:
     track = make_track(tmp_path / "track.m4a", {"date": ["2015"]})
-    write_managed_tags(track, {"originaldate": ["1970"]})
+    write_managed_tags(track, {"originaldate": ["1970"], "date": ["2015"]})
 
     raw = MP4(track)  # type: ignore[no-untyped-call]
     # originaldate lands in the iTunes freeform atom, never in the ©day (date) atom.
     assert "----:com.apple.iTunes:ORIGINALDATE" in raw
     assert raw["©day"] == ["2015"]
+
+
+# The full wrong-release "stamp" the mismatch-fix flow repairs: the five original fields plus
+# the 13 widened ones (the six MB ids, identity title/album/date, track/disc numbers, and the
+# two sort names). ``date``/``originaldate`` need valid year values on MP3 (EasyID3 silently
+# drops an unparseable TDRC), so the round-trip uses realistic values per field.
+_EXPECTED_MANAGED = frozenset(
+    {
+        "genre",
+        "albumartist",
+        "artist",
+        "musicbrainz_artistid",
+        "originaldate",
+        "title",
+        "album",
+        "date",
+        "tracknumber",
+        "discnumber",
+        "artistsort",
+        "albumartistsort",
+        "musicbrainz_albumtype",
+        "musicbrainz_albumartistid",
+        "musicbrainz_albumid",
+        "musicbrainz_releasegroupid",
+        "musicbrainz_releasetrackid",
+        "musicbrainz_trackid",
+    },
+)
+_NEW_FIELD_VALUES: dict[str, list[str]] = {
+    "title": ["A Song"],
+    "album": ["An Album"],
+    "date": ["2015"],
+    "tracknumber": ["3/12"],
+    "discnumber": ["1/2"],
+    "artistsort": ["Osbourne, Ozzy"],
+    "albumartistsort": ["Osbourne, Ozzy"],
+    "musicbrainz_albumtype": ["album"],
+    "musicbrainz_albumartistid": ["mb-aa-id"],
+    "musicbrainz_albumid": ["mb-al-id"],
+    "musicbrainz_releasegroupid": ["mb-rg-id"],
+    "musicbrainz_releasetrackid": ["mb-rt-id"],
+    "musicbrainz_trackid": ["mb-tr-id"],
+}
+
+
+def test_managed_tags_is_exactly_the_widened_set() -> None:
+    assert MANAGED_TAGS == _EXPECTED_MANAGED
+    # Each newly-managed field is a member (the fix flow + revert can touch all of them).
+    for field in _NEW_FIELD_VALUES:
+        assert field in MANAGED_TAGS
+
+
+@pytest.mark.parametrize("suffix", _ALL_FORMATS)
+def test_new_managed_fields_round_trip(tmp_path: Path, suffix: str) -> None:
+    # Every widened field must be provably writable + readable on all four formats — the
+    # EasyID3/EasyMP4 write path raises on an unregistered key, so this is not assumable.
+    track = make_track(tmp_path / f"track{suffix}")
+    write_managed_tags(track, dict(_NEW_FIELD_VALUES))
+
+    tags = read_tags(track).tags
+    for field, expected in _NEW_FIELD_VALUES.items():
+        # The "n/total" slash form for tracknumber/discnumber round-trips literally on all
+        # four containers (Vorbis stores the string; EasyID3/EasyMP4 reconstruct it).
+        assert tags.get(field) == expected, field
+
+
+def test_release_ids_use_picard_freeform_atoms_on_m4a(tmp_path: Path) -> None:
+    # The two MB ids EasyMP4 has no native mapping for must land on the exact iTunes
+    # freeform atom names Picard writes, so a Picard-tagged file round-trips through us.
+    track = make_track(tmp_path / "ids.m4a")
+    write_managed_tags(
+        track,
+        {"musicbrainz_releasegroupid": ["rg-1"], "musicbrainz_releasetrackid": ["rt-1"]},
+    )
+
+    raw = MP4(track)  # type: ignore[no-untyped-call]
+    assert "----:com.apple.iTunes:MusicBrainz Release Group Id" in raw
+    assert "----:com.apple.iTunes:MusicBrainz Release Track Id" in raw
+
+
+def test_vorbis_separate_tracknumber_and_total_reads_number_only(tmp_path: Path) -> None:
+    # Accepted v1 behavior (documented): a Vorbis file tagged with separate TRACKNUMBER +
+    # TRACKTOTAL reads the managed `tracknumber` back as the bare number; the total lives in
+    # the unmanaged `tracktotal` (never managed — EasyID3 has no such key, writing it would
+    # crash MP3 commits), and a managed slash-form write leaves that total untouched.
+    track = make_track(tmp_path / "sep.flac")
+    audio = FLAC(track)
+    audio["tracknumber"] = ["3"]
+    audio["tracktotal"] = ["12"]
+    audio.save()
+
+    assert read_tags(track).tags["tracknumber"] == ["3"]
+
+    write_managed_tags(track, {"tracknumber": ["5/12"]})
+    tags = read_tags(track).tags
+    assert tags["tracknumber"] == ["5/12"]  # slash form stored literally
+    assert tags["tracktotal"] == ["12"]  # unmanaged total preserved
 
 
 def test_alias_band_maps_to_albumartist(tmp_path: Path) -> None:

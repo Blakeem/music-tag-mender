@@ -104,14 +104,21 @@ def stage_tags(
 ) -> dict[str, object]:
     """Stage a managed-tag change for one file (the git "index"). Writes nothing to disk.
 
-    Records *tags* as the desired target for *file_id*, replacing any pending change for
-    that file. Only managed tags are allowed (``genre``, ``artist``, ``albumartist``,
-    ``musicbrainz_artistid``). The music file is not touched and no history is recorded
-    until you call ``commit_tags``.
+    Records *tags* for *file_id*, replacing any pending change for that file. Only managed
+    tags are allowed — the closed ``tags.MANAGED_TAGS`` set (the genre/artist names plus
+    the full title/album/date/track/disc + MusicBrainz-id identity "stamp"); any other key
+    is rejected. The music file is not touched and no history is recorded until you call
+    ``commit_tags``.
+
+    *tags* is merged **onto** the file's current managed tags: keys you omit are left
+    alone, so staging ``{"genre": ["Synthwave"]}`` changes only the genre and preserves
+    title/album/track/MusicBrainz ids. To intentionally clear a managed field, pass it
+    explicitly with an empty list (e.g. ``{"genre": []}``).
 
     Args:
         file_id: Stable id of the file (from ``scan_library`` / the snapshot).
-        tags: Target managed tags as name -> ordered values, e.g. ``{"genre": ["Synthwave"]}``.
+        tags: Managed tags to set, as name -> ordered values, e.g. ``{"genre": ["Synthwave"]}``.
+            Omitted managed keys are preserved; ``{"key": []}`` deletes that key.
         note: Optional free-text note stored with the eventual revision.
 
     Returns:
@@ -205,9 +212,10 @@ def list_files(
     """List tracked files with their current managed tags (to discover file ids).
 
     Each entry carries the stable ``file_id`` you pass to ``stage_tags`` / ``history_tags``
-    / ``revert_tags``, plus the file's folder/filename, current managed tags
-    (``genre``, ``artist``, ``albumartist``, ``musicbrainz_artistid``), and its genre
-    workflow ``genre_status``. Run ``scan_library`` first to populate the snapshot.
+    / ``revert_tags``, plus the file's folder/filename, current managed tags (the closed
+    ``tags.MANAGED_TAGS`` set — genre/artist names + the title/album/date/track/disc +
+    MusicBrainz-id identity "stamp"), and its genre workflow ``genre_status``. Run
+    ``scan_library`` first to populate the snapshot.
 
     ``genre_status="no_match"`` is the **fix-by-hand worklist**: files Last.fm had nothing
     for. Each carries ``genre_source_artist``/``genre_source_album`` — the identity the

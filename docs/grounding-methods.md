@@ -225,6 +225,12 @@ good argument for building them as an axis-agnostic helper, not album-only code.
 2. **Managed-tag additions:** `album`, `originaldate`, `originalyear`, `musicbrainz_albumid`
    (+ `musicbrainz_releasegroupid`?). Confirm the set; verify mutagen-easy key support for
    `originalyear` across ID3/Vorbis/MP4.
+   - **Resolved (mismatch-fix foundation, schema v9):** `MANAGED_TAGS` was widened to the
+     full 18-field wrong-release "stamp" — `album`, `originaldate`, `musicbrainz_albumid`,
+     and `musicbrainz_releasegroupid` are all managed now (write/revert coverage; the two
+     MP4 freeform ids use the Picard atom names). `originalyear` stays **out** (no confirmed
+     need). This is coverage, not a new workflow axis — the album axis still blank-fills only
+     `originaldate`.
 3. **Album-name blank-fill ambition:** siblings + folder only (safe), or also MB-by-track-title
    (riskier)? The YouTube rips may simply stay blank.
 4. **Scope of the MB client now:** minimal (release-group search + lookup, 1 req/s, User-Agent,

@@ -24,6 +24,10 @@ Resolve name variants to a single canonical spelling via `artist.getCorrection`,
 
 Blank-fill each album's original release year (`originaldate`) from MusicBrainz without overwriting values you already have.
 
+### 🔍 Mislabeled-file detection
+
+Find files whose identity tags disagree with their folder path — the fingerprint of a tagger matching the wrong release (e.g. an Ozzy Osbourne album stamped as another artist's) — with `tagmend detect` or the `detect_mismatches` MCP tool. A read-only, confidence-tiered (high/medium/low) report; nothing is changed on disk.
+
 ### ↩️ Fully revertible history
 
 A git-like flow: stage → commit → revert. Files are only written on commit, each change is recorded in an append-only per-file log, and any single file or whole commit can be undone. Reverts are themselves tracked commits.
@@ -78,7 +82,7 @@ tagmend config-path     # show where settings.json lives
 tagmend doctor          # readiness check
 ```
 
-CLI commands: `doctor`, `scan`, `stats`, `config`, `config-set`, `config-path`, `mcp`, `version`.
+CLI commands: `doctor`, `scan`, `stats`, `detect`, `config`, `config-set`, `config-path`, `mcp`, `version`.
 
 ### Use as an MCP server
 

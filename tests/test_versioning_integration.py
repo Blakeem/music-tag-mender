@@ -114,7 +114,7 @@ def test_revert_restores_file_and_live_snapshot(
 ) -> None:
     track = make_track(
         music_dir / f"track{suffix}",
-        {"genre": ["Electronic"], "title": ["Song"]},
+        {"genre": ["Electronic"], "grouping": ["Song"]},
     )
     scan_library(engine_settings)
     file_id = _file_id(engine_settings, music_dir, track.name)
@@ -129,7 +129,8 @@ def test_revert_restores_file_and_live_snapshot(
 
     reverted = read_tags(track).tags
     assert reverted["genre"] == ["Electronic"]
-    assert reverted.get("title") == ["Song"]  # unmanaged tag left untouched
+    # `grouping` is unmanaged (writable on all four formats via easy mode) -> left untouched.
+    assert reverted.get("grouping") == ["Song"]
 
     assert _live_tags(engine_settings, file_id)["genre"] == ["Electronic"]
 
@@ -145,6 +146,52 @@ def test_revert_restores_file_and_live_snapshot(
     assert commit is not None
     assert commit.origin == "revert"
     assert commit.status == "applied"
+
+
+@pytest.mark.parametrize("suffix", _FORMATS)
+def test_revert_to_pre_widening_baseline_preserves_new_fields(
+    engine_settings: Settings,
+    music_dir: Path,
+    suffix: str,
+) -> None:
+    # A baseline captured BEFORE MANAGED_TAGS widened holds only the original 5-field subset
+    # (here genre+artist). The widened identity fields (title/album/track/MB id) live on disk
+    # but that snapshot never governed them, so reverting to it must NOT delete them (their
+    # absence is "not tracked then", not "delete") while the original fields still restore to
+    # the baseline values. Regression for the revert-path delete-on-absent data loss the
+    # widened MANAGED_TAGS would otherwise cause on any pre-migration revision.
+    track = make_track(
+        music_dir / f"track{suffix}",
+        {
+            "genre": ["Wrong Genre"],
+            "artist": ["Wrong Artist"],
+            "title": ["Keep Title"],
+            "album": ["Keep Album"],
+            "tracknumber": ["3/12"],
+            "musicbrainz_albumid": ["keep-mb-al"],
+        },
+    )
+    scan_library(engine_settings)
+    file_id = _file_id(engine_settings, music_dir, track.name)
+
+    # Simulate the pre-widening v0 baseline: only the original managed subset was captured.
+    _baseline(
+        engine_settings,
+        file_id,
+        {"genre": ["Original Genre"], "artist": ["Original Artist"]},
+    )
+
+    versioning.revert(engine_settings, file_id, 0)
+
+    reverted = read_tags(track).tags
+    # Original 5-field values restored from the baseline (delete-on-revert intact).
+    assert reverted["genre"] == ["Original Genre"]
+    assert reverted["artist"] == ["Original Artist"]
+    # Widened fields the baseline never governed survive untouched on disk.
+    assert reverted.get("title") == ["Keep Title"]
+    assert reverted.get("album") == ["Keep Album"]
+    assert reverted.get("tracknumber") == ["3/12"]
+    assert reverted.get("musicbrainz_albumid") == ["keep-mb-al"]
 
 
 def test_revert_a_revert_rolls_back_and_forward(
@@ -232,7 +279,7 @@ def test_revert_with_staged_change_raises(engine_settings: Settings, music_dir: 
 def test_write_managed_tags_preserves_unmanaged_and_deletes_omitted(tmp_path: Path) -> None:
     track = make_track(
         tmp_path / "t.flac",
-        {"genre": ["Electronic"], "artist": ["A"], "title": ["Song"]},
+        {"genre": ["Electronic"], "artist": ["A"], "composer": ["Song"]},
     )
 
     write_managed_tags(track, {"genre": ["Synthwave"]})
@@ -240,7 +287,7 @@ def test_write_managed_tags_preserves_unmanaged_and_deletes_omitted(tmp_path: Pa
     tags = read_tags(track).tags
     assert tags["genre"] == ["Synthwave"]
     assert "artist" not in tags  # managed but omitted -> deleted
-    assert tags.get("title") == ["Song"]  # unmanaged -> preserved
+    assert tags.get("composer") == ["Song"]  # unmanaged -> preserved
 
 
 def test_write_managed_tags_leaves_no_temp_file(tmp_path: Path) -> None:
@@ -256,4 +303,4 @@ def test_write_managed_tags_rejects_unmanaged_key(tmp_path: Path) -> None:
     track = make_track(tmp_path / "t.mp3", {"genre": ["Electronic"]})
 
     with pytest.raises(ValueError, match="non-managed"):
-        write_managed_tags(track, {"title": ["Nope"]})
+        write_managed_tags(track, {"composer": ["Nope"]})

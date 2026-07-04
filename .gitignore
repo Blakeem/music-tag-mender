@@ -9,6 +9,7 @@ music-raw-backup/
 
 # Scratch workspace for the claude code dynamic workflows — local only.
 aipg/
+.claude/commands
 
 # Local SQLite ledger if a dev ever points it at the repo root
 *.sqlite3

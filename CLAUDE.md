@@ -64,9 +64,14 @@ ships in v6; logic deferred).
   `tagmend/engine/*`, then gets a thin CLI subcommand and/or MCP tool.
 - **Settings live on disk, not in env.** The MCP server can't see the CLI's shell.
   Read config via `tagmend.config.load_settings()`; never read env/JSON directly.
-- **Tests never touch the real `music/` folder** (it's gitignored, copyrighted).
-  Use `tmp_path` / the `temp_library` fixture for snapshot tests, or `make_track`
-  (copies a silent `.mp3`/`.flac`/`.m4a`/`.ogg` template + writes tags) for real-audio
+- **`music/` is the live-testing sandbox — unit tests NEVER touch it.** It is a full
+  **copy** of Blake's real 135 GB / 11,196-file library (the original sits untouched
+  elsewhere and can be re-copied anytime). Live testing, scanning, resolve/fix runs, and
+  problem discovery deliberately run against this copy so everything is proven perfect
+  before the real library is overwritten with the result (ROADMAP B3). It's gitignored
+  and copyrighted. Unit tests use **generated files only**: `tmp_path` / the
+  `temp_library` fixture for snapshot tests, or `make_track` (copies a silent
+  `.mp3`/`.flac`/`.m4a`/`.ogg` template + writes tags) for real-audio
   read/write/commit/revert coverage across all four formats.
 
 ## Quality gates — all four must pass before anything is "done"
@@ -96,7 +101,8 @@ broaden the ignore list without reason. `cli.py` intentionally omits
 
 Settings file (this machine): `C:\Users\Blake\AppData\Local\tagmend\settings.json`.
 SQLite ledger: `C:\Users\Blake\AppData\Local\tagmend\tagmend.sqlite3`.
-(`music_path` is already set to `E:\music-tag-mender\music` for dev.)
+(`music_path` is set to `E:\music-tag-mender\music` — the full-library working copy; see
+the golden rule above.)
 
 ## MCP Inspector (from the command line)
 

@@ -100,6 +100,7 @@ class ResolveArtistsResult:
     skipped_sentinel: int
     skipped_manual: int
     no_correction: int
+    already_canonical: int
     errors: int
     pending_remaining: int
     more: bool
@@ -107,6 +108,7 @@ class ResolveArtistsResult:
     multi_artist_files: list[int]
     manual_files: list[int]
     no_correction_values: list[str]
+    already_canonical_values: list[str]
     error_values: list[dict[str, str]]
     summary: str
 
@@ -120,6 +122,7 @@ class ResolveArtistsResult:
             "skipped_sentinel": self.skipped_sentinel,
             "skipped_manual": self.skipped_manual,
             "no_correction": self.no_correction,
+            "already_canonical": self.already_canonical,
             "errors": self.errors,
             "pending_remaining": self.pending_remaining,
             "more": self.more,
@@ -127,6 +130,7 @@ class ResolveArtistsResult:
             "multi_artist_files": list(self.multi_artist_files),
             "manual_files": list(self.manual_files),
             "no_correction_values": list(self.no_correction_values),
+            "already_canonical_values": list(self.already_canonical_values),
             "error_values": [dict(e) for e in self.error_values],
             "summary": self.summary,
         }
@@ -143,6 +147,7 @@ class _Tally:
     multi_artist_files: list[int] = field(default_factory=list)
     manual_files: list[int] = field(default_factory=list)
     no_correction_values: list[str] = field(default_factory=list)
+    already_canonical_values: list[str] = field(default_factory=list)
     error_values: list[dict[str, str]] = field(default_factory=list)
     # value -> correction (only those whose canonical form actually differs).
     corrections: dict[str, ArtistCorrection] = field(default_factory=dict)
@@ -324,7 +329,8 @@ def _resolve_one_value(
 
     A transient :class:`LastfmError` leaves the value pending (not cached) and is reported,
     never aborting the run. A correction equal to the current value is already canonical →
-    no change.
+    no change, but recorded (``already_canonical``) so the outcome buckets sum to
+    ``processed``.
     """
     try:
         correction = client.artist_correction(value)
@@ -339,6 +345,8 @@ def _resolve_one_value(
 
     if correction.name != value:
         tally.corrections[value] = correction
+    else:
+        tally.already_canonical_values.append(value)
 
 
 # --- staging -------------------------------------------------------------------------
@@ -452,6 +460,7 @@ def _build_result(
         skipped_sentinel=tally.skipped_sentinel,
         skipped_manual=tally.skipped_manual,
         no_correction=len(tally.no_correction_values),
+        already_canonical=len(tally.already_canonical_values),
         errors=len(tally.error_values),
         pending_remaining=pending_remaining,
         more=more,
@@ -459,6 +468,7 @@ def _build_result(
         multi_artist_files=list(tally.multi_artist_files),
         manual_files=list(tally.manual_files),
         no_correction_values=list(tally.no_correction_values),
+        already_canonical_values=list(tally.already_canonical_values),
         error_values=list(tally.error_values),
         summary=summary,
     )
@@ -477,6 +487,7 @@ def _summarize(
         f"Skipped multi-artist {tally.skipped_multi_artist}, "
         f"sentinel/feat/empty {tally.skipped_sentinel}, "
         f"manual {tally.skipped_manual}; "
+        f"{len(tally.already_canonical_values)} already canonical, "
         f"no correction {len(tally.no_correction_values)}.",
     ]
     if pending_remaining > 0:

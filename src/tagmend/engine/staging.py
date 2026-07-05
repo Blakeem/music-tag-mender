@@ -153,6 +153,17 @@ class TagDomain:
         # Refresh the live snapshot, append the revision, delete the staged row.
         fresh = read_tags(path).tags
         store.replace_tags(conn, file_id, fresh, now)
+        # Re-sync the files-row signature to the just-written bytes (same fields the
+        # scanner stats), so the next incremental scan sees this file as unchanged
+        # rather than spuriously re-flagging every committed file as updated.
+        stat_result = path.stat()
+        store.update_signature(
+            conn,
+            file_id,
+            size_bytes=stat_result.st_size,
+            mtime_ns=stat_result.st_mtime_ns,
+            now=now,
+        )
         version = versioning.append_revision(
             conn,
             file_id,

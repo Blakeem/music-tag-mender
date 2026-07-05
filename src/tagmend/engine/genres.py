@@ -538,10 +538,12 @@ class ArtistRow:
         return {"artist": self.artist, "file_count": self.file_count}
 
 
-def list_artists(settings: Settings) -> list[ArtistRow]:
+def list_artists(settings: Settings, *, limit: int | None = None) -> list[ArtistRow]:
     """Return each distinct ``artist`` tag value with its file count (value order).
 
-    A discovery aid for scoping ``stage_genres`` by artist. Read-only.
+    A discovery aid for scoping ``stage_genres`` by artist. Read-only. *limit* (when given)
+    caps the number of rows returned, applied AFTER the value ordering so the cap is
+    deterministic.
     """
     connection = db.connect(settings.db_path)
     try:
@@ -549,4 +551,7 @@ def list_artists(settings: Settings) -> list[ArtistRow]:
         rows = store.distinct_artists(connection)
     finally:
         connection.close()
-    return [ArtistRow(artist=value, file_count=count) for value, count in rows]
+    result = [ArtistRow(artist=value, file_count=count) for value, count in rows]
+    if limit is not None:
+        result = result[:limit]
+    return result

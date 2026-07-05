@@ -88,6 +88,15 @@ def _is_missing(settings: Settings, file_id: int) -> bool:
         conn.close()
 
 
+def _stored_tags(settings: Settings, file_id: int) -> dict[str, list[str]]:
+    conn = connect(settings.db_path)
+    try:
+        apply_schema(conn)
+        return store.get_tags(conn, file_id)
+    finally:
+        conn.close()
+
+
 @pytest.mark.parametrize("suffix", _FORMATS)
 def test_commit_applies_and_records(
     engine_settings: Settings,
@@ -189,6 +198,53 @@ def test_commit_groups_multiple_files_under_one_commit_id(
     assert result.committed == 2
     assert _revisions(engine_settings, a_id)[-1].commit_id == result.commit_id
     assert _revisions(engine_settings, b_id)[-1].commit_id == result.commit_id
+
+
+def test_commit_refreshes_signature_so_next_scan_is_unchanged(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    """A commit rewrites the file (new mtime/size) and must refresh the files-row
+    signature, so the next incremental scan reports it ``unchanged`` — not spuriously
+    ``updated`` — while the snapshot still matches disk."""
+    track = make_track(music_dir / "sig.mp3", {"genre": ["Electronic"]})
+
+    scan_library(engine_settings)
+    file_id = _file_id(engine_settings, music_dir, track.name)
+
+    staging.stage_tags(engine_settings, file_id=file_id, managed_tags={"genre": ["Synthwave"]})
+    staging.commit_tags(engine_settings)
+
+    result = scan_library(engine_settings)
+
+    assert result.updated == 0
+    assert result.unchanged == 1
+    assert result.tags_read == 0
+    assert _stored_tags(engine_settings, file_id)["genre"] == ["Synthwave"]
+    assert read_tags(track).tags["genre"] == ["Synthwave"]
+
+
+def test_revert_refreshes_signature_so_next_scan_is_unchanged(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    """A revert rewrites the file too, so it must likewise refresh the signature."""
+    track = make_track(music_dir / "sigrev.mp3", {"genre": ["Electronic"]})
+
+    scan_library(engine_settings)
+    file_id = _file_id(engine_settings, music_dir, track.name)
+
+    staging.stage_tags(engine_settings, file_id=file_id, managed_tags={"genre": ["Synthwave"]})
+    staging.commit_tags(engine_settings)
+    versioning.revert(engine_settings, file_id, 0)
+
+    result = scan_library(engine_settings)
+
+    assert result.updated == 0
+    assert result.unchanged == 1
+    assert result.tags_read == 0
+    assert _stored_tags(engine_settings, file_id)["genre"] == ["Electronic"]
+    assert read_tags(track).tags["genre"] == ["Electronic"]
 
 
 def test_baseline_captured_at_stage_survives_rescan(

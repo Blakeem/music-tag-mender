@@ -391,6 +391,25 @@ def test_zero_disposition_output_is_byte_compatible() -> None:
     assert payload["low"] == 5
 
 
+def test_to_dict_rounds_disagreement_rate() -> None:
+    # The engine keeps full float precision (for the RELIABILITY_FLOOR comparison), but
+    # the JSON payload an LLM reads on every call must not carry 17 digits of noise.
+    report = mismatch.MismatchReport(
+        rows=[],
+        total_files=80,
+        flagged=1,
+        high=1,
+        medium=0,
+        low=0,
+        disagreement_rate=0.01250861814242096,
+        path_signal_suppressed=False,
+        summary="1 flagged",
+    )
+
+    assert report.to_dict()["disagreement_rate"] == 0.0125
+    assert report.disagreement_rate == 0.01250861814242096  # engine float untouched
+
+
 def test_fresh_disposition_suppresses_row_and_reports_it() -> None:
     files = _all_classes_library()
     dispositions = {100: _disp("legit_ignore", "albumartist", "Jem")}

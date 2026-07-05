@@ -516,6 +516,10 @@ def _try_read_and_store(
     if new_tags == current:
         return
     store.replace_tags(conn, file_id, new_tags, _utc_now())
+    # tags_read counts files whose tags were re-read AND actually differed from the
+    # stored snapshot (i.e. re-persisted this run); an identical re-read is an honest
+    # no-op and is not tallied (see test_full_mode_honest_noop_then_reread). This is
+    # distinct from `updated`, which counts size/mtime signature changes.
     counters.tags_read += 1
 
 

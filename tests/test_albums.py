@@ -516,3 +516,62 @@ def test_commit_then_revert_commit_restores_blank_originaldate(
     restored = read_tags(track).tags
     assert "originaldate" not in restored  # back to blank
     assert restored["date"] == ["2015"]  # reissue year never disturbed
+
+
+# --- list_albums: blank_originaldate + limit + album_status filter -------------------
+
+
+def test_list_albums_reports_blank_originaldate_count(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    # Group with all files already carrying originaldate → 0 blanks.
+    make_track(
+        music_dir / "present.mp3",
+        {"artist": ["Rush"], "album": ["Moving Pictures"], "originaldate": ["1981"]},
+    )
+    # Group with some blanks → the exact blank count.
+    make_track(music_dir / "blank1.mp3", {"artist": ["Yes"], "album": ["Fragile"]})
+    make_track(
+        music_dir / "blank2.flac",
+        {"artist": ["Yes"], "album": ["Fragile"], "originaldate": ["1971"]},
+    )
+    scan_library(engine_settings)
+
+    rows = {row.album: row for row in albums.list_albums(engine_settings)}
+    assert rows["Moving Pictures"].blank_originaldate == 0
+    assert rows["Fragile"].file_count == 2
+    assert rows["Fragile"].blank_originaldate == 1
+    # to_dict carries the new field.
+    assert rows["Fragile"].to_dict()["blank_originaldate"] == 1
+
+
+def test_list_albums_limit_caps_after_ordering(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    make_track(music_dir / "a.mp3", {"artist": ["Alpha"], "album": ["A1"]})
+    make_track(music_dir / "b.mp3", {"artist": ["Bravo"], "album": ["B1"]})
+    make_track(music_dir / "c.mp3", {"artist": ["Charlie"], "album": ["C1"]})
+    scan_library(engine_settings)
+
+    limited = albums.list_albums(engine_settings, limit=2)
+    assert [row.artist for row in limited] == ["Alpha", "Bravo"]
+
+
+def test_list_albums_album_status_filter(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    track = make_track(music_dir / "a.mp3", {"artist": ["Alpha"], "album": ["A1"]})
+    make_track(music_dir / "b.mp3", {"artist": ["Bravo"], "album": ["B1"]})
+    scan_library(engine_settings)
+
+    file_id = _file_id(engine_settings, music_dir, track.name)
+    albums.set_album_status(engine_settings, file_ids=[file_id], status="manual")
+
+    manual = albums.list_albums(engine_settings, album_status="manual")
+    assert [row.album for row in manual] == ["A1"]
+
+    pending = albums.list_albums(engine_settings, album_status="pending")
+    assert [row.album for row in pending] == ["B1"]

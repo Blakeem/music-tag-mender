@@ -341,7 +341,9 @@ class MismatchReport:
             "high": self.high,
             "medium": self.medium,
             "low": self.low,
-            "disagreement_rate": self.disagreement_rate,
+            # Round at the serialization edge only; the engine float keeps full precision
+            # for the RELIABILITY_FLOOR comparison in _reliability.
+            "disagreement_rate": round(self.disagreement_rate, 4),
             "path_signal_suppressed": self.path_signal_suppressed,
             "suppressed": self.suppressed,
             "summary": self.summary,

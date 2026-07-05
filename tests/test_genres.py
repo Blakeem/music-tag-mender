@@ -443,6 +443,19 @@ def test_list_artists_reports_distinct_values_with_counts(
     assert counts == {"Daft Punk": 2, "Justice": 1}
 
 
+def test_list_artists_limit_caps_rows_after_ordering(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    make_track(music_dir / "a.mp3", {"artist": ["Alpha"]})
+    make_track(music_dir / "b.mp3", {"artist": ["Bravo"]})
+    make_track(music_dir / "c.mp3", {"artist": ["Charlie"]})
+    scan_library(engine_settings)
+
+    rows = genres.list_artists(engine_settings, limit=2)
+    assert [row.artist for row in rows] == ["Alpha", "Bravo"]
+
+
 # --- genre-status visibility: end-to-end coherence -----------------------------------
 
 

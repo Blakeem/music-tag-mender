@@ -67,8 +67,11 @@ def scan_library(
 
     Returns:
         Per-run counts (``added``, ``updated``, ``tags_read``, ``missing_flagged``,
-        ``restored``, ``errors``, ...) plus ``ok``. On a configuration/path problem,
-        returns ``{"ok": False, "error": <message>}``.
+        ``restored``, ``errors``, ...) plus ``ok``. ``updated`` counts files whose
+        on-disk size/mtime signature changed since the last scan. ``tags_read`` counts
+        files whose tags were re-read and actually differed from the stored snapshot (an
+        identical re-read is an honest no-op and is not tallied). On a configuration/path
+        problem, returns ``{"ok": False, "error": <message>}``.
     """
     settings = load_settings()
     try:
@@ -88,10 +91,17 @@ def library_stats() -> dict[str, object]:
 
     Returns totals for tracked files, how many are present vs missing on disk, how many
     are still ``unprocessed`` (no tags read yet), a per-extension breakdown, the total
-    number of stored tag values, and a ``genre`` block counting every file's genre
-    workflow state (``pending`` / ``staged`` / ``done`` / ``no_match`` / ``manual``) —
-    the progress gauge for ``stage_genres``. Drill into a non-zero ``no_match`` or
-    ``manual`` count with ``list_files(genre_status=...)``.
+    number of stored tag values, and four per-axis workflow-state blocks — each a
+    progress gauge for one resolver, drilled into with the matching ``list_files`` filter:
+
+    * ``genre`` — ``pending`` / ``staged`` / ``done`` / ``no_match`` / ``manual`` for
+      ``stage_genres``; drill with ``list_files(genre_status=...)``.
+    * ``artist`` — ``pending`` / ``staged`` / ``done`` / ``manual`` (no ``no_match`` on
+      this axis) for ``resolve_artists``; drill with ``list_files(artist_status=...)``.
+    * ``album`` — ``pending`` / ``staged`` / ``done`` / ``no_match`` / ``manual`` for
+      ``resolve_albums``; drill with ``list_files(album_status=...)``.
+    * ``mismatch`` — ``pending`` / ``legit_ignore`` / ``misfiled_deferred`` for
+      ``detect_mismatches`` dispositions; drill with ``list_files(mismatch_status=...)``.
     """
     return {"ok": True, **library.library_stats(load_settings())}
 
@@ -363,8 +373,9 @@ def get_file(file_id: int) -> dict[str, object]:
 
     Returns ``{"ok": True, "file": {file_id, folder, filename, ext, is_missing,
     managed_tags, genre_status, genre_source_artist, genre_source_album, artist_status,
-    artist_source_artist, artist_source_albumartist}}``, or
-    ``{"ok": False, "error": ...}`` if the id is unknown.
+    artist_source_artist, artist_source_albumartist, album_status, album_source_artist,
+    album_source_album, mismatch_status, mismatch_source_field, mismatch_source_value}}``,
+    or ``{"ok": False, "error": ...}`` if the id is unknown.
     """
     view = library.get_file_view(load_settings(), file_id)
     if view is None:
@@ -631,10 +642,13 @@ def resolve_artists(
 
     It deliberately **skips** (and reports) values in the ``feat``/``ft``/``featuring``
     family, compilation sentinels (``various artists``/``various``/``va``), and empty
-    values; and any file whose ``artist``/``albumartist`` is multi-value. Values already
-    canonical, or with no Last.fm correction, stage nothing (the latter reported under
-    ``no_correction``). A transient Last.fm error leaves that value pending under
-    ``error_values`` so a re-run retries it.
+    values; and any file whose ``artist``/``albumartist`` is multi-value. Values Last.fm
+    confirms are already canonical stage nothing but are counted under ``already_canonical``
+    (a useful signal, distinct from "nothing happened"); values with no Last.fm correction
+    are reported under ``no_correction``. A transient Last.fm error leaves that value pending
+    under ``error_values`` so a re-run retries it. The per-value outcome buckets
+    (``corrected_values`` + ``already_canonical`` + ``no_correction`` + ``errors``) sum to
+    ``processed``.
 
     Args:
         artist: Limit to files whose ``artist`` tag equals this value.
@@ -646,8 +660,9 @@ def resolve_artists(
 
     Returns:
         ``{"ok": True, processed, staged_files, corrected_values, skipped_multi_artist,
-        skipped_sentinel, no_correction, errors, pending_remaining, more, mappings,
-        multi_artist_files, no_correction_values, error_values, summary}``, or
+        skipped_sentinel, no_correction, already_canonical, errors, pending_remaining, more,
+        mappings, multi_artist_files, no_correction_values, already_canonical_values,
+        error_values, summary}``, or
         ``{"ok": False, "error": ...}`` (e.g. pending changes, or no API key configured).
     """
     try:
@@ -664,13 +679,17 @@ def resolve_artists(
 
 
 @mcp.tool()
-def list_artists() -> dict[str, object]:
+def list_artists(limit: int | None = None) -> dict[str, object]:
     """List distinct ``artist`` tag values with file counts (to scope ``stage_genres``).
 
     Returns ``{"ok": True, "artists": [{artist, file_count}, ...]}`` in artist-value order.
     Run ``scan_library`` first to populate the snapshot.
+
+    Args:
+        limit: Cap the number of artists returned (applied after the value ordering).
+            Keeps the payload context-cheap on a large library.
     """
-    rows = genres.list_artists(load_settings())
+    rows = genres.list_artists(load_settings(), limit=limit)
     return {"ok": True, "artists": [row.to_dict() for row in rows]}
 
 
@@ -912,15 +931,28 @@ def resolve_albums(
 
 
 @mcp.tool()
-def list_albums() -> dict[str, object]:
+def list_albums(
+    album_status: Literal["pending", "no_match", "manual", "staged", "done"] | None = None,
+    limit: int | None = None,
+) -> dict[str, object]:
     """List distinct album groups with file counts + status (to scope ``resolve_albums``).
 
-    Groups files by ``(albumartist-else-artist, album)`` and reports each group's file count
-    and derived album workflow status. Returns ``{"ok": True, "albums": [{artist, album,
-    file_count, album_status}, ...]}`` in ``(artist, album)`` order. Run ``scan_library``
-    first to populate the snapshot.
+    Groups files by ``(albumartist-else-artist, album)`` and reports each group's file count,
+    derived album workflow status, and ``blank_originaldate`` — the count of the group's
+    files whose ``originaldate`` is empty. A group with ``blank_originaldate > 0`` is
+    actionable for ``resolve_albums`` (it has years to fill); ``album_status: "pending"``
+    alone does NOT mean actionable, since every file may already carry ``originaldate``.
+    Returns ``{"ok": True, "albums": [{artist, album, file_count, album_status,
+    blank_originaldate}, ...]}`` in ``(artist, album)`` order. Run ``scan_library`` first to
+    populate the snapshot.
+
+    Args:
+        album_status: Keep only groups in this derived album workflow state (``pending`` |
+            ``no_match`` | ``manual`` | ``staged`` | ``done``), applied before ``limit``.
+        limit: Cap the number of groups returned (applied after ordering + filtering).
+            Keeps the payload context-cheap on a large library.
     """
-    rows = albums.list_albums(load_settings())
+    rows = albums.list_albums(load_settings(), album_status=album_status, limit=limit)
     return {"ok": True, "albums": [row.to_dict() for row in rows]}
 
 

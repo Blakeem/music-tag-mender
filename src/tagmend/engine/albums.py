@@ -536,6 +536,7 @@ class AlbumRow:
     album: str
     file_count: int
     album_status: str
+    blank_originaldate: int
 
     def to_dict(self) -> dict[str, object]:
         """JSON-serializable form for the MCP tool."""
@@ -544,25 +545,42 @@ class AlbumRow:
             "album": self.album,
             "file_count": self.file_count,
             "album_status": self.album_status,
+            "blank_originaldate": self.blank_originaldate,
         }
 
 
-def list_albums(settings: Settings) -> list[AlbumRow]:
+def list_albums(
+    settings: Settings,
+    *,
+    album_status: str | None = None,
+    limit: int | None = None,
+) -> list[AlbumRow]:
     """Return each distinct album group with its file count + a representative status.
 
     Groups in-scope files by ``(albumartist-else-artist, album)`` (the album identity) and
-    reports the derived album status of the group's first file. A discovery aid for scoping
-    ``resolve_albums``. Read-only.
+    reports the derived album status of the group's first file plus ``blank_originaldate``
+    — the count of the group's files whose ``originaldate`` tag is empty (the files
+    :func:`resolve_albums` can actually fill; ``> 0`` marks an actionable group). A
+    discovery aid for scoping ``resolve_albums``. Read-only.
+
+    *album_status* (when given) keeps only groups whose derived status matches, applied
+    AFTER ordering and BEFORE *limit*. *limit* (when given) caps the number of rows
+    returned so a large library stays context-cheap.
     """
     connection = db.connect(settings.db_path)
     try:
         schema.apply_schema(connection)
         groups: dict[tuple[str | None, str], list[int]] = {}
+        blanks: dict[tuple[str | None, str], int] = {}
         for fid in store.files_in_scope(connection):
-            identity = genres._identity(store.get_tags(connection, fid))  # noqa: SLF001
+            tags = store.get_tags(connection, fid)
+            identity = genres._identity(tags)  # noqa: SLF001
             if identity.album is None:
                 continue
-            groups.setdefault((identity.artist, identity.album), []).append(fid)
+            key = (identity.artist, identity.album)
+            groups.setdefault(key, []).append(fid)
+            if not tags.get(_ALBUM_FIELD):
+                blanks[key] = blanks.get(key, 0) + 1
 
         rows = [
             AlbumRow(
@@ -570,9 +588,16 @@ def list_albums(settings: Settings) -> list[AlbumRow]:
                 album=album,
                 file_count=len(fids),
                 album_status=store.derived_album_status(connection, fids[0]),
+                blank_originaldate=blanks.get((artist, album), 0),
             )
             for (artist, album), fids in groups.items()
         ]
     finally:
         connection.close()
-    return sorted(rows, key=lambda r: (r.artist or "", r.album))
+
+    ordered = sorted(rows, key=lambda r: (r.artist or "", r.album))
+    if album_status is not None:
+        ordered = [row for row in ordered if row.album_status == album_status]
+    if limit is not None:
+        ordered = ordered[:limit]
+    return ordered

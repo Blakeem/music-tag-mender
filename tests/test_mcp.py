@@ -354,7 +354,31 @@ def test_album_status_tools_and_list_albums(music_dir: Path) -> None:
     assert albums_payload["ok"] is True
     rows = albums_payload["albums"]
     assert isinstance(rows, list)
-    assert any(r["album"] == "Paranoid" for r in rows)
+    paranoid = next(r for r in rows if r["album"] == "Paranoid")
+    # The lone Paranoid file has no originaldate → the group is actionable.
+    assert paranoid["blank_originaldate"] == 1
+
+    # limit + album_status params thread through to the engine.
+    limited = mcp_server.list_albums(limit=1)
+    assert isinstance(limited["albums"], list)
+    assert len(limited["albums"]) == 1
+    pending_only = mcp_server.list_albums(album_status="pending")
+    assert isinstance(pending_only["albums"], list)
+    assert all(r["album_status"] == "pending" for r in pending_only["albums"])
+    assert any(r["album"] == "Paranoid" for r in pending_only["albums"])
+
+
+def test_list_artists_limit_param(music_dir: Path) -> None:
+    make_track(music_dir / "a.mp3", {"artist": ["Alpha"]})
+    make_track(music_dir / "b.mp3", {"artist": ["Bravo"]})
+    mcp_server.scan_library(path=str(music_dir))
+
+    payload = mcp_server.list_artists(limit=1)
+    assert payload["ok"] is True
+    artists_list = payload["artists"]
+    assert isinstance(artists_list, list)
+    assert len(artists_list) == 1
+    assert artists_list[0]["artist"] == "Alpha"
 
 
 def test_set_album_status_rejects_unknown_status(music_dir: Path) -> None:

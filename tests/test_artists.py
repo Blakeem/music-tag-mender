@@ -221,6 +221,19 @@ def test_already_canonical_stages_nothing_and_rerun_is_noop(
     assert first.staged_files == 0
     assert len(staging.diff_tags(engine_settings)) == 0
 
+    # An already-canonical value is visible (not silently invisible) and the per-value
+    # outcome buckets sum to processed.
+    assert first.processed == 1
+    assert first.corrected_values == 0
+    assert first.no_correction == 0
+    assert first.already_canonical == 1
+    assert first.already_canonical_values == ["Daft Punk"]
+    assert (
+        first.corrected_values + first.already_canonical + first.no_correction + first.errors
+        == first.processed
+    )
+    assert "1 already canonical" in first.summary
+
 
 def test_rerun_after_commit_is_idempotent(
     engine_settings: Settings,

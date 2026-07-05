@@ -234,6 +234,16 @@ def _revert_file(
     now = _utc_now()
     reverted_tags = read_tags(path).tags
     store.replace_tags(conn, file_id, reverted_tags, now)
+    # Re-sync the files-row signature to the just-written bytes (same fields the scanner
+    # stats), so the next incremental scan sees the reverted file as unchanged.
+    stat_result = path.stat()
+    store.update_signature(
+        conn,
+        file_id,
+        size_bytes=stat_result.st_size,
+        mtime_ns=stat_result.st_mtime_ns,
+        now=now,
+    )
 
     # Append the revert (always, even on an empty diff).
     previous = store.max_version(conn, file_id)

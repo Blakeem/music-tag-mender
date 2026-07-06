@@ -10,9 +10,13 @@ from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final
+
+import httpx
 
 from tagmend.engine import commits, db, scan, schema
+from tagmend.engine.lastfm import LastfmClient, LastfmError
+from tagmend.engine.musicbrainz import MusicBrainzClient, MusicBrainzError
 from tagmend.log import get_logger
 
 if TYPE_CHECKING:
@@ -21,6 +25,12 @@ if TYPE_CHECKING:
     from tagmend.config import Settings
 
 logger = get_logger(__name__)
+
+# Well-known ping targets — fixed, uncontroversial entities that exercise each authority's
+# only read endpoint. The result is discarded; we only care that the round-trip succeeded.
+_LASTFM_PING_ARTIST: Final = "Radiohead"
+_MB_PING_ARTIST: Final = "Black Sabbath"
+_MB_PING_ALBUM: Final = "Paranoid"
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,12 +61,24 @@ class HealthReport:
         }
 
 
-def run_health_check(settings: Settings) -> HealthReport:
-    """Run every readiness check against *settings* and return the aggregate report."""
+def run_health_check(
+    settings: Settings,
+    *,
+    lastfm_transport: httpx.BaseTransport | None = None,
+    musicbrainz_transport: httpx.BaseTransport | None = None,
+) -> HealthReport:
+    """Run every readiness check against *settings* and return the aggregate report.
+
+    The two ``*_transport`` kwargs are test-only injection seams (default: the real httpx
+    transport); production callers (CLI, MCP) never pass them, so both authorities are
+    pinged live.
+    """
     checks = [
         _check_music_path(settings.music_path),
         _check_database(settings.db_path),
         _check_interrupted_commits(settings.db_path),
+        _check_lastfm(settings, transport=lastfm_transport),
+        _check_musicbrainz(settings, transport=musicbrainz_transport),
     ]
     report = HealthReport(checks=checks)
     logger.info("health check complete: ok=%s", report.ok)
@@ -126,3 +148,78 @@ def _check_interrupted_commits(db_path: Path) -> Check:
         ok=True,
         detail=f"{len(interrupted)} interrupted run(s) ({ids}) — run commit_tags to recover",
     )
+
+
+def _memory_conn() -> sqlite3.Connection:
+    """Return a throwaway in-memory connection with the schema applied.
+
+    Both API clients are unconditionally cache-first, so pinging against the real ledger
+    cache would verify nothing after the first run. Building each check's client over a
+    fresh, empty cache forces a genuine live round-trip every time (and never touches or
+    pollutes the real ledger's API caches).
+    """
+    conn = sqlite3.connect(":memory:")
+    schema.apply_schema(conn)
+    return conn
+
+
+def _check_lastfm(
+    settings: Settings,
+    *,
+    transport: httpx.BaseTransport | None = None,
+) -> Check:
+    """Confirm Last.fm is reachable with the configured key (one live ``getCorrection``).
+
+    A missing key fails immediately with **no HTTP attempted** (genre + artist resolution
+    both need it). With a key, one ``artist.getCorrection`` round-trip against an empty
+    throwaway cache proves the key + network are live; any client/HTTP error is caught so
+    no exception escapes.
+    """
+    name = "lastfm"
+
+    if not settings.lastfm_api_key:
+        return Check(
+            name=name,
+            ok=False,
+            detail="not configured — set lastfm_api_key (needed by stage_genres/resolve_artists)",
+        )
+
+    conn = _memory_conn()
+    try:
+        with LastfmClient(settings.lastfm_api_key, conn, transport=transport) as client:
+            client.artist_correction(_LASTFM_PING_ARTIST)
+    except (LastfmError, httpx.HTTPError) as exc:
+        return Check(name=name, ok=False, detail=f"unreachable: {exc}")
+    finally:
+        conn.close()
+
+    return Check(name=name, ok=True, detail="reachable")
+
+
+def _check_musicbrainz(
+    settings: Settings,
+    *,
+    transport: httpx.BaseTransport | None = None,
+) -> Check:
+    """Confirm MusicBrainz is reachable (one live release-group search).
+
+    No API key is required — just the configured ``User-Agent``. One
+    ``album_first_release`` round-trip against an empty throwaway cache proves the network
+    is live; any client/HTTP error is caught so no exception escapes.
+    """
+    name = "musicbrainz"
+
+    conn = _memory_conn()
+    try:
+        with MusicBrainzClient(
+            settings.musicbrainz_user_agent,
+            conn,
+            transport=transport,
+        ) as client:
+            client.album_first_release(_MB_PING_ARTIST, _MB_PING_ALBUM)
+    except (MusicBrainzError, httpx.HTTPError) as exc:
+        return Check(name=name, ok=False, detail=f"unreachable: {exc}")
+    finally:
+        conn.close()
+
+    return Check(name=name, ok=True, detail="reachable")

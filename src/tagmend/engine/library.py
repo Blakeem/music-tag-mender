@@ -185,14 +185,16 @@ def list_files(  # noqa: PLR0913 - cohesive keyword-only discovery filters
     """Return tracked files (id order) with their managed tags, for discovery.
 
     Optionally limited to files under *root*, filtered to one genre workflow status
-    (``pending`` | ``no_match`` | ``manual`` | ``staged`` | ``done``), one artist workflow
-    status (``pending`` | ``manual`` | ``staged`` | ``done``), one album workflow status
-    (``pending`` | ``no_match`` | ``manual`` | ``staged`` | ``done``), one mismatch disposition
+    (``pending`` | ``no_identity`` | ``no_match`` | ``manual`` | ``staged`` | ``done``), one
+    artist workflow status (``pending`` | ``no_identity`` | ``manual`` | ``staged`` |
+    ``done``), one album workflow status (``pending`` | ``no_identity`` | ``no_match`` |
+    ``manual`` | ``staged`` | ``done``), one mismatch disposition
     (``pending`` | ``legit_ignore`` | ``misfiled_deferred``), and/or capped at *limit* rows.
-    ``genre_status="no_match"`` is the "fix by hand" worklist. With NO status filter the cap is
-    applied before reading tags, so a large library stays cheap to browse; with any filter, all
-    candidate rows are examined, ALL filters are applied, and the cap counts the *matching*
-    files. Raises :class:`ValueError` for an unknown status. Read-only.
+    ``genre_status="no_match"`` is the "fix by hand" worklist; ``no_identity`` lists the files
+    that carry neither ``artist`` nor ``albumartist`` (every resolver skips them). With NO
+    status filter the cap is applied before reading tags, so a large library stays cheap to
+    browse; with any filter, all candidate rows are examined, ALL filters are applied, and the
+    cap counts the *matching* files. Raises :class:`ValueError` for an unknown status. Read-only.
     """
     if genre_status is not None and genre_status not in store.GENRE_WORKFLOW_STATUSES:
         message = (

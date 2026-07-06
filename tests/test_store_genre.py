@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import sqlite3
 
-from tagmend.engine import store
+import pytest
+
+from tagmend.engine import genres, store
 
 _NOW = "2026-06-08T00:00:00+00:00"
 _LATER = "2026-06-08T01:00:00+00:00"
@@ -19,8 +21,15 @@ def _insert(
     *,
     folder: str = "/lib",
     filename: str = "a.mp3",
+    artist: str | None = "A",
 ) -> int:
-    return store.insert_file(
+    """Insert a file, giving it a source identity (``artist``) unless *artist* is ``None``.
+
+    An identity keeps the file in ``pending``/``staged``/``done``/stored-status territory;
+    passing ``artist=None`` (no ``artist`` and no ``albumartist``) makes it derive the new
+    ``no_identity`` worklist state.
+    """
+    file_id = store.insert_file(
         conn,
         folder=folder,
         filename=filename,
@@ -29,6 +38,9 @@ def _insert(
         mtime_ns=1_000,
         now=_NOW,
     )
+    if artist is not None:
+        store.replace_tags(conn, file_id, {"artist": [artist]}, _NOW)
+    return file_id
 
 
 # --- lastfm_cache -------------------------------------------------------------------
@@ -350,6 +362,88 @@ def test_derived_status_done_beats_no_match(db_conn: sqlite3.Connection) -> None
     assert store.derived_genre_status(db_conn, file_id) == "done"
 
 
+# --- has_identity + the no_identity worklist state ----------------------------------
+
+
+def test_has_identity_true_with_artist(db_conn: sqlite3.Connection) -> None:
+    file_id = _insert(db_conn, artist="Daft Punk")
+    assert store.has_identity(db_conn, file_id) is True
+
+
+def test_has_identity_true_with_only_albumartist(db_conn: sqlite3.Connection) -> None:
+    file_id = _insert(db_conn, artist=None)
+    store.replace_tags(db_conn, file_id, {"albumartist": ["Various"]}, _NOW)
+    assert store.has_identity(db_conn, file_id) is True
+
+
+def test_has_identity_false_when_no_identity_tags(db_conn: sqlite3.Connection) -> None:
+    file_id = _insert(db_conn, artist=None)
+    assert store.has_identity(db_conn, file_id) is False
+
+
+@pytest.mark.parametrize("blank", [" ", "\t", "\n", "   ", "\t\n "])
+def test_has_identity_false_for_whitespace_only(db_conn: sqlite3.Connection, blank: str) -> None:
+    # ``str.strip()`` (NOT SQL one-arg ``TRIM``) is the arbiter, so tab/newline count as
+    # blank too — the Python-side rule the plan requires proving.
+    file_id = _insert(db_conn, artist=None)
+    store.replace_tags(db_conn, file_id, {"artist": [blank], "albumartist": [blank]}, _NOW)
+    assert store.has_identity(db_conn, file_id) is False
+
+
+def test_no_identity_file_derives_no_identity_on_all_axes(db_conn: sqlite3.Connection) -> None:
+    file_id = _insert(db_conn, artist=None)
+    assert store.derived_genre_status(db_conn, file_id) == "no_identity"
+    assert store.derived_artist_status(db_conn, file_id) == "no_identity"
+    assert store.derived_album_status(db_conn, file_id) == "no_identity"
+
+
+def test_has_identity_agrees_with_genres_identity_on_later_ordinal(
+    db_conn: sqlite3.Connection,
+) -> None:
+    # albumartist ordinal 0 is whitespace-only but a real value sits at ordinal 1: the
+    # resolver's _identity scans all ordinals and finds it (the file IS looked up and
+    # processed), so has_identity must agree — the two blankness rules stay PROVABLY
+    # identical, and the file is NOT flagged as a no-identity orphan. Regression guard for
+    # the ordinal-0-only divergence.
+    file_id = _insert(db_conn, artist=None)
+    store.replace_tags(db_conn, file_id, {"albumartist": ["  ", "Real Artist"]}, _NOW)
+
+    identity = genres._identity(store.get_tags(db_conn, file_id))
+    assert identity.artist == "Real Artist"
+    assert store.has_identity(db_conn, file_id) is (identity.artist is not None)
+    assert store.has_identity(db_conn, file_id) is True
+    assert store.derived_genre_status(db_conn, file_id) == "pending"
+    assert store.derived_album_status(db_conn, file_id) == "pending"
+    assert store.derived_artist_status(db_conn, file_id) == "pending"
+
+
+def test_tab_newline_identity_derives_no_identity(db_conn: sqlite3.Connection) -> None:
+    # A tab-only artist AND a newline-only albumartist: both blank after strip → no_identity.
+    file_id = _insert(db_conn, artist=None)
+    store.replace_tags(db_conn, file_id, {"artist": ["\t"], "albumartist": ["\n"]}, _NOW)
+    assert store.derived_genre_status(db_conn, file_id) == "no_identity"
+    assert store.derived_album_status(db_conn, file_id) == "no_identity"
+
+
+def test_stored_status_beats_no_identity(db_conn: sqlite3.Connection) -> None:
+    # A human-recorded decision still wins over the derived no_identity bucket.
+    file_id = _insert(db_conn, artist=None)
+    _set_status(db_conn, file_id, "manual")
+    assert store.derived_genre_status(db_conn, file_id) == "manual"
+
+
+def test_staged_beats_no_identity(db_conn: sqlite3.Connection) -> None:
+    file_id = _insert(db_conn, artist=None)
+    _stage(db_conn, file_id)  # a manually-staged genre change on an identity-less file
+    assert store.derived_genre_status(db_conn, file_id) == "staged"
+
+
+def test_done_beats_no_identity(db_conn: sqlite3.Connection) -> None:
+    file_id = _insert(db_conn, artist=None)
+    _commit_auto(db_conn, file_id)  # a committed auto genre revision
+    assert store.derived_genre_status(db_conn, file_id) == "done"
+
+
 # --- genre_status_counts ------------------------------------------------------------
 
 
@@ -391,6 +485,7 @@ def test_genre_status_counts_matrix(db_conn: sqlite3.Connection) -> None:
     counts = store.genre_status_counts(db_conn)
     assert counts == {
         "pending": 1,
+        "no_identity": 0,
         "no_match": 1,
         "manual": 1,
         "staged": 1,
@@ -452,11 +547,19 @@ def _commit_auto_field(
 
 
 def _stage_field(conn: sqlite3.Connection, file_id: int, field_name: str) -> None:
-    """Stage a pending change that alters only *field_name* (current tags are empty)."""
+    """Stage a change to *field_name* for *file_id*, merged onto its current tags.
+
+    Only *field_name* differs from the file's current tags, so ``has_staged_change_for``
+    reads the file as staged on that field ALONE and the other axes stay unstaged — matching
+    production ``staging.stage_tags`` (which merges onto current), not a bare single-key row
+    that would read as deleting every other managed tag.
+    """
+    managed = dict(store.get_tags(conn, file_id))
+    managed[field_name] = ["X"]
     store.upsert_staged_tag(
         conn,
         file_id=file_id,
-        managed_tags={field_name: ["X"]},
+        managed_tags=managed,
         origin="auto",
         now=_NOW,
     )
@@ -590,6 +693,7 @@ def test_artist_status_counts_matrix(db_conn: sqlite3.Connection) -> None:
     _seed_artist_matrix(db_conn)
     assert store.artist_status_counts(db_conn) == {
         "pending": 1,
+        "no_identity": 0,
         "manual": 1,
         "staged": 1,
         "done": 1,

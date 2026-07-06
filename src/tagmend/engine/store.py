@@ -794,6 +794,28 @@ def void_auto_changes(
     )
 
 
+def has_identity(conn: sqlite3.Connection, file_id: int) -> bool:
+    """Return whether *file_id* carries any non-blank ``artist`` or ``albumartist`` value.
+
+    The store-side twin of :func:`tagmend.engine.genres._identity`'s blankness rule, kept
+    PROVABLY identical: both treat a file as having identity exactly when at least one
+    ``artist`` or ``albumartist`` value is non-blank at ANY ordinal (``_identity`` returns a
+    non-``None`` artist iff its ``_first_nonblank`` scan finds one, so a real value at a later
+    ordinal counts even when ordinal 0 is blank — the file is looked up and processed, hence
+    is NOT a no-identity orphan). It fetches every ``artist``/``albumartist`` value in ONE
+    indexed query (the ``file_tags`` PK covers the ``file_id``/``name`` prefix) and decides
+    blankness in Python via ``str.strip()``. SQLite's one-argument ``TRIM`` strips only the
+    ASCII space, so a tab-only or newline-only value would diverge — Python must be the
+    arbiter. A file with neither tag, or only whitespace-only values at every ordinal, has no
+    identity (and derives ``no_identity``).
+    """
+    cursor = conn.execute(
+        "SELECT value FROM file_tags WHERE file_id = ? AND name IN ('artist', 'albumartist')",
+        (file_id,),
+    )
+    return any(str(row[0]).strip() for row in cursor.fetchall())
+
+
 def has_staged_change_for(
     conn: sqlite3.Connection,
     file_id: int,
@@ -812,10 +834,11 @@ def has_staged_change_for(
     return any(staged.managed_tags.get(name, []) != current.get(name, []) for name in fields)
 
 
-# The five user-facing genre workflow states (re-exported from the genre axis): two are
-# stored (`no_match`/`manual`, rows in file_genre_status), two are derived (`staged`/`done`
-# from the revision tables), `pending` = none of the above. Single source of truth for the
-# ``list_files(genre_status=...)`` filter and the stats counts.
+# The user-facing genre workflow states (re-exported from the genre axis): two are stored
+# (`no_match`/`manual`, rows in file_genre_status), two are derived (`staged`/`done` from
+# the revision tables), `no_identity` = neither artist nor albumartist, `pending` = none of
+# the above. Single source of truth for the ``list_files(genre_status=...)`` filter and the
+# stats counts.
 GENRE_WORKFLOW_STATUSES: Final = axis.GENRE_AXIS.workflow_statuses
 
 
@@ -830,8 +853,10 @@ def derived_status(conn: sqlite3.Connection, axis_: axis.Axis, file_id: int) -> 
     FIELD-AWARE (keyed on the axis's ``fields``), so a genre-only change does not read as
     artist-``done`` and vice versa. Reports the STORED status even when it is stale (genre's
     ``no_match`` staleness re-check still lets ``stage_genres`` retry it; the listing surfaces
-    the recorded decision so a human can judge it). Files with no source identity count as
-    ``pending`` (unprocessable until tagged, not terminal).
+    the recorded decision so a human can judge it). A file with no source identity (neither
+    ``artist`` nor ``albumartist``) that every resolver skips derives ``no_identity`` — a
+    distinct worklist bucket, ranked BELOW a stored decision but above ``pending`` (so a
+    manual/no_match a human recorded still wins), unprocessable until tagged.
     """
     if has_staged_change_for(conn, file_id, axis_.fields):
         return "staged"
@@ -840,6 +865,8 @@ def derived_status(conn: sqlite3.Connection, axis_: axis.Axis, file_id: int) -> 
     decision = axis.get_status(conn, axis_, file_id)
     if decision is not None:
         return decision.status
+    if not has_identity(conn, file_id):
+        return "no_identity"
     return "pending"
 
 
@@ -852,7 +879,7 @@ def derived_genre_status(conn: sqlite3.Connection, file_id: int) -> str:
 
 
 def genre_status_counts(conn: sqlite3.Connection) -> dict[str, int]:
-    """Return file counts per genre workflow status, all five keys always present.
+    """Return file counts per genre workflow status, every axis key always present.
 
     One pass over every tracked file via :func:`derived_genre_status` (the single source
     of truth), so the counts and the per-file status can never drift.
@@ -874,11 +901,11 @@ def status_counts(conn: sqlite3.Connection, axis_: axis.Axis) -> dict[str, int]:
 
 # --- file_artist_status (sticky manual exclusion; artist-axis twin of genre) ---------
 
-# The four artist workflow states (re-exported from the artist axis). One is stored
+# The artist workflow states (re-exported from the artist axis). One is stored
 # (``manual`` — a row in ``file_artist_status``), two are derived (``staged``/``done``
-# field-awarely from the revision tables), and ``pending`` = none of the above. There is no
-# ``no_match`` state on this axis. Single source of truth for the
-# ``list_files(artist_status=...)`` filter and the stats counts.
+# field-awarely from the revision tables), ``no_identity`` = neither artist nor albumartist,
+# and ``pending`` = none of the above. There is no ``no_match`` state on this axis. Single
+# source of truth for the ``list_files(artist_status=...)`` filter and the stats counts.
 ARTIST_WORKFLOW_STATUSES: Final = axis.ARTIST_AXIS.workflow_statuses
 
 
@@ -947,7 +974,7 @@ def derived_artist_status(conn: sqlite3.Connection, file_id: int) -> str:
 
 
 def artist_status_counts(conn: sqlite3.Connection) -> dict[str, int]:
-    """Return file counts per artist workflow status, all four keys always present.
+    """Return file counts per artist workflow status, every axis key always present.
 
     One pass over every tracked file via :func:`derived_artist_status` (the single source
     of truth), so the counts and the per-file status can never drift.
@@ -957,10 +984,11 @@ def artist_status_counts(conn: sqlite3.Connection) -> dict[str, int]:
 
 # --- file_album_status (terminal album decisions; album-axis twin of genre) ----------
 
-# The five album workflow states (re-exported from the album axis). Two are stored
+# The album workflow states (re-exported from the album axis). Two are stored
 # (``no_match``/``manual`` — rows in ``file_album_status``), two are derived
-# (``staged``/``done`` field-awarely on ``originaldate``), ``pending`` = none of the above.
-# Single source of truth for the ``list_files(album_status=...)`` filter and the stats.
+# (``staged``/``done`` field-awarely on ``originaldate``), ``no_identity`` = neither artist
+# nor albumartist, ``pending`` = none of the above. Single source of truth for the
+# ``list_files(album_status=...)`` filter and the stats.
 ALBUM_WORKFLOW_STATUSES: Final = axis.ALBUM_AXIS.workflow_statuses
 
 
@@ -1028,7 +1056,7 @@ def derived_album_status(conn: sqlite3.Connection, file_id: int) -> str:
 
 
 def album_status_counts(conn: sqlite3.Connection) -> dict[str, int]:
-    """Return file counts per album workflow status, all five keys always present.
+    """Return file counts per album workflow status, every axis key always present.
 
     One pass over every tracked file via :func:`derived_album_status` (the single source
     of truth), so the counts and the per-file status can never drift.

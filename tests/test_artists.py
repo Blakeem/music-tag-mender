@@ -277,6 +277,79 @@ def test_no_correction_is_reported_not_an_error(
     assert result.errors == 0
 
 
+# --- (7b) MusicBrainz placeholder guard ----------------------------------------------
+
+
+@pytest.mark.parametrize("placeholder", ["[unknown]", "[no artist]", "[anonymous]"])
+def test_placeholder_correction_is_treated_as_no_correction(
+    engine_settings: Settings,
+    music_dir: Path,
+    placeholder: str,
+) -> None:
+    # A junk album-artist label whose getCorrection is a MB special-purpose placeholder
+    # (+MBID) must NOT cascade-stage — it is treated exactly like "no correction".
+    make_track(music_dir / "ost.mp3", {"albumartist": ["Original Soundtrack"]})
+    scan_library(engine_settings)
+
+    fake = FakeCorrectionSource(
+        {"Original Soundtrack": ArtistCorrection(placeholder, "125ec42a-mbid")},
+    )
+    result = artists.resolve_artists(engine_settings, client=fake)
+
+    assert result.corrected_values == 0
+    assert result.staged_files == 0
+    assert result.no_correction == 1
+    assert result.no_correction_values == ["Original Soundtrack"]
+    assert result.already_canonical == 0
+    assert result.mappings == []
+    assert len(staging.diff_tags(engine_settings)) == 0
+
+
+def test_placeholder_correction_dry_run_parity(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    make_track(music_dir / "ost.mp3", {"albumartist": ["Original Soundtrack"]})
+    scan_library(engine_settings)
+
+    fake = FakeCorrectionSource(
+        {"Original Soundtrack": ArtistCorrection("[unknown]", "125ec42a-mbid")},
+    )
+    result = artists.resolve_artists(engine_settings, client=fake, dry_run=True)
+
+    assert result.corrected_values == 0
+    assert result.staged_files == 0
+    assert result.no_correction_values == ["Original Soundtrack"]
+    assert result.mappings == []
+    assert len(staging.diff_tags(engine_settings)) == 0
+
+
+def test_normal_correction_still_stages_with_mbid_alongside_placeholder(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    # A placeholder value is dropped while a normal correction in the same run behaves
+    # exactly as before, MBID enrichment included.
+    make_track(music_dir / "ost.mp3", {"albumartist": ["Original Soundtrack"]})
+    good = make_track(music_dir / "good.mp3", {"artist": ["Miami Nights '84"]})
+    scan_library(engine_settings)
+
+    fake = FakeCorrectionSource(
+        {
+            "Original Soundtrack": ArtistCorrection("[unknown]", "125ec42a-mbid"),
+            "Miami Nights '84": ArtistCorrection("Miami Nights 1984", "mbid-1"),
+        },
+    )
+    result = artists.resolve_artists(engine_settings, client=fake)
+    staging.commit_tags(engine_settings, origin="auto")
+
+    assert result.corrected_values == 1
+    assert result.staged_files == 1
+    assert result.no_correction_values == ["Original Soundtrack"]
+    assert read_tags(good).tags["artist"] == ["Miami Nights 1984"]
+    assert read_tags(good).tags["musicbrainz_artistid"] == ["mbid-1"]
+
+
 # --- (8) dry-run ---------------------------------------------------------------------
 
 

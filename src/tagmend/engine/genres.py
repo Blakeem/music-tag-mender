@@ -64,24 +64,35 @@ class _Identity:
     album: str | None
 
 
+def _first_nonblank(values: list[str] | None) -> str | None:
+    """Return the first value that is non-blank after ``str.strip()``, else ``None``.
+
+    Whitespace-only tag values (spaces, tabs, newlines) count as absent — the Python twin
+    of :func:`tagmend.engine.store.has_identity`'s blankness rule, so ``_select``'s
+    ``identity.artist is None`` gate buckets such files as ``skipped_no_artist`` (rather
+    than looking up ``" "`` junk) and the derived ``no_identity`` status agrees. The value
+    is returned verbatim (unstripped), preserving the exact lookup string for non-blank tags.
+    """
+    if not values:
+        return None
+    for value in values:
+        if value.strip():
+            return value
+    return None
+
+
 def _identity(tags: dict[str, list[str]]) -> _Identity:
     """Derive the lookup identity for a file's tags.
 
-    Lookup artist is the first ``albumartist`` value when a non-empty one exists (better
-    identity for compilations), else the first ``artist`` value; ``None`` when neither is
-    present. Album is the first ``album`` value, or ``None``.
+    Lookup artist is the first non-blank ``albumartist`` value when one exists (better
+    identity for compilations), else the first non-blank ``artist`` value; ``None`` when
+    neither has a non-blank value. Album is the first non-blank ``album`` value, or ``None``.
+    Whitespace-only values are treated as absent (see :func:`_first_nonblank`).
     """
-    album_artist = tags.get("albumartist")
-    artist = tags.get("artist")
-    if album_artist:
-        lookup_artist: str | None = album_artist[0]
-    elif artist:
-        lookup_artist = artist[0]
-    else:
-        lookup_artist = None
-
-    album_values = tags.get("album")
-    lookup_album = album_values[0] if album_values else None
+    lookup_artist = _first_nonblank(tags.get("albumartist")) or _first_nonblank(
+        tags.get("artist"),
+    )
+    lookup_album = _first_nonblank(tags.get("album"))
     return _Identity(artist=lookup_artist, album=lookup_album)
 
 

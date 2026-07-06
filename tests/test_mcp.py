@@ -137,11 +137,12 @@ def test_list_tools_exposes_expected_tools_and_schema() -> None:
     list_tool = next(tool for tool in tools if tool.name == "list_files")
     genre_status_schema = list_tool.inputSchema["properties"]["genre_status"]
     enum_values = _enum_values(genre_status_schema)
-    assert set(enum_values) == {"pending", "no_match", "manual", "staged", "done"}
+    assert set(enum_values) == {"pending", "no_identity", "no_match", "manual", "staged", "done"}
 
     album_status_schema = list_tool.inputSchema["properties"]["album_status"]
     assert set(_enum_values(album_status_schema)) == {
         "pending",
+        "no_identity",
         "no_match",
         "manual",
         "staged",
@@ -162,8 +163,12 @@ def read_tags_via_disk(music_dir: Path, filename: str = "track.mp3") -> list[str
 
 
 def _scanned_track_id(music_dir: Path, filename: str = "track.mp3") -> int:
-    """Make + scan one track via the MCP scan tool and return its stable file id."""
-    track = make_track(music_dir / filename, {"genre": ["Electronic"]})
+    """Make + scan one track via the MCP scan tool and return its stable file id.
+
+    The track carries an ``artist`` so it has a source identity — its genre/artist/album
+    axes derive ``pending`` (unprocessed), not the ``no_identity`` worklist state.
+    """
+    track = make_track(music_dir / filename, {"artist": ["Some Artist"], "genre": ["Electronic"]})
     mcp_server.scan_library(path=str(music_dir))
     conn = connect(load_settings().db_path)
     try:

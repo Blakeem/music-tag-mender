@@ -60,6 +60,13 @@ _SENTINELS: Final = frozenset({"various artists", "various", "va"})
 # value means it is a multi-artist credit we must not rewrite as a single canonical name.
 _FEAT_RE: Final = re.compile(r"\b(?:feat|ft|featuring)\b\.?", re.IGNORECASE)
 
+# The MusicBrainz special-purpose bracket convention (``[unknown]``, ``[no artist]``,
+# ``[anonymous]``, …): a getCorrection can hand back one of these placeholders as the
+# "canonical" name for junk album-artist labels. It is not a real artist, so a correction
+# to a placeholder is treated exactly like no correction at all. Case-irrelevant by
+# construction — the payload is punctuation-wrapped, not a cased word.
+_MB_PLACEHOLDER_RE: Final = re.compile(r"^\[.*\]$")
+
 # The two states ``set_artist_status`` is allowed to drive: ``manual`` writes a sticky
 # exclusion row; ``pending`` deletes it (re-queue). There is no engine-owned ``no_match``
 # on this axis.
@@ -84,6 +91,11 @@ def _is_sentinel(value: str) -> bool:
 def _is_guarded(value: str) -> bool:
     """Return whether *value* must be skipped outright (empty, feat., or a sentinel)."""
     return not value.strip() or _is_feat(value) or _is_sentinel(value)
+
+
+def _is_placeholder(name: str) -> bool:
+    """Return whether *name* is a MusicBrainz special-purpose placeholder (``[unknown]`` …)."""
+    return _MB_PLACEHOLDER_RE.match(name.strip()) is not None
 
 
 # --- result types --------------------------------------------------------------------
@@ -330,7 +342,8 @@ def _resolve_one_value(
     A transient :class:`LastfmError` leaves the value pending (not cached) and is reported,
     never aborting the run. A correction equal to the current value is already canonical →
     no change, but recorded (``already_canonical``) so the outcome buckets sum to
-    ``processed``.
+    ``processed``. A correction to a MusicBrainz special-purpose placeholder (``[unknown]``,
+    ``[no artist]``, …) is not a real name and is treated exactly like no correction.
     """
     try:
         correction = client.artist_correction(value)
@@ -339,7 +352,7 @@ def _resolve_one_value(
         tally.error_values.append({"value": value, "message": str(exc)})
         return
 
-    if correction is None:
+    if correction is None or _is_placeholder(correction.name):
         tally.no_correction_values.append(value)
         return
 

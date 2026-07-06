@@ -10,6 +10,7 @@ from typer.testing import CliRunner
 from conftest import make_track
 from tagmend import __version__
 from tagmend.cli import app
+from tagmend.engine.doctor import Check, HealthReport
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -18,6 +19,20 @@ if TYPE_CHECKING:
 runner = CliRunner()
 
 _N = 2
+
+
+def _stub_health(monkeypatch: pytest.MonkeyPatch, report: HealthReport) -> None:
+    """Stub the doctor so the CLI smoke test stays offline.
+
+    ``doctor`` is a thin renderer over ``run_health_check``; the live Last.fm / MusicBrainz
+    round-trips it now runs are the operator's job (plan Test Strategy), not this wiring
+    test's — so we pin the report and assert only the CLI's render + exit-code behavior.
+    """
+
+    def _fake(_settings: object, **_kwargs: object) -> HealthReport:
+        return report
+
+    monkeypatch.setattr("tagmend.cli.run_health_check", _fake)
 
 
 def _populate(music_dir: Path, count: int) -> None:
@@ -50,13 +65,24 @@ def test_config_command_prints_url(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "http://127.0.0.1:54321/" in result.stdout
 
 
-def test_doctor_ok_with_music_path_override(temp_library: Path) -> None:
+def test_doctor_ok_with_music_path_override(
+    temp_library: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_health(monkeypatch, HealthReport(checks=[Check(name="music_path", ok=True, detail="ok")]))
     result = runner.invoke(app, ["doctor", "--music-path", str(temp_library)])
     assert result.exit_code == 0
     assert "All checks passed" in result.stdout
 
 
-def test_doctor_fails_for_missing_path(tmp_path: Path) -> None:
+def test_doctor_fails_for_missing_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_health(
+        monkeypatch,
+        HealthReport(checks=[Check(name="music_path", ok=False, detail="nope")]),
+    )
     result = runner.invoke(app, ["doctor", "--music-path", str(tmp_path / "nope")])
     assert result.exit_code == 1
 

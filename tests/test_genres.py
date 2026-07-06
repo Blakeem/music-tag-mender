@@ -174,6 +174,27 @@ def test_file_with_no_artist_is_skipped_and_untouched(
     assert read_tags(track).tags["genre"] == ["Old"]
 
 
+def test_whitespace_only_artist_is_skipped_no_artist(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    # A tab-only artist strips to blank → ``_identity`` yields None → the file is bucketed
+    # ``skipped_no_artist`` and NEVER looked up as ``"\t"`` junk (the live-testing artifact),
+    # so the Python identity rule agrees with the store-side ``no_identity``.
+    track = make_track(music_dir / "ws.mp3", {"artist": ["\t"], "genre": ["Old"]})
+    scan_library(engine_settings)
+    file_id = _file_id(engine_settings, music_dir, track.name)
+
+    fake = FakeTagSource({})
+    result = genres.stage_genres(engine_settings, client=fake)
+
+    assert result.skipped["no_artist"] == 1
+    assert result.processed == 0
+    assert fake.artist_lookups == []  # no lookup for the whitespace junk
+    assert _genre_status(engine_settings, file_id) is None
+    assert read_tags(track).tags["genre"] == ["Old"]
+
+
 def test_commit_preserves_albumartist_and_replaces_only_genre(
     engine_settings: Settings,
     music_dir: Path,

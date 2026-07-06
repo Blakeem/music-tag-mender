@@ -1,8 +1,9 @@
 """The metadata-axis abstraction: ONE parameterized status machinery for genre/artist.
 
 Genre and artist (and the album/song axes to come) each carry a per-file *workflow
-status* — ``pending`` / ``staged`` / ``done`` / ``manual`` (and ``no_match`` on the genre
-axis). Their machinery is identical bar a handful of values, so it lives here ONCE as a
+status* — ``pending`` / ``staged`` / ``done`` / ``manual`` / ``no_identity`` (and
+``no_match`` on the genre and album axes). Their machinery is identical bar a handful of
+values, so it lives here ONCE as a
 parameterized :class:`Axis`: the name, the managed-tag *fields* its field-aware
 ``staged``/``done`` derivation keys on, its ``file_<name>_status`` side table and that
 table's source-identity columns, its valid workflow-status set, and the staleness rule
@@ -90,7 +91,9 @@ class Axis:
     ``("source_artist", "source_albumartist")``."""
 
     workflow_statuses: frozenset[str]
-    """The valid derived-status set (5 for genre incl. ``no_match``; 4 for artist)."""
+    """The valid derived-status set. Includes the derived ``no_identity`` (a file with
+    neither ``artist`` nor ``albumartist``) on the genre/artist/album axes; the mismatch
+    axis (stored-or-pending only) omits it."""
 
     decision_blocks: Callable[[StatusRow, Identity], bool]
     """Whether a STORED decision still blocks reprocessing for the given current identity.
@@ -172,9 +175,12 @@ GENRE_AXIS: Final = Axis(
     fields=("genre",),
     status_table="file_genre_status",
     source_columns=("source_artist", "source_album"),
-    # Five user-facing genre states: two stored (`no_match`/`manual`), two derived
-    # (`staged`/`done`), `pending` = none of the above.
-    workflow_statuses=frozenset({"pending", "no_match", "manual", "staged", "done"}),
+    # Six user-facing genre states: two stored (`no_match`/`manual`), two derived
+    # (`staged`/`done`), the derived `no_identity` (neither artist nor albumartist), and
+    # `pending` = none of the above.
+    workflow_statuses=frozenset(
+        {"pending", "no_identity", "no_match", "manual", "staged", "done"},
+    ),
     decision_blocks=_genre_decision_blocks,
 )
 
@@ -183,9 +189,10 @@ ARTIST_AXIS: Final = Axis(
     fields=("artist", "albumartist"),
     status_table="file_artist_status",
     source_columns=("source_artist", "source_albumartist"),
-    # Four artist states: one stored (sticky `manual`), two derived (`staged`/`done`),
-    # `pending` = none of the above. There is NO `no_match` state on this axis.
-    workflow_statuses=frozenset({"pending", "manual", "staged", "done"}),
+    # Five artist states: one stored (sticky `manual`), two derived (`staged`/`done`), the
+    # derived `no_identity` (neither artist nor albumartist), and `pending` = none of the
+    # above. There is NO `no_match` state on this axis.
+    workflow_statuses=frozenset({"pending", "no_identity", "manual", "staged", "done"}),
     decision_blocks=_artist_decision_blocks,
 )
 
@@ -196,9 +203,12 @@ ALBUM_AXIS: Final = Axis(
     # The SAME identity genre uses: primary = the resolved lookup artist
     # (albumartist-else-artist), secondary = album.
     source_columns=("source_artist", "source_album"),
-    # Five album states (a near-clone of genre): two stored (`no_match`/`manual`), two
-    # derived (`staged`/`done`), `pending` = none of the above.
-    workflow_statuses=frozenset({"pending", "no_match", "manual", "staged", "done"}),
+    # Six album states (a near-clone of genre): two stored (`no_match`/`manual`), two
+    # derived (`staged`/`done`), the derived `no_identity` (neither artist nor albumartist),
+    # and `pending` = none of the above.
+    workflow_statuses=frozenset(
+        {"pending", "no_identity", "no_match", "manual", "staged", "done"},
+    ),
     decision_blocks=_album_decision_blocks,
 )
 

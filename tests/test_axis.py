@@ -42,12 +42,12 @@ def test_genre_axis_source_columns() -> None:
 
 def test_genre_axis_workflow_statuses_exact_set() -> None:
     assert GENRE_AXIS.workflow_statuses == frozenset(
-        {"pending", "no_match", "manual", "staged", "done"}
+        {"pending", "no_identity", "no_match", "manual", "staged", "done"}
     )
 
 
 def test_genre_axis_workflow_statuses_cardinality() -> None:
-    assert len(GENRE_AXIS.workflow_statuses) == 5
+    assert len(GENRE_AXIS.workflow_statuses) == 6
 
 
 # ---------------------------------------------------------------------------
@@ -72,11 +72,13 @@ def test_artist_axis_source_columns() -> None:
 
 
 def test_artist_axis_workflow_statuses_exact_set() -> None:
-    assert ARTIST_AXIS.workflow_statuses == frozenset({"pending", "manual", "staged", "done"})
+    assert ARTIST_AXIS.workflow_statuses == frozenset(
+        {"pending", "no_identity", "manual", "staged", "done"}
+    )
 
 
 def test_artist_axis_workflow_statuses_cardinality() -> None:
-    assert len(ARTIST_AXIS.workflow_statuses) == 4
+    assert len(ARTIST_AXIS.workflow_statuses) == 5
 
 
 # ---------------------------------------------------------------------------
@@ -92,9 +94,18 @@ def test_no_match_not_in_artist_workflow_statuses() -> None:
     assert "no_match" not in ARTIST_AXIS.workflow_statuses
 
 
-def test_genre_has_five_states_artist_has_four() -> None:
-    assert len(GENRE_AXIS.workflow_statuses) == 5
-    assert len(ARTIST_AXIS.workflow_statuses) == 4
+def test_genre_has_six_states_artist_has_five() -> None:
+    assert len(GENRE_AXIS.workflow_statuses) == 6
+    assert len(ARTIST_AXIS.workflow_statuses) == 5
+
+
+def test_no_identity_in_genre_artist_album_but_not_mismatch() -> None:
+    # The derived worklist state rides the three identity-driven axes; the mismatch axis
+    # (stored-or-pending only) must stay unchanged.
+    assert "no_identity" in GENRE_AXIS.workflow_statuses
+    assert "no_identity" in ARTIST_AXIS.workflow_statuses
+    assert "no_identity" in ALBUM_AXIS.workflow_statuses
+    assert "no_identity" not in MISMATCH_AXIS.workflow_statuses
 
 
 # ---------------------------------------------------------------------------
@@ -286,12 +297,12 @@ def test_album_axis_source_columns() -> None:
 
 def test_album_axis_workflow_statuses_exact_set() -> None:
     assert ALBUM_AXIS.workflow_statuses == frozenset(
-        {"pending", "no_match", "manual", "staged", "done"}
+        {"pending", "no_identity", "no_match", "manual", "staged", "done"}
     )
 
 
 def test_album_axis_workflow_statuses_cardinality() -> None:
-    assert len(ALBUM_AXIS.workflow_statuses) == 5
+    assert len(ALBUM_AXIS.workflow_statuses) == 6
 
 
 def test_no_match_in_album_workflow_statuses() -> None:

@@ -548,6 +548,70 @@ def test_library_stats_includes_album_block(
     assert album["pending"] == _N - 1
 
 
+# --- no_identity worklist (files carrying neither artist nor albumartist) ------------
+
+
+def test_no_identity_file_derives_no_identity_on_all_axes(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    make_track(music_dir / "orphan.mp3", {"genre": ["Synthwave"]})  # no artist/albumartist
+    scan_library(engine_settings)
+
+    view = list_files(engine_settings)[0]
+    assert view.genre_status == "no_identity"
+    assert view.artist_status == "no_identity"
+    assert view.album_status == "no_identity"
+
+
+def test_list_files_filters_to_no_identity_on_each_axis(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    # orphan (no identity) + one with artist + one with only albumartist (both have identity).
+    make_track(music_dir / "orphan.mp3", {"genre": ["Synthwave"]})
+    make_track(music_dir / "byartist.mp3", {"artist": ["Alpha"], "genre": ["Rock"]})
+    make_track(music_dir / "byaa.mp3", {"albumartist": ["Bravo"], "genre": ["Jazz"]})
+    scan_library(engine_settings)
+
+    by_genre = list_files(engine_settings, genre_status="no_identity")
+    by_artist = list_files(engine_settings, artist_status="no_identity")
+    by_album = list_files(engine_settings, album_status="no_identity")
+    assert [v.filename for v in by_genre] == ["orphan.mp3"]
+    assert [v.filename for v in by_artist] == ["orphan.mp3"]
+    assert [v.filename for v in by_album] == ["orphan.mp3"]
+
+
+def test_whitespace_only_artist_derives_no_identity(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    # A tab-only artist + newline-only albumartist round-trip through scan and are treated as
+    # blank (``str.strip``), so the file lands on the no_identity worklist (proves the
+    # Python-side blankness rule beyond the ASCII-space case).
+    make_track(
+        music_dir / "ws.mp3",
+        {"artist": ["\t"], "albumartist": ["\n"], "genre": ["Rock"]},
+    )
+    scan_library(engine_settings)
+
+    views = list_files(engine_settings, genre_status="no_identity")
+    assert [v.filename for v in views] == ["ws.mp3"]
+
+
+def test_no_identity_composes_with_other_filters(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    # An orphan is no_identity on BOTH the genre and album axes → it matches an AND of both.
+    make_track(music_dir / "orphan.mp3", {"genre": ["Synthwave"]})
+    make_track(music_dir / "byartist.mp3", {"artist": ["Alpha"], "genre": ["Rock"]})
+    scan_library(engine_settings)
+
+    views = list_files(engine_settings, genre_status="no_identity", album_status="no_identity")
+    assert [v.filename for v in views] == ["orphan.mp3"]
+
+
 # --- mismatch_status filter + new FileView fields -----------------------------------
 
 

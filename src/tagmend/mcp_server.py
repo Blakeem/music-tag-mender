@@ -94,12 +94,13 @@ def library_stats() -> dict[str, object]:
     number of stored tag values, and four per-axis workflow-state blocks — each a
     progress gauge for one resolver, drilled into with the matching ``list_files`` filter:
 
-    * ``genre`` — ``pending`` / ``staged`` / ``done`` / ``no_match`` / ``manual`` for
-      ``stage_genres``; drill with ``list_files(genre_status=...)``.
-    * ``artist`` — ``pending`` / ``staged`` / ``done`` / ``manual`` (no ``no_match`` on
-      this axis) for ``resolve_artists``; drill with ``list_files(artist_status=...)``.
-    * ``album`` — ``pending`` / ``staged`` / ``done`` / ``no_match`` / ``manual`` for
-      ``resolve_albums``; drill with ``list_files(album_status=...)``.
+    * ``genre`` — ``pending`` / ``no_identity`` / ``staged`` / ``done`` / ``no_match`` /
+      ``manual`` for ``stage_genres``; drill with ``list_files(genre_status=...)``.
+    * ``artist`` — ``pending`` / ``no_identity`` / ``staged`` / ``done`` / ``manual`` (no
+      ``no_match`` on this axis) for ``resolve_artists``; drill with
+      ``list_files(artist_status=...)``.
+    * ``album`` — ``pending`` / ``no_identity`` / ``staged`` / ``done`` / ``no_match`` /
+      ``manual`` for ``resolve_albums``; drill with ``list_files(album_status=...)``.
     * ``mismatch`` — ``pending`` / ``legit_ignore`` / ``misfiled_deferred`` for
       ``detect_mismatches`` dispositions; drill with ``list_files(mismatch_status=...)``.
     """
@@ -302,9 +303,11 @@ def repend_axes(commit_id: int) -> dict[str, object]:
 def list_files(  # noqa: PLR0913 - cohesive MCP discovery filters
     path: str | None = None,
     limit: int | None = None,
-    genre_status: Literal["pending", "no_match", "manual", "staged", "done"] | None = None,
-    artist_status: Literal["pending", "manual", "staged", "done"] | None = None,
-    album_status: Literal["pending", "no_match", "manual", "staged", "done"] | None = None,
+    genre_status: Literal["pending", "no_identity", "no_match", "manual", "staged", "done"]
+    | None = None,
+    artist_status: Literal["pending", "no_identity", "manual", "staged", "done"] | None = None,
+    album_status: Literal["pending", "no_identity", "no_match", "manual", "staged", "done"]
+    | None = None,
     mismatch_status: Literal["pending", "legit_ignore", "misfiled_deferred"] | None = None,
 ) -> dict[str, object]:
     """List tracked files with their current managed tags (to discover file ids).
@@ -321,22 +324,24 @@ def list_files(  # noqa: PLR0913 - cohesive MCP discovery filters
     the tags, rescan, and ``stage_genres`` retries automatically). ``manual`` lists the
     sticky exclusions (``set_genre_status``). A stored status is reported even if the
     file's identity changed since (compare the source fields to spot staleness).
-    ``pending`` includes files ``stage_genres`` cannot process for lack of an artist tag.
+    ``no_identity`` is the separate worklist of files that carry neither ``artist`` nor
+    ``albumartist`` (whitespace-only counts as blank) — every resolver skips them, and they
+    are reported on the genre/artist/album axes alike (never ``pending``).
 
     Args:
         path: When given, only files at this folder or nested under it are returned.
         limit: Cap the number of files returned. With ``genre_status`` the cap counts
             *matching* files; without it, it is applied before reading tags.
         genre_status: Return only files in this genre workflow state
-            (``pending`` | ``no_match`` | ``manual`` | ``staged`` | ``done``).
+            (``pending`` | ``no_identity`` | ``no_match`` | ``manual`` | ``staged`` | ``done``).
         artist_status: Return only files in this artist workflow state
-            (``pending`` | ``manual`` | ``staged`` | ``done``). Combined with
+            (``pending`` | ``no_identity`` | ``manual`` | ``staged`` | ``done``). Combined with
             ``genre_status``, a file must match BOTH. The axes are independent:
             ``staged``/``done`` are field-aware (genre keys on ``genre``; artist on
             ``artist``/``albumartist``; album on ``originaldate``).
         album_status: Return only files in this album workflow state
-            (``pending`` | ``no_match`` | ``manual`` | ``staged`` | ``done``). Combined with
-            the other filters, a file must match ALL. ``album_source_artist`` /
+            (``pending`` | ``no_identity`` | ``no_match`` | ``manual`` | ``staged`` | ``done``).
+            Combined with the other filters, a file must match ALL. ``album_source_artist`` /
             ``album_source_album`` carry the resolved identity a stored decision was taken
             against.
         mismatch_status: Return only files with this mismatch disposition
@@ -645,7 +650,10 @@ def resolve_artists(
     values; and any file whose ``artist``/``albumartist`` is multi-value. Values Last.fm
     confirms are already canonical stage nothing but are counted under ``already_canonical``
     (a useful signal, distinct from "nothing happened"); values with no Last.fm correction
-    are reported under ``no_correction``. A transient Last.fm error leaves that value pending
+    are reported under ``no_correction``. A correction to a MusicBrainz special-purpose
+    placeholder (``[unknown]``, ``[no artist]``, …) is treated as no correction — nothing
+    is staged and the value is reported under ``no_correction``. A transient Last.fm error
+    leaves that value pending
     under ``error_values`` so a re-run retries it. The per-value outcome buckets
     (``corrected_values`` + ``already_canonical`` + ``no_correction`` + ``errors``) sum to
     ``processed``.
@@ -932,7 +940,8 @@ def resolve_albums(
 
 @mcp.tool()
 def list_albums(
-    album_status: Literal["pending", "no_match", "manual", "staged", "done"] | None = None,
+    album_status: Literal["pending", "no_identity", "no_match", "manual", "staged", "done"]
+    | None = None,
     limit: int | None = None,
 ) -> dict[str, object]:
     """List distinct album groups with file counts + status (to scope ``resolve_albums``).
@@ -948,7 +957,8 @@ def list_albums(
 
     Args:
         album_status: Keep only groups in this derived album workflow state (``pending`` |
-            ``no_match`` | ``manual`` | ``staged`` | ``done``), applied before ``limit``.
+            ``no_identity`` | ``no_match`` | ``manual`` | ``staged`` | ``done``), applied
+            before ``limit``.
         limit: Cap the number of groups returned (applied after ordering + filtering).
             Keeps the payload context-cheap on a large library.
     """

@@ -23,7 +23,7 @@
       `commit_tags(path=folder)` (one revertible commit per release) → `repend_axes`.
       **Do this BEFORE the full resolve run (B2)** — identity fixes re-pend derived genre/year,
       so fixing identity first avoids resolving axes against wrong artists.
-- Known per-folder routing from live testing (2026-07-04, `docs/live-test-findings.md`):
+- Known per-folder routing from live testing (2026-07-04):
   - [ ] **Skrillex/Gypsyhook ("Sonny", 8 files):** Last.fm `getCorrection("Sonny")` returns
         *already canonical* — the alias will NOT be fixed by `resolve_artists`. Fix flow
         (research the Gypsyhook EP identity) or `legit_ignore` if the Sonny credit is wanted.
@@ -67,7 +67,8 @@
 - **Song axis (title + track number) — after the CLI; scope re-measured 2026-07-05.** Two
   distinct flavors, deliberately sequenced late:
   - **Blank-fill (small, text-only):** the full 11,196-file library has **61 files with no
-    title, 203 with no tracknumber, 10 placeholder "Track NN" titles** (the old "0 missing"
+    title, 203 with no tracknumber, 2 placeholder "Track NN" titles** (re-measured 2026-08-02;
+    the old "0 missing"
     audit was the 720-file dev library). Much of this may fall out of B0 (wrong-release fixes
     rewrite title/tracknumber) or be fixable from filenames via the folder-parsing primitive.
     Re-measure after B0/B2 before building anything.

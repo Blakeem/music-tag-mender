@@ -4,9 +4,11 @@
 > removed (through the album-gaps detector: schema v11, 31 MCP tools; see `CLAUDE.md` for the
 > shipped-state summary and `PLAN.md` for the design of record).
 >
-> **Direction:** finish the **metadata** mission first. Filesystem moves/renames (M6) and the
-> **CLI surface** are deliberately last — CLI is pushed back until everything else is complete
-> and finalized (reaffirmed 2026-07-05).
+> **Direction (updated 2026-08-02):** finish the **metadata** mission (Phase B), then the
+> **path-canonicalization** mission (Phase C: prove path↔tag coherence for every path-encoded
+> field, then pattern-driven renames/moves, then promote). Tags are the source of truth;
+> paths become derived output. The **CLI surface** stays deliberately last (reaffirmed
+> 2026-07-05).
 
 ---
 
@@ -48,39 +50,68 @@
       `list_albums(album_status=…, limit=…)` (actionable groups = `blank_originaldate > 0`).
       Followed by a deliberate **review/testing break** before any filesystem work begins.
 
-### B3. Promote the result (user action, not code)
-- [ ] Once B0 + B2 are verified perfect on the working copy, overwrite the actual library with
-      the mended copy.
+---
+
+## Phase C — path canonicalization (decided 2026-08-02; runs after Phase B is clean)
+
+> End state: every file's path is **generated from its tags** via a configurable naming
+> pattern (e.g. `Artist\Artist - Year - Album\NN - Title.ext`) — including cases like a bare
+> album folder in the library root moving under its artist folder. Tags are the source of
+> truth; paths are derived output. **Nothing renames until every path↔tag disagreement is
+> either fixed or carries a deliberate ignore disposition.**
+
+### C1. Full path↔tag coherence detector (the pre-rename gate)
+- [ ] Widen mismatch detection from today's albumartist-only signal to EVERY path-encoded
+      field: top folder ↔ artist/albumartist (exists today), release-folder leaf ↔ album +
+      year-in-leaf (via `parsing.parse_folder`), filename ↔ tracknumber + title (via
+      `parsing.parse_filename_track`). Reuses `fold` matching + the fix-or-ignore disposition
+      pattern (`file_mismatch_status`). The C4 gate is ZERO unresolved rows: every
+      disagreement fixed through the stage→commit flow or explicitly ignored.
+
+### C2. Year-disagreement report (review-only)
+- [ ] Report files whose stored `date`/`originaldate` disagrees with the MusicBrainz
+      release-group first-release date (the comparator `resolve_albums` already fetches and
+      caches). Review-only, never auto-staged: re-releases and soundtracks make a wrong
+      `(artist, album)` → release-group match plausible, so a human confirms every correction.
+
+### C3. Song axis — AcoustID fingerprint verification (title + tracknumber)
+- [ ] The audio-truth tier (promoted from deferred 2026-08-02 — track numbers must be proven
+      before C4 renames them into filenames). Local **fpcalc/Chromaprint** (LGPL-2.1+,
+      subprocess, prebuilt static Windows binary) via MIT `pyacoustid` → **AcoustID** web
+      service (free app API key, ~3 req/s) → MB recording IDs → canonical title +, via the
+      chosen MB release's tracklist, tracknumber. Covers both flavors: blank-fill (61
+      no-title / 203 no-tracknumber / 2 placeholder titles, measured 2026-08-02; re-measure
+      after B0/B2 — wrong-release fixes rewrite these) and wrong-value verification that text
+      cannot do (the tags lie consistently; only the audio is independent). New axis on the
+      existing `Axis` abstraction (`file_song_status`, `resolve_songs`, filter/stats/tools) +
+      persistent fingerprint/lookup caches so re-runs are network-free. **Spec the
+      recording→release/tracknumber reconciliation in PLAN.md first** (one recording ↔ many
+      releases; scoring is the hard correctness question — anchor on the folder's files
+      converging on one release's tracklist). New deps: fpcalc on PATH (needs a `doctor`
+      check) + a second API key; re-verify fpcalc/AcoustID details at build time. Coverage
+      caveat by design: bootlegs/remixes/YouTube rips are often absent from AcoustID — they
+      fail safe (no match → worklist/ignore), never wrong-match.
+
+### C4. Organize — pattern-driven renames/moves (M6 realized)
+- [ ] `paths` becomes the second live `RevisionDomain` (`moves.py` stub; `path_revisions` DDL
+      ships since v6): a naming-pattern setting generates every file's canonical path from its
+      tags; a grouped detect/report proposes the moves (root-level bare album folders → their
+      artist folder included); staged → committed → revertible per file, mirroring the tags
+      domain (PLAN.md §18). First customers: every `misfiled_deferred` disposition from B0.
+      Open seam questions: intra-batch move ordering, collision policy (§15), folder-rename
+      atomicity.
+
+### C5. Promote the result (user action, not code — was B3)
+- [ ] Once Phases B + C are verified perfect on the working copy (everything clean except
+      deliberately-ignored files), overwrite the actual library with the mended, renamed copy.
 
 ---
 
-## Deferred until after Phase B
+## Deferred until after Phases B + C
 
-- **M6 — Organize (opt-in moves/renames):** `paths` is the second `RevisionDomain`; `moves.py`
-  is a stub, `path_revisions` DDL ships since v6. Design stays on the books (revertible per-file
-  moves; PLAN.md §18). Three open seam questions: intra-batch move ordering, collision policy
-  (§15), folder-rename atomicity. **First real customers already queued:** every
-  `misfiled_deferred` disposition from B0.
 - **CLI surface — deliberately LAST (user decision, reaffirmed 2026-07-05):** all tools are
   MCP-first. Eventual pass exposes the axis verbs (`resolve-*`, `set-*-status`, `diff`/`commit`,
   `revert`/`revert-commit`, `list --*-status …`) once everything else is complete and finalized.
-- **Song axis (title + track number) — after the CLI; scope re-measured 2026-07-05.** Two
-  distinct flavors, deliberately sequenced late:
-  - **Blank-fill (small, text-only):** the full 11,196-file library has **61 files with no
-    title, 203 with no tracknumber, 2 placeholder "Track NN" titles** (re-measured 2026-08-02;
-    the old "0 missing"
-    audit was the 720-file dev library). Much of this may fall out of B0 (wrong-release fixes
-    rewrite title/tracknumber) or be fixable from filenames via the folder-parsing primitive.
-    Re-measure after B0/B2 before building anything.
-  - **Wrong-title correction (the real lift):** can't be done from text metadata at all (the
-    tags lie; nothing to compare against) — needs **acoustic fingerprinting**, mirroring
-    Picard's "Scan": **fpcalc/Chromaprint** (LGPL-2.1+, subprocess, prebuilt static binaries)
-    likely via MIT `pyacoustid` → **AcoustID** web service (free app API key) → MB recording
-    IDs → canonical title/track. New axis on the existing `Axis` abstraction (`file_song_status`,
-    `resolve_songs`, filter/stats/tools). **Spec the track/recording reconciliation in PLAN.md
-    first** (one fingerprint ↔ many recordings; scoring is the hard correctness question).
-    New deps the text axes don't have: an external binary on PATH (needs a `doctor` check) + a
-    second API key. Re-verify fpcalc/AcoustID details at build time.
 - **M5 — Polish:** genre vocabulary tuning, album-level genre override, README pass, packaging
   (`uv tool install` / `uvx tagmend mcp` / `pipx`).
 

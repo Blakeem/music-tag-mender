@@ -1,6 +1,6 @@
 """MusicBrainz client: an album's original (first) release year, cached and paced.
 
-The album-axis authority (mirrors :mod:`tagmend.engine.lastfm`'s shape). Last.fm cannot
+The year-axis authority (mirrors :mod:`tagmend.engine.lastfm`'s shape). Last.fm cannot
 supply an album's year and has no album correction; MusicBrainz can — a *release-group*'s
 ``first-release-date`` is the original year (e.g. *Paranoid* = 1970), distinct from a
 reissue *release* ``date`` (the edition year). One endpoint is used:
@@ -63,7 +63,7 @@ _YEAR_PREFIX_LEN: Final = 4
 
 @dataclass(frozen=True, slots=True)
 class MBAlbum:
-    """A MusicBrainz release group's original-year resolution for the album axis."""
+    """A MusicBrainz release group's original-year resolution for the year axis."""
 
     album_title: str
     original_date: str
@@ -95,7 +95,7 @@ class MBAlbumSource(Protocol):
     """The album lookup the orchestrator depends on (so it can use a fake in tests).
 
     Returns an :class:`MBAlbum` when a usable Album release group is found, or ``None`` when
-    nothing usable exists (genuinely no first-release year for the album axis to fill).
+    nothing usable exists (genuinely no first-release year for the year axis to fill).
     """
 
     def album_first_release(self, artist: str, album: str) -> MBAlbum | None:

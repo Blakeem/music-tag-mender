@@ -40,7 +40,7 @@ def test_direct_scan_and_stats(music_dir: Path) -> None:
     assert scan_payload["ok"] is True
     assert scan_payload["added"] == _N
 
-    stats_payload = mcp_server.library_stats()
+    stats_payload = mcp_server.get_library_stats()
     assert stats_payload["ok"] is True
     assert stats_payload["present"] == _N
 
@@ -104,9 +104,9 @@ def test_list_tools_exposes_expected_tools_and_schema() -> None:
     tools = asyncio.run(mcp_server.mcp.list_tools())
     names = {tool.name for tool in tools}
     assert {
-        "health_check",
+        "check_health",
         "scan_library",
-        "library_stats",
+        "get_library_stats",
         "list_files",
         "get_file",
         "stage_tags",
@@ -114,16 +114,16 @@ def test_list_tools_exposes_expected_tools_and_schema() -> None:
         "unstage_tags",
         "diff_tags",
         "commit_tags",
-        "repend_axes",
+        "reopen_axes",
         "history_tags",
         "revert_tags",
         "revert_commit",
         "list_commits",
         "get_commit",
-        "resolve_albums",
+        "resolve_years",
         "list_albums",
-        "set_album_status",
-        "reset_album_status",
+        "set_year_status",
+        "reset_year_status",
         "set_mismatch_status",
         "reset_mismatch_status",
     } <= names
@@ -139,8 +139,8 @@ def test_list_tools_exposes_expected_tools_and_schema() -> None:
     enum_values = _enum_values(genre_status_schema)
     assert set(enum_values) == {"pending", "no_identity", "no_match", "manual", "staged", "done"}
 
-    album_status_schema = list_tool.inputSchema["properties"]["album_status"]
-    assert set(_enum_values(album_status_schema)) == {
+    year_status_schema = list_tool.inputSchema["properties"]["year_status"]
+    assert set(_enum_values(year_status_schema)) == {
         "pending",
         "no_identity",
         "no_match",
@@ -320,11 +320,11 @@ def test_list_files_bad_genre_status_returns_error(music_dir: Path) -> None:
     assert "error" in payload
 
 
-def test_library_stats_includes_genre_block(music_dir: Path) -> None:
+def test_get_library_stats_includes_genre_block(music_dir: Path) -> None:
     file_id = _scanned_track_id(music_dir)
     _set_no_match(file_id, source_artist="Obscure Band")
 
-    stats = mcp_server.library_stats()
+    stats = mcp_server.get_library_stats()
 
     assert stats["ok"] is True
     genre = stats["genre"]
@@ -333,7 +333,7 @@ def test_library_stats_includes_genre_block(music_dir: Path) -> None:
     assert genre["no_match"] == 1
 
 
-def test_album_status_tools_and_list_albums(music_dir: Path) -> None:
+def test_year_status_tools_and_list_albums(music_dir: Path) -> None:
     track = make_track(music_dir / "p.mp3", {"artist": ["Black Sabbath"], "album": ["Paranoid"]})
     mcp_server.scan_library(path=str(music_dir))
     conn = connect(load_settings().db_path)
@@ -344,16 +344,16 @@ def test_album_status_tools_and_list_albums(music_dir: Path) -> None:
     finally:
         conn.close()
 
-    # set_album_status manual → list_files filters → reset re-queues.
-    assert mcp_server.set_album_status("manual", file_ids=[file_id]) == {"ok": True, "affected": 1}
-    listed = mcp_server.list_files(album_status="manual")
+    # set_year_status manual → list_files filters → reset re-queues.
+    assert mcp_server.set_year_status("manual", file_ids=[file_id]) == {"ok": True, "affected": 1}
+    listed = mcp_server.list_files(year_status="manual")
     assert listed["ok"] is True
     files = listed["files"]
     assert isinstance(files, list)
     assert files[0]["file_id"] == file_id
-    assert files[0]["album_status"] == "manual"
+    assert files[0]["year_status"] == "manual"
 
-    assert mcp_server.reset_album_status(file_ids=[file_id]) == {"ok": True, "affected": 1}
+    assert mcp_server.reset_year_status(file_ids=[file_id]) == {"ok": True, "affected": 1}
 
     albums_payload = mcp_server.list_albums()
     assert albums_payload["ok"] is True
@@ -363,13 +363,13 @@ def test_album_status_tools_and_list_albums(music_dir: Path) -> None:
     # The lone Paranoid file has no originaldate → the group is actionable.
     assert paranoid["blank_originaldate"] == 1
 
-    # limit + album_status params thread through to the engine.
+    # limit + year_status params thread through to the engine.
     limited = mcp_server.list_albums(limit=1)
     assert isinstance(limited["albums"], list)
     assert len(limited["albums"]) == 1
-    pending_only = mcp_server.list_albums(album_status="pending")
+    pending_only = mcp_server.list_albums(year_status="pending")
     assert isinstance(pending_only["albums"], list)
-    assert all(r["album_status"] == "pending" for r in pending_only["albums"])
+    assert all(r["year_status"] == "pending" for r in pending_only["albums"])
     assert any(r["album"] == "Paranoid" for r in pending_only["albums"])
 
 
@@ -386,20 +386,20 @@ def test_list_artists_limit_param(music_dir: Path) -> None:
     assert artists_list[0]["artist"] == "Alpha"
 
 
-def test_set_album_status_rejects_unknown_status(music_dir: Path) -> None:
+def test_set_year_status_rejects_unknown_status(music_dir: Path) -> None:
     _scanned_track_id(music_dir)
-    payload = mcp_server.set_album_status("no_match", file_ids=[1])
+    payload = mcp_server.set_year_status("no_match", file_ids=[1])
     assert payload["ok"] is False
     assert "error" in payload
 
 
-def test_library_stats_includes_album_block(music_dir: Path) -> None:
+def test_get_library_stats_includes_year_block(music_dir: Path) -> None:
     _scanned_track_id(music_dir)
-    stats = mcp_server.library_stats()
+    stats = mcp_server.get_library_stats()
     assert stats["ok"] is True
-    album = stats["album"]
-    assert isinstance(album, dict)
-    assert set(album) == store.ALBUM_WORKFLOW_STATUSES
+    year = stats["year"]
+    assert isinstance(year, dict)
+    assert set(year) == store.YEAR_WORKFLOW_STATUSES
 
 
 def test_history_and_revert_roundtrip(music_dir: Path) -> None:

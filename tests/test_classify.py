@@ -1,7 +1,7 @@
 """Unit tests for the genre classifier (``engine/classify.py``).
 
 Covers :func:`load_vocabulary` against the real bundled YAML (fold/alias/overlay matching,
-single-valued index, collision handling) and the pure :func:`resolve_genres` pipeline on
+single-valued index, collision handling) and the pure :func:`classify_genres` pipeline on
 the real band examples from ``docs/genre-tagging-spec.md``.
 """
 
@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 
 from tagmend.config import Settings
-from tagmend.engine.classify import Vocabulary, fold, load_vocabulary, resolve_genres
+from tagmend.engine.classify import Vocabulary, classify_genres, fold, load_vocabulary
 from tagmend.engine.lastfm import Tag
 
 # A sane lower bound for the generated MusicBrainz vocabulary (about 2,156 genres, plus
@@ -40,9 +40,9 @@ def captured_warnings(caplog: pytest.LogCaptureFixture) -> Iterator[pytest.LogCa
 
 
 def _settings(*, min_weight: int = 2, max_count: int | None = None) -> Settings:
-    """A Settings with only the genre knobs that ``resolve_genres`` reads set.
+    """A Settings with only the genre knobs that ``classify_genres`` reads set.
 
-    ``resolve_genres`` never touches ``db_path``, so a throwaway path keeps it simple.
+    ``classify_genres`` never touches ``db_path``, so a throwaway path keeps it simple.
     """
     return Settings(
         music_path=None,
@@ -102,10 +102,10 @@ def test_load_vocabulary_index_is_single_valued_and_large() -> None:
         assert isinstance(name, str)
 
 
-# --- resolve_genres: real band examples ----------------------------------------------
+# --- classify_genres: real band examples ----------------------------------------------
 
 
-def test_resolve_genres_thermostatic_artist_only() -> None:
+def test_classify_genres_thermostatic_artist_only() -> None:
     vocab = load_vocabulary()
     artist_tags = [
         Tag("synthpop", 100),
@@ -117,7 +117,7 @@ def test_resolve_genres_thermostatic_artist_only() -> None:
         Tag("electronica", 4),
     ]
 
-    result = resolve_genres(artist_tags, None, vocab, _settings(min_weight=2))
+    result = classify_genres(artist_tags, None, vocab, _settings(min_weight=2))
 
     # Weight-ordered desc, name asc on ties. bitpop(38) and electropop(38) tie → name asc.
     assert result == [
@@ -130,7 +130,7 @@ def test_resolve_genres_thermostatic_artist_only() -> None:
     ]
 
 
-def test_resolve_genres_daft_punk_artist_plus_album_merge() -> None:
+def test_classify_genres_daft_punk_artist_plus_album_merge() -> None:
     vocab = load_vocabulary()
     # From spec §6.1 (Daft Punk / Random Access Memories), min_weight=2.
     artist_tags = [
@@ -151,7 +151,7 @@ def test_resolve_genres_daft_punk_artist_plus_album_merge() -> None:
         Tag("pop", 1),  # below min_weight → dropped
     ]
 
-    result = resolve_genres(artist_tags, album_tags, vocab, _settings(min_weight=2))
+    result = classify_genres(artist_tags, album_tags, vocab, _settings(min_weight=2))
 
     # Merge by max weight: electronic 100, house 63, disco 43, dance 36, funk 32,
     # techno 26, electronica 11, electro 2. disco/funk only exist via the album.
@@ -167,7 +167,7 @@ def test_resolve_genres_daft_punk_artist_plus_album_merge() -> None:
     ]
 
 
-def test_resolve_genres_max_count_caps_top_n() -> None:
+def test_classify_genres_max_count_caps_top_n() -> None:
     vocab = load_vocabulary()
     artist_tags = [
         Tag("electronic", 100),
@@ -176,7 +176,7 @@ def test_resolve_genres_max_count_caps_top_n() -> None:
         Tag("techno", 26),
     ]
 
-    result = resolve_genres(
+    result = classify_genres(
         artist_tags,
         None,
         vocab,
@@ -186,7 +186,7 @@ def test_resolve_genres_max_count_caps_top_n() -> None:
     assert result == ["electronic", "house"]
 
 
-def test_resolve_genres_min_weight_drops_weak_tail() -> None:
+def test_classify_genres_min_weight_drops_weak_tail() -> None:
     vocab = load_vocabulary()
     artist_tags = [
         Tag("electronic", 100),
@@ -194,20 +194,20 @@ def test_resolve_genres_min_weight_drops_weak_tail() -> None:
         Tag("techno", 1),  # below a higher threshold
     ]
 
-    result = resolve_genres(artist_tags, None, vocab, _settings(min_weight=5))
+    result = classify_genres(artist_tags, None, vocab, _settings(min_weight=5))
 
     assert result == ["electronic", "house"]  # techno(1) dropped
 
 
-def test_resolve_genres_empty_and_no_match_inputs() -> None:
+def test_classify_genres_empty_and_no_match_inputs() -> None:
     vocab = load_vocabulary()
     settings = _settings(min_weight=2)
 
-    assert resolve_genres([], None, vocab, settings) == []
+    assert classify_genres([], None, vocab, settings) == []
     # All non-vocab tags → empty.
-    assert resolve_genres([Tag("2013", 100), Tag("swedish", 80)], None, vocab, settings) == []
+    assert classify_genres([Tag("2013", 100), Tag("swedish", 80)], None, vocab, settings) == []
     # album_tags=None vs an empty album list both behave (empty album contributes nothing).
-    assert resolve_genres([], [], vocab, settings) == []
+    assert classify_genres([], [], vocab, settings) == []
 
 
 # --- overlay collision handling ------------------------------------------------------

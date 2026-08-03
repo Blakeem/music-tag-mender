@@ -2,15 +2,15 @@
 
 A thin Typer frontend over :mod:`tagmend.engine`. Subcommands:
 
-* ``tagmend doctor``       — readiness check (settings, music folder, ledger).
-* ``tagmend scan``         — scan the library into the snapshot (read-only).
-* ``tagmend stats``        — show library-wide snapshot counts.
-* ``tagmend detect``       — list files whose tags disagree with their path (read-only).
-* ``tagmend config``       — launch the local config web UI.
-* ``tagmend config-set``   — write a value into ``settings.json``.
-* ``tagmend config-path``  — print the settings file location.
-* ``tagmend mcp``          — run the MCP server over stdio.
-* ``tagmend version``      — print the version.
+* ``tagmend check-health``      — readiness check (settings, music folder, ledger).
+* ``tagmend scan-library``      — scan the library into the snapshot (read-only).
+* ``tagmend get-library-stats`` — show library-wide snapshot counts.
+* ``tagmend detect-mismatches`` — list files whose tags disagree with their path (read-only).
+* ``tagmend config``            — launch the local config web UI.
+* ``tagmend config-set``        — write a value into ``settings.json``.
+* ``tagmend config-path``       — print the settings file location.
+* ``tagmend mcp``               — run the MCP server over stdio.
+* ``tagmend version``           — print the version.
 """
 
 # NOTE: deliberately no `from __future__ import annotations` here — Typer evaluates
@@ -22,8 +22,7 @@ from typing import Annotated
 import typer
 
 from tagmend import __version__, config, configui, mcp_server
-from tagmend.engine import library, mismatch
-from tagmend.engine.doctor import run_health_check
+from tagmend.engine import health, library, mismatch
 from tagmend.engine.library import ScanMode
 from tagmend.log import get_logger, set_level
 
@@ -50,8 +49,8 @@ def _main(
         set_level("DEBUG")
 
 
-@app.command()
-def doctor(
+@app.command(name="check-health")
+def check_health(
     music_path: Annotated[
         Path | None,
         typer.Option(help="Override the configured music folder for this check."),
@@ -62,7 +61,7 @@ def doctor(
     if music_path is not None:
         settings = replace(settings, music_path=music_path)
 
-    report = run_health_check(settings)
+    report = health.check_health(settings)
     for check in report.checks:
         mark = "OK  " if check.ok else "FAIL"
         typer.echo(f"[{mark}] {check.name}: {check.detail}")
@@ -73,8 +72,8 @@ def doctor(
     typer.echo("All checks passed — ready to go.")
 
 
-@app.command()
-def scan(
+@app.command(name="scan-library")
+def scan_library(
     path: Annotated[
         Path | None,
         typer.Argument(help="Folder to scan; defaults to the configured music_path."),
@@ -103,11 +102,11 @@ def scan(
     typer.echo(f"  errors:          {result.errors}")
 
 
-@app.command()
-def stats() -> None:
+@app.command(name="get-library-stats")
+def get_library_stats() -> None:
     """Show library-wide snapshot counts (present/missing/unprocessed, by extension)."""
     settings = config.load_settings()
-    summary = library.library_stats(settings)
+    summary = library.get_library_stats(settings)
 
     typer.echo(f"total files:  {summary['total_files']}")
     typer.echo(f"present:      {summary['present']}")
@@ -123,8 +122,8 @@ def stats() -> None:
     typer.echo(f"total tag values: {summary['total_tag_values']}")
 
 
-@app.command()
-def detect(
+@app.command(name="detect-mismatches")
+def detect_mismatches(
     tier: Annotated[
         str | None,
         typer.Option(help="Only show this tier: high | medium | low."),

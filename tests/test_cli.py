@@ -10,7 +10,7 @@ from typer.testing import CliRunner
 from conftest import make_track
 from tagmend import __version__
 from tagmend.cli import app
-from tagmend.engine.doctor import Check, HealthReport
+from tagmend.engine.health import Check, HealthReport
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -22,9 +22,9 @@ _N = 2
 
 
 def _stub_health(monkeypatch: pytest.MonkeyPatch, report: HealthReport) -> None:
-    """Stub the doctor so the CLI smoke test stays offline.
+    """Stub the health check so the CLI smoke test stays offline.
 
-    ``doctor`` is a thin renderer over ``run_health_check``; the live Last.fm / MusicBrainz
+    ``check-health`` is a thin renderer over ``check_health``; the live Last.fm / MusicBrainz
     round-trips it now runs are the operator's job (plan Test Strategy), not this wiring
     test's — so we pin the report and assert only the CLI's render + exit-code behavior.
     """
@@ -32,7 +32,7 @@ def _stub_health(monkeypatch: pytest.MonkeyPatch, report: HealthReport) -> None:
     def _fake(_settings: object, **_kwargs: object) -> HealthReport:
         return report
 
-    monkeypatch.setattr("tagmend.cli.run_health_check", _fake)
+    monkeypatch.setattr("tagmend.engine.health.check_health", _fake)
 
 
 def _populate(music_dir: Path, count: int) -> None:
@@ -65,17 +65,17 @@ def test_config_command_prints_url(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "http://127.0.0.1:54321/" in result.stdout
 
 
-def test_doctor_ok_with_music_path_override(
+def test_check_health_ok_with_music_path_override(
     temp_library: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _stub_health(monkeypatch, HealthReport(checks=[Check(name="music_path", ok=True, detail="ok")]))
-    result = runner.invoke(app, ["doctor", "--music-path", str(temp_library)])
+    result = runner.invoke(app, ["check-health", "--music-path", str(temp_library)])
     assert result.exit_code == 0
     assert "All checks passed" in result.stdout
 
 
-def test_doctor_fails_for_missing_path(
+def test_check_health_fails_for_missing_path(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -83,46 +83,46 @@ def test_doctor_fails_for_missing_path(
         monkeypatch,
         HealthReport(checks=[Check(name="music_path", ok=False, detail="nope")]),
     )
-    result = runner.invoke(app, ["doctor", "--music-path", str(tmp_path / "nope")])
+    result = runner.invoke(app, ["check-health", "--music-path", str(tmp_path / "nope")])
     assert result.exit_code == 1
 
 
-def test_scan_with_explicit_path(music_dir: Path) -> None:
+def test_scan_library_with_explicit_path(music_dir: Path) -> None:
     _populate(music_dir, _N)
 
-    result = runner.invoke(app, ["scan", str(music_dir)])
+    result = runner.invoke(app, ["scan-library", str(music_dir)])
 
     assert result.exit_code == 0
     assert "added:" in result.stdout
     assert str(_N) in result.stdout
 
 
-def test_scan_then_stats_share_ledger(music_dir: Path) -> None:
+def test_scan_library_then_get_library_stats_share_ledger(music_dir: Path) -> None:
     # Both invocations run under the same isolated config/data dirs (one tmp_path),
     # so the scan's ledger is the one stats reads back.
     _populate(music_dir, _N)
-    scan_result = runner.invoke(app, ["scan", str(music_dir)])
+    scan_result = runner.invoke(app, ["scan-library", str(music_dir)])
     assert scan_result.exit_code == 0
 
-    stats_result = runner.invoke(app, ["stats"])
+    stats_result = runner.invoke(app, ["get-library-stats"])
     assert stats_result.exit_code == 0
     assert "total files:" in stats_result.stdout
     assert str(_N) in stats_result.stdout
 
 
-def test_scan_presence_mode_reads_no_tags(music_dir: Path) -> None:
+def test_scan_library_presence_mode_reads_no_tags(music_dir: Path) -> None:
     _populate(music_dir, _N)
 
-    result = runner.invoke(app, ["scan", str(music_dir), "--mode", "presence"])
+    result = runner.invoke(app, ["scan-library", str(music_dir), "--mode", "presence"])
 
     assert result.exit_code == 0
     assert "tags read:" in result.stdout
     assert "0" in result.stdout
 
 
-def test_scan_without_configured_music_path() -> None:
+def test_scan_library_without_configured_music_path() -> None:
     # The isolate fixture clears config, so no music_path is set and no path arg given.
-    result = runner.invoke(app, ["scan"])
+    result = runner.invoke(app, ["scan-library"])
 
     assert result.exit_code == 1
     assert "music_path" in result.stdout

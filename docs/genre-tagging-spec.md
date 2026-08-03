@@ -365,7 +365,7 @@ vocabulary* where:
       curated aliases; run §4.2 dedup + §4.4 collision check.
 - [ ] `data/genre_vocabulary.yml` v1: 2,156 names + seed aliases.
 - [ ] `classify.py`: load vocab → `fold-key → name` index (+ collision assertion);
-      `resolve_genres(artist_tags, album_tags, settings) -> ordered list[name]`.
+      `classify_genres(artist_tags, album_tags, settings) -> ordered list[name]`.
 - [ ] `lastfm.py`: `get_top_tags(artist)` / `get_top_tags(artist, album)` with
       `lastfm_cache` + 1 req/sec pacing; error-6 (not found) → empty list.
 - [ ] Settings: `genre_min_weight`, `genre_max_count`, `genre_use_album_tags`.

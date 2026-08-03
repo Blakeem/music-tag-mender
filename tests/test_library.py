@@ -17,7 +17,7 @@ from tagmend.engine.db import connect
 from tagmend.engine.library import (
     ScanMode,
     get_file_view,
-    library_stats,
+    get_library_stats,
     list_files,
     scan_library,
 )
@@ -143,7 +143,7 @@ def test_first_scan_adds_and_reads(engine_settings: Settings, music_dir: Path) -
     assert result.tags_read == _N
     assert result.total_seen == _N
 
-    stats = library_stats(engine_settings)
+    stats = get_library_stats(engine_settings)
     assert stats["present"] == _N
     assert stats["missing"] == 0
     assert stats["unprocessed"] == 0
@@ -182,7 +182,7 @@ def test_untagged_new_file_is_processed(engine_settings: Settings, music_dir: Pa
 
     scan_library(engine_settings)
 
-    stats = library_stats(engine_settings)
+    stats = get_library_stats(engine_settings)
     assert stats["unprocessed"] == 0
 
 
@@ -195,7 +195,7 @@ def test_missing_then_restored(engine_settings: Settings, music_dir: Path) -> No
     missing_result = scan_library(engine_settings)
     assert missing_result.missing_flagged == 1
 
-    stats = library_stats(engine_settings)
+    stats = get_library_stats(engine_settings)
     assert stats["missing"] == 1
     assert stats["present"] == _N - 1
     assert _file_row(engine_settings, music_dir, gone.name).is_missing is True
@@ -215,7 +215,7 @@ def test_presence_mode_skips_tag_reads(engine_settings: Settings, music_dir: Pat
     assert result.added == _N
     assert result.tags_read == 0
 
-    stats = library_stats(engine_settings)
+    stats = get_library_stats(engine_settings)
     assert stats["unprocessed"] == _N  # tags never read in presence mode
 
 
@@ -266,7 +266,7 @@ def test_scan_continues_past_corrupt_file(engine_settings: Settings, music_dir: 
     assert result.errors >= 1
     # All good tracks were still added (added counts the corrupt file too; tags_read
     # is what excludes it). The good tracks have their tags stored.
-    stats = library_stats(engine_settings)
+    stats = get_library_stats(engine_settings)
     total_tag_values = stats["total_tag_values"]
     assert isinstance(total_tag_values, int)
     assert total_tag_values >= _N
@@ -359,7 +359,7 @@ def test_list_files_unknown_genre_status_raises(
         list_files(engine_settings, genre_status="bogus")
 
 
-def test_library_stats_includes_genre_block(
+def test_get_library_stats_includes_genre_block(
     engine_settings: Settings,
     music_dir: Path,
 ) -> None:
@@ -368,7 +368,7 @@ def test_library_stats_includes_genre_block(
     row = _file_row(engine_settings, music_dir, tracks[0].name)
     _set_no_match(engine_settings, row.id, source_artist="Artist 0")
 
-    stats = library_stats(engine_settings)
+    stats = get_library_stats(engine_settings)
 
     assert "genre" in stats
     genre = stats["genre"]
@@ -431,7 +431,7 @@ def test_list_files_composes_both_status_filters(
     assert [v.file_id for v in views] == [row2.id]
 
 
-def test_library_stats_includes_artist_block(
+def test_get_library_stats_includes_artist_block(
     engine_settings: Settings,
     music_dir: Path,
 ) -> None:
@@ -440,7 +440,7 @@ def test_library_stats_includes_artist_block(
     row = _file_row(engine_settings, music_dir, tracks[0].name)
     artists.set_artist_status(engine_settings, file_ids=[row.id], status="manual")
 
-    stats = library_stats(engine_settings)
+    stats = get_library_stats(engine_settings)
 
     assert "artist" in stats
     artist = stats["artist"]
@@ -449,21 +449,21 @@ def test_library_stats_includes_artist_block(
     assert artist["manual"] == 1
 
 
-# --- album_status filter + composition + new FileView fields ------------------------
+# --- year_status filter + composition + new FileView fields -------------------------
 
 
-def _set_album_no_match(
+def _set_year_no_match(
     settings: Settings,
     file_id: int,
     *,
     source_artist: str,
     source_album: str,
 ) -> None:
-    """Persist a terminal ``no_match`` album decision in the isolated ledger."""
+    """Persist a terminal ``no_match`` year decision in the isolated ledger."""
     conn = connect(settings.db_path)
     try:
         apply_schema(conn)
-        store.set_album_status(
+        store.set_year_status(
             conn,
             file_id=file_id,
             status="no_match",
@@ -476,7 +476,7 @@ def _set_album_no_match(
         conn.close()
 
 
-def test_list_files_filters_to_album_no_match_with_sources(
+def test_list_files_filters_to_year_no_match_with_sources(
     engine_settings: Settings,
     music_dir: Path,
 ) -> None:
@@ -484,68 +484,68 @@ def test_list_files_filters_to_album_no_match_with_sources(
     scan_library(engine_settings)
 
     target = _file_row(engine_settings, music_dir, tracks[1].name)
-    _set_album_no_match(
+    _set_year_no_match(
         engine_settings,
         target.id,
         source_artist="Artist 1",
         source_album="Some Album",
     )
 
-    views = list_files(engine_settings, album_status="no_match")
+    views = list_files(engine_settings, year_status="no_match")
 
     assert [v.file_id for v in views] == [target.id]
     only = views[0]
-    assert only.album_status == "no_match"
-    assert only.album_source_artist == "Artist 1"
-    assert only.album_source_album == "Some Album"
+    assert only.year_status == "no_match"
+    assert only.year_source_artist == "Artist 1"
+    assert only.year_source_album == "Some Album"
 
 
-def test_list_files_unknown_album_status_raises(
+def test_list_files_unknown_year_status_raises(
     engine_settings: Settings,
     music_dir: Path,
 ) -> None:
     _populate(music_dir, 1)
     scan_library(engine_settings)
-    with pytest.raises(ValueError, match="unknown album_status"):
-        list_files(engine_settings, album_status="bogus")
+    with pytest.raises(ValueError, match="unknown year_status"):
+        list_files(engine_settings, year_status="bogus")
 
 
-def test_list_files_composes_album_with_other_filters(
+def test_list_files_composes_year_with_other_filters(
     engine_settings: Settings,
     music_dir: Path,
 ) -> None:
     tracks = _populate(music_dir, _N)
     scan_library(engine_settings)
 
-    # Track 0: album-no_match only. Track 2: album-no_match AND artist-manual.
+    # Track 0: year-no_match only. Track 2: year-no_match AND artist-manual.
     row0 = _file_row(engine_settings, music_dir, tracks[0].name)
     row2 = _file_row(engine_settings, music_dir, tracks[2].name)
-    _set_album_no_match(engine_settings, row0.id, source_artist="A0", source_album="X")
-    _set_album_no_match(engine_settings, row2.id, source_artist="A2", source_album="Y")
+    _set_year_no_match(engine_settings, row0.id, source_artist="A0", source_album="X")
+    _set_year_no_match(engine_settings, row2.id, source_artist="A2", source_album="Y")
     artists.set_artist_status(engine_settings, file_ids=[row2.id], status="manual")
 
     # Both filters set → only track 2 satisfies BOTH.
-    views = list_files(engine_settings, album_status="no_match", artist_status="manual")
+    views = list_files(engine_settings, year_status="no_match", artist_status="manual")
     assert [v.file_id for v in views] == [row2.id]
 
 
-def test_library_stats_includes_album_block(
+def test_get_library_stats_includes_year_block(
     engine_settings: Settings,
     music_dir: Path,
 ) -> None:
     tracks = _populate(music_dir, _N)
     scan_library(engine_settings)
     row = _file_row(engine_settings, music_dir, tracks[0].name)
-    _set_album_no_match(engine_settings, row.id, source_artist="Artist 0", source_album="Alb")
+    _set_year_no_match(engine_settings, row.id, source_artist="Artist 0", source_album="Alb")
 
-    stats = library_stats(engine_settings)
+    stats = get_library_stats(engine_settings)
 
-    assert "album" in stats
-    album = stats["album"]
-    assert isinstance(album, dict)
-    assert set(album) == store.ALBUM_WORKFLOW_STATUSES
-    assert album["no_match"] == 1
-    assert album["pending"] == _N - 1
+    assert "year" in stats
+    year = stats["year"]
+    assert isinstance(year, dict)
+    assert set(year) == store.YEAR_WORKFLOW_STATUSES
+    assert year["no_match"] == 1
+    assert year["pending"] == _N - 1
 
 
 # --- no_identity worklist (files carrying neither artist nor albumartist) ------------
@@ -561,7 +561,7 @@ def test_no_identity_file_derives_no_identity_on_all_axes(
     view = list_files(engine_settings)[0]
     assert view.genre_status == "no_identity"
     assert view.artist_status == "no_identity"
-    assert view.album_status == "no_identity"
+    assert view.year_status == "no_identity"
 
 
 def test_list_files_filters_to_no_identity_on_each_axis(
@@ -576,10 +576,10 @@ def test_list_files_filters_to_no_identity_on_each_axis(
 
     by_genre = list_files(engine_settings, genre_status="no_identity")
     by_artist = list_files(engine_settings, artist_status="no_identity")
-    by_album = list_files(engine_settings, album_status="no_identity")
+    by_year = list_files(engine_settings, year_status="no_identity")
     assert [v.filename for v in by_genre] == ["orphan.mp3"]
     assert [v.filename for v in by_artist] == ["orphan.mp3"]
-    assert [v.filename for v in by_album] == ["orphan.mp3"]
+    assert [v.filename for v in by_year] == ["orphan.mp3"]
 
 
 def test_whitespace_only_artist_derives_no_identity(
@@ -603,12 +603,12 @@ def test_no_identity_composes_with_other_filters(
     engine_settings: Settings,
     music_dir: Path,
 ) -> None:
-    # An orphan is no_identity on BOTH the genre and album axes → it matches an AND of both.
+    # An orphan is no_identity on BOTH the genre and year axes → it matches an AND of both.
     make_track(music_dir / "orphan.mp3", {"genre": ["Synthwave"]})
     make_track(music_dir / "byartist.mp3", {"artist": ["Alpha"], "genre": ["Rock"]})
     scan_library(engine_settings)
 
-    views = list_files(engine_settings, genre_status="no_identity", album_status="no_identity")
+    views = list_files(engine_settings, genre_status="no_identity", year_status="no_identity")
     assert [v.filename for v in views] == ["orphan.mp3"]
 
 
@@ -678,7 +678,7 @@ def test_list_files_composes_mismatch_with_other_filters(
     assert [v.file_id for v in views] == [row2.id]
 
 
-def test_library_stats_includes_mismatch_block(
+def test_get_library_stats_includes_mismatch_block(
     engine_settings: Settings,
     music_dir: Path,
 ) -> None:
@@ -687,7 +687,7 @@ def test_library_stats_includes_mismatch_block(
     row = _file_row(engine_settings, music_dir, tracks[0].name)
     mismatch.set_mismatch_status(engine_settings, file_ids=[row.id], status="misfiled_deferred")
 
-    stats = library_stats(engine_settings)
+    stats = get_library_stats(engine_settings)
 
     assert "mismatch" in stats
     block = stats["mismatch"]

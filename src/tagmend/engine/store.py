@@ -247,7 +247,7 @@ def compute_stats(conn: sqlite3.Connection) -> dict[str, object]:
         "by_ext": by_ext,
         "genre": genre_status_counts(conn),
         "artist": artist_status_counts(conn),
-        "album": album_status_counts(conn),
+        "year": year_status_counts(conn),
         "mismatch": mismatch_status_counts(conn),
     }
 
@@ -547,7 +547,7 @@ def _parse_tag_pairs(raw: str) -> list[tuple[str, int]]:
     return [(str(name), _as_int(weight)) for name, weight in parsed]
 
 
-# --- musicbrainz_cache (persistent release-group lookup cache; PLAN — album axis) ----
+# --- musicbrainz_cache (persistent release-group lookup cache; PLAN — year axis) -----
 
 
 @dataclass(frozen=True, slots=True)
@@ -926,7 +926,7 @@ def derived_status(conn: sqlite3.Connection, axis_: axis.Axis, file_id: int) -> 
     stored ``file_<axis>_status`` decision, else ``pending``. The staged/done checks are
     FIELD-AWARE (keyed on the axis's ``fields``), so a genre-only change does not read as
     artist-``done`` and vice versa. Reports the STORED status even when it is stale (genre's
-    ``no_match`` staleness re-check still lets ``stage_genres`` retry it; the listing surfaces
+    ``no_match`` staleness re-check still lets ``resolve_genres`` retry it; the listing surfaces
     the recorded decision so a human can judge it). A file with no source identity (neither
     ``artist`` nor ``albumartist``) that every resolver skips derives ``no_identity`` — a
     distinct worklist bucket, ranked BELOW a stored decision but above ``pending`` (so a
@@ -1056,41 +1056,41 @@ def artist_status_counts(conn: sqlite3.Connection) -> dict[str, int]:
     return status_counts(conn, axis.ARTIST_AXIS)
 
 
-# --- file_album_status (terminal album decisions; album-axis twin of genre) ----------
+# --- file_year_status (terminal year decisions; year-axis twin of genre) -------------
 
-# The album workflow states (re-exported from the album axis). Two are stored
-# (``no_match``/``manual`` — rows in ``file_album_status``), two are derived
+# The year workflow states (re-exported from the year axis). Two are stored
+# (``no_match``/``manual`` — rows in ``file_year_status``), two are derived
 # (``staged``/``done`` field-awarely on ``originaldate``), ``no_identity`` = neither artist
 # nor albumartist, ``pending`` = none of the above. Single source of truth for the
-# ``list_files(album_status=...)`` filter and the stats.
-ALBUM_WORKFLOW_STATUSES: Final = axis.ALBUM_AXIS.workflow_statuses
+# ``list_files(year_status=...)`` filter and the stats.
+YEAR_WORKFLOW_STATUSES: Final = axis.YEAR_AXIS.workflow_statuses
 
 
 @dataclass(frozen=True, slots=True)
-class AlbumStatusRow:
-    """One row from ``file_album_status`` (a ``'no_match'`` / ``'manual'`` decision)."""
+class YearStatusRow:
+    """One row from ``file_year_status`` (a ``'no_match'`` / ``'manual'`` decision)."""
 
     status: str
     source_artist: str | None
     source_album: str | None
 
 
-def _album_row(decision: axis.StatusRow) -> AlbumStatusRow:
-    """Adapt a generic axis :class:`~tagmend.engine.axis.StatusRow` to the album-named row."""
-    return AlbumStatusRow(
+def _year_row(decision: axis.StatusRow) -> YearStatusRow:
+    """Adapt a generic axis :class:`~tagmend.engine.axis.StatusRow` to the year-named row."""
+    return YearStatusRow(
         status=decision.status,
         source_artist=decision.source_primary,
         source_album=decision.source_secondary,
     )
 
 
-def get_album_status(conn: sqlite3.Connection, file_id: int) -> AlbumStatusRow | None:
-    """Return *file_id*'s terminal album decision, or ``None`` if it has none."""
-    decision = axis.get_status(conn, axis.ALBUM_AXIS, file_id)
-    return None if decision is None else _album_row(decision)
+def get_year_status(conn: sqlite3.Connection, file_id: int) -> YearStatusRow | None:
+    """Return *file_id*'s terminal year decision, or ``None`` if it has none."""
+    decision = axis.get_status(conn, axis.YEAR_AXIS, file_id)
+    return None if decision is None else _year_row(decision)
 
 
-def set_album_status(  # noqa: PLR0913 - cohesive keyword-only status payload
+def set_year_status(  # noqa: PLR0913 - cohesive keyword-only status payload
     conn: sqlite3.Connection,
     *,
     file_id: int,
@@ -1099,7 +1099,7 @@ def set_album_status(  # noqa: PLR0913 - cohesive keyword-only status payload
     source_album: str | None,
     now: str,
 ) -> None:
-    """Insert or replace *file_id*'s terminal album decision.
+    """Insert or replace *file_id*'s terminal year decision.
 
     ``source_artist``/``source_album`` record the resolved identity
     (``albumartist``-else-``artist`` + ``album``) the decision was computed against, so a
@@ -1107,7 +1107,7 @@ def set_album_status(  # noqa: PLR0913 - cohesive keyword-only status payload
     """
     axis.set_status(
         conn,
-        axis.ALBUM_AXIS,
+        axis.YEAR_AXIS,
         file_id=file_id,
         status=status,
         source_primary=source_artist,
@@ -1116,26 +1116,26 @@ def set_album_status(  # noqa: PLR0913 - cohesive keyword-only status payload
     )
 
 
-def delete_album_status(conn: sqlite3.Connection, file_id: int) -> None:
-    """Remove *file_id*'s terminal album decision (no-op if none)."""
-    axis.delete_status(conn, axis.ALBUM_AXIS, file_id)
+def delete_year_status(conn: sqlite3.Connection, file_id: int) -> None:
+    """Remove *file_id*'s terminal year decision (no-op if none)."""
+    axis.delete_status(conn, axis.YEAR_AXIS, file_id)
 
 
-def derived_album_status(conn: sqlite3.Connection, file_id: int) -> str:
-    """Return *file_id*'s album workflow status: staged | done | no_match | manual | pending.
+def derived_year_status(conn: sqlite3.Connection, file_id: int) -> str:
+    """Return *file_id*'s year workflow status: staged | done | no_match | manual | pending.
 
-    Thin wrapper over :func:`derived_status` for the album axis (keyed on ``originaldate``).
+    Thin wrapper over :func:`derived_status` for the year axis (keyed on ``originaldate``).
     """
-    return derived_status(conn, axis.ALBUM_AXIS, file_id)
+    return derived_status(conn, axis.YEAR_AXIS, file_id)
 
 
-def album_status_counts(conn: sqlite3.Connection) -> dict[str, int]:
-    """Return file counts per album workflow status, every axis key always present.
+def year_status_counts(conn: sqlite3.Connection) -> dict[str, int]:
+    """Return file counts per year workflow status, every axis key always present.
 
-    One pass over every tracked file via :func:`derived_album_status` (the single source
+    One pass over every tracked file via :func:`derived_year_status` (the single source
     of truth), so the counts and the per-file status can never drift.
     """
-    return status_counts(conn, axis.ALBUM_AXIS)
+    return status_counts(conn, axis.YEAR_AXIS)
 
 
 # --- file_mismatch_status (per-file mismatch dispositions; mismatch-axis twin) --------
@@ -1332,7 +1332,7 @@ def files_in_scope(
 ) -> list[int]:
     """Return the file ids in scope, in ascending id order.
 
-    Precedence mirrors the ``stage_genres`` scope rules:
+    Precedence mirrors the ``resolve_genres`` scope rules:
 
     * *file_ids* given → the subset of those that actually exist (others dropped);
     * else *artist* given → files whose ``artist`` tag equals it, narrowed by *album*

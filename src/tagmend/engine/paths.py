@@ -1,21 +1,22 @@
-"""Opt-in file/folder reorganization with an append-only path history (M6).
+"""Opt-in file/folder path reorganization with an append-only path history (M6).
 
 Disabled by default (``organize.enabled = false``). Renames files and renames/moves
-folders into a consistent scheme, recording every move in ``path_revisions`` (keyed
+folders into a consistent scheme, recording every path change in ``path_revisions`` (keyed
 by a stable ``file_id``) so any rename/move is individually revertible — separately
 from tag history.
 
-Planned public API::
+Planned public API (the paths twin of the tags spine ``stage_tags`` → ``commit_tags`` →
+``history_tags`` → ``revert_tags``)::
 
-    plan_organize(root: Path, *, template, folder_template) -> MovePlan   # dry-run
-    commit_organize(plan: MovePlan) -> None                               # atomic
-    revert_move(file_id: str, version: int) -> int
-    move_history(file_id: str) -> list[PathRevision]
+    stage_paths(root: Path, *, template, folder_template) -> PathPlan   # dry-run
+    commit_paths(plan: PathPlan) -> None                                # atomic
+    revert_paths(file_id: str, version: int) -> int
+    history_paths(file_id: str) -> list[PathRevision]
 
 Not yet implemented — see PLAN.md §18.
 
 Paths is the *second* :class:`tagmend.engine.commits.RevisionDomain`, mirroring
-``staging.TagDomain``. The sketch below validates that the shared commit seam fits a move
+``staging.TagDomain``. The sketch below validates that the shared commit seam fits a path
 domain; it is a design note, not shipped code. Only the per-domain pieces differ from
 tags — the crash-safe ``commits.run_commit`` loop is reused unchanged::
 
@@ -32,15 +33,15 @@ tags — the crash-safe ``commits.run_commit`` loop is reused unchanged::
     #                              to_path=staged.to_path, commit_id=commit_id, note=...)
     #         store.delete_staged_path(conn, file_id)
     #     post_commit_file           -> prune the now-empty source dir (organize.prune_empty_dirs)
-    #     plan_order                 -> topological move order + collision resolution
+    #     plan_order                 -> topological path-change order + collision resolution
 
 THREE seam questions parked for the M6 paths build (do NOT assume these are solved by the
 tags seam — they are paths-only and unresolved here):
 
-1. **Intra-batch move ordering / clobber.** Moves ``A->B`` and ``B->C`` in one commit must
-   run in dependency order or ``A->B`` clobbers the file ``B->C`` was about to move.
-   ``plan_order`` is the hook for a topological sort; confirm it is expressive enough (it
-   returns only an order, not a per-step plan).
+1. **Intra-batch path-change ordering / clobber.** Path changes ``A->B`` and ``B->C`` in one
+   commit must run in dependency order or ``A->B`` clobbers the file ``B->C`` was about to
+   move. ``plan_order`` is the hook for a topological sort; confirm it is expressive enough
+   (it returns only an order, not a per-step plan).
 
 2. **Collision policy (PLAN.md §15, OPEN).** When two files resolve to the same destination
    (e.g. a folder rename collapsing two artist spellings), the policy — refuse / suffix /
@@ -51,7 +52,7 @@ tags seam — they are paths-only and unresolved here):
 3. **Folder-rename atomicity.** ``run_commit`` commits per file, so a multi-file folder
    rename is not atomic — a crash mid-folder leaves half the album moved (the rest re-sweep
    on the next commit). Tags have no equivalent. Decide whether per-file granularity is
-   acceptable for moves or whether folder moves need a coarser transaction boundary.
+   acceptable for path changes or whether folder moves need a coarser transaction boundary.
 """
 
 from __future__ import annotations

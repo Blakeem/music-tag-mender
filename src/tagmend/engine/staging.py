@@ -462,8 +462,8 @@ def commit_tags(
 
 
 @dataclass(frozen=True, slots=True)
-class RependResult:
-    """Immutable summary of one :func:`repend_axes` call, JSON-ready for the MCP tool."""
+class ReopenResult:
+    """Immutable summary of one :func:`reopen_axes` call, JSON-ready for the MCP tool."""
 
     commit_id: int
     files: int
@@ -478,7 +478,7 @@ class RependResult:
         }
 
 
-def repend_axes(settings: Settings, *, commit_id: int) -> RependResult:
+def reopen_axes(settings: Settings, *, commit_id: int) -> ReopenResult:
     """Re-open the derived axes for every file a manual identity-fix commit changed (NN7).
 
     The explicit post-fix coherence step: after committing a manual identity fix (the
@@ -487,9 +487,9 @@ def repend_axes(settings: Settings, *, commit_id: int) -> RependResult:
     file with a ``tag_revisions`` row in *commit_id* this, in ONE transaction:
 
     * voids the derived-axis fields (:data:`tagmend.engine.axis.GENRE_AXIS.fields` +
-      :data:`~tagmend.engine.axis.ALBUM_AXIS.fields`) via
+      :data:`~tagmend.engine.axis.YEAR_AXIS.fields`) via
       :func:`tagmend.engine.store.void_auto_changes`, so ``derived_genre_status`` /
-      ``derived_album_status`` flip ``done`` → ``pending`` and the axes re-pend (a LATER fresh
+      ``derived_year_status`` flip ``done`` → ``pending`` and the axes re-open (a LATER fresh
       auto commit reads ``done`` again — the Run-1 watermark semantics); and
     * deletes any :func:`tagmend.engine.store.delete_artist_status` row.
 
@@ -499,7 +499,7 @@ def repend_axes(settings: Settings, *, commit_id: int) -> RependResult:
     affected file count and how many artist rows were cleared. Owns its transaction; never
     touches the ``commits`` table or the append-only ``tag_revisions`` history.
     """
-    void_fields = axis.GENRE_AXIS.fields + axis.ALBUM_AXIS.fields
+    void_fields = axis.GENRE_AXIS.fields + axis.YEAR_AXIS.fields
 
     connection = db.connect(settings.db_path)
     try:
@@ -511,8 +511,8 @@ def repend_axes(settings: Settings, *, commit_id: int) -> RependResult:
             raise ValueError(message)
         if commit.origin == "auto":
             message = (
-                f"cannot repend an auto commit (commit_id={commit_id}); "
-                "repend targets manual identity-fix commits"
+                f"cannot reopen an auto commit (commit_id={commit_id}); "
+                "reopen targets manual identity-fix commits"
             )
             raise ValueError(message)
 
@@ -528,12 +528,12 @@ def repend_axes(settings: Settings, *, commit_id: int) -> RependResult:
         connection.close()
 
     logger.info(
-        "repend commit %d: %d file(s) re-pended, %d artist status row(s) cleared",
+        "reopen commit %d: %d file(s) re-opened, %d artist status row(s) cleared",
         commit_id,
         len(file_ids),
         artist_cleared,
     )
-    return RependResult(
+    return ReopenResult(
         commit_id=commit_id,
         files=len(file_ids),
         artist_status_cleared=artist_cleared,

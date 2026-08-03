@@ -12,11 +12,11 @@ def _table_names(conn: sqlite3.Connection) -> set[str]:
     return {str(row[0]) for row in cursor.fetchall()}
 
 
-def test_apply_schema_stamps_version_11(db_conn: sqlite3.Connection) -> None:
-    # db_conn already applied the schema; confirm the stamped user_version is v11.
+def test_apply_schema_stamps_version_12(db_conn: sqlite3.Connection) -> None:
+    # db_conn already applied the schema; confirm the stamped user_version is v12.
     version = db_conn.execute("PRAGMA user_version").fetchone()[0]
-    assert version == 11
-    assert SCHEMA_VERSION == 11
+    assert version == 12
+    assert SCHEMA_VERSION == 12
 
 
 def test_apply_schema_creates_genre_tables(db_conn: sqlite3.Connection) -> None:
@@ -29,9 +29,9 @@ def test_apply_schema_creates_artist_status_table(db_conn: sqlite3.Connection) -
     assert "file_artist_status" in _table_names(db_conn)
 
 
-def test_apply_schema_creates_album_tables(db_conn: sqlite3.Connection) -> None:
+def test_apply_schema_creates_year_tables(db_conn: sqlite3.Connection) -> None:
     tables = _table_names(db_conn)
-    assert "file_album_status" in tables
+    assert "file_year_status" in tables
     assert "musicbrainz_cache" in tables
 
 
@@ -75,12 +75,12 @@ def test_apply_schema_is_idempotent() -> None:
     try:
         apply_schema(conn)
         apply_schema(conn)  # second application must not raise
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 11
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 12
     finally:
         conn.close()
 
 
-def test_v10_ledger_upgrades_to_v11_in_place() -> None:
+def test_v10_ledger_gains_the_recording_cache_in_place() -> None:
     # A v10 ledger (no recording cache) gains the table + version bump additively, with the
     # existing tables/data intact.
     conn = sqlite3.connect(":memory:")
@@ -98,11 +98,46 @@ def test_v10_ledger_upgrades_to_v11_in_place() -> None:
 
         apply_schema(conn)  # the in-place upgrade
 
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 11
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 12
         assert "musicbrainz_recording_cache" in _table_names(conn)
         # Pre-existing data survives the additive upgrade.
         kept = conn.execute("SELECT COUNT(*) FROM musicbrainz_cache").fetchone()[0]
         assert kept == 1
+    finally:
+        conn.close()
+
+
+def test_v11_ledger_upgrades_to_v12_in_place() -> None:
+    # A v11 ledger names the year-axis table ``file_album_status``; v12 renames it to
+    # ``file_year_status`` in place, carrying every stored disposition across.
+    conn = sqlite3.connect(":memory:")
+    try:
+        apply_schema(conn)
+        file_id = _insert_file(conn)
+        conn.execute("PRAGMA user_version = 11")  # pretend this is a pre-v12 ledger
+        conn.execute("ALTER TABLE file_year_status RENAME TO file_album_status")
+        conn.execute(
+            """
+            INSERT INTO file_album_status
+              (file_id, status, source_artist, source_album, updated_at)
+            VALUES (?, 'no_match', 'Obscure', 'Demos', '2026-07-06T00:00:00+00:00')
+            """,
+            (file_id,),
+        )
+        conn.commit()
+
+        apply_schema(conn)  # the in-place upgrade
+
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 12
+        tables = _table_names(conn)
+        assert "file_year_status" in tables
+        assert "file_album_status" not in tables  # renamed, not copied
+        # The disposition row survives the rename with every column intact.
+        row = conn.execute(
+            "SELECT status, source_artist, source_album FROM file_year_status WHERE file_id = ?",
+            (file_id,),
+        ).fetchone()
+        assert row == ("no_match", "Obscure", "Demos")
     finally:
         conn.close()
 

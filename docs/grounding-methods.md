@@ -197,7 +197,7 @@ same release-group-first-release behavior we'd adopt.
   name that doesn't match any RG/alias) **for review, not auto-change**.
 - **Update pass (blank-fill)** — for flagged blanks with a confident grounding, stage the additive
   change (`origin='auto'`), reusing the existing stage→diff→commit→revert spine and a new
-  `file_album_status` axis (sticky `manual` exclusion; `no_match` when MB has nothing). Identity
+  `file_year_status` axis (sticky `manual` exclusion; `no_match` when MB has nothing). Identity
   grouping = `(albumartist|artist, album-or-folder)`, like genre.
 
 ---

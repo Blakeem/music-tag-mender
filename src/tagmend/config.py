@@ -50,7 +50,7 @@ _GENRE_MAX_COUNT_DEFAULT: Final = 4
 _LASTFM_RATE_PER_SEC_DEFAULT: Final = 1.0
 _GENRE_STAGE_LIMIT_DEFAULT: Final = 300
 
-# Defaults for the album-axis MusicBrainz settings. MusicBrainz's published rate limit is
+# Defaults for the year-axis MusicBrainz settings. MusicBrainz's published rate limit is
 # ~1 request/second and it REQUIRES a descriptive User-Agent identifying the application
 # plus a contact (an email or URL). We compose ``TagMend/<live-version> ( <contact> )`` at
 # request time so the version never drifts; only the contact is user-configurable, and it

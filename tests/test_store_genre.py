@@ -394,7 +394,7 @@ def test_no_identity_file_derives_no_identity_on_all_axes(db_conn: sqlite3.Conne
     file_id = _insert(db_conn, artist=None)
     assert store.derived_genre_status(db_conn, file_id) == "no_identity"
     assert store.derived_artist_status(db_conn, file_id) == "no_identity"
-    assert store.derived_album_status(db_conn, file_id) == "no_identity"
+    assert store.derived_year_status(db_conn, file_id) == "no_identity"
 
 
 def test_has_identity_agrees_with_genres_identity_on_later_ordinal(
@@ -413,7 +413,7 @@ def test_has_identity_agrees_with_genres_identity_on_later_ordinal(
     assert store.has_identity(db_conn, file_id) is (identity.artist is not None)
     assert store.has_identity(db_conn, file_id) is True
     assert store.derived_genre_status(db_conn, file_id) == "pending"
-    assert store.derived_album_status(db_conn, file_id) == "pending"
+    assert store.derived_year_status(db_conn, file_id) == "pending"
     assert store.derived_artist_status(db_conn, file_id) == "pending"
 
 
@@ -422,7 +422,7 @@ def test_tab_newline_identity_derives_no_identity(db_conn: sqlite3.Connection) -
     file_id = _insert(db_conn, artist=None)
     store.replace_tags(db_conn, file_id, {"artist": ["\t"], "albumartist": ["\n"]}, _NOW)
     assert store.derived_genre_status(db_conn, file_id) == "no_identity"
-    assert store.derived_album_status(db_conn, file_id) == "no_identity"
+    assert store.derived_year_status(db_conn, file_id) == "no_identity"
 
 
 def test_stored_status_beats_no_identity(db_conn: sqlite3.Connection) -> None:
@@ -721,12 +721,12 @@ def test_compute_stats_includes_artist_block(db_conn: sqlite3.Connection) -> Non
     assert stats["artist"] == store.artist_status_counts(db_conn)
 
 
-# --- file_album_status (album-axis twin of genre) -----------------------------------
+# --- file_year_status (year-axis twin of genre) ------------------------------------
 
 
-def test_album_status_set_get_delete_round_trip(db_conn: sqlite3.Connection) -> None:
+def test_year_status_set_get_delete_round_trip(db_conn: sqlite3.Connection) -> None:
     file_id = _insert(db_conn)
-    store.set_album_status(
+    store.set_year_status(
         db_conn,
         file_id=file_id,
         status="no_match",
@@ -734,23 +734,23 @@ def test_album_status_set_get_delete_round_trip(db_conn: sqlite3.Connection) -> 
         source_album="Paranoid",
         now=_NOW,
     )
-    row = store.get_album_status(db_conn, file_id)
+    row = store.get_year_status(db_conn, file_id)
     assert row is not None
     assert row.status == "no_match"
     assert row.source_artist == "Black Sabbath"
     assert row.source_album == "Paranoid"
 
-    store.delete_album_status(db_conn, file_id)
-    assert store.get_album_status(db_conn, file_id) is None
-    store.delete_album_status(db_conn, file_id)  # idempotent no-op
+    store.delete_year_status(db_conn, file_id)
+    assert store.get_year_status(db_conn, file_id) is None
+    store.delete_year_status(db_conn, file_id)  # idempotent no-op
 
 
-def test_derived_album_status_across_all_five_states(db_conn: sqlite3.Connection) -> None:
+def test_derived_year_status_across_all_five_states(db_conn: sqlite3.Connection) -> None:
     pending = _insert(db_conn, filename="alp.mp3")
-    assert store.derived_album_status(db_conn, pending) == "pending"
+    assert store.derived_year_status(db_conn, pending) == "pending"
 
     no_match = _insert(db_conn, filename="alnm.mp3")
-    store.set_album_status(
+    store.set_year_status(
         db_conn,
         file_id=no_match,
         status="no_match",
@@ -758,10 +758,10 @@ def test_derived_album_status_across_all_five_states(db_conn: sqlite3.Connection
         source_album="B",
         now=_NOW,
     )
-    assert store.derived_album_status(db_conn, no_match) == "no_match"
+    assert store.derived_year_status(db_conn, no_match) == "no_match"
 
     manual = _insert(db_conn, filename="alm.mp3")
-    store.set_album_status(
+    store.set_year_status(
         db_conn,
         file_id=manual,
         status="manual",
@@ -769,21 +769,21 @@ def test_derived_album_status_across_all_five_states(db_conn: sqlite3.Connection
         source_album=None,
         now=_NOW,
     )
-    assert store.derived_album_status(db_conn, manual) == "manual"
+    assert store.derived_year_status(db_conn, manual) == "manual"
 
     staged = _insert(db_conn, filename="als.mp3")
     _stage_field(db_conn, staged, "originaldate")
-    assert store.derived_album_status(db_conn, staged) == "staged"
+    assert store.derived_year_status(db_conn, staged) == "staged"
 
     done = _insert(db_conn, filename="ald.mp3")
     _commit_auto_field(db_conn, done, "originaldate")
-    assert store.derived_album_status(db_conn, done) == "done"
+    assert store.derived_year_status(db_conn, done) == "done"
 
 
-def test_album_status_counts_match_per_file_derivation(db_conn: sqlite3.Connection) -> None:
+def test_year_status_counts_match_per_file_derivation(db_conn: sqlite3.Connection) -> None:
     pending = _insert(db_conn, filename="p.mp3")
     no_match = _insert(db_conn, filename="nm.mp3")
-    store.set_album_status(
+    store.set_year_status(
         db_conn,
         file_id=no_match,
         status="no_match",
@@ -794,18 +794,18 @@ def test_album_status_counts_match_per_file_derivation(db_conn: sqlite3.Connecti
     done = _insert(db_conn, filename="d.mp3")
     _commit_auto_field(db_conn, done, "originaldate")
 
-    expected = dict.fromkeys(store.ALBUM_WORKFLOW_STATUSES, 0)
+    expected = dict.fromkeys(store.YEAR_WORKFLOW_STATUSES, 0)
     for file_id in (pending, no_match, done):
-        expected[store.derived_album_status(db_conn, file_id)] += 1
-    assert store.album_status_counts(db_conn) == expected
+        expected[store.derived_year_status(db_conn, file_id)] += 1
+    assert store.year_status_counts(db_conn) == expected
 
 
-def test_compute_stats_includes_album_block(db_conn: sqlite3.Connection) -> None:
+def test_compute_stats_includes_year_block(db_conn: sqlite3.Connection) -> None:
     file_id = _insert(db_conn)
     _commit_auto_field(db_conn, file_id, "originaldate")
     stats = store.compute_stats(db_conn)
-    assert "album" in stats
-    assert stats["album"] == store.album_status_counts(db_conn)
+    assert "year" in stats
+    assert stats["year"] == store.year_status_counts(db_conn)
 
 
 # --- musicbrainz_cache --------------------------------------------------------------
@@ -875,7 +875,7 @@ def _commit_auto_field_at(
     )
 
 
-def test_void_auto_changes_repends_the_voided_field(db_conn: sqlite3.Connection) -> None:
+def test_void_auto_changes_reopens_the_voided_field(db_conn: sqlite3.Connection) -> None:
     file_id = _insert(db_conn)
     _commit_auto_field(db_conn, file_id, "genre")  # version 0, auto
     assert store.has_auto_change_for(db_conn, file_id, ("genre",)) is True
@@ -948,19 +948,19 @@ def test_void_auto_changes_is_a_noop_without_revisions(db_conn: sqlite3.Connecti
     assert store.has_auto_change_for(db_conn, file_id, ("genre",)) is True
 
 
-def test_void_flips_derived_genre_and_album_status(db_conn: sqlite3.Connection) -> None:
+def test_void_flips_derived_genre_and_year_status(db_conn: sqlite3.Connection) -> None:
     file_id = _insert(db_conn)
     _commit_auto_field_at(db_conn, file_id, "genre", 0)  # genre done
-    _commit_auto_field_at(db_conn, file_id, "originaldate", 1)  # album done
+    _commit_auto_field_at(db_conn, file_id, "originaldate", 1)  # year done
     assert store.derived_genre_status(db_conn, file_id) == "done"
-    assert store.derived_album_status(db_conn, file_id) == "done"
+    assert store.derived_year_status(db_conn, file_id) == "done"
 
     store.void_auto_changes(db_conn, file_id, ("genre", "originaldate"))
     assert store.derived_genre_status(db_conn, file_id) == "pending"
-    assert store.derived_album_status(db_conn, file_id) == "pending"
+    assert store.derived_year_status(db_conn, file_id) == "pending"
 
     # A fresh auto commit past the watermark returns both axes to done.
     _commit_auto_field_at(db_conn, file_id, "genre", 2)
     _commit_auto_field_at(db_conn, file_id, "originaldate", 3)
     assert store.derived_genre_status(db_conn, file_id) == "done"
-    assert store.derived_album_status(db_conn, file_id) == "done"
+    assert store.derived_year_status(db_conn, file_id) == "done"

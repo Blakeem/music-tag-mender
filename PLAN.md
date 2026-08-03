@@ -5,7 +5,7 @@
 >   long-tail search ("music tag mender", "fix music genre tags") in the URL.
 > - **Display / brand:** **TagMend** (README H1, logo).
 > - **PyPI package + CLI command + Python module:** `tagmend`
->   (`pip install tagmend`, `tagmend scan ~/Music`).
+>   (`pip install tagmend`, `tagmend scan-library ~/Music`).
 > - **MCP:** exposed as a `tagmend mcp` subcommand — *not* in the project name,
 >   since this is also a CLI today and may grow a GUI later.
 >
@@ -178,7 +178,7 @@ The valuable, risky work is deterministic and must not live inside an LLM. Build
 ## 7. Data model (SQLite)
 
 WAL mode. **Versioning is the heart of the safety story.** `PRAGMA user_version`
-tracks the applied schema version (**currently 6**: the read-path snapshot landed at
+tracks the applied schema version (**currently 12**: the read-path snapshot landed at
 M1; the `commits` / `tag_revisions` / `tag_revisions_staged` change-tracking tables
 shipped at M3; `lastfm_cache` + `file_genre_status` shipped at M2). The model is
 **resume-free** — a crash just leaves work staged for the next commit to sweep up; see
@@ -243,7 +243,7 @@ and deletes it. Per-file `version` is the friendly per-file restore handle.
 The shared commit machinery (the `commits` table, the crash-safe per-file commit loop,
 and a small `RevisionDomain` seam) lives in `engine/commits.py` and is **domain-neutral**,
 so the tags side (`engine/staging.py`, shipped) and the future paths side
-(`engine/moves.py`, §18) are two parallel implementations of the same lifecycle.
+(`engine/paths.py`, §18) are two parallel implementations of the same lifecycle.
 
 ```sql
 -- M2 (shipped): parsed Last.fm responses, so re-runs never re-hit the API.
@@ -262,7 +262,7 @@ CREATE TABLE lastfm_cache (
 -- "done" is DERIVED from the staged/committed revision tables — no 'tagged' state
 -- to desync. source_artist/source_album record the identity the decision was
 -- computed against, so a later artist/album retag makes a 'no_match' row STALE and
--- the file is automatically retried on the next stage_genres pass.
+-- the file is automatically retried on the next resolve_genres pass.
 CREATE TABLE file_genre_status (
   file_id         INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
   status          TEXT NOT NULL,      -- no_match | manual
@@ -433,7 +433,7 @@ Free API key only. Key endpoints:
 ## 10. The review workflow (auto vs human/LLM)
 
 > **Shipped reality (M2):** for the *genre* axis the workflow engine is
-> `file_genre_status` (§7.2) — `stage_genres` auto-stages what it can resolve, flags
+> `file_genre_status` (§7.2) — `resolve_genres` auto-stages what it can resolve, flags
 > `no_match` for what Last.fm doesn't know, and honors a sticky `manual` exclusion
 > set via `set_genre_status`. The artist-*name* review loop sketched below
 > (`needs_review` → LLM picks canonical name → cascade) is **M4** and will get its
@@ -493,9 +493,9 @@ commit inspection (`list_commits`, `get_commit`).
 
 | Tool | Purpose |
 |---|---|
-| `health_check()` | Readiness probe (M0): settings load, music path reachable, ledger opens; also reports any `interrupted` commit left by a crash. |
+| `check_health()` | Readiness probe (M0): settings load, music path reachable, ledger opens; also reports any `interrupted` commit left by a crash. |
 | `scan_library(path, mode)` | Walk a folder into the `files`/`file_tags` snapshot; `mode` ∈ incremental/full/presence. (M1.) |
-| `library_stats()` | Library-wide snapshot counts (total/present/missing/unprocessed, by ext, tag-value total) + per-status genre workflow counts. (M1; genre block M3.5.) |
+| `get_library_stats()` | Library-wide snapshot counts (total/present/missing/unprocessed, by ext, tag-value total) + per-status genre workflow counts. (M1; genre block M3.5.) |
 | `list_files(path?, limit?, genre_status?)` | List tracked files with their current managed tags + genre workflow status — discovers `file_id`s, and `genre_status="no_match"` is the fix-by-hand worklist (rows carry the `source_artist`/`source_album` the lookup used). (M3; filter M3.5.) |
 | `get_file(file_id)` | One tracked file with its current managed tags. (M3.) |
 | `stage_tags(file_id, tags, note?)` | Stage a managed-tag target (git's index); captures the v0 baseline; writes nothing to disk. (M3.) |
@@ -507,13 +507,13 @@ commit inspection (`list_commits`, `get_commit`).
 | `revert_commit(commit_id, note?, dry_run?)` | Undo an entire commit as a unit: every file back to its pre-commit tags under ONE new `origin='revert'` commit with `reverted_from` set. Files changed by later commits are skipped + reported; requires an empty staging area; `dry_run` previews the per-file plan. (M3.5.) |
 | `list_commits(limit?)` | List commits newest first (the revertible units); status applied/applying/interrupted. (M3.) |
 | `get_commit(commit_id)` | One commit row by id. (M3.) |
-| `stage_genres(artist?, album?, file_ids?, limit?)` | Query Last.fm (cached/paced), resolve through the vocabulary (§9), and stage the result with `origin="auto"` — only `genre` is replaced. Flags unresolvable files `no_match`. (M2.) |
-| `list_artists()` | Distinct `artist` tag values with file counts — the scoping aid for `stage_genres`. (M2.) |
+| `resolve_genres(artist?, album?, file_ids?, limit?)` | Query Last.fm (cached/paced), resolve through the vocabulary (§9), and stage the result with `origin="auto"` — only `genre` is replaced. Flags unresolvable files `no_match`. (M2.) |
+| `list_artists()` | Distinct `artist` tag values with file counts — the scoping aid for `resolve_genres`. (M2.) |
 | `set_genre_status(status, file_ids?, artist?)` | Mark files `manual` (sticky-exclude from genre tagging — "I'll handle these by hand") or `pending` (re-queue). (M2.) |
 | `reset_genre_status(file_ids?, artist?)` | Clear any genre status row (`no_match` *and* `manual`), returning files to pending. (M2.) |
 
 > The MCP layer is intentionally `origin`-free for the tag tools: every direct MCP
-> `stage_tags` is `manual`; `stage_genres` stages with `origin="auto"` internally.
+> `stage_tags` is `manual`; `resolve_genres` stages with `origin="auto"` internally.
 
 **Artist-name normalization + review loop (M4) — not yet built:**
 
@@ -527,10 +527,11 @@ commit inspection (`list_commits`, `get_commit`).
 | `review_stats()` | Review-workflow progress (pending/auto/applied/error counts). |
 
 **Organize / paths family (opt-in, §18) — added once M6 lands:** the `*_paths` mirror of
-the tags family. A `plan_organize(path)`-style step computes destination paths from the
-target scheme and **stages** them (`stage_paths`); `commit_paths` applies the moves;
-`diff_paths` / `history_paths` / `revert_paths` round it out. Because the path domain is
-the same `RevisionDomain` seam, tags and paths revert **independently**.
+the tags family, one-for-one. `stage_paths(path)` computes destination paths from the
+target scheme and **stages** them (`stage_paths_batch` for a whole run, `unstage_paths` to
+drop one); `commit_paths` applies the moves; `diff_paths` / `history_paths` / `revert_paths`
+round it out. Because the path domain is the same `RevisionDomain` seam, tags and paths
+revert **independently**.
 
 Each tool mirrors a 1:1 engine operation; CLI subcommands are added selectively (the CLI
 surface is being chosen *after* the MCP set proves out in practice).
@@ -554,20 +555,20 @@ music-tag-mender/             # GitHub repo slug (SEO)
 │   ├── config.py            # settings.json in OS config dir via platformdirs (§19)
 │   ├── engine/
 │   │   ├── db.py             # SQLite connection (WAL); schema added per-feature
-│   │   ├── schema.py         # DDL for all tables + PRAGMA user_version (v5)
-│   │   ├── doctor.py         # health_check: settings + music + db + interrupted-commit (M0/M3)
+│   │   ├── schema.py         # DDL for all tables + PRAGMA user_version (v12)
+│   │   ├── health.py         # check_health: settings + music + db + interrupted-commit (M0/M3)
 │   │   ├── scan.py           # filesystem discovery + signatures (size/mtime)
 │   │   ├── store.py          # pure data access for files/file_tags + tag_revisions[_staged] (M1/M3)
 │   │   ├── library.py        # scan orchestration (3 modes) + stats + list_files/get_file (M1/M3)
 │   │   ├── lastfm.py         # client: artist/album getTopTags, cache, pacing (M2; getCorrection lands at M4)
-│   │   ├── classify.py       # vocab + overlay loader → fold-key index; resolve_genres (M2)
-│   │   ├── genres.py         # stage_genres orchestration + file_genre_status workflow (M2)
+│   │   ├── classify.py       # vocab + overlay loader → fold-key index; classify.classify_genres, pure (M2)
+│   │   ├── genres.py         # resolve_genres orchestration + file_genre_status workflow (M2)
 │   │   ├── tags.py           # mutagen read (M1) / write (M3) of the managed tag set
 │   │   ├── versioning.py     # tag-revision baseline/append + revert + history (M3)
 │   │   ├── commits.py        # domain-neutral commit core: commits table + RevisionDomain
 │   │   │                     #   seam + the shared crash-safe run_commit loop (M3)
 │   │   ├── staging.py        # tags domain (TagDomain) + stage/diff/commit_tags orchestration (M3)
-│   │   └── moves.py          # opt-in paths domain + path_revisions (§18) — STUB (M6)
+│   │   └── paths.py          # opt-in paths domain + path_revisions (§18) — STUB (M6)
 │   ├── data/
 │   │   └── genre_vocabulary.yml  # MusicBrainz genres + aliases (generated; shipped as package data)
 │   ├── mcp_server.py          # FastMCP — thin wrapper over engine
@@ -588,23 +589,24 @@ so there is one install, one command, and the MCP server is just one of its mode
 
 - **M0 — Skeleton.** Repo, `pyproject`, strict ruff + mypy gates, shared logger,
   `settings.json` config, SQLite connection (WAL, no tables yet), FastMCP server +
-  CLI wired together, and a working `health_check`/`doctor` that proves the music
+  CLI wired together, and a working `check_health`/`check-health` that proves the music
   path is reachable. Dry-run only, nothing writes.
 - **M1 — Read path (shipped).** `files` + `file_tags` snapshot (stable integer
   `file_id`, normalized EAV tags); `scan_library` with three modes
-  (incremental/full/presence); `library_stats`; `tags.py` read via mutagen "easy"
-  mode + alias map. CLI `scan`/`stats` + MCP `scan_library`/`library_stats`. Reads
+  (incremental/full/presence); `get_library_stats`; `tags.py` read via mutagen "easy"
+  mode + alias map. CLI `scan-library`/`get-library-stats` + MCP
+  `scan_library`/`get_library_stats`. Reads
   files into the ledger only — never writes music files.
 - **M2 — Last.fm + genre resolution (genre side shipped).** **Done:** the
   genre-vocabulary foundation — the MusicBrainz-derived controlled vocabulary
   (`genre_vocabulary.yml`, 2,145 genres + 556 aliases), the dump-streaming build
   script, the full design (`docs/genre-tagging-spec.md`) — **plus the whole genre
   pipeline**: `lastfm.py` (cached/paced artist+album top-tags, negative cache),
-  `classify.py` (vocab/overlay fold-key index + `resolve_genres`), `genres.py`
-  (`stage_genres` orchestration feeding the commit core with `origin="auto"`), the
+  `classify.py` (vocab/overlay fold-key index + the pure `classify.classify_genres`),
+  `genres.py` (the `resolve_genres` tool feeding the commit core with `origin="auto"`), the
   `file_genre_status` workflow table (§7.2), genre settings (`genre_min_weight`,
   `genre_max_count`, `genre_use_album_tags`, `lastfm_rate_per_sec`,
-  `genre_stage_limit`), and 4 MCP tools (`stage_genres`, `list_artists`,
+  `genre_stage_limit`), and 4 MCP tools (`resolve_genres`, `list_artists`,
   `set_genre_status`, `reset_genre_status`). Schema is **v6**. **Moved out:**
   artist-name normalization (`artist.getCorrection`) is now part of **M4** — it is
   the review loop's reason to exist. *Note: M3's write-path core was built ahead of M2.*
@@ -616,7 +618,7 @@ so there is one install, one command, and the MCP server is just one of its mode
   is itself a commit**; **(b)** genre-status visibility — `list_files` grew a
   `genre_status` filter (`pending`/`no_match`/`manual`/`staged`/`done`) + per-file
   status fields (with the `source_artist`/`source_album` a `no_match` was computed
-  against), and `library_stats` a per-status `genre` count block. The derived-status
+  against), and `get_library_stats` a per-status `genre` count block. The derived-status
   logic (`store.derived_genre_status`) mirrors `genres._select` — keep in sync.
 - **M3 — Write path + versioning + commit core (core shipped).** The git-like
   stage → commit → history → revert engine: the **domain-neutral commit core**
@@ -632,8 +634,8 @@ so there is one install, one command, and the MCP server is just one of its mode
   §12). Must land **before** organize (M6), since canonical names drive folder layout.
 - **M5 — Polish.** Genre vocabulary tuning, album-level override, docs, packaging.
 - **M6 — Organize (opt-in moves & renames).** Stable `file_id` migration,
-  `plan_organize` (dry-run path plan), `commit_organize` (atomic per-item moves),
-  `path_revisions` append-only log, `revert_move`, `move_history`. Gated behind a
+  `stage_paths` (dry-run path plan), `commit_paths` (atomic per-item moves),
+  `path_revisions` append-only log, `revert_paths`, `history_paths`. Gated behind a
   config flag; **revert proven before any real run** (same bar as M3). See **§18**.
 
 ## 15. Open questions
@@ -683,7 +685,7 @@ so we cover both discovery and ergonomics instead of trading one for the other:
 |---|---|---|
 | GitHub repo / URL | `music-tag-mender` | Hyphens are word boundaries to crawlers → the URL matches the descriptive long-tail query ("music tag mender", "fix music genre tags"). Competing tools (Picard, Mp3tag) don't contain "mender", so the field is wide open. |
 | Display / brand | **TagMend** | Memorable CamelCase for the README H1, logo, and word-of-mouth. |
-| PyPI package + CLI + module | `tagmend` | Short and ergonomic: `pip install tagmend`, `tagmend scan …`. PyPI normalizes case, so `TagMend` ≡ `tagmend`. |
+| PyPI package + CLI + module | `tagmend` | Short and ergonomic: `pip install tagmend`, `tagmend scan-library …`. PyPI normalizes case, so `TagMend` ≡ `tagmend`. |
 | MCP | `tagmend mcp` subcommand | Keep "mcp" out of the project name — this is a CLI today and may grow a GUI. |
 
 The two names reinforce each other in search: the repo ranks for the descriptive
@@ -770,14 +772,14 @@ the next `commit_paths` sweeps the rows still in `path_revisions_staged` into a 
 `TagDomain`), reusing the commit core in `engine/commits.py` unchanged. The move-specific
 parts — the disk action, plus three **parked seam questions** (intra-batch move ordering
 to avoid clobber, the collision policy of §15, and folder-rename atomicity vs the per-file
-commit boundary) — are sketched as a design note in `engine/moves.py`.
+commit boundary) — are sketched as a design note in `engine/paths.py`.
 
 ### 18.3 Semantics
 
-- **Plan first.** `plan_organize(path)` computes destination paths from the target
+- **Plan first.** `stage_paths(path)` computes destination paths from the target
   scheme + the (already cleaned) tags, detects collisions, and **stages** them into
   `path_revisions_staged`. Nothing on disk changes.
-- **Commit atomically.** `commit_organize()` opens a `commits` row, then per item:
+- **Commit atomically.** `commit_paths()` opens a `commits` row, then per item:
   ensures the destination folder exists (`mkdir -p`), moves the file with a temp +
   atomic-rename where the OS/filesystem allows (NAS-safe), appends a `path_revisions`
   row under the run's `commit_id`, and clears the staged row. Non-audio sidecars (art,
@@ -787,7 +789,7 @@ commit boundary) — are sketched as a design note in `engine/moves.py`.
   `organize.prune_empty_dirs`. We **scope pruning to the source dirs of the move** — we
   never sweep the whole library for empty folders — and `rmdir` naturally refuses on a
   non-empty dir, so a folder still holding art/junk is left alone.
-- **Revert.** `revert_move(file_id, version)` `mkdir -p`s the target path, moves the
+- **Revert.** `revert_paths(file_id, version)` `mkdir -p`s the target path, moves the
   file back, prunes any now-empty source dir, and appends a new `origin='revert'` row —
   same append-only model as tag reverts. Reverting a whole `commit_id` undoes a run.
 - **This is why we need no `kind` and no folder-create records:** reverting a move that
@@ -901,16 +903,21 @@ predictably as it grows milestone by milestone:
 The three layers (core engine ↔ CLI ↔ MCP) map **1:1** onto the same operation, and a
 shared enum (`ScanMode`) is used identically across all three so behavior can't drift:
 
+> The authoritative naming grammar (the closed verb set, the shape table, and the
+> finding-noun glossary) lives in **`CLAUDE.md` § Tool naming**. This section covers only
+> how the three layers line up.
+
 - **Engine functions:** `snake_case`, **verb-first**, descriptive
-  (`scan_library`, `library_stats`, `read_tags`). All logic lives here; the frontends
+  (`scan_library`, `get_library_stats`, `read_tags`). All logic lives here; the frontends
   are thin marshalling wrappers.
-- **CLI subcommands:** terse verbs matching the existing style (`doctor`, `scan`,
-  `stats`) — short to type for the unattended bulk path.
-- **MCP tool names:** descriptive `verb_noun` (`scan_library`, `library_stats`,
-  `health_check`) for LLM clarity, since the tool name is part of the model-facing UX
+- **CLI subcommands:** the MCP tool name with `-` for `_`, no aliases (`check-health`,
+  `scan-library`, `get-library-stats`, `detect-mismatches`).
+- **MCP tool names:** `verb_object` (`scan_library`, `get_library_stats`,
+  `check_health`) for LLM clarity, since the tool name is part of the model-facing UX
   and benefits from being self-describing.
-- **The 1:1 map (M1 example):** core `library.scan_library` ↔ CLI `scan` ↔ MCP
-  `scan_library`; core `library.library_stats` ↔ CLI `stats` ↔ MCP `library_stats`.
+- **The 1:1 map (M1 example):** core `library.scan_library` ↔ CLI `scan-library` ↔ MCP
+  `scan_library`; core `library.get_library_stats` ↔ CLI `get-library-stats` ↔ MCP
+  `get_library_stats`.
 - **Shared enums:** `ScanMode` (`incremental`/`full`/`presence`) is the single source
   of truth; the CLI takes it directly as a Typer option and the MCP tool accepts the
   equivalent `Literal[...]` string and maps it onto the same enum.

@@ -1,8 +1,8 @@
 """The metadata-axis abstraction: ONE parameterized status machinery for genre/artist.
 
-Genre and artist (and the album/song axes to come) each carry a per-file *workflow
+Genre and artist (and the year/song axes to come) each carry a per-file *workflow
 status* — ``pending`` / ``staged`` / ``done`` / ``manual`` / ``no_identity`` (and
-``no_match`` on the genre and album axes). Their machinery is identical bar a handful of
+``no_match`` on the genre and year axes). Their machinery is identical bar a handful of
 values, so it lives here ONCE as a
 parameterized :class:`Axis`: the name, the managed-tag *fields* its field-aware
 ``staged``/``done`` derivation keys on, its ``file_<name>_status`` side table and that
@@ -74,7 +74,7 @@ class Axis:
     """
 
     name: str
-    """The key used in tool params, ``list_files`` filters, ``library_stats`` blocks, and
+    """The key used in tool params, ``list_files`` filters, ``get_library_stats`` blocks, and
     the ``diff`` JSON paths (e.g. ``"genre"`` / ``"artist"``)."""
 
     fields: tuple[str, ...]
@@ -92,7 +92,7 @@ class Axis:
 
     workflow_statuses: frozenset[str]
     """The valid derived-status set. Includes the derived ``no_identity`` (a file with
-    neither ``artist`` nor ``albumartist``) on the genre/artist/album axes; the mismatch
+    neither ``artist`` nor ``albumartist``) on the genre/artist/year axes; the mismatch
     axis (stored-or-pending only) omits it."""
 
     decision_blocks: Callable[[StatusRow, Identity], bool]
@@ -110,7 +110,7 @@ def _genre_decision_blocks(decision: StatusRow, identity: Identity) -> bool:
     """Genre rule: ``manual`` always blocks; ``no_match`` blocks unless its identity changed.
 
     A ``no_match`` whose ``source`` identity no longer matches the file's current identity is
-    *stale* and falls through to be reprocessed (``stage_genres`` retries it).
+    *stale* and falls through to be reprocessed (``resolve_genres`` retries it).
     """
     if decision.status == "manual":
         return True
@@ -127,8 +127,8 @@ def _artist_decision_blocks(decision: StatusRow, _identity: Identity) -> bool:
     return decision.status == "manual"
 
 
-def _album_decision_blocks(decision: StatusRow, identity: Identity) -> bool:
-    """Album rule (same as genre): ``manual`` always blocks; ``no_match`` blocks unless stale.
+def _year_decision_blocks(decision: StatusRow, identity: Identity) -> bool:
+    """Year rule (same as genre): ``manual`` always blocks; ``no_match`` blocks unless stale.
 
     Identity is ``(albumartist-else-artist, album)``; a stored ``no_match`` whose recorded
     identity no longer matches the file's current one is *stale* and falls through to be
@@ -196,20 +196,20 @@ ARTIST_AXIS: Final = Axis(
     decision_blocks=_artist_decision_blocks,
 )
 
-ALBUM_AXIS: Final = Axis(
-    name="album",
+YEAR_AXIS: Final = Axis(
+    name="year",
     fields=("originaldate",),
-    status_table="file_album_status",
+    status_table="file_year_status",
     # The SAME identity genre uses: primary = the resolved lookup artist
     # (albumartist-else-artist), secondary = album.
     source_columns=("source_artist", "source_album"),
-    # Six album states (a near-clone of genre): two stored (`no_match`/`manual`), two
+    # Six year states (a near-clone of genre): two stored (`no_match`/`manual`), two
     # derived (`staged`/`done`), the derived `no_identity` (neither artist nor albumartist),
     # and `pending` = none of the above.
     workflow_statuses=frozenset(
         {"pending", "no_identity", "no_match", "manual", "staged", "done"},
     ),
-    decision_blocks=_album_decision_blocks,
+    decision_blocks=_year_decision_blocks,
 )
 
 MISMATCH_AXIS: Final = Axis(

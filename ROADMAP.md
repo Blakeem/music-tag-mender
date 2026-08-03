@@ -1,7 +1,7 @@
 # TagMend — ROADMAP (forward-looking)
 
 > Updated **2026-08-02**. This file lists only what **remains** — everything shipped has been
-> removed (through the album-gaps detector: schema v11, 31 MCP tools; see `CLAUDE.md` for the
+> removed (through the album-gaps detector: schema v12, 31 MCP tools; see `CLAUDE.md` for the
 > shipped-state summary and `PLAN.md` for the design of record).
 >
 > **Direction (updated 2026-08-02):** finish the **metadata** mission (Phase B), then the
@@ -22,7 +22,7 @@
 ### B0. Live mismatch fix pass (next up)
 - [ ] Drive the fix flow over the **19 flagged folders / 144 files**: grouped detect → research
       the correct release per folder → `stage_tags_batch` → review `diff_tags` →
-      `commit_tags(path=folder)` (one revertible commit per release) → `repend_axes`.
+      `commit_tags(path=folder)` (one revertible commit per release) → `reopen_axes`.
       **Do this BEFORE the full resolve run (B2)** — identity fixes re-pend derived genre/year,
       so fixing identity first avoids resolving axes against wrong artists.
 - Known per-folder routing from live testing (2026-07-04):
@@ -40,14 +40,14 @@
 ### B1. Live album-gap fill pass (92 blank-`album` files, measured 2026-07-05)
 - [ ] Drive `detect_album_gaps` over the library: bulk-stage the `green` sibling proposals,
       confirm each `confirm`/`review` proposal per folder, then the usual
-      `stage_tags_batch → diff_tags → commit_tags → repend_axes` spine (one commit per folder).
-      Do this before/alongside B2 so `resolve_albums` (originaldate) can see the filled albums.
+      `stage_tags_batch → diff_tags → commit_tags → reopen_axes` spine (one commit per folder).
+      Do this before/alongside B2 so `resolve_years` (originaldate) can see the filled albums.
 
 ### B2. First full-library resolve run over all metadata axes
-- [ ] Drive genre + artist + album over the full 11,196-file library via MCP, chunked with
+- [ ] Drive genre + artist + year over the full 11,196-file library via MCP, chunked with
       `limit`, reviewing staged diffs before each commit. **This is the goal:** clean metadata so
       Navidrome tag-search works. Scope the work with `list_artists(limit=…)` /
-      `list_albums(album_status=…, limit=…)` (actionable groups = `blank_originaldate > 0`).
+      `list_albums(year_status=…, limit=…)` (actionable groups = `blank_originaldate > 0`).
       Followed by a deliberate **review/testing break** before any filesystem work begins.
 
 ---
@@ -68,9 +68,9 @@
       pattern (`file_mismatch_status`). The C4 gate is ZERO unresolved rows: every
       disagreement fixed through the stage→commit flow or explicitly ignored.
 
-### C2. Year-disagreement report (review-only)
+### C2. Year-disagreement report (review-only) — `detect_year_disagreements`
 - [ ] Report files whose stored `date`/`originaldate` disagrees with the MusicBrainz
-      release-group first-release date (the comparator `resolve_albums` already fetches and
+      release-group first-release date (the comparator `resolve_years` already fetches and
       caches). Review-only, never auto-staged: re-releases and soundtracks make a wrong
       `(artist, album)` → release-group match plausible, so a human confirms every correction.
 
@@ -83,23 +83,25 @@
       no-title / 203 no-tracknumber / 2 placeholder titles, measured 2026-08-02; re-measure
       after B0/B2 — wrong-release fixes rewrite these) and wrong-value verification that text
       cannot do (the tags lie consistently; only the audio is independent). New axis on the
-      existing `Axis` abstraction (`file_song_status`, `resolve_songs`, filter/stats/tools) +
-      persistent fingerprint/lookup caches so re-runs are network-free. **Spec the
+      existing `Axis` abstraction (`file_song_status`, `resolve_songs`, `set_song_status`/
+      `reset_song_status`, filter/stats; no `list_songs`) + persistent
+      fingerprint/lookup caches so re-runs are network-free. **Spec the
       recording→release/tracknumber reconciliation in PLAN.md first** (one recording ↔ many
       releases; scoring is the hard correctness question — anchor on the folder's files
-      converging on one release's tracklist). New deps: fpcalc on PATH (needs a `doctor`
-      check) + a second API key; re-verify fpcalc/AcoustID details at build time. Coverage
-      caveat by design: bootlegs/remixes/YouTube rips are often absent from AcoustID — they
-      fail safe (no match → worklist/ignore), never wrong-match.
+      converging on one release's tracklist). New deps: fpcalc on PATH (needs a
+      `check_health` check) + a second API key; re-verify fpcalc/AcoustID details at build
+      time. Coverage caveat by design: bootlegs/remixes/YouTube rips are often absent from
+      AcoustID — they fail safe (no match → worklist/ignore), never wrong-match.
 
 ### C4. Organize — pattern-driven renames/moves (M6 realized)
-- [ ] `paths` becomes the second live `RevisionDomain` (`moves.py` stub; `path_revisions` DDL
+- [ ] `paths` becomes the second live `RevisionDomain` (`paths.py` stub; `path_revisions` DDL
       ships since v6): a naming-pattern setting generates every file's canonical path from its
-      tags; a grouped detect/report proposes the moves (root-level bare album folders → their
-      artist folder included); staged → committed → revertible per file, mirroring the tags
-      domain (PLAN.md §18). First customers: every `misfiled_deferred` disposition from B0.
-      Open seam questions: intra-batch move ordering, collision policy (§15), folder-rename
-      atomicity.
+      tags; `detect_path_deviations` (grouped, read-only) proposes the moves (root-level bare
+      album folders → their artist folder included); `stage_paths`/`stage_paths_batch` →
+      `diff_paths` → `commit_paths` → `history_paths`/`revert_paths` (`unstage_paths` to drop
+      one), mirroring the tags domain per file (PLAN.md §18). First customers: every
+      `misfiled_deferred` disposition from B0. Open seam questions: intra-batch move
+      ordering, collision policy (§15), folder-rename atomicity.
 
 ### C5. Promote the result (user action, not code — was B3)
 - [ ] Once Phases B + C are verified perfect on the working copy (everything clean except
@@ -110,8 +112,9 @@
 ## Deferred until after Phases B + C
 
 - **CLI surface — deliberately LAST (user decision, reaffirmed 2026-07-05):** all tools are
-  MCP-first. Eventual pass exposes the axis verbs (`resolve-*`, `set-*-status`, `diff`/`commit`,
-  `revert`/`revert-commit`, `list --*-status …`) once everything else is complete and finalized.
+  MCP-first. Eventual pass mirrors each MCP tool name with `-` for `_` (`resolve-*`,
+  `set-*-status`, `diff-tags`/`commit-tags`, `revert-tags`/`revert-commit`,
+  `list-files --*-status …`) once everything else is complete and finalized.
 - **M5 — Polish:** genre vocabulary tuning, album-level genre override, README pass, packaging
   (`uv tool install` / `uvx tagmend mcp` / `pipx`).
 

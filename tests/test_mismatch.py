@@ -336,12 +336,12 @@ def test_detect_requires_music_path(tmp_path: Path) -> None:
 # --- CLI + MCP wiring ---------------------------------------------------------------
 
 
-def test_cli_detect_reports_high(music_dir: Path) -> None:
+def test_cli_detect_mismatches_reports_high(music_dir: Path) -> None:
     config.set_setting("music_path", str(music_dir))
     _make_mislabeled_library(music_dir)
 
-    assert runner.invoke(app, ["scan", str(music_dir)]).exit_code == 0
-    result = runner.invoke(app, ["detect"])
+    assert runner.invoke(app, ["scan-library", str(music_dir)]).exit_code == 0
+    result = runner.invoke(app, ["detect-mismatches"])
 
     assert result.exit_code == 0
     assert "HIGH" in result.stdout
@@ -644,7 +644,7 @@ def test_mismatch_fix_flow_end_to_end(
     fp_id = _file_id(engine_settings, folders["fp"], "remix.mp3")
 
     # Seed prior auto genre/year work + a sticky artist exclusion on the poisoned files, so
-    # repend has real derived-axis state to re-open.
+    # reopen has real derived-axis state to re-open.
     for fid in (jem1, jem2):
         staging.stage_tags(
             engine_settings,
@@ -685,11 +685,11 @@ def test_mismatch_fix_flow_end_to_end(
     commit_id = result.commit_id
     assert commit_id is not None
 
-    # 5. repend the derived axes + clear the artist status for the fixed files.
-    repend = staging.repend_axes(engine_settings, commit_id=commit_id)
-    assert repend.files == 2
-    assert repend.artist_status_cleared == 2
-    # genre/album flip done -> pending; the artist status row is gone.
+    # 5. reopen the derived axes + clear the artist status for the fixed files.
+    reopen = staging.reopen_axes(engine_settings, commit_id=commit_id)
+    assert reopen.files == 2
+    assert reopen.artist_status_cleared == 2
+    # genre/year flip done -> pending; the artist status row is gone.
     assert _derived(engine_settings, jem1) == ("pending", "pending", "pending")
 
     # 6. detect no longer flags the poisoned folder (self-resolving accept, no row needed).
@@ -706,7 +706,7 @@ def _derived(settings: Settings, file_id: int) -> tuple[str, str, str]:
     try:
         return (
             store.derived_genre_status(conn, file_id),
-            store.derived_album_status(conn, file_id),
+            store.derived_year_status(conn, file_id),
             store.derived_artist_status(conn, file_id),
         )
     finally:
@@ -721,7 +721,7 @@ def test_mcp_new_mismatch_tools_listed() -> None:
     names = {tool.name for tool in tools}
     assert {
         "stage_tags_batch",
-        "repend_axes",
+        "reopen_axes",
         "set_mismatch_status",
         "reset_mismatch_status",
     } <= names
@@ -765,12 +765,12 @@ def test_mcp_detect_group_and_folder(music_dir: Path) -> None:
     assert all(r["folder"] == str(ozzy) for r in rows)
 
 
-def test_cli_detect_group_lists_folders(music_dir: Path) -> None:
+def test_cli_detect_mismatches_group_lists_folders(music_dir: Path) -> None:
     config.set_setting("music_path", str(music_dir))
     _make_mislabeled_library(music_dir)
-    assert runner.invoke(app, ["scan", str(music_dir)]).exit_code == 0
+    assert runner.invoke(app, ["scan-library", str(music_dir)]).exit_code == 0
 
-    result = runner.invoke(app, ["detect", "--group"])
+    result = runner.invoke(app, ["detect-mismatches", "--group"])
     assert result.exit_code == 0
     assert "Ozzy Osbourne" in result.stdout
     assert "flagged" in result.stdout
@@ -841,7 +841,7 @@ def test_mcp_stage_tags_batch_rejects_bare_string_value(music_dir: Path) -> None
     assert mcp_server.commit_tags()["committed"] == 0
 
 
-def test_mcp_repend_axes_rejects_auto_commit(music_dir: Path) -> None:
+def test_mcp_reopen_axes_rejects_auto_commit(music_dir: Path) -> None:
     config.set_setting("music_path", str(music_dir))
     track = make_track(music_dir / "a.mp3", {"genre": ["Pop"]})
     mcp_server.scan_library(path=str(music_dir))
@@ -860,11 +860,11 @@ def test_mcp_repend_axes_rejects_auto_commit(music_dir: Path) -> None:
     auto_commit = staging.commit_tags(config.load_settings(), origin="auto").commit_id
     assert auto_commit is not None
 
-    payload = mcp_server.repend_axes(auto_commit)
+    payload = mcp_server.reopen_axes(auto_commit)
     assert payload["ok"] is False
     assert "auto" in str(payload["error"])
 
-    assert mcp_server.repend_axes(9999)["ok"] is False  # unknown commit id
+    assert mcp_server.reopen_axes(9999)["ok"] is False  # unknown commit id
 
 
 # --- container-folder path-signal suppression ---------------------------------------
@@ -978,7 +978,7 @@ def test_container_and_disposition_suppression_are_distinct() -> None:
 
 
 def _make_container_real_library(music_dir: Path) -> None:
-    """12 clean single-artist folders + a Soundtracks container of uniform composer albums."""
+    """12 clean single-artist folders + a Soundtracks container of uniform composer years."""
     for index in range(12):
         make_track(
             music_dir / f"Clean{index}" / "01.mp3",

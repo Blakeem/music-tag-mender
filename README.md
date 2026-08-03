@@ -26,7 +26,7 @@ Blank-fill each album's original release year (`originaldate`) from MusicBrainz 
 
 ### 🔍 Mislabeled-file detection
 
-Find files whose identity tags disagree with their folder path — the fingerprint of a tagger matching the wrong release (e.g. an Ozzy Osbourne album stamped as another artist's) — with `tagmend detect` or the `detect_mismatches` MCP tool. A read-only, confidence-tiered (high/medium/low) report; nothing is changed on disk.
+Find files whose identity tags disagree with their folder path — the fingerprint of a tagger matching the wrong release (e.g. an Ozzy Osbourne album stamped as another artist's) — with `tagmend detect-mismatches` or the `detect_mismatches` MCP tool. A read-only, confidence-tiered (high/medium/low) report; nothing is changed on disk.
 
 ### 🕳️ Blank-album gap detection
 
@@ -38,7 +38,7 @@ A git-like flow: stage → commit → revert. Files are only written on commit, 
 
 ### 🗂️ Per-file status workflow
 
-Mark files as `manual` to exclude them from an axis (genre, artist, or album), or re-queue them as `pending`. Status is sticky and respected on every run.
+Mark files as `manual` to exclude them from an axis (genre, artist, or year), or re-queue them as `pending`. Status is sticky and respected on every run.
 
 ### 🎚️ Multi-format and engine-first
 
@@ -83,10 +83,10 @@ This starts a loopback-only web server on `127.0.0.1:<random-port>`, prints the 
 ```bash
 tagmend config-set music_path "E:\path\to\music"
 tagmend config-path     # show where settings.json lives
-tagmend doctor          # readiness check
+tagmend check-health    # readiness check
 ```
 
-CLI commands: `doctor`, `scan`, `stats`, `detect`, `config`, `config-set`, `config-path`, `mcp`, `version`.
+CLI commands: `check-health`, `scan-library`, `get-library-stats`, `detect-mismatches`, `config`, `config-set`, `config-path`, `mcp`, `version`.
 
 ### Use as an MCP server
 
@@ -124,9 +124,9 @@ The MCP server exposes 31 tools. All tag edits are staged in memory and only wri
 
 | Tool | Description |
 |------|-------------|
-| `health_check` | Verify TagMend is ready to use |
+| `check_health` | Verify TagMend is ready to use |
 | `scan_library` | Scan a music folder into the snapshot database (reads files, never writes them) |
-| `library_stats` | Report library-wide snapshot counts |
+| `get_library_stats` | Report library-wide snapshot counts |
 | `list_files` | List tracked files with their current managed tags (to discover file ids) |
 | `get_file` | Return one tracked file with its managed tags, by stable `file_id` |
 | `detect_mismatches` | Detect files whose identity tags disagree with their folder path (read-only report) |
@@ -156,7 +156,7 @@ The MCP server exposes 31 tools. All tag edits are staged in memory and only wri
 
 | Tool | Description |
 |------|-------------|
-| `stage_genres` | Look up Last.fm genres for in-scope files and stage the result (writes nothing to disk) |
+| `resolve_genres` | Look up Last.fm genres for in-scope files and stage the result (writes nothing to disk) |
 | `set_genre_status` | Exclude files from genre tagging (`manual`) or re-queue them (`pending`) |
 | `reset_genre_status` | Clear any genre status row for in-scope files, returning them to `pending` |
 
@@ -174,19 +174,19 @@ The MCP server exposes 31 tools. All tag edits are staged in memory and only wri
 | Tool | Description |
 |------|-------------|
 | `list_albums` | List distinct album groups with file counts and status (to scope a run) |
-| `resolve_albums` | Blank-fill the original release year (`originaldate`) from MusicBrainz (no disk write) |
-| `set_album_status` | Exclude files from album-year fill (`manual`) or re-queue them (`pending`) |
-| `reset_album_status` | Clear any album status row for in-scope files, returning them to `pending` |
+| `resolve_years` | Blank-fill the original release year (`originaldate`) from MusicBrainz (no disk write) |
+| `set_year_status` | Exclude files from album-year fill (`manual`) or re-queue them (`pending`) |
+| `reset_year_status` | Clear any year status row for in-scope files, returning them to `pending` |
 
 ### Mismatch fixing
 
-Use `detect_mismatches` (above) to find files whose identity tags disagree with their folder path, then drive the fix through the staging engine (`stage_tags_batch` → `commit_tags` → `repend_axes`) and disposition the false positives.
+Use `detect_mismatches` (above) to find files whose identity tags disagree with their folder path, then drive the fix through the staging engine (`stage_tags_batch` → `commit_tags` → `reopen_axes`) and disposition the false positives.
 
 | Tool | Description |
 |------|-------------|
 | `set_mismatch_status` | Silence a mismatch false positive (`legit_ignore`) or defer a misfiled file (`misfiled_deferred`), or clear with `pending` |
 | `reset_mismatch_status` | Clear any mismatch disposition for in-scope files, returning them to `pending` |
-| `repend_axes` | After committing a manual identity fix, re-open the file's derived genre/year axes and clear its stale artist status |
+| `reopen_axes` | After committing a manual identity fix, re-open the file's derived genre/year axes and clear its stale artist status |
 
 ## Development
 
@@ -206,7 +206,7 @@ Test the MCP server non-interactively with the [MCP Inspector](https://github.co
 
 ```bash
 npx -y @modelcontextprotocol/inspector --cli tagmend mcp --method tools/list
-npx -y @modelcontextprotocol/inspector --cli tagmend mcp --method tools/call --tool-name health_check
+npx -y @modelcontextprotocol/inspector --cli tagmend mcp --method tools/call --tool-name check_health
 ```
 
 ## License

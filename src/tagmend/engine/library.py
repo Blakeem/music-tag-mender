@@ -52,9 +52,9 @@ class FileView:
     artist_status: str = "pending"
     artist_source_artist: str | None = None  # values a manual exclusion was recorded against
     artist_source_albumartist: str | None = None
-    album_status: str = "pending"
-    album_source_artist: str | None = None  # identity a no_match/manual was recorded against
-    album_source_album: str | None = None
+    year_status: str = "pending"
+    year_source_artist: str | None = None  # identity a no_match/manual was recorded against
+    year_source_album: str | None = None
     mismatch_status: str = "pending"
     mismatch_source_field: str | None = None  # which tag a disposition was recorded against
     mismatch_source_value: str | None = None  # that tag's value at decision time
@@ -74,9 +74,9 @@ class FileView:
             "artist_status": self.artist_status,
             "artist_source_artist": self.artist_source_artist,
             "artist_source_albumartist": self.artist_source_albumartist,
-            "album_status": self.album_status,
-            "album_source_artist": self.album_source_artist,
-            "album_source_album": self.album_source_album,
+            "year_status": self.year_status,
+            "year_source_artist": self.year_source_artist,
+            "year_source_album": self.year_source_album,
             "mismatch_status": self.mismatch_status,
             "mismatch_source_field": self.mismatch_source_field,
             "mismatch_source_value": self.mismatch_source_value,
@@ -99,9 +99,9 @@ def _to_view(conn: sqlite3.Connection, row: store.FileRow) -> FileView:
     artist_decision = store.get_artist_status(conn, row.id)
     has_stored_artist = artist_decision is not None and artist_status == artist_decision.status
 
-    album_status = store.derived_album_status(conn, row.id)
-    album_decision = store.get_album_status(conn, row.id)
-    has_stored_album = album_decision is not None and album_status == album_decision.status
+    year_status = store.derived_year_status(conn, row.id)
+    year_decision = store.get_year_status(conn, row.id)
+    has_stored_year = year_decision is not None and year_status == year_decision.status
 
     mismatch_status = store.derived_mismatch_status(conn, row.id)
     mismatch_decision = store.get_mismatch_status(conn, row.id)
@@ -129,13 +129,11 @@ def _to_view(conn: sqlite3.Connection, row: store.FileRow) -> FileView:
         artist_source_albumartist=artist_decision.source_albumartist
         if has_stored_artist and artist_decision
         else None,
-        album_status=album_status,
-        album_source_artist=album_decision.source_artist
-        if has_stored_album and album_decision
+        year_status=year_status,
+        year_source_artist=year_decision.source_artist
+        if has_stored_year and year_decision
         else None,
-        album_source_album=album_decision.source_album
-        if has_stored_album and album_decision
-        else None,
+        year_source_album=year_decision.source_album if has_stored_year and year_decision else None,
         mismatch_status=mismatch_status,
         mismatch_source_field=mismatch_decision.source_field
         if has_stored_mismatch and mismatch_decision
@@ -152,7 +150,7 @@ def _row_matches_status(  # noqa: PLR0913 - cohesive keyword-only status filters
     *,
     genre_status: str | None,
     artist_status: str | None,
-    album_status: str | None,
+    year_status: str | None,
     mismatch_status: str | None,
 ) -> bool:
     """Return whether *file_id* satisfies every requested workflow-status filter.
@@ -164,7 +162,7 @@ def _row_matches_status(  # noqa: PLR0913 - cohesive keyword-only status filters
         return False
     if artist_status is not None and store.derived_artist_status(conn, file_id) != artist_status:
         return False
-    if album_status is not None and store.derived_album_status(conn, file_id) != album_status:
+    if year_status is not None and store.derived_year_status(conn, file_id) != year_status:
         return False
     return not (
         mismatch_status is not None
@@ -179,7 +177,7 @@ def list_files(  # noqa: PLR0913 - cohesive keyword-only discovery filters
     limit: int | None = None,
     genre_status: str | None = None,
     artist_status: str | None = None,
-    album_status: str | None = None,
+    year_status: str | None = None,
     mismatch_status: str | None = None,
 ) -> list[FileView]:
     """Return tracked files (id order) with their managed tags, for discovery.
@@ -187,7 +185,7 @@ def list_files(  # noqa: PLR0913 - cohesive keyword-only discovery filters
     Optionally limited to files under *root*, filtered to one genre workflow status
     (``pending`` | ``no_identity`` | ``no_match`` | ``manual`` | ``staged`` | ``done``), one
     artist workflow status (``pending`` | ``no_identity`` | ``manual`` | ``staged`` |
-    ``done``), one album workflow status (``pending`` | ``no_identity`` | ``no_match`` |
+    ``done``), one year workflow status (``pending`` | ``no_identity`` | ``no_match`` |
     ``manual`` | ``staged`` | ``done``), one mismatch disposition
     (``pending`` | ``legit_ignore`` | ``misfiled_deferred``), and/or capped at *limit* rows.
     ``genre_status="no_match"`` is the "fix by hand" worklist; ``no_identity`` lists the files
@@ -208,10 +206,10 @@ def list_files(  # noqa: PLR0913 - cohesive keyword-only discovery filters
             f"(expected one of {sorted(store.ARTIST_WORKFLOW_STATUSES)})"
         )
         raise ValueError(message)
-    if album_status is not None and album_status not in store.ALBUM_WORKFLOW_STATUSES:
+    if year_status is not None and year_status not in store.YEAR_WORKFLOW_STATUSES:
         message = (
-            f"unknown album_status: {album_status!r} "
-            f"(expected one of {sorted(store.ALBUM_WORKFLOW_STATUSES)})"
+            f"unknown year_status: {year_status!r} "
+            f"(expected one of {sorted(store.YEAR_WORKFLOW_STATUSES)})"
         )
         raise ValueError(message)
     if mismatch_status is not None and mismatch_status not in store.MISMATCH_WORKFLOW_STATUSES:
@@ -224,7 +222,7 @@ def list_files(  # noqa: PLR0913 - cohesive keyword-only discovery filters
     filtered = (
         genre_status is not None
         or artist_status is not None
-        or album_status is not None
+        or year_status is not None
         or mismatch_status is not None
     )
 
@@ -251,7 +249,7 @@ def list_files(  # noqa: PLR0913 - cohesive keyword-only discovery filters
                 row.id,
                 genre_status=genre_status,
                 artist_status=artist_status,
-                album_status=album_status,
+                year_status=year_status,
                 mismatch_status=mismatch_status,
             ):
                 continue
@@ -535,7 +533,7 @@ def _reconcile_missing(conn: sqlite3.Connection, root: Path, counters: _Counters
         counters.missing_flagged += 1
 
 
-def library_stats(settings: Settings) -> dict[str, object]:
+def get_library_stats(settings: Settings) -> dict[str, object]:
     """Return library-wide counts from the snapshot."""
     connection = db.connect(settings.db_path)
     try:

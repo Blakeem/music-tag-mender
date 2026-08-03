@@ -1,6 +1,6 @@
 """Tests for the health check / readiness probe.
 
-Every ``run_health_check`` call injects BOTH network transports (MockTransport / the
+Every ``check_health`` call injects BOTH network transports (MockTransport / the
 no-key path): the ``musicbrainz`` check has no key gate, so an un-injected call would
 make a live release-group round-trip. No test here touches the real network.
 """
@@ -14,7 +14,7 @@ import httpx
 from tagmend.config import Settings
 from tagmend.engine import commits
 from tagmend.engine.db import connect
-from tagmend.engine.doctor import HealthReport, run_health_check
+from tagmend.engine.health import HealthReport, check_health
 from tagmend.engine.schema import apply_schema
 
 if TYPE_CHECKING:
@@ -86,7 +86,7 @@ def _ok_mb() -> httpx.MockTransport:
 
 def _run_ok(settings: Settings) -> HealthReport:
     """Run the health check with success transports for both network authorities."""
-    return run_health_check(
+    return check_health(
         settings,
         lastfm_transport=_ok_lastfm(),
         musicbrainz_transport=_ok_mb(),
@@ -156,7 +156,7 @@ def test_database_check_creates_ledger(temp_library: Path, tmp_path: Path) -> No
 
 def test_lastfm_no_key_fails_without_http(temp_library: Path, tmp_path: Path) -> None:
     lastfm_transport, calls = _fixed_transport(httpx.Response(200, json=_LASTFM_OK_BODY))
-    report = run_health_check(
+    report = check_health(
         _settings(temp_library, tmp_path, lastfm_api_key=None),
         lastfm_transport=lastfm_transport,
         musicbrainz_transport=_ok_mb(),
@@ -180,7 +180,7 @@ def test_network_checks_pass_on_success(temp_library: Path, tmp_path: Path) -> N
 
 def test_lastfm_http_error_fails_gracefully(temp_library: Path, tmp_path: Path) -> None:
     error_transport, calls = _fixed_transport(httpx.Response(500, json={}))
-    report = run_health_check(
+    report = check_health(
         _settings(temp_library, tmp_path, lastfm_api_key=_LASTFM_KEY),
         lastfm_transport=error_transport,
         musicbrainz_transport=_ok_mb(),
@@ -196,7 +196,7 @@ def test_lastfm_http_error_fails_gracefully(temp_library: Path, tmp_path: Path) 
 
 def test_musicbrainz_http_error_fails_gracefully(temp_library: Path, tmp_path: Path) -> None:
     error_transport, calls = _fixed_transport(httpx.Response(503, json={}))
-    report = run_health_check(
+    report = check_health(
         _settings(temp_library, tmp_path, lastfm_api_key=_LASTFM_KEY),
         lastfm_transport=_ok_lastfm(),
         musicbrainz_transport=error_transport,
@@ -210,7 +210,7 @@ def test_musicbrainz_http_error_fails_gracefully(temp_library: Path, tmp_path: P
 
 def test_musicbrainz_network_down_fails_gracefully(temp_library: Path, tmp_path: Path) -> None:
     mb_transport, calls = _raising_transport(httpx.ConnectError("network down"))
-    report = run_health_check(
+    report = check_health(
         _settings(temp_library, tmp_path, lastfm_api_key=_LASTFM_KEY),
         lastfm_transport=_ok_lastfm(),
         musicbrainz_transport=mb_transport,

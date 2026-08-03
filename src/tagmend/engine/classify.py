@@ -7,7 +7,7 @@ genre names spelled against the bundled **MusicBrainz** vocabulary. It owns two 
   by construction) and merge the user-editable ``data/genre_overlay.yml`` over it per
   ``docs/genre-tagging-spec.md`` §4.5, producing a frozen :class:`Vocabulary` whose
   ``fold-key → canonical name`` index is single-valued.
-* :func:`resolve_genres` — the pure pipeline of spec §6: fold-match each tag to a
+* :func:`classify_genres` — the pure pipeline of spec §6: fold-match each tag to a
   canonical name, drop sub-threshold weights, merge artist + album by *max* weight, order
   by weight desc then name asc, and optionally cap at ``genre_max_count``.
 
@@ -239,7 +239,7 @@ def _entry_aliases(entry: Mapping[str, object]) -> list[str]:
 # --- resolution pipeline -------------------------------------------------------------
 
 
-def resolve_genres(
+def classify_genres(
     artist_tags: list[Tag],
     album_tags: list[Tag] | None,
     vocab: Vocabulary,

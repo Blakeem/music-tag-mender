@@ -17,16 +17,16 @@ from tagmend import configui
 from tagmend.config import load_settings
 from tagmend.engine import (
     album_gaps,
-    albums,
     artists,
     commits,
     genres,
+    health,
     library,
     mismatch,
     staging,
     versioning,
+    years,
 )
-from tagmend.engine.doctor import run_health_check
 from tagmend.engine.library import ScanMode
 from tagmend.log import get_logger
 
@@ -36,7 +36,7 @@ mcp = FastMCP("tagmend")
 
 
 @mcp.tool()
-def health_check() -> dict[str, object]:
+def check_health() -> dict[str, object]:
     """Verify TagMend is ready to use.
 
     Checks that settings load, the configured music folder is reachable and
@@ -45,7 +45,7 @@ def health_check() -> dict[str, object]:
     wired up correctly before building or running anything else.
     """
     settings = load_settings()
-    report = run_health_check(settings)
+    report = health.check_health(settings)
     return report.to_dict()
 
 
@@ -87,7 +87,7 @@ def scan_library(
 
 
 @mcp.tool()
-def library_stats() -> dict[str, object]:
+def get_library_stats() -> dict[str, object]:
     """Report library-wide snapshot counts.
 
     Returns totals for tracked files, how many are present vs missing on disk, how many
@@ -96,16 +96,16 @@ def library_stats() -> dict[str, object]:
     progress gauge for one resolver, drilled into with the matching ``list_files`` filter:
 
     * ``genre`` — ``pending`` / ``no_identity`` / ``staged`` / ``done`` / ``no_match`` /
-      ``manual`` for ``stage_genres``; drill with ``list_files(genre_status=...)``.
+      ``manual`` for ``resolve_genres``; drill with ``list_files(genre_status=...)``.
     * ``artist`` — ``pending`` / ``no_identity`` / ``staged`` / ``done`` / ``manual`` (no
       ``no_match`` on this axis) for ``resolve_artists``; drill with
       ``list_files(artist_status=...)``.
-    * ``album`` — ``pending`` / ``no_identity`` / ``staged`` / ``done`` / ``no_match`` /
-      ``manual`` for ``resolve_albums``; drill with ``list_files(album_status=...)``.
+    * ``year`` — ``pending`` / ``no_identity`` / ``staged`` / ``done`` / ``no_match`` /
+      ``manual`` for ``resolve_years``; drill with ``list_files(year_status=...)``.
     * ``mismatch`` — ``pending`` / ``legit_ignore`` / ``misfiled_deferred`` for
       ``detect_mismatches`` dispositions; drill with ``list_files(mismatch_status=...)``.
     """
-    return {"ok": True, **library.library_stats(load_settings())}
+    return {"ok": True, **library.get_library_stats(load_settings())}
 
 
 @mcp.tool()
@@ -275,14 +275,14 @@ def commit_tags(message: str | None = None, path: str | None = None) -> dict[str
 
 
 @mcp.tool()
-def repend_axes(commit_id: int) -> dict[str, object]:
+def reopen_axes(commit_id: int) -> dict[str, object]:
     """Re-open the derived axes after a manual identity fix (call this AFTER committing one).
 
     The post-fix coherence step for the mismatch-fix flow. When you correct a file's identity
     (``albumartist``/``artist``/``album``…) and commit it, that file's previously auto-resolved
     genre and original year now describe the OLD identity, and any sticky artist exclusion was
     tied to the old name. For every file the given commit actually changed, this voids the
-    stale auto-resolved ``genre``/``originaldate`` (so ``stage_genres``/``resolve_albums`` will
+    stale auto-resolved ``genre``/``originaldate`` (so ``resolve_genres``/``resolve_years`` will
     re-pend them) and clears any ``file_artist_status`` row — without mutating history.
 
     Call it with a ``manual`` (or ``revert``) commit id from ``commit_tags`` / ``list_commits``.
@@ -294,7 +294,7 @@ def repend_axes(commit_id: int) -> dict[str, object]:
         or ``{"ok": False, "error": ...}`` if the commit id is unknown or is an ``auto`` commit.
     """
     try:
-        result = staging.repend_axes(load_settings(), commit_id=commit_id)
+        result = staging.reopen_axes(load_settings(), commit_id=commit_id)
     except ValueError as exc:
         return {"ok": False, "error": str(exc)}
     return {"ok": True, **result.to_dict()}
@@ -307,7 +307,7 @@ def list_files(  # noqa: PLR0913 - cohesive MCP discovery filters
     genre_status: Literal["pending", "no_identity", "no_match", "manual", "staged", "done"]
     | None = None,
     artist_status: Literal["pending", "no_identity", "manual", "staged", "done"] | None = None,
-    album_status: Literal["pending", "no_identity", "no_match", "manual", "staged", "done"]
+    year_status: Literal["pending", "no_identity", "no_match", "manual", "staged", "done"]
     | None = None,
     mismatch_status: Literal["pending", "legit_ignore", "misfiled_deferred"] | None = None,
 ) -> dict[str, object]:
@@ -322,12 +322,12 @@ def list_files(  # noqa: PLR0913 - cohesive MCP discovery filters
     ``genre_status="no_match"`` is the **fix-by-hand worklist**: files Last.fm had nothing
     for. Each carries ``genre_source_artist``/``genre_source_album`` — the identity the
     lookup used — so a misspelled artist/album is visible next to the current tags (fix
-    the tags, rescan, and ``stage_genres`` retries automatically). ``manual`` lists the
+    the tags, rescan, and ``resolve_genres`` retries automatically). ``manual`` lists the
     sticky exclusions (``set_genre_status``). A stored status is reported even if the
     file's identity changed since (compare the source fields to spot staleness).
     ``no_identity`` is the separate worklist of files that carry neither ``artist`` nor
     ``albumartist`` (whitespace-only counts as blank) — every resolver skips them, and they
-    are reported on the genre/artist/album axes alike (never ``pending``).
+    are reported on the genre/artist/year axes alike (never ``pending``).
 
     Args:
         path: When given, only files at this folder or nested under it are returned.
@@ -339,11 +339,11 @@ def list_files(  # noqa: PLR0913 - cohesive MCP discovery filters
             (``pending`` | ``no_identity`` | ``manual`` | ``staged`` | ``done``). Combined with
             ``genre_status``, a file must match BOTH. The axes are independent:
             ``staged``/``done`` are field-aware (genre keys on ``genre``; artist on
-            ``artist``/``albumartist``; album on ``originaldate``).
-        album_status: Return only files in this album workflow state
+            ``artist``/``albumartist``; year on ``originaldate``).
+        year_status: Return only files in this year workflow state
             (``pending`` | ``no_identity`` | ``no_match`` | ``manual`` | ``staged`` | ``done``).
-            Combined with the other filters, a file must match ALL. ``album_source_artist`` /
-            ``album_source_album`` carry the resolved identity a stored decision was taken
+            Combined with the other filters, a file must match ALL. ``year_source_artist`` /
+            ``year_source_album`` carry the resolved identity a stored decision was taken
             against.
         mismatch_status: Return only files with this mismatch disposition
             (``pending`` | ``legit_ignore`` | ``misfiled_deferred``). Combined with the other
@@ -353,8 +353,8 @@ def list_files(  # noqa: PLR0913 - cohesive MCP discovery filters
     Returns:
         ``{"ok": True, "files": [{file_id, folder, filename, ext, is_missing,
         managed_tags, genre_status, genre_source_artist, genre_source_album,
-        artist_status, artist_source_artist, artist_source_albumartist, album_status,
-        album_source_artist, album_source_album, mismatch_status, mismatch_source_field,
+        artist_status, artist_source_artist, artist_source_albumartist, year_status,
+        year_source_artist, year_source_album, mismatch_status, mismatch_source_field,
         mismatch_source_value}, ...]}``,
         or ``{"ok": False, "error": ...}`` on a bad request.
     """
@@ -365,7 +365,7 @@ def list_files(  # noqa: PLR0913 - cohesive MCP discovery filters
             limit=limit,
             genre_status=genre_status,
             artist_status=artist_status,
-            album_status=album_status,
+            year_status=year_status,
             mismatch_status=mismatch_status,
         )
     except ValueError as exc:
@@ -379,8 +379,8 @@ def get_file(file_id: int) -> dict[str, object]:
 
     Returns ``{"ok": True, "file": {file_id, folder, filename, ext, is_missing,
     managed_tags, genre_status, genre_source_artist, genre_source_album, artist_status,
-    artist_source_artist, artist_source_albumartist, album_status, album_source_artist,
-    album_source_album, mismatch_status, mismatch_source_field, mismatch_source_value}}``,
+    artist_source_artist, artist_source_albumartist, year_status, year_source_artist,
+    year_source_album, mismatch_status, mismatch_source_field, mismatch_source_value}}``,
     or ``{"ok": False, "error": ...}`` if the id is unknown.
     """
     view = library.get_file_view(load_settings(), file_id)
@@ -406,7 +406,7 @@ def detect_mismatches(
     Recommended workflow: start with ``group=true`` for a compact one-line-per-folder overview
     (cheap on a big library), then expand a single folder with ``folder="<exact folder path>"``
     to see its flagged rows, research the correct identity, and fix them with ``stage_tags_batch``
-    → ``commit_tags(path=<folder>)`` → ``repend_axes``. Silence a false positive or defer a
+    → ``commit_tags(path=<folder>)`` → ``reopen_axes``. Silence a false positive or defer a
     misfiled file with ``set_mismatch_status`` — such files are dropped from the flagged rows and
     reported under ``suppressed`` (a disposition-status → count map) so nothing is hidden
     silently; the disposition goes stale (and the file re-surfaces) if its identity tag changes.
@@ -468,7 +468,7 @@ def detect_album_gaps(
     """Find blank-``album`` files, grouped by folder, with grounded fill proposals.
 
     The blank-``album`` companion to ``detect_mismatches``: 92-ish files carry no ``album`` at
-    all, so ``resolve_albums`` skips them and nothing else can even list them. This groups every
+    all, so ``resolve_years`` skips them and nothing else can even list them. This groups every
     file whose ``album`` is blank (across ALL tag ordinals) by its folder and, per folder,
     proposes a fill from one of three grounded tiers — or leaves it blank when there is no
     defensible ground. Writes nothing to tags/status/staging; only the recording tier touches
@@ -500,7 +500,7 @@ def detect_album_gaps(
     folder with ``folder="<exact folder path>"``, then per tier feed the proposals'
     ``{file_id, proposed}`` + ``note`` to ``stage_tags_batch`` (one call per tier keeps the
     ``note`` accurate) → review ``diff_tags(path=<folder>)`` → ``commit_tags(path=<folder>)`` →
-    ``repend_axes(commit_id)`` to re-open the filled files' derived genre/year axes.
+    ``reopen_axes(commit_id)`` to re-open the filled files' derived genre/year axes.
 
     Args:
         limit: Cap the number of folder groups returned; the ``green``/``confirm``/``review``/
@@ -661,7 +661,7 @@ def _commit_to_dict(commit: commits.Commit) -> dict[str, object]:
 
 
 @mcp.tool()
-def stage_genres(
+def resolve_genres(
     artist: str | None = None,
     album: str | None = None,
     file_ids: list[int] | None = None,
@@ -696,7 +696,7 @@ def stage_genres(
         ``{"ok": False, "error": ...}`` (e.g. no API key configured).
     """
     try:
-        result = genres.stage_genres(
+        result = genres.resolve_genres(
             load_settings(),
             artist=artist,
             album=album,
@@ -767,7 +767,7 @@ def resolve_artists(
 
 @mcp.tool()
 def list_artists(limit: int | None = None) -> dict[str, object]:
-    """List distinct ``artist`` tag values with file counts (to scope ``stage_genres``).
+    """List distinct ``artist`` tag values with file counts (to scope ``resolve_genres``).
 
     Returns ``{"ok": True, "artists": [{artist, file_count}, ...]}`` in artist-value order.
     Run ``scan_library`` first to populate the snapshot.
@@ -788,7 +788,7 @@ def set_genre_status(
 ) -> dict[str, object]:
     """Exclude files from genre tagging (``manual``) or re-queue them (``pending``).
 
-    ``manual`` marks the in-scope files as a deliberate human/LLM choice: ``stage_genres``
+    ``manual`` marks the in-scope files as a deliberate human/LLM choice: ``resolve_genres``
     skips them until you reset. ``pending`` removes any status row, re-queuing them. You
     may exclude or re-include files, but cannot set engine-owned outcomes (e.g.
     ``no_match`` — that is decided by the Last.fm lookup).
@@ -821,7 +821,7 @@ def reset_genre_status(
 ) -> dict[str, object]:
     """Clear any genre status row for in-scope files, returning them to ``pending``.
 
-    Removes both ``no_match`` and ``manual`` decisions so ``stage_genres`` will reconsider
+    Removes both ``no_match`` and ``manual`` decisions so ``resolve_genres`` will reconsider
     the files on its next run.
 
     Args:
@@ -969,7 +969,7 @@ def reset_mismatch_status(
 
 
 @mcp.tool()
-def resolve_albums(
+def resolve_years(
     album: str | None = None,
     file_ids: list[int] | None = None,
     limit: int | None = None,
@@ -1005,7 +1005,7 @@ def resolve_albums(
         ``{"ok": False, "error": ...}`` (e.g. pending changes).
     """
     try:
-        result = albums.resolve_albums(
+        result = years.resolve_years(
             load_settings(),
             album=album,
             file_ids=file_ids,
@@ -1019,41 +1019,41 @@ def resolve_albums(
 
 @mcp.tool()
 def list_albums(
-    album_status: Literal["pending", "no_identity", "no_match", "manual", "staged", "done"]
+    year_status: Literal["pending", "no_identity", "no_match", "manual", "staged", "done"]
     | None = None,
     limit: int | None = None,
 ) -> dict[str, object]:
-    """List distinct album groups with file counts + status (to scope ``resolve_albums``).
+    """List distinct album groups with file counts + status (to scope ``resolve_years``).
 
     Groups files by ``(albumartist-else-artist, album)`` and reports each group's file count,
-    derived album workflow status, and ``blank_originaldate`` — the count of the group's
+    derived year workflow status, and ``blank_originaldate`` — the count of the group's
     files whose ``originaldate`` is empty. A group with ``blank_originaldate > 0`` is
-    actionable for ``resolve_albums`` (it has years to fill); ``album_status: "pending"``
+    actionable for ``resolve_years`` (it has years to fill); ``year_status: "pending"``
     alone does NOT mean actionable, since every file may already carry ``originaldate``.
-    Returns ``{"ok": True, "albums": [{artist, album, file_count, album_status,
+    Returns ``{"ok": True, "albums": [{artist, album, file_count, year_status,
     blank_originaldate}, ...]}`` in ``(artist, album)`` order. Run ``scan_library`` first to
     populate the snapshot.
 
     Args:
-        album_status: Keep only groups in this derived album workflow state (``pending`` |
+        year_status: Keep only groups in this derived year workflow state (``pending`` |
             ``no_identity`` | ``no_match`` | ``manual`` | ``staged`` | ``done``), applied
             before ``limit``.
         limit: Cap the number of groups returned (applied after ordering + filtering).
             Keeps the payload context-cheap on a large library.
     """
-    rows = albums.list_albums(load_settings(), album_status=album_status, limit=limit)
+    rows = years.list_albums(load_settings(), year_status=year_status, limit=limit)
     return {"ok": True, "albums": [row.to_dict() for row in rows]}
 
 
 @mcp.tool()
-def set_album_status(
+def set_year_status(
     status: Literal["manual", "pending"],
     file_ids: list[int] | None = None,
     value: str | None = None,
 ) -> dict[str, object]:
     """Exclude files from album-year fill (``manual``) or re-queue them (``pending``).
 
-    ``manual`` marks the in-scope files as a deliberate human/LLM choice: ``resolve_albums``
+    ``manual`` marks the in-scope files as a deliberate human/LLM choice: ``resolve_years``
     skips them until you reset. ``pending`` removes any status row, re-queuing them.
 
     Scope is ``file_ids`` when given, else every file carrying ``value`` as its ``album``
@@ -1069,7 +1069,7 @@ def set_album_status(
         ``{"ok": True, "affected": <count>}``, or ``{"ok": False, "error": ...}``.
     """
     try:
-        affected = albums.set_album_status(
+        affected = years.set_year_status(
             load_settings(),
             file_ids=file_ids,
             value=value,
@@ -1081,13 +1081,13 @@ def set_album_status(
 
 
 @mcp.tool()
-def reset_album_status(
+def reset_year_status(
     file_ids: list[int] | None = None,
     value: str | None = None,
 ) -> dict[str, object]:
-    """Clear any album status row for in-scope files, returning them to ``pending``.
+    """Clear any year status row for in-scope files, returning them to ``pending``.
 
-    Removes both ``no_match`` and ``manual`` decisions so ``resolve_albums`` will reconsider
+    Removes both ``no_match`` and ``manual`` decisions so ``resolve_years`` will reconsider
     the files on its next run.
 
     Args:
@@ -1098,7 +1098,7 @@ def reset_album_status(
     Returns:
         ``{"ok": True, "affected": <count>}``.
     """
-    affected = albums.reset_album_status(
+    affected = years.reset_year_status(
         load_settings(),
         file_ids=file_ids,
         value=value,

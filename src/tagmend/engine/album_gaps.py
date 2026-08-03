@@ -11,7 +11,7 @@ per-file proposals with a confidence label + provenance note pre-formatted for
 ``stage_tags_batch``. Nothing stages, nothing auto-commits. Tiers 1-2 are network-free; the
 recording tier is opt-out (``use_musicbrainz=False``) and its result is ``confidence:
 "review"`` (never green). The report feeds the existing ``stage_tags_batch → diff_tags(root)
-→ commit_tags(root) → repend_axes`` spine, where the human is the diff-gate.
+→ commit_tags(root) → reopen_axes`` spine, where the human is the diff-gate.
 
 The recording tier's ONLY side effect is its persistent lookup cache
 (``musicbrainz_recording_cache``): tags, status, and staging are untouched, so a re-run after
@@ -22,7 +22,7 @@ merge does not guard against overwriting a present ``album`` — so a proposal i
 emitted for a file whose ``album`` is blank across every ordinal. That blank predicate
 scans all ordinals via :func:`tagmend.engine.genres._first_nonblank` over
 :func:`tagmend.engine.store.get_tags` (NOT the ordinal-0-only ``load_tag_values``), exactly
-mirroring ``resolve_albums``' ``skipped_no_album`` gate, so a file carrying a non-blank
+mirroring ``resolve_years``' ``skipped_no_album`` gate, so a file carrying a non-blank
 album at any ordinal can never appear in a proposal.
 
 Mirrors :mod:`tagmend.engine.mismatch` in shape (frozen result dataclasses with hand-written
@@ -94,7 +94,7 @@ class _FileInput:
     """One tracked file reduced to what the detector reads.
 
     ``album`` is the first non-blank ``album`` value across ALL ordinals (the exact
-    ``resolve_albums`` identity rule), or ``None`` when the file's album is blank
+    ``resolve_years`` identity rule), or ``None`` when the file's album is blank
     everywhere — the only files that may ever be proposed. ``artist`` (the
     ``albumartist``-else-``artist`` identity) and ``title`` are the ``(artist, title)`` the
     MusicBrainz recording tier looks a blank file up against; each is ``None`` when blank
@@ -486,7 +486,7 @@ def _limit_report(report: AlbumGapsReport, limit: int) -> AlbumGapsReport:
 def _gather_inputs(conn: sqlite3.Connection) -> list[_FileInput]:
     """Read every non-missing tracked file into a :class:`_FileInput` (album/artist/title).
 
-    ``album``/``artist`` come from the shared ``resolve_albums`` identity
+    ``album``/``artist`` come from the shared ``resolve_years`` identity
     (:func:`tagmend.engine.genres._identity` — ``albumartist``-else-``artist``, first non-blank
     album at ANY ordinal), so the binding blank-only guarantee cannot drift; ``title`` is the
     file's first non-blank ``title``. The two carry the ``(artist, title)`` the review tier

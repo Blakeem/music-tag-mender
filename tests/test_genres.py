@@ -2,9 +2,9 @@
 
 These use real temp audio files (the silent templates) across all four formats and a real
 temp ledger via the ``engine_settings`` fixture, so they exercise the full loop end to
-end — scan → ``stage_genres`` → ``diff_tags`` → ``commit_tags`` → ``read_tags`` /
+end — scan → ``resolve_genres`` → ``diff_tags`` → ``commit_tags`` → ``read_tags`` /
 ``revert`` — with **no network**: a fake :class:`TagSource` is injected at the
-``stage_genres(client=...)` signature (the documented DI seam), mapping artist → tags.
+``resolve_genres(client=...)` signature (the documented DI seam), mapping artist → tags.
 
 Coverage mirrors PLAN — Last.fm genre tagging § "Verification (Integration)":
 the happy path on every format (incl. the m4a multi-value ``genre`` round-trip), the P0
@@ -33,7 +33,7 @@ if TYPE_CHECKING:
 
 _FORMATS = [".mp3", ".flac", ".m4a", ".ogg"]
 
-# Real vocabulary genres so ``resolve_genres`` yields a deterministic, multi-value result.
+# Real vocabulary genres so ``classify_genres`` yields a deterministic, multi-value result.
 _DAFT_PUNK_TAGS = [
     Tag("electronic", 100),
     Tag("house", 63),
@@ -110,7 +110,7 @@ def test_happy_path_stages_diffs_commits_multivalue_genre(
     scan_library(engine_settings)
 
     fake = FakeTagSource({"Daft Punk": _DAFT_PUNK_TAGS})
-    result = genres.stage_genres(engine_settings, client=fake)
+    result = genres.resolve_genres(engine_settings, client=fake)
 
     assert result.processed == 1
     assert result.staged == 1
@@ -145,7 +145,7 @@ def test_albumartist_is_preferred_lookup_identity(
     scan_library(engine_settings)
 
     fake = FakeTagSource({"Daft Punk": _DAFT_PUNK_TAGS})
-    result = genres.stage_genres(engine_settings, client=fake)
+    result = genres.resolve_genres(engine_settings, client=fake)
 
     assert result.staged == 1
     assert fake.artist_lookups == ["Daft Punk"]  # albumartist beat artist
@@ -163,7 +163,7 @@ def test_file_with_no_artist_is_skipped_and_untouched(
     file_id = _file_id(engine_settings, music_dir, track.name)
 
     fake = FakeTagSource({})
-    result = genres.stage_genres(engine_settings, client=fake)
+    result = genres.resolve_genres(engine_settings, client=fake)
 
     assert result.skipped["no_artist"] == 1
     assert result.processed == 0
@@ -186,7 +186,7 @@ def test_whitespace_only_artist_is_skipped_no_artist(
     file_id = _file_id(engine_settings, music_dir, track.name)
 
     fake = FakeTagSource({})
-    result = genres.stage_genres(engine_settings, client=fake)
+    result = genres.resolve_genres(engine_settings, client=fake)
 
     assert result.skipped["no_artist"] == 1
     assert result.processed == 0
@@ -206,7 +206,7 @@ def test_commit_preserves_albumartist_and_replaces_only_genre(
     scan_library(engine_settings)
 
     fake = FakeTagSource({"Daft Punk": _DAFT_PUNK_TAGS})
-    genres.stage_genres(engine_settings, client=fake)
+    genres.resolve_genres(engine_settings, client=fake)
     staging.commit_tags(engine_settings, origin="auto")
 
     on_disk = read_tags(track).tags
@@ -227,11 +227,11 @@ def test_committed_auto_revision_is_skipped_as_done_on_rerun(
     scan_library(engine_settings)
 
     fake = FakeTagSource({"Daft Punk": _DAFT_PUNK_TAGS})
-    genres.stage_genres(engine_settings, client=fake)
+    genres.resolve_genres(engine_settings, client=fake)
     staging.commit_tags(engine_settings, origin="auto")
 
     # Re-run: the committed auto revision derives "done" with no stored flag.
-    second = genres.stage_genres(engine_settings, client=fake)
+    second = genres.resolve_genres(engine_settings, client=fake)
     assert second.processed == 0
     assert second.skipped["done"] == 1
 
@@ -244,10 +244,10 @@ def test_already_staged_file_is_skipped_as_done(
     scan_library(engine_settings)
 
     fake = FakeTagSource({"Daft Punk": _DAFT_PUNK_TAGS})
-    genres.stage_genres(engine_settings, client=fake)  # stages but does NOT commit
+    genres.resolve_genres(engine_settings, client=fake)  # stages but does NOT commit
 
     # Without committing, the staged row alone derives "done".
-    second = genres.stage_genres(engine_settings, client=fake)
+    second = genres.resolve_genres(engine_settings, client=fake)
     assert second.processed == 0
     assert second.skipped["done"] == 1
 
@@ -262,7 +262,7 @@ def test_genre_pipeline_is_field_aware_artist_only_change_stays_processable(
     ``origin='auto'`` revision that changed only ``artist`` (or a staged change that
     touches only ``artist``) must leave the file genre-processable — not bucketed into
     ``skipped['done']`` — and must agree with ``derived_genre_status == 'pending'`` so the
-    status view and ``stage_genres`` can no longer disagree.
+    status view and ``resolve_genres`` can no longer disagree.
     """
     make_track(music_dir / "committed.mp3", {"artist": ["Daft Punk"], "genre": ["Old"]})
     make_track(music_dir / "staged.mp3", {"artist": ["daft punk"], "genre": ["Old"]})
@@ -302,7 +302,7 @@ def test_genre_pipeline_is_field_aware_artist_only_change_stays_processable(
         conn.close()
 
     fake = FakeTagSource({"Daft Punk": _DAFT_PUNK_TAGS})
-    result = genres.stage_genres(engine_settings, client=fake)
+    result = genres.resolve_genres(engine_settings, client=fake)
 
     # Neither file is skipped as done; the committed one is processed + genre-staged.
     # (The staged-id already has a staged genre? No — its staged row is artist-only, so it
@@ -323,7 +323,7 @@ def test_no_match_recorded_with_source_then_skipped(
     file_id = _file_id(engine_settings, music_dir, track.name)
 
     fake = FakeTagSource({"Obscure Band": None})  # not on Last.fm
-    result = genres.stage_genres(engine_settings, client=fake)
+    result = genres.resolve_genres(engine_settings, client=fake)
 
     assert result.no_match == 1
     assert result.staged == 0
@@ -337,7 +337,7 @@ def test_no_match_recorded_with_source_then_skipped(
 
     # Nothing staged; re-run skips it as a non-stale no_match.
     assert len(staging.diff_tags(engine_settings)) == 0
-    second = genres.stage_genres(engine_settings, client=fake)
+    second = genres.resolve_genres(engine_settings, client=fake)
     assert second.processed == 0
     assert second.skipped["no_match"] == 1
 
@@ -351,14 +351,14 @@ def test_stale_no_match_is_reprocessed_after_artist_changes(
 
     # First pass: artist unknown → no_match against "Wrong Name".
     fake = FakeTagSource({"Wrong Name": None, "Daft Punk": _DAFT_PUNK_TAGS})
-    genres.stage_genres(engine_settings, client=fake)
+    genres.resolve_genres(engine_settings, client=fake)
 
     # Fix the artist tag on disk and rescan so the snapshot identity changes.
     write_managed_tags(track, {"artist": ["Daft Punk"], "genre": ["Old"]})
     scan_library(engine_settings, mode=ScanMode.FULL)
 
     # The stale no_match (source_artist="Wrong Name" != "Daft Punk") is reprocessed.
-    result = genres.stage_genres(engine_settings, client=fake)
+    result = genres.resolve_genres(engine_settings, client=fake)
     assert result.processed == 1
     assert result.staged == 1
     assert result.skipped["no_match"] == 0
@@ -379,14 +379,14 @@ def test_manual_status_skips_then_reset_requeues(
     assert affected == 1
 
     fake = FakeTagSource({"Daft Punk": _DAFT_PUNK_TAGS})
-    first = genres.stage_genres(engine_settings, client=fake)
+    first = genres.resolve_genres(engine_settings, client=fake)
     assert first.processed == 0
     assert first.skipped["manual"] == 1
     assert fake.artist_lookups == []  # sticky: never even looked up
 
     # reset re-queues it.
     assert genres.reset_genre_status(engine_settings, file_ids=[file_id]) == 1
-    second = genres.stage_genres(engine_settings, client=fake)
+    second = genres.resolve_genres(engine_settings, client=fake)
     assert second.processed == 1
     assert second.staged == 1
 
@@ -412,14 +412,14 @@ def test_limit_caps_and_reports_pending_then_continues(
         {"Alpha": _DAFT_PUNK_TAGS, "Bravo": _DAFT_PUNK_TAGS, "Charlie": _DAFT_PUNK_TAGS},
     )
 
-    first = genres.stage_genres(engine_settings, client=fake, limit=2)
+    first = genres.resolve_genres(engine_settings, client=fake, limit=2)
     assert first.processed == 2
     assert first.staged == 2
     assert first.pending_remaining == 1
     assert first.more is True
 
     # A second call continues with the remaining candidate (the first two are now "done").
-    second = genres.stage_genres(engine_settings, client=fake, limit=2)
+    second = genres.resolve_genres(engine_settings, client=fake, limit=2)
     assert second.processed == 1
     assert second.staged == 1
     assert second.pending_remaining == 0
@@ -438,7 +438,7 @@ def test_revert_restores_original_genre(
     file_id = _file_id(engine_settings, music_dir, track.name)
 
     fake = FakeTagSource({"Daft Punk": _DAFT_PUNK_TAGS})
-    genres.stage_genres(engine_settings, client=fake)
+    genres.resolve_genres(engine_settings, client=fake)
     staging.commit_tags(engine_settings, origin="auto")
     assert read_tags(track).tags["genre"] == _EXPECTED_DAFT_PUNK
 
@@ -497,7 +497,7 @@ def test_listing_status_tracks_stage_then_commit_and_no_match_source(
     unknown_id = _file_id(engine_settings, music_dir, unknown.name)
 
     fake = FakeTagSource({"Daft Punk": _DAFT_PUNK_TAGS, "Obscure Band": None})
-    genres.stage_genres(engine_settings, client=fake)
+    genres.resolve_genres(engine_settings, client=fake)
 
     # The matched file lists as 'staged' before commit; the no-match file as 'no_match'
     # carrying the artist its lookup was recorded against.
@@ -513,21 +513,21 @@ def test_listing_status_tracks_stage_then_commit_and_no_match_source(
     assert _status_of(engine_settings, unknown_id) == "no_match"
 
 
-def test_no_match_listing_is_pinned_while_stage_genres_reprocesses_stale(
+def test_no_match_listing_is_pinned_while_resolve_genres_reprocesses_stale(
     engine_settings: Settings,
     music_dir: Path,
 ) -> None:
     """Staleness pin: a stored no_match keeps listing as 'no_match' (recorded decision),
 
     even after the on-disk artist is fixed and rescanned — while a fresh
-    ``stage_genres`` run reprocesses the now-stale file rather than skipping it.
+    ``resolve_genres`` run reprocesses the now-stale file rather than skipping it.
     """
     track = make_track(music_dir / "t.mp3", {"artist": ["Wrong Name"], "genre": ["Old"]})
     scan_library(engine_settings)
     file_id = _file_id(engine_settings, music_dir, track.name)
 
     fake = FakeTagSource({"Wrong Name": None, "Daft Punk": _DAFT_PUNK_TAGS})
-    genres.stage_genres(engine_settings, client=fake)
+    genres.resolve_genres(engine_settings, client=fake)
     assert _status_of(engine_settings, file_id) == "no_match"
 
     # Fix the artist on disk and rescan so the snapshot identity changes.
@@ -540,8 +540,8 @@ def test_no_match_listing_is_pinned_while_stage_genres_reprocesses_stale(
     assert stale_view.genre_status == "no_match"
     assert stale_view.genre_source_artist == "Wrong Name"
 
-    # A fresh stage_genres run, however, reprocesses the stale file (does not skip it).
-    result = genres.stage_genres(engine_settings, client=fake)
+    # A fresh resolve_genres run, however, reprocesses the stale file (does not skip it).
+    result = genres.resolve_genres(engine_settings, client=fake)
     assert result.processed == 1
     assert result.staged == 1
     assert result.skipped["no_match"] == 0

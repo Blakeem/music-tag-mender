@@ -1,6 +1,6 @@
 """Album original-year fill: group → look up MusicBrainz → blank-fill ``originaldate``.
 
-The album-axis orchestrator (a near-clone of :mod:`tagmend.engine.genres`'s identity/status
+The year-axis orchestrator (a near-clone of :mod:`tagmend.engine.genres`'s identity/status
 model, borrowing :mod:`tagmend.engine.artists`'s dry-run / value-scoped-exclusion / result
 ergonomics). It ties the read path, the cached MusicBrainz client, and the revertible
 staging engine together: it groups in-scope files by ``(albumartist-else-artist, album)``
@@ -45,10 +45,10 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
-# The single managed field the album axis fills (shared with the status derivation).
-_ALBUM_FIELD = "originaldate"
+# The single managed field the year axis fills (shared with the status derivation).
+_YEAR_FIELD = "originaldate"
 
-# The two states ``set_album_status`` is allowed to drive: ``manual`` writes a sticky
+# The two states ``set_year_status`` is allowed to drive: ``manual`` writes a sticky
 # exclusion row; ``pending`` deletes it (re-queue). ``no_match`` is engine-owned.
 _USER_STATUSES = frozenset({"manual", "pending"})
 
@@ -62,8 +62,8 @@ def _utc_now() -> str:
 
 
 @dataclass(frozen=True, slots=True)
-class ResolveAlbumsResult:
-    """Immutable summary of one :func:`resolve_albums` call, JSON-ready for the MCP tool."""
+class ResolveYearsResult:
+    """Immutable summary of one :func:`resolve_years` call, JSON-ready for the MCP tool."""
 
     processed: int
     staged_files: int
@@ -96,7 +96,7 @@ class ResolveAlbumsResult:
 
 @dataclass(slots=True)
 class _Tally:
-    """Mutable accumulator for one ``resolve_albums`` run, frozen into the result at end."""
+    """Mutable accumulator for one ``resolve_years`` run, frozen into the result at end."""
 
     staged_files: int = 0
     no_match: int = 0
@@ -119,7 +119,7 @@ class _Candidate:
 # --- public entry --------------------------------------------------------------------
 
 
-def resolve_albums(  # noqa: PLR0913 - cohesive keyword-only scope + injection params
+def resolve_years(  # noqa: PLR0913 - cohesive keyword-only scope + injection params
     settings: Settings,
     *,
     album: str | None = None,
@@ -127,7 +127,7 @@ def resolve_albums(  # noqa: PLR0913 - cohesive keyword-only scope + injection p
     limit: int | None = None,
     dry_run: bool = False,
     client: MBAlbumSource | None = None,
-) -> ResolveAlbumsResult:
+) -> ResolveYearsResult:
     """Blank-fill ``originaldate`` from MusicBrainz for in-scope files (writes no disk).
 
     Selects the in-scope files that need filling (a blank ``originaldate``, an ``album`` and
@@ -186,12 +186,12 @@ def _candidate_scope(
     album: str | None,
     file_ids: list[int] | None,
 ) -> list[int]:
-    """Resolve the candidate file ids for a ``resolve_albums`` run, in ascending id order.
+    """Resolve the candidate file ids for a ``resolve_years`` run, in ascending id order.
 
     Precedence: *file_ids* (when given) win; else *album* narrows to every file carrying it
     as its ``album`` tag (``store.files_in_scope`` only honors ``album`` alongside an
     ``artist``, so the album-only scope is resolved explicitly here); else every tracked
-    file. This is what makes ``resolve_albums(album=…)`` actually scope to that album rather
+    file. This is what makes ``resolve_years(album=…)`` actually scope to that album rather
     than fan MusicBrainz lookups across the whole library.
     """
     if file_ids is None and album is not None:
@@ -208,9 +208,9 @@ def _select(
 
     Mutates *tally* with the skip counts. A candidate is processable when it has an artist
     and an album, its ``originaldate`` is currently blank, it is not already done
-    (staged / committed ``originaldate`` revision), and it has no blocking album decision.
+    (staged / committed ``originaldate`` revision), and it has no blocking year decision.
     """
-    album_fields = axis.ALBUM_AXIS.fields
+    year_fields = axis.YEAR_AXIS.fields
     processable: list[_Candidate] = []
     for fid in candidate_ids:
         tags = store.get_tags(conn, fid)
@@ -222,20 +222,20 @@ def _select(
         if identity.album is None:
             tally.skipped_no_album += 1
             continue
-        if tags.get(_ALBUM_FIELD):
+        if tags.get(_YEAR_FIELD):
             tally.skipped_present += 1
             continue
 
-        if store.has_staged_change_for(conn, fid, album_fields) or store.has_auto_change_for(
+        if store.has_staged_change_for(conn, fid, year_fields) or store.has_auto_change_for(
             conn,
             fid,
-            album_fields,
+            year_fields,
         ):
             # Already filled by us (staged or committed) — treat as present/done.
             tally.skipped_present += 1
             continue
 
-        decision = store.get_album_status(conn, fid)
+        decision = store.get_year_status(conn, fid)
         if decision is not None and _decision_blocks(decision, identity):
             # A sticky 'manual' is reported; a non-stale 'no_match' is silently held back
             # (a stale no_match does not block and falls through to be reprocessed).
@@ -247,14 +247,14 @@ def _select(
     return processable
 
 
-def _decision_blocks(decision: store.AlbumStatusRow, identity: _Identity) -> bool:
-    """Whether a stored album decision still blocks processing for the current identity.
+def _decision_blocks(decision: store.YearStatusRow, identity: _Identity) -> bool:
+    """Whether a stored year decision still blocks processing for the current identity.
 
-    The shared album staleness/sticky rule (``manual`` always blocks; ``no_match`` blocks
+    The shared year staleness/sticky rule (``manual`` always blocks; ``no_match`` blocks
     only while NOT stale) lives on the axis, so this skip path and the user-facing
-    :func:`tagmend.engine.store.derived_album_status` can never drift.
+    :func:`tagmend.engine.store.derived_year_status` can never drift.
     """
-    return axis.ALBUM_AXIS.decision_blocks(
+    return axis.YEAR_AXIS.decision_blocks(
         axis.StatusRow(
             status=decision.status,
             source_primary=decision.source_artist,
@@ -351,7 +351,7 @@ def _process_one_group(  # noqa: PLR0913 - cohesive per-group inputs
         return
     now = _utc_now()
     for fid in file_ids:
-        store.set_album_status(
+        store.set_year_status(
             conn,
             file_id=fid,
             status="no_match",
@@ -375,7 +375,7 @@ def _stage_resolved(
     preserved through the commit's delete-on-absent write. ``stage_tags`` owns its conn.
     """
     target = dict(versioning.managed_subset(store.get_tags(conn, file_id)))
-    target[_ALBUM_FIELD] = [original_date]
+    target[_YEAR_FIELD] = [original_date]
     staging.stage_tags(
         settings,
         file_id=file_id,
@@ -393,15 +393,15 @@ def _build_result(
     *,
     processed: int,
     pending_remaining: int,
-) -> ResolveAlbumsResult:
-    """Freeze the run's tally + counts into the public :class:`ResolveAlbumsResult`."""
+) -> ResolveYearsResult:
+    """Freeze the run's tally + counts into the public :class:`ResolveYearsResult`."""
     mappings = [
         {"artist": artist, "album": album, "original_date": date}
         for (artist, album), date in tally.mappings.items()
     ]
     more = pending_remaining > 0
     summary = _summarize(tally, processed=processed, pending_remaining=pending_remaining)
-    return ResolveAlbumsResult(
+    return ResolveYearsResult(
         processed=processed,
         staged_files=tally.staged_files,
         no_match=tally.no_match,
@@ -437,13 +437,13 @@ def _summarize(
 # --- status tools --------------------------------------------------------------------
 
 
-def _album_scope(
+def _year_scope(
     conn: sqlite3.Connection,
     *,
     file_ids: list[int] | None,
     value: str | None,
 ) -> list[int]:
-    """Resolve the in-scope file ids for the album status tools, in ascending id order.
+    """Resolve the in-scope file ids for the year status tools, in ascending id order.
 
     *file_ids* (when given) win; otherwise *value* matches every file carrying it as its
     ``album`` tag. With neither given the scope is empty (the tools require a target).
@@ -455,7 +455,7 @@ def _album_scope(
     return store.files_by_tag_value(conn, "album", value)
 
 
-def set_album_status(
+def set_year_status(
     settings: Settings,
     *,
     file_ids: list[int] | None = None,
@@ -466,7 +466,7 @@ def set_album_status(
 
     Scope is *file_ids* when given, else every file carrying *value* as its ``album`` tag.
     ``manual`` writes a sticky row (recording the file's resolved identity for audit) so
-    :func:`resolve_albums` always skips it; ``pending`` deletes any row, re-queuing the
+    :func:`resolve_years` always skips it; ``pending`` deletes any row, re-queuing the
     file. Returns the number of files affected. Raises :class:`ValueError` for an unknown
     *status*. Owns its transaction.
     """
@@ -477,12 +477,12 @@ def set_album_status(
     connection = db.connect(settings.db_path)
     try:
         schema.apply_schema(connection)
-        scoped = _album_scope(connection, file_ids=file_ids, value=value)
+        scoped = _year_scope(connection, file_ids=file_ids, value=value)
         now = _utc_now()
         for fid in scoped:
             if status == "manual":
                 identity = genres._identity(store.get_tags(connection, fid))  # noqa: SLF001
-                store.set_album_status(
+                store.set_year_status(
                     connection,
                     file_id=fid,
                     status="manual",
@@ -491,37 +491,37 @@ def set_album_status(
                     now=now,
                 )
             else:
-                store.delete_album_status(connection, fid)
+                store.delete_year_status(connection, fid)
         connection.commit()
     finally:
         connection.close()
 
-    logger.info("set album status=%s for %d file(s)", status, len(scoped))
+    logger.info("set year status=%s for %d file(s)", status, len(scoped))
     return len(scoped)
 
 
-def reset_album_status(
+def reset_year_status(
     settings: Settings,
     *,
     file_ids: list[int] | None = None,
     value: str | None = None,
 ) -> int:
-    """Delete the album status row for every file in scope (back to ``pending``).
+    """Delete the year status row for every file in scope (back to ``pending``).
 
-    Same ``album``-value scoping as :func:`set_album_status`. Returns the number of files
+    Same ``album``-value scoping as :func:`set_year_status`. Returns the number of files
     affected. Owns its transaction.
     """
     connection = db.connect(settings.db_path)
     try:
         schema.apply_schema(connection)
-        scoped = _album_scope(connection, file_ids=file_ids, value=value)
+        scoped = _year_scope(connection, file_ids=file_ids, value=value)
         for fid in scoped:
-            store.delete_album_status(connection, fid)
+            store.delete_year_status(connection, fid)
         connection.commit()
     finally:
         connection.close()
 
-    logger.info("reset album status for %d file(s)", len(scoped))
+    logger.info("reset year status for %d file(s)", len(scoped))
     return len(scoped)
 
 
@@ -535,7 +535,7 @@ class AlbumRow:
     artist: str | None
     album: str
     file_count: int
-    album_status: str
+    year_status: str
     blank_originaldate: int
 
     def to_dict(self) -> dict[str, object]:
@@ -544,7 +544,7 @@ class AlbumRow:
             "artist": self.artist,
             "album": self.album,
             "file_count": self.file_count,
-            "album_status": self.album_status,
+            "year_status": self.year_status,
             "blank_originaldate": self.blank_originaldate,
         }
 
@@ -552,18 +552,18 @@ class AlbumRow:
 def list_albums(
     settings: Settings,
     *,
-    album_status: str | None = None,
+    year_status: str | None = None,
     limit: int | None = None,
 ) -> list[AlbumRow]:
     """Return each distinct album group with its file count + a representative status.
 
     Groups in-scope files by ``(albumartist-else-artist, album)`` (the album identity) and
-    reports the derived album status of the group's first file plus ``blank_originaldate``
+    reports the derived year status of the group's first file plus ``blank_originaldate``
     — the count of the group's files whose ``originaldate`` tag is empty (the files
-    :func:`resolve_albums` can actually fill; ``> 0`` marks an actionable group). A
-    discovery aid for scoping ``resolve_albums``. Read-only.
+    :func:`resolve_years` can actually fill; ``> 0`` marks an actionable group). A
+    discovery aid for scoping ``resolve_years``. Read-only.
 
-    *album_status* (when given) keeps only groups whose derived status matches, applied
+    *year_status* (when given) keeps only groups whose derived status matches, applied
     AFTER ordering and BEFORE *limit*. *limit* (when given) caps the number of rows
     returned so a large library stays context-cheap.
     """
@@ -579,7 +579,7 @@ def list_albums(
                 continue
             key = (identity.artist, identity.album)
             groups.setdefault(key, []).append(fid)
-            if not tags.get(_ALBUM_FIELD):
+            if not tags.get(_YEAR_FIELD):
                 blanks[key] = blanks.get(key, 0) + 1
 
         rows = [
@@ -587,7 +587,7 @@ def list_albums(
                 artist=artist,
                 album=album,
                 file_count=len(fids),
-                album_status=store.derived_album_status(connection, fids[0]),
+                year_status=store.derived_year_status(connection, fids[0]),
                 blank_originaldate=blanks.get((artist, album), 0),
             )
             for (artist, album), fids in groups.items()
@@ -596,8 +596,8 @@ def list_albums(
         connection.close()
 
     ordered = sorted(rows, key=lambda r: (r.artist or "", r.album))
-    if album_status is not None:
-        ordered = [row for row in ordered if row.album_status == album_status]
+    if year_status is not None:
+        ordered = [row for row in ordered if row.year_status == year_status]
     if limit is not None:
         ordered = ordered[:limit]
     return ordered

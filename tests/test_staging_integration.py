@@ -431,7 +431,7 @@ def test_widened_fields_ride_through_commit_and_revert(
     suffix: str,
 ) -> None:
     # A genre-only auto stage, built the way the resolve flows build it (the full managed
-    # subset of current tags | the changed field — genres.py:384 / albums.py:377), must
+    # subset of current tags | the changed field — genres.py:384 / years.py:377), must
     # carry every OTHER widened field through the commit un-deleted, record a diff touching
     # ONLY $.genre (no spurious axis flips), and stay revertible via the v0 baseline the
     # stage auto-captured for the new fields.
@@ -594,7 +594,7 @@ def test_stage_tags_batch_rejects_duplicate_file_id(
     assert _staged(engine_settings, a_id) is None
 
 
-# --- repend_axes (NN7: re-open derived axes after a manual identity fix) -------------
+# --- reopen_axes (NN7: re-open derived axes after a manual identity fix) -------------
 
 
 def _auto_genre_year(
@@ -604,7 +604,7 @@ def _auto_genre_year(
     genre: str = "Metal",
     year: str = "2001",
 ) -> None:
-    """Commit an auto genre+year change so the file reads genre-done and album-done."""
+    """Commit an auto genre+year change so the file reads genre-done and year-done."""
     staging.stage_tags(
         engine_settings,
         file_id=file_id,
@@ -619,13 +619,13 @@ def _derived(engine_settings: Settings, file_id: int) -> tuple[str, str]:
     try:
         return (
             store.derived_genre_status(conn, file_id),
-            store.derived_album_status(conn, file_id),
+            store.derived_year_status(conn, file_id),
         )
     finally:
         conn.close()
 
 
-def test_repend_axes_flips_done_to_pending_and_stays_repend_safe(
+def test_reopen_axes_flips_done_to_pending_and_stays_reopen_safe(
     engine_settings: Settings,
     music_dir: Path,
 ) -> None:
@@ -641,16 +641,16 @@ def test_repend_axes_flips_done_to_pending_and_stays_repend_safe(
     fix = staging.commit_tags(engine_settings)
     assert fix.commit_id is not None
 
-    repend = staging.repend_axes(engine_settings, commit_id=fix.commit_id)
-    assert repend.files == 1
+    reopen = staging.reopen_axes(engine_settings, commit_id=fix.commit_id)
+    assert reopen.files == 1
     assert _derived(engine_settings, file_id) == ("pending", "pending")
 
-    # Re-pend-safe: a LATER fresh auto commit (a real change, above the watermark) reads done.
+    # Reopen-safe: a LATER fresh auto commit (a real change, above the watermark) reads done.
     _auto_genre_year(engine_settings, file_id, genre="Ambient", year="2002")
     assert _derived(engine_settings, file_id) == ("done", "done")
 
 
-def test_repend_axes_clears_artist_status(
+def test_reopen_axes_clears_artist_status(
     engine_settings: Settings,
     music_dir: Path,
 ) -> None:
@@ -663,8 +663,8 @@ def test_repend_axes_clears_artist_status(
     fix = staging.commit_tags(engine_settings)
     assert fix.commit_id is not None
 
-    repend = staging.repend_axes(engine_settings, commit_id=fix.commit_id)
-    assert repend.artist_status_cleared == 1
+    reopen = staging.reopen_axes(engine_settings, commit_id=fix.commit_id)
+    assert reopen.artist_status_cleared == 1
     conn = connect(engine_settings.db_path)
     try:
         assert store.get_artist_status(conn, file_id) is None
@@ -672,7 +672,7 @@ def test_repend_axes_clears_artist_status(
         conn.close()
 
 
-def test_repend_axes_rejects_auto_and_unknown_commit(
+def test_reopen_axes_rejects_auto_and_unknown_commit(
     engine_settings: Settings,
     music_dir: Path,
 ) -> None:
@@ -690,16 +690,16 @@ def test_repend_axes_rejects_auto_and_unknown_commit(
     assert auto.commit_id is not None
 
     with pytest.raises(ValueError, match="auto commit"):
-        staging.repend_axes(engine_settings, commit_id=auto.commit_id)
+        staging.reopen_axes(engine_settings, commit_id=auto.commit_id)
     with pytest.raises(ValueError, match="unknown commit_id"):
-        staging.repend_axes(engine_settings, commit_id=9999)
+        staging.reopen_axes(engine_settings, commit_id=9999)
 
 
-def test_repend_axes_ignores_noop_files(
+def test_reopen_axes_ignores_noop_files(
     engine_settings: Settings,
     music_dir: Path,
 ) -> None:
-    # A no-op commit (target == current) leaves no revision row, so repend touches nobody.
+    # A no-op commit (target == current) leaves no revision row, so reopen touches nobody.
     track = make_track(music_dir / "t.mp3", {"genre": ["Rock"]})
     scan_library(engine_settings)
     file_id = _file_id(engine_settings, music_dir, track.name)
@@ -710,7 +710,7 @@ def test_repend_axes_ignores_noop_files(
     assert noop.commit_id is not None
     assert noop.noop == 1
 
-    repend = staging.repend_axes(engine_settings, commit_id=noop.commit_id)
-    assert repend.files == 0  # the noop file has no revision in this commit
+    reopen = staging.reopen_axes(engine_settings, commit_id=noop.commit_id)
+    assert reopen.files == 0  # the noop file has no revision in this commit
     # Genre stays done because nothing was voided.
     assert _derived(engine_settings, file_id) == ("done", "done")

@@ -2,7 +2,7 @@
 
 Verifies that the environment is wired up: settings resolve, the configured music
 folder is reachable and readable, and the SQLite ledger can be opened. Surfaced both
-as ``tagmend doctor`` (CLI) and the ``health_check`` MCP tool, so the very first
+as ``tagmend check-health`` (CLI) and the ``check_health`` MCP tool, so the very first
 thing we can do — before any feature exists — is confirm we're ready to build.
 """
 
@@ -61,7 +61,7 @@ class HealthReport:
         }
 
 
-def run_health_check(
+def check_health(
     settings: Settings,
     *,
     lastfm_transport: httpx.BaseTransport | None = None,
@@ -181,7 +181,7 @@ def _check_lastfm(
         return Check(
             name=name,
             ok=False,
-            detail="not configured — set lastfm_api_key (needed by stage_genres/resolve_artists)",
+            detail="not configured — set lastfm_api_key (needed by resolve_genres/resolve_artists)",
         )
 
     conn = _memory_conn()

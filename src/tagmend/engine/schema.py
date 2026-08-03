@@ -44,10 +44,10 @@ The M4 artist normalization path adds one more side table (schema v7, purely add
 The album original-year path adds two more side tables (schema v8, purely additive — a v7
 ledger upgrades in place with no data loss):
 
-* ``file_album_status`` — the album-axis twin of ``file_genre_status`` (same identity:
-  ``(albumartist-else-artist, album)`` → ``source_artist``/``source_album``), storing the
-  ``'no_match'`` / ``'manual'`` decisions; "done"/"staged" are *derived* field-awarely
-  (keyed on ``originaldate``).
+* ``file_year_status`` (named ``file_album_status`` until v12) — the year-axis twin of
+  ``file_genre_status`` (same identity: ``(albumartist-else-artist, album)`` →
+  ``source_artist``/``source_album``), storing the ``'no_match'`` / ``'manual'`` decisions;
+  "done"/"staged" are *derived* field-awarely (keyed on ``originaldate``).
 * ``musicbrainz_cache`` — a persistent cache of MusicBrainz release-group lookups keyed by a
   request hash. ``found`` is the negative-cache sentinel (0 = no usable Album release group),
   mirroring ``lastfm_cache``.
@@ -83,6 +83,15 @@ additive — a v10 ledger upgrades in place with no data loss):
   release group for the recording; 1 = found). The found columns hold the selected recording's
   release-group title/id + the recording MBID. Feeds ``detect_album_gaps``' review-only tier;
   cache writes are its ONLY ledger writes.
+
+The tool-naming pass renames one table (schema v12, no new tables — a v11 ledger upgrades in
+place with no data loss):
+
+* ``file_album_status`` → ``file_year_status``. The album *axis* became the **year** axis
+  (it fills ``originaldate``, never the ``album`` tag), so its status table follows the axis
+  name. :func:`apply_schema` performs a SQLite-native ``ALTER TABLE ... RENAME TO`` before the
+  DDL runs, so every stored ``'no_match'`` / ``'manual'`` disposition is preserved. Nothing
+  about the album *entity* changes (``musicbrainz_cache``, the ``album`` tag, ``list_albums``).
 """
 
 from __future__ import annotations
@@ -96,7 +105,7 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
-SCHEMA_VERSION: Final = 11
+SCHEMA_VERSION: Final = 12
 
 _FILES_DDL: Final = """
 CREATE TABLE IF NOT EXISTS files (
@@ -260,15 +269,16 @@ CREATE TABLE IF NOT EXISTS file_artist_status (
 )
 """
 
-# Per-file terminal/negative album decisions (the album-axis twin of ``file_genre_status``,
+# Per-file terminal/negative year decisions (the year-axis twin of ``file_genre_status``,
 # identical shape). Stores ONLY ``'no_match'`` (no usable MusicBrainz Album release group)
 # and ``'manual'`` (user/LLM excluded it). "Done"/"staged" are DERIVED elsewhere from the
 # field-aware revision tables (keyed on ``originaldate``), so there is no state here to
 # desync. ``source_artist``/``source_album`` record the resolved identity
 # (``albumartist``-else-``artist`` + ``album``) the decision was taken against, so a later
-# tag change makes a ``'no_match'`` stale and re-processable. See PLAN — album axis.
-_FILE_ALBUM_STATUS_DDL: Final = """
-CREATE TABLE IF NOT EXISTS file_album_status (
+# tag change makes a ``'no_match'`` stale and re-processable. Named ``file_album_status``
+# before v12. See PLAN — year axis.
+_FILE_YEAR_STATUS_DDL: Final = """
+CREATE TABLE IF NOT EXISTS file_year_status (
   file_id       INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
   status        TEXT NOT NULL,
   source_artist TEXT,
@@ -280,7 +290,7 @@ CREATE TABLE IF NOT EXISTS file_album_status (
 # Persistent cache of MusicBrainz release-group lookups, keyed by a request hash (so it
 # survives MCP restarts), mirroring ``lastfm_cache``. ``found`` is the negative-cache
 # sentinel (0 = no usable Album release group; 1 = found). The found columns hold the
-# selected release group's original ``first-release-date`` and ids. See PLAN — album axis.
+# selected release group's original ``first-release-date`` and ids. See PLAN — year axis.
 _MUSICBRAINZ_CACHE_DDL: Final = """
 CREATE TABLE IF NOT EXISTS musicbrainz_cache (
   request_key      TEXT PRIMARY KEY,
@@ -344,14 +354,40 @@ CREATE TABLE IF NOT EXISTS file_mismatch_status (
 """
 
 
+def _table_exists(connection: sqlite3.Connection, name: str) -> bool:
+    """Whether a table called *name* exists in this ledger (``sqlite_master`` lookup)."""
+    row = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (name,),
+    ).fetchone()
+    return row is not None
+
+
+def _migrate_v12_year_status(connection: sqlite3.Connection) -> None:
+    """v12: rename ``file_album_status`` → ``file_year_status``, preserving every row.
+
+    Runs BEFORE the DDL so the ``CREATE TABLE IF NOT EXISTS`` below finds the renamed table
+    and does not create an empty second one. The rename is SQLite-native (``ALTER TABLE ...
+    RENAME TO``), so all stored ``'no_match'``/``'manual'`` dispositions survive. Idempotent:
+    it fires only when the old table exists and the new one does not (a fresh ledger has
+    neither, a v12+ ledger has only the new one).
+    """
+    if not _table_exists(connection, "file_album_status"):
+        return
+    if _table_exists(connection, "file_year_status"):
+        return
+    connection.execute("ALTER TABLE file_album_status RENAME TO file_year_status")
+    logger.info("schema v12: renamed file_album_status to file_year_status")
+
+
 def apply_schema(connection: sqlite3.Connection) -> None:
     """Create all tables (idempotently) and stamp ``PRAGMA user_version``.
 
     Creating tables on a fresh ledger needs no migration: the ``CREATE TABLE IF NOT
     EXISTS`` statements create whatever is missing and the ``PRAGMA user_version``
     re-stamp advances the version. NOTE: this does **not** alter columns of tables that
-    already exist, nor rename them, so a *pre-release* dev ledger from an earlier schema
-    must be deleted and rescanned. In particular **a v4 ledger must be deleted before
+    already exist, so a *pre-release* dev ledger from an earlier schema must be deleted and
+    rescanned. In particular **a v4 ledger must be deleted before
     v5**: v5 drops the ``commit_id`` column from both staged tables
     (``tag_revisions_staged`` / ``path_revisions_staged``) and ``apply_schema`` cannot
     drop a column. (v4 renamed the staging tables
@@ -360,12 +396,17 @@ def apply_schema(connection: sqlite3.Connection) -> None:
     ``batch_id``→``commit_id`` and dropped ``kind``/``plan_id``.) There is no production
     data to migrate yet.
 
+    The ONE in-place migration is v12's table rename (``file_album_status`` →
+    ``file_year_status``), applied by :func:`_migrate_v12_year_status` before any DDL runs so
+    a v11 ledger upgrades with its dispositions intact.
+
     Staged rows no longer carry a ``commit_id``; a lingering ``'applying'`` commit means
     an interrupted run, recovered by simply committing again.
 
     ``commits`` is created before the revision/staging tables that reference it.
     """
     logger.debug("applying schema version %d", SCHEMA_VERSION)
+    _migrate_v12_year_status(connection)
     connection.execute(_FILES_DDL)
     connection.execute(_FILE_TAGS_DDL)
     connection.execute(_FILE_TAGS_INDEX_DDL)
@@ -377,7 +418,7 @@ def apply_schema(connection: sqlite3.Connection) -> None:
     connection.execute(_LASTFM_CACHE_DDL)
     connection.execute(_FILE_GENRE_STATUS_DDL)
     connection.execute(_FILE_ARTIST_STATUS_DDL)
-    connection.execute(_FILE_ALBUM_STATUS_DDL)
+    connection.execute(_FILE_YEAR_STATUS_DDL)
     connection.execute(_MUSICBRAINZ_CACHE_DDL)
     connection.execute(_MUSICBRAINZ_RECORDING_CACHE_DDL)
     connection.execute(_VOIDED_AUTO_DDL)

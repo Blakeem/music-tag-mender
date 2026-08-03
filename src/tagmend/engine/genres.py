@@ -101,7 +101,7 @@ def _identity(tags: dict[str, list[str]]) -> _Identity:
 
 @dataclass(frozen=True, slots=True)
 class StageGenresResult:
-    """Immutable summary of one :func:`stage_genres` call, JSON-ready for the MCP tool."""
+    """Immutable summary of one :func:`resolve_genres` call, JSON-ready for the MCP tool."""
 
     processed: int
     staged: int
@@ -130,7 +130,7 @@ class StageGenresResult:
 
 @dataclass(slots=True)
 class _Tally:
-    """Mutable accumulator for one ``stage_genres`` run, frozen into the result at the end."""
+    """Mutable accumulator for one ``resolve_genres`` run, frozen into the result at the end."""
 
     staged: int = 0
     no_match: int = 0
@@ -218,7 +218,7 @@ def _decision_blocks(decision: store.GenreStatusRow, identity: _Identity) -> boo
 # --- staging orchestration -----------------------------------------------------------
 
 
-def stage_genres(  # noqa: PLR0913 - cohesive keyword-only scope + injection params
+def resolve_genres(  # noqa: PLR0913 - cohesive keyword-only scope + injection params
     settings: Settings,
     *,
     artist: str | None = None,
@@ -377,7 +377,7 @@ def _resolve_group(
     if settings.genre_use_album_tags and identity.album is not None:
         album_tags = client.album_top_tags(lookup_artist, identity.album)
 
-    return classify.resolve_genres(artist_tags, album_tags, vocab, settings)
+    return classify.classify_genres(artist_tags, album_tags, vocab, settings)
 
 
 def _stage_resolved(
@@ -552,7 +552,7 @@ class ArtistRow:
 def list_artists(settings: Settings, *, limit: int | None = None) -> list[ArtistRow]:
     """Return each distinct ``artist`` tag value with its file count (value order).
 
-    A discovery aid for scoping ``stage_genres`` by artist. Read-only. *limit* (when given)
+    A discovery aid for scoping ``resolve_genres`` by artist. Read-only. *limit* (when given)
     caps the number of rows returned, applied AFTER the value ordering so the cap is
     deterministic.
     """

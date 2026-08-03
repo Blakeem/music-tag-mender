@@ -15,11 +15,11 @@ the tags domain (`engine/staging.py` — `stage_tags`/`unstage_tags`/`diff_tags`
 `commit_tags`, v0 baseline captured at stage time), plus `versioning.py`
 (revert/history) and the full tags MCP family + discovery + commit inspection. M2's
 genre side is live: `lastfm.py` (cached/paced artist+album top-tags), `classify.py`
-(vocab/overlay + `resolve_genres`), `genres.py` (`stage_genres` + the
-`file_genre_status` workflow: `no_match`/`manual`/pending-by-absence). M3.5 shipped
+(vocab/overlay + the pure `classify.classify_genres`), `genres.py` (the `resolve_genres`
+tool + the `file_genre_status` workflow: `no_match`/`manual`/pending-by-absence). M3.5 shipped
 too: `revert_commit` group undo (skip+report, empty-staging guard, dry-run; every
 revert — even per-file `revert_tags` — is now its own `origin='revert'` commit) and
-genre-status visibility (`list_files(genre_status=...)` filter + `library_stats`
+genre-status visibility (`list_files(genre_status=...)` filter + `get_library_stats`
 genre counts via `store.derived_genre_status`, the mirror of `genres._select`).
 M4 phase 1 shipped too: `artists.py` (`resolve_artists` — cascade-stages the
 `artist.getCorrection` canonical name + MBID across `artist`/`albumartist`, with
@@ -29,27 +29,28 @@ artist-axis twin of the genre-status workflow — a sticky per-file `file_artist
 (`manual` exclusion only; **no** `no_match` state) that `resolve_artists` always skips
 (`skipped_manual`/`manual_files`); `set_artist_status`/`reset_artist_status` (scope by
 file or by a value matched across BOTH `artist` and `albumartist`);
-`list_files(artist_status=...)` + a `library_stats['artist']` block. Both axes'
+`list_files(artist_status=...)` + a `get_library_stats['artist']` block. Both axes'
 `staged`/`done` are now **field-aware** (`store.has_staged_change_for` /
 `has_auto_change_for`, the latter via SQLite JSON1 `json_extract` on the committed
 `diff`): genre keys on `genre`, artist on `artist`/`albumartist`, so the two columns are
 independent (a genre-only commit no longer reads as artist-`done`, and vice versa).
-The album axis (`albums.py`) shipped next (MusicBrainz `originaldate` blank-fill + sticky
-`manual`/engine `no_match`, `list_files(album_status=...)` + a `library_stats['album']`
+The year axis (`years.py`) shipped next (MusicBrainz `originaldate` blank-fill + sticky
+`manual`/engine `no_match`, `list_files(year_status=...)` + a `get_library_stats['year']`
 block). The **mismatch-fix** surface shipped last (decide run `fix-mismatches`, Run 2):
 `detect_mismatches` gained sticky per-file dispositions (`file_mismatch_status` —
 `legit_ignore`/`misfiled_deferred`, snapshot-and-go-stale), grouped output (`group=True`) +
 exact-folder expansion + a staleness-aware skip-filter; `set_mismatch_status`/
 `reset_mismatch_status`; `stage_tags_batch` (one atomic multi-file stage, always
-`origin="manual"`); and `repend_axes(commit_id)` — the first caller of
+`origin="manual"`); and `reopen_axes(commit_id)` — the first caller of
 `store.void_auto_changes`, re-opening a fixed file's derived genre/year axes + clearing its
-stale artist status. `list_files(mismatch_status=...)` + a `library_stats['mismatch']` block
+stale artist status. `list_files(mismatch_status=...)` + a `get_library_stats['mismatch']` block
 round it out. The `detect_album_gaps` tool (`album_gaps.py` + the pure, standalone
 `parsing.py`) groups blank-`album` files by folder and proposes sibling / folder-parse fills
 plus a review-only MusicBrainz `(artist, title)` recording tier (`mb_recording`, opt-out via
 `use_musicbrainz=False`, cached in `musicbrainz_recording_cache`) for the `stage_tags_batch →
-diff → commit → repend_axes` spine. 31 MCP tools total. Schema is **v11** (additive: adds
-`musicbrainz_recording_cache`; a v10 ledger upgrades in place). M6 organize/moves (`moves.py`)
+diff → commit → reopen_axes` spine. 31 MCP tools total. Schema is **v12** (additive: v11 adds
+`musicbrainz_recording_cache`, v12 renames `file_album_status` → `file_year_status` in place —
+dispositions preserved; an older ledger upgrades in place). M6 organize/paths (`paths.py`)
 is a paper sketch (its DDL ships in v6; logic deferred).
 
 ## Python
@@ -78,6 +79,64 @@ is a paper sketch (its DDL ships in v6; logic deferred).
   `.mp3`/`.flac`/`.m4a`/`.ogg` template + writes tags) for real-audio
   read/write/commit/revert coverage across all four formats.
 
+## Tool naming
+
+Every MCP tool is `verb_object[_qualifier]`, lowercase snake_case, **verb always first, no
+exceptions**. The verb names the operation; the object names the domain, axis, entity, or finding
+(compound nouns allowed: `album_gaps`, `library_stats`). The CLI mirrors the MCP name with `-` for
+`_` (`check_health` → `tagmend check-health`); no aliases. CLI-only program commands (`mcp`,
+`version`, `config*`) sit outside the grammar.
+
+**The verb set is closed.** A tool is **mutating** if it changes any persisted state other than the
+snapshot mirror (`files`/`file_tags`): staged rows, commits, status rows, watermarks, or the music
+files themselves.
+
+- Observing: `check, scan, list, get, detect, diff, history` (`diff`/`history` are git-style nouns
+  in the verb slot; `scan` refreshes only the snapshot mirror)
+- Mutating: `stage, unstage, commit, revert, resolve, set, reset, reopen`
+
+A verb may span two call/return shapes when the object disambiguates (`get_file` vs
+`get_library_stats`; `revert_tags` vs `revert_commit` — the commit ledger is domain-neutral). A new
+verb requires an operation no existing verb covers.
+
+| Shape | Template |
+|---|---|
+| readiness / ingest | `check_health` · `scan_library` |
+| enumerate / fetch | `list_<plural>` · `get_<singular>` · `get_library_stats` |
+| read-only findings | `detect_[<field>_]<plural finding noun>` |
+| stage→commit cycle | `stage_/unstage_/diff_/commit_/history_/revert_<domain>` — domains `tags`, `paths` |
+| atomic multi-target | `<stage-verb>_<domain>_batch` (`_batch` reserved, reusable) |
+| commit ledger | `list_commits` · `get_commit` · `revert_commit` (bare — one `commits` table, no domain column) |
+| lookup → stage | `resolve_<axis>s` |
+| axis status | `set_<axis>_status` / `reset_<axis>_status` |
+| post-commit reopen | `reopen_axes` (keyed by `commit_id`) |
+
+Rules, in order:
+
+1. All read-only findings reports are ONE `detect_*` family — defined by call shape, never split by
+   problem class or by whether a disposition table exists.
+2. Reports name the **finding**, state ops name the **domain** (`stage_paths`, never `stage_moves`).
+   One distinct plural finding noun per comparison (glossary below); qualify with the field when the
+   finding lives in exactly one (`album_gaps`, `year_disagreements`, `path_deviations`), bare when
+   it spans fields (`mismatches`). Reuse the repo's word for that concept if one exists; otherwise
+   coin exactly one noun and add it to the glossary in the same commit. A token that already means
+   something else in the repo is not a reuse.
+3. Prefer an existing verb over a new one.
+4. **Tool identity:** a report is one tool per (left source, right source, conformance criterion)
+   triple. More fields on the same triple = body change, same name. A new comparison or a third
+   input (e.g. the naming pattern) = a new tool.
+5. Number is fixed by slot: axis singular in `set_/reset_<axis>_status`, plural in
+   `resolve_<axis>s`; domain and finding nouns always plural.
+6. The `<axis>` token equals `Axis.name` in `engine/axis.py`, exactly. Renaming an axis is a code
+   change first (`Axis.name` + `file_<name>_status` via `ALTER TABLE … RENAME TO` + the engine
+   module), tool rename second — never one without the other.
+7. One concept = one term, both directions, across tool names, CLI commands, engine
+   module/function/class names, `Axis.name` values, status tables, and prose.
+
+Glossary — the comparison behind each finding noun: `mismatch` = tags ↔ folder path · `gap` = tag ↔
+absent · `disagreement` = tag ↔ external source (MusicBrainz) · `deviation` = current path ↔
+canonical path generated from tags by the naming pattern (coined).
+
 ## Quality gates — all four must pass before anything is "done"
 
 Run from the repo root (venv at `.venv`):
@@ -97,7 +156,7 @@ broaden the ignore list without reason. `cli.py` intentionally omits
 ## Running the tool
 
 ```powershell
-.\.venv\Scripts\tagmend.exe doctor                       # readiness check
+.\.venv\Scripts\tagmend.exe check-health                  # readiness check
 .\.venv\Scripts\tagmend.exe config-set music_path "E:\path\to\music"
 .\.venv\Scripts\tagmend.exe config-path                  # where settings.json lives
 .\.venv\Scripts\tagmend.exe mcp                          # run MCP server (stdio)
@@ -120,7 +179,7 @@ $tag = "E:\music-tag-mender\.venv\Scripts\tagmend.exe"
 npx -y @modelcontextprotocol/inspector --cli $tag mcp --method tools/list
 
 # Call the readiness tool (expect "ok": true, isError: false)
-npx -y @modelcontextprotocol/inspector --cli $tag mcp --method tools/call --tool-name health_check
+npx -y @modelcontextprotocol/inspector --cli $tag mcp --method tools/call --tool-name check_health
 ```
 
 For the interactive browser UI, drop `--cli` and the `--method ...`:
@@ -145,9 +204,9 @@ src/tagmend/
   mcp_server.py     FastMCP server (thin) — 31 tools
   engine/
     db.py           SQLite connection (WAL)
-    schema.py       all DDL + PRAGMA user_version (v11)
+    schema.py       all DDL + PRAGMA user_version (v12)
     scan.py         filesystem discovery + signatures
-    doctor.py       health_check / readiness + interrupted-commit report
+    health.py       check_health / readiness + interrupted-commit report
     store.py        pure data access: files/file_tags + tag_revisions[_staged] + genre/artist status
     library.py      scan orchestration (3 modes) + stats + list_files/get_file
     tags.py         mutagen read/write of the managed tag set
@@ -155,10 +214,11 @@ src/tagmend/
     commits.py      domain-neutral commit core: commits table + RevisionDomain + run_commit
     staging.py      tags domain (TagDomain) + stage/diff/commit_tags orchestration
     lastfm.py       Last.fm top-tags client: lastfm_cache + pacing (getCorrection → M4)
-    classify.py     genre vocab/overlay loader + fold-key index + resolve_genres
-    genres.py       stage_genres orchestration + file_genre_status workflow
+    classify.py     genre vocab/overlay loader + fold-key index + classify.classify_genres (pure)
+    genres.py       resolve_genres orchestration + file_genre_status workflow
     artists.py      resolve_artists + set/reset_artist_status: getCorrection cascade-stage + file_artist_status workflow
-    moves.py        STUB + PathDomain paper sketch — M6 (organize/moves)
+    years.py        resolve_years + set/reset_year_status: MusicBrainz originaldate blank-fill + file_year_status workflow
+    paths.py        STUB + PathDomain paper sketch — M6 (organize/paths)
 tests/              pytest; conftest isolates config + builds temp libraries (make_track)
 ```
 

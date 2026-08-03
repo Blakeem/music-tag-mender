@@ -28,6 +28,10 @@ Blank-fill each album's original release year (`originaldate`) from MusicBrainz 
 
 Find files whose identity tags disagree with their folder path — the fingerprint of a tagger matching the wrong release (e.g. an Ozzy Osbourne album stamped as another artist's) — with `tagmend detect` or the `detect_mismatches` MCP tool. A read-only, confidence-tiered (high/medium/low) report; nothing is changed on disk.
 
+### 🕳️ Blank-album gap detection
+
+Find files carrying no `album` tag at all — invisible to every album-scoped tool — with the `detect_album_gaps` MCP tool. Groups them by folder and proposes grounded fills (unanimous folder mates, the parsed folder name, or a review-only MusicBrainz recording lookup). A read-only report; proposals only ever fill blanks, never overwrite.
+
 ### ↩️ Fully revertible history
 
 A git-like flow: stage → commit → revert. Files are only written on commit, each change is recorded in an append-only per-file log, and any single file or whole commit can be undone. Reverts are themselves tracked commits.
@@ -114,7 +118,7 @@ Edits apply on the next tool call; every command and MCP tool re-reads `settings
 
 ## Tools
 
-The MCP server exposes 30 tools. All tag edits are staged in memory and only written to disk on `commit_tags`, and everything is revertible.
+The MCP server exposes 31 tools. All tag edits are staged in memory and only written to disk on `commit_tags`, and everything is revertible.
 
 ### Core & Library
 
@@ -126,6 +130,7 @@ The MCP server exposes 30 tools. All tag edits are staged in memory and only wri
 | `list_files` | List tracked files with their current managed tags (to discover file ids) |
 | `get_file` | Return one tracked file with its managed tags, by stable `file_id` |
 | `detect_mismatches` | Detect files whose identity tags disagree with their folder path (read-only report) |
+| `detect_album_gaps` | Find files with a blank `album` tag, grouped by folder, with tiered fill proposals (read-only report) |
 
 ### Staging & Commits
 

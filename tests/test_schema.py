@@ -12,11 +12,11 @@ def _table_names(conn: sqlite3.Connection) -> set[str]:
     return {str(row[0]) for row in cursor.fetchall()}
 
 
-def test_apply_schema_stamps_version_10(db_conn: sqlite3.Connection) -> None:
-    # db_conn already applied the schema; confirm the stamped user_version is v10.
+def test_apply_schema_stamps_version_11(db_conn: sqlite3.Connection) -> None:
+    # db_conn already applied the schema; confirm the stamped user_version is v11.
     version = db_conn.execute("PRAGMA user_version").fetchone()[0]
-    assert version == 10
-    assert SCHEMA_VERSION == 10
+    assert version == 11
+    assert SCHEMA_VERSION == 11
 
 
 def test_apply_schema_creates_genre_tables(db_conn: sqlite3.Connection) -> None:
@@ -33,6 +33,22 @@ def test_apply_schema_creates_album_tables(db_conn: sqlite3.Connection) -> None:
     tables = _table_names(db_conn)
     assert "file_album_status" in tables
     assert "musicbrainz_cache" in tables
+
+
+def test_apply_schema_creates_recording_cache_table(db_conn: sqlite3.Connection) -> None:
+    assert "musicbrainz_recording_cache" in _table_names(db_conn)
+
+
+def test_musicbrainz_recording_cache_columns(db_conn: sqlite3.Connection) -> None:
+    cursor = db_conn.execute("PRAGMA table_info(musicbrainz_recording_cache)")
+    columns = {str(row[1]): (str(row[2]), bool(row[3]), bool(row[5])) for row in cursor.fetchall()}
+    # name -> (declared type, NOT NULL, is-primary-key)
+    assert columns["request_key"] == ("TEXT", False, True)
+    assert columns["found"] == ("INTEGER", True, False)
+    assert columns["album_title"] == ("TEXT", False, False)
+    assert columns["release_group_id"] == ("TEXT", False, False)
+    assert columns["recording_mbid"] == ("TEXT", False, False)
+    assert columns["fetched_at"] == ("TEXT", True, False)
 
 
 def test_apply_schema_creates_voided_auto_table(db_conn: sqlite3.Connection) -> None:
@@ -59,7 +75,34 @@ def test_apply_schema_is_idempotent() -> None:
     try:
         apply_schema(conn)
         apply_schema(conn)  # second application must not raise
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 10
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 11
+    finally:
+        conn.close()
+
+
+def test_v10_ledger_upgrades_to_v11_in_place() -> None:
+    # A v10 ledger (no recording cache) gains the table + version bump additively, with the
+    # existing tables/data intact.
+    conn = sqlite3.connect(":memory:")
+    try:
+        apply_schema(conn)
+        conn.execute("PRAGMA user_version = 10")  # pretend this is a pre-v11 ledger
+        conn.execute("DROP TABLE musicbrainz_recording_cache")  # the v11-only table
+        conn.execute(
+            """
+            INSERT INTO musicbrainz_cache (request_key, found, fetched_at)
+            VALUES ('k', 1, '2026-07-06T00:00:00+00:00')
+            """,
+        )
+        conn.commit()
+
+        apply_schema(conn)  # the in-place upgrade
+
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 11
+        assert "musicbrainz_recording_cache" in _table_names(conn)
+        # Pre-existing data survives the additive upgrade.
+        kept = conn.execute("SELECT COUNT(*) FROM musicbrainz_cache").fetchone()[0]
+        assert kept == 1
     finally:
         conn.close()
 

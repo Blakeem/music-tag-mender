@@ -138,3 +138,37 @@ def test_set_settings_writes_atomically_without_leftover_temp() -> None:
     leftovers = list(config.config_dir().glob(".settings-*"))
     assert leftovers == []
     assert config.settings_path().exists()
+
+
+# --- container_folders (mismatch path-signal suppression) ---------------------------
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (None, ()),
+        ("", ()),
+        ("Soundtracks", ("Soundtracks",)),
+        ("a;b", ("a", "b")),
+        ("  a ; b  ", ("a", "b")),
+        ("a;;b;", ("a", "b")),
+        (";", ()),
+    ],
+)
+def test_coerce_folder_list(raw: str | None, expected: tuple[str, ...]) -> None:
+    assert config._coerce_folder_list(raw) == expected
+
+
+def test_container_folders_default_empty() -> None:
+    assert config.load_settings().container_folders == ()
+
+
+def test_container_folders_roundtrip() -> None:
+    config.set_setting("container_folders", "Soundtracks;Compilations")
+    assert config.load_settings().container_folders == ("Soundtracks", "Compilations")
+
+
+def test_container_folders_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    config.set_setting("container_folders", "FromFile")
+    monkeypatch.setenv("TAGMEND_CONTAINER_FOLDERS", "FromEnv;Other")
+    assert config.load_settings().container_folders == ("FromEnv", "Other")

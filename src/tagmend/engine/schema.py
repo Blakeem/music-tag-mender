@@ -73,6 +73,16 @@ ledger upgrades in place with no data loss):
   tag (which of ``albumartist``/``artist`` + its value at decision time) so a later tag change
   makes the disposition stale and the file re-surfaces. Unlike the other three axes this one
   has NO ``staged``/``done`` derivation, so it never routes through ``derived_status``.
+
+The album-gaps MusicBrainz recording-search tier adds one more side table (schema v11, purely
+additive — a v10 ledger upgrades in place with no data loss):
+
+* ``musicbrainz_recording_cache`` — a persistent cache of MusicBrainz recording-search
+  lookups keyed by a request hash (the ``(artist, title)`` twin of ``musicbrainz_cache``,
+  mirroring ``lastfm_cache``). ``found`` is the negative-cache sentinel (0 = no usable Album
+  release group for the recording; 1 = found). The found columns hold the selected recording's
+  release-group title/id + the recording MBID. Feeds ``detect_album_gaps``' review-only tier;
+  cache writes are its ONLY ledger writes.
 """
 
 from __future__ import annotations
@@ -86,7 +96,7 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
-SCHEMA_VERSION: Final = 10
+SCHEMA_VERSION: Final = 11
 
 _FILES_DDL: Final = """
 CREATE TABLE IF NOT EXISTS files (
@@ -283,6 +293,23 @@ CREATE TABLE IF NOT EXISTS musicbrainz_cache (
 )
 """
 
+# Persistent cache of MusicBrainz recording-search lookups, keyed by a request hash (so it
+# survives MCP restarts), mirroring ``musicbrainz_cache`` for the ``(artist, title)`` axis.
+# ``found`` is the negative-cache sentinel (0 = no usable Album release group for the
+# recording; 1 = found). The found columns hold the selected recording's release-group
+# title/id + the recording MBID. Feeds ``detect_album_gaps``' review-only tier. See PLAN —
+# album-gaps recording tier.
+_MUSICBRAINZ_RECORDING_CACHE_DDL: Final = """
+CREATE TABLE IF NOT EXISTS musicbrainz_recording_cache (
+  request_key      TEXT PRIMARY KEY,
+  found            INTEGER NOT NULL,
+  album_title      TEXT,
+  release_group_id TEXT,
+  recording_mbid   TEXT,
+  fetched_at       TEXT NOT NULL
+)
+"""
+
 # Per-``(file_id, field)`` watermark that voids stale auto-resolved values WITHOUT touching
 # the append-only ``tag_revisions`` history. ``voided_through_version`` records the field's
 # ``MAX(version)`` at the moment of a manual identity fix; ``has_auto_change_for`` then
@@ -352,6 +379,7 @@ def apply_schema(connection: sqlite3.Connection) -> None:
     connection.execute(_FILE_ARTIST_STATUS_DDL)
     connection.execute(_FILE_ALBUM_STATUS_DDL)
     connection.execute(_MUSICBRAINZ_CACHE_DDL)
+    connection.execute(_MUSICBRAINZ_RECORDING_CACHE_DDL)
     connection.execute(_VOIDED_AUTO_DDL)
     connection.execute(_FILE_MISMATCH_STATUS_DDL)
     connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")

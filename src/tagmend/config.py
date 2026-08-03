@@ -40,6 +40,7 @@ _KNOWN_KEYS: Final[frozenset[str]] = frozenset(
         "musicbrainz_rate_per_sec",
         "musicbrainz_contact",
         "album_stage_limit",
+        "container_folders",
     },
 )
 
@@ -121,6 +122,9 @@ class Settings:
     musicbrainz_rate_per_sec: float = _MUSICBRAINZ_RATE_PER_SEC_DEFAULT
     musicbrainz_contact: str = _MUSICBRAINZ_CONTACT_DEFAULT
     album_stage_limit: int = _ALBUM_STAGE_LIMIT_DEFAULT
+    # Top-level container folders whose path signal the mismatch detector suppresses; a
+    # semicolon-delimited string on disk, coerced to a tuple here.
+    container_folders: tuple[str, ...] = ()
 
     @property
     def musicbrainz_user_agent(self) -> str:
@@ -181,6 +185,7 @@ def load_settings() -> Settings:
             _resolve_raw("album_stage_limit", raw),
             _ALBUM_STAGE_LIMIT_DEFAULT,
         ),
+        container_folders=_coerce_folder_list(_resolve_raw("container_folders", raw)),
     )
 
 
@@ -239,6 +244,17 @@ def _coerce_bool(value: str | None, *, default: bool) -> bool:
     if value is None:
         return default
     return value.strip().lower() not in _FALSE_TOKENS
+
+
+def _coerce_folder_list(value: str | None) -> tuple[str, ...]:
+    """Parse a semicolon-delimited folder list into a tuple; strip entries, drop empties.
+
+    Unset (``None``) or all-empty yields ``()``. Each segment is stripped and blank segments
+    (from leading/trailing/repeated ``;``) are dropped, so ``" a ; ;b; "`` → ``("a", "b")``.
+    """
+    if value is None:
+        return ()
+    return tuple(stripped for part in value.split(";") if (stripped := part.strip()))
 
 
 def set_setting(key: str, value: str) -> Path:

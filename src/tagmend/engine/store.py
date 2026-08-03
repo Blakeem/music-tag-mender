@@ -626,6 +626,80 @@ def put_cached_mb_album(  # noqa: PLR0913 - cohesive keyword-only cache payload
     )
 
 
+# --- musicbrainz_recording_cache (persistent recording-search cache; album-gaps tier) ----
+
+
+@dataclass(frozen=True, slots=True)
+class MBRecordingRow:
+    """One cached MusicBrainz recording-search lookup (a found recording's resolved fields)."""
+
+    album_title: str | None
+    release_group_id: str | None
+    recording_mbid: str | None
+
+
+def get_cached_mb_recording(
+    conn: sqlite3.Connection,
+    request_key: str,
+) -> tuple[bool, MBRecordingRow] | None:
+    """Return the cached recording-search lookup for *request_key*, or ``None`` on a miss.
+
+    ``None`` distinguishes a never-cached key from a cached negative result. A hit is
+    ``(found, row)``: ``found=False`` is the negative-cache sentinel (no usable Album release
+    group for the recording), while ``found=True`` carries the resolved fields on *row*.
+    """
+    cursor = conn.execute(
+        """
+        SELECT found, album_title, release_group_id, recording_mbid
+        FROM musicbrainz_recording_cache WHERE request_key = ?
+        """,
+        (request_key,),
+    )
+    row = cursor.fetchone()
+    if row is None:
+        return None
+    found = bool(row[0])
+    recording = MBRecordingRow(
+        album_title=None if row[1] is None else str(row[1]),
+        release_group_id=None if row[2] is None else str(row[2]),
+        recording_mbid=None if row[3] is None else str(row[3]),
+    )
+    return (found, recording)
+
+
+def put_cached_mb_recording(  # noqa: PLR0913 - cohesive keyword-only cache payload
+    conn: sqlite3.Connection,
+    *,
+    request_key: str,
+    found: bool,
+    album_title: str | None,
+    release_group_id: str | None,
+    recording_mbid: str | None,
+    now: str,
+) -> None:
+    """Insert or replace the cached recording-search lookup for *request_key*.
+
+    A re-fetch overwrites any prior cached value. Pass ``found=False`` with the resolved
+    columns ``None`` to negative-cache (no usable Album release group for the recording).
+    """
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO musicbrainz_recording_cache (
+            request_key, found, album_title, release_group_id, recording_mbid, fetched_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            request_key,
+            1 if found else 0,
+            album_title,
+            release_group_id,
+            recording_mbid,
+            now,
+        ),
+    )
+
+
 # --- file_<axis>_status (per-file workflow decisions; PLAN — Status model) -----------
 #
 # The genre/artist status machinery is ONE parameterized concept; the per-axis config and

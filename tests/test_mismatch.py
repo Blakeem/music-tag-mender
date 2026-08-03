@@ -865,3 +865,149 @@ def test_mcp_repend_axes_rejects_auto_commit(music_dir: Path) -> None:
     assert "auto" in str(payload["error"])
 
     assert mcp_server.repend_axes(9999)["ok"] is False  # unknown commit id
+
+
+# --- container-folder path-signal suppression ---------------------------------------
+
+_CONTAINER = frozenset({mismatch.fold("Soundtracks")})
+
+
+def _container_library() -> list[mismatch._FileInput]:
+    """Soundtracks container (uniform composer leaves) + clean padding + a genuine artist.
+
+    Without the container setting the Soundtracks leaves flag MEDIUM (uniform path
+    disagreement); the padding keeps the library-wide rate under the reliability floor. The
+    genuine ``The Luna Sequence`` folder flags MEDIUM regardless of the setting.
+    """
+    files = [_mk(i, _MUSIC / f"Clean{i}", "01.mp3", albumartist=f"Clean{i}") for i in range(1, 21)]
+    soundtracks = _MUSIC / "Soundtracks"
+    files += [
+        _mk(100, soundtracks / "Album A", "01.mp3", albumartist="Composer A"),
+        _mk(101, soundtracks / "Album A", "02.mp3", albumartist="Composer A"),
+        _mk(102, soundtracks / "Album B", "01.mp3", albumartist="Composer B"),
+        _mk(103, soundtracks / "Album B", "02.mp3", albumartist="Composer B"),
+    ]
+    luna = _MUSIC / "The Luna Sequence" / "(2010) Album"
+    files += [
+        _mk(200, luna, "01.mp3", albumartist="Wrong Artist"),
+        _mk(201, luna, "02.mp3", albumartist="Wrong Artist"),
+    ]
+    return files
+
+
+def test_container_folder_suppresses_path_signal() -> None:
+    files = _container_library()
+    soundtracks_ids = (100, 101, 102, 103)
+
+    # Baseline (no setting): the Soundtracks composer leaves flag MEDIUM on the path signal.
+    baseline = mismatch._classify(files, _MUSIC)
+    assert baseline.path_signal_suppressed is False
+    for fid in soundtracks_ids:
+        row = _find(baseline, fid)
+        assert row is not None
+        assert row.tier == "medium"
+
+    # With Soundtracks listed: zero rows for those files, still counted + visibly suppressed.
+    report = mismatch._classify(files, _MUSIC, container_folders=_CONTAINER)
+    for fid in soundtracks_ids:
+        assert _find(report, fid) is None
+    assert report.container_suppressed == {"Soundtracks": 4}
+    assert report.total_files == baseline.total_files  # suppressed files still count
+    assert report.suppressed == {}  # distinct from the disposition map
+    assert "container folder" in report.summary
+
+    # A genuine artist folder (The Luna Sequence) is untouched -> still flags MEDIUM.
+    for fid in (200, 201):
+        row = _find(report, fid)
+        assert row is not None
+        assert row.tier == "medium"
+
+
+def test_container_mixed_leaf_still_flags_variant_low() -> None:
+    """A mixed-albumartist album folder INSIDE a container still surfaces (documented scope).
+
+    The path signal is suppressed for both files, but the folder-consistency variant-LOW
+    fallback keys on the leaf folder's albumartist variance (independent of the path signal),
+    so an in-container misfile is still flagged.
+    """
+    mixed = _MUSIC / "Soundtracks" / "Weird Album"
+    files = [
+        _mk(1, _MUSIC / "CleanA", "01.mp3", albumartist="CleanA"),
+        _mk(300, mixed, "01.mp3", albumartist="Artist One"),
+        _mk(301, mixed, "02.mp3", albumartist="Artist Two"),
+    ]
+
+    report = mismatch._classify(files, _MUSIC, container_folders=_CONTAINER)
+
+    for fid in (300, 301):
+        row = _find(report, fid)
+        assert row is not None
+        assert row.tier == "low"
+    assert report.container_suppressed == {"Soundtracks": 2}
+
+
+def test_container_reliability_excludes_suppressed_files() -> None:
+    files = _container_library()
+
+    baseline = mismatch._classify(files, _MUSIC)
+    report = mismatch._classify(files, _MUSIC, container_folders=_CONTAINER)
+
+    # 20 clean + 4 soundtrack + 2 luna = 26 considered, 6 disagreeing -> ~0.231.
+    assert baseline.disagreement_rate == pytest.approx(6 / 26)
+    # The 4 container files leave the sample -> 22 considered, 2 disagreeing -> ~0.091.
+    assert report.disagreement_rate == pytest.approx(2 / 22)
+
+
+def test_container_and_disposition_suppression_are_distinct() -> None:
+    files = _container_library()
+    dispositions = {200: _disp("legit_ignore", "albumartist", "Wrong Artist")}
+
+    report = mismatch._classify(
+        files,
+        _MUSIC,
+        dispositions=dispositions,
+        container_folders=_CONTAINER,
+    )
+
+    assert report.container_suppressed == {"Soundtracks": 4}
+    assert report.suppressed == {"legit_ignore": 1}  # the Luna row, disposition-silenced
+    assert _find(report, 200) is None
+    payload = report.to_dict()
+    assert payload["container_suppressed"] == {"Soundtracks": 4}
+    assert payload["suppressed"] == {"legit_ignore": 1}
+
+
+def _make_container_real_library(music_dir: Path) -> None:
+    """12 clean single-artist folders + a Soundtracks container of uniform composer albums."""
+    for index in range(12):
+        make_track(
+            music_dir / f"Clean{index}" / "01.mp3",
+            {"albumartist": [f"Clean{index}"], "artist": [f"Clean{index}"]},
+        )
+    soundtracks = music_dir / "Soundtracks"
+    for album, composer in (("Album A", "Composer A"), ("Album B", "Composer B")):
+        for track in ("01.mp3", "02.mp3"):
+            make_track(soundtracks / album / track, {"albumartist": [composer]})
+
+
+def test_detect_container_suppression_integration(tmp_path: Path, music_dir: Path) -> None:
+    _make_container_real_library(music_dir)
+    db_path = tmp_path / "ledger.sqlite3"
+    plain = Settings(music_path=music_dir, lastfm_api_key=None, db_path=db_path)
+    scan_library(plain)
+
+    # Without the setting the Soundtracks composer albums flag on the path signal.
+    assert detect_mismatches(plain).flagged > 0
+
+    listed = Settings(
+        music_path=music_dir,
+        lastfm_api_key=None,
+        db_path=db_path,
+        container_folders=("Soundtracks",),
+    )
+    report = detect_mismatches(listed)
+    assert report.flagged == 0
+    assert report.container_suppressed == {"Soundtracks": 4}
+    # Exact-folder expansion of a container leaf yields no rows.
+    leaf = str(music_dir / "Soundtracks" / "Album A")
+    assert detect_mismatches(listed, folder=leaf).rows == []

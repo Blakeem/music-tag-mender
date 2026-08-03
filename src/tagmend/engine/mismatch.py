@@ -226,6 +226,9 @@ class _Analysis:
     file: _FileInput
     top_artist: str | None
     albumartist_disagrees: bool  # only meaningful when albumartist present & non-VA
+    # Raw top-folder name when this file sits under a configured container folder (its path
+    # signal was suppressed); ``None`` otherwise. Drives the reliability filter + count map.
+    container_folder: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -313,9 +316,11 @@ class MismatchReport:
     ``flagged`` counts describe the whole library MINUS files silenced by a fresh disposition
     (so a filtered view still shows the full picture of what remains actionable). ``suppressed``
     is a disposition-status → count map of the flagged rows a fresh disposition silenced
-    (``{}`` when none), so silencing is always visible. ``groups`` is populated only in the
-    ``group=True`` view (``rows`` is then empty); ``suppressed_by_folder`` is internal plumbing
-    for that view and is not serialized.
+    (``{}`` when none), so silencing is always visible. ``container_suppressed`` is the separate
+    top-folder → file-count map of files whose path signal a configured ``container_folders``
+    entry suppressed (``{}`` when none) — distinct from the per-disposition ``suppressed`` map.
+    ``groups`` is populated only in the ``group=True`` view (``rows`` is then empty);
+    ``suppressed_by_folder`` is internal plumbing for that view and is not serialized.
     """
 
     rows: list[MismatchRow]
@@ -328,6 +333,7 @@ class MismatchReport:
     path_signal_suppressed: bool
     summary: str
     suppressed: dict[str, int] = field(default_factory=dict)
+    container_suppressed: dict[str, int] = field(default_factory=dict)
     groups: list[MismatchGroup] = field(default_factory=list)
     suppressed_by_folder: dict[str, dict[str, int]] = field(default_factory=dict)
 
@@ -346,6 +352,7 @@ class MismatchReport:
             "disagreement_rate": round(self.disagreement_rate, 4),
             "path_signal_suppressed": self.path_signal_suppressed,
             "suppressed": self.suppressed,
+            "container_suppressed": self.container_suppressed,
             "summary": self.summary,
         }
 
@@ -367,21 +374,49 @@ def _folder_stats(files: list[_FileInput]) -> _FolderStats:
     )
 
 
-def _analyze(f: _FileInput, music_path: Path) -> _Analysis:
-    """Precompute a file's top-artist folder and its ``albumartist`` path-disagreement."""
+def _analyze(
+    f: _FileInput,
+    music_path: Path,
+    *,
+    container_folders: frozenset[str] = frozenset(),
+) -> _Analysis:
+    """Precompute a file's top-artist folder and its ``albumartist`` path-disagreement.
+
+    When the (fold-keyed) top-level folder is a configured container (``container_folders``,
+    pre-folded), the path signal is suppressed: ``top_artist`` is treated as ``None`` (so no
+    HIGH/MEDIUM path tier or artist fallback can fire) and the raw folder name is recorded in
+    ``container_folder`` for the reliability filter and the visible count map.
+    """
     top = _top_artist(f.folder, music_path)
+    container = top if top is not None and fold(top) in container_folders else None
+    if container is not None:
+        top = None
     disagrees = (
         f.albumartist is not None
         and not _is_va(f.albumartist)
         and _disagrees(f.albumartist, f.path, top)
     )
-    return _Analysis(file=f, top_artist=top, albumartist_disagrees=disagrees)
+    return _Analysis(
+        file=f,
+        top_artist=top,
+        albumartist_disagrees=disagrees,
+        container_folder=container,
+    )
 
 
 def _reliability(analyses: list[_Analysis]) -> tuple[float, bool]:
-    """Return ``(disagreement_rate, suppressed)`` over non-VA files that have an albumartist."""
+    """Return ``(disagreement_rate, suppressed)`` over non-VA files that have an albumartist.
+
+    Container-suppressed files are excluded from the sample exactly like VA files: their path
+    signal is nulled, so leaving them in the denominator would dilute the rate with non-
+    disagreers rather than measuring how well the path encodes artist.
+    """
     considered = [
-        a for a in analyses if a.file.albumartist is not None and not _is_va(a.file.albumartist)
+        a
+        for a in analyses
+        if a.file.albumartist is not None
+        and not _is_va(a.file.albumartist)
+        and a.container_folder is None
     ]
     if not considered:
         return 0.0, False
@@ -516,6 +551,7 @@ def _classify(
     music_path: Path,
     *,
     dispositions: dict[int, store.MismatchStatusRow] | None = None,
+    container_folders: frozenset[str] = frozenset(),
 ) -> MismatchReport:
     """Classify constructed file inputs into a full :class:`MismatchReport` (pure core).
 
@@ -523,12 +559,20 @@ def _classify(
     non-empty string). Produces every flagged row over ALL files (the folder stats +
     reliability guard are computed over every file), then applies the disposition skip-filter
     so a fresh ``legit_ignore``/``misfiled_deferred`` silences its file's row (reported in the
-    report's ``suppressed`` map). tier/limit/group narrowing is applied later by
-    :func:`detect_mismatches`.
+    report's ``suppressed`` map). *container_folders* is the pre-folded set of top-level folder
+    names whose path signal is suppressed (counted in the report's ``container_suppressed`` map).
+    tier/limit/group narrowing is applied later by :func:`detect_mismatches`.
     """
     stats = _folder_stats(files)
-    analyses = [_analyze(f, music_path) for f in files]
+    analyses = [_analyze(f, music_path, container_folders=container_folders) for f in files]
     rate, suppressed = _reliability(analyses)
+
+    container_suppressed: dict[str, int] = {}
+    for a in analyses:
+        if a.container_folder is not None:
+            container_suppressed[a.container_folder] = (
+                container_suppressed.get(a.container_folder, 0) + 1
+            )
 
     rows: list[MismatchRow] = []
     for a in analyses:
@@ -550,6 +594,7 @@ def _classify(
         suppressed=suppressed,
         suppressed_dispositions=suppressed_dispositions,
         suppressed_by_folder=suppressed_by_folder,
+        container_suppressed=container_suppressed,
     )
 
 
@@ -561,6 +606,7 @@ def _assemble_report(  # noqa: PLR0913 - cohesive keyword-only report payload
     suppressed: bool,
     suppressed_dispositions: dict[str, int],
     suppressed_by_folder: dict[str, dict[str, int]],
+    container_suppressed: dict[str, int],
 ) -> MismatchReport:
     """Freeze the kept rows + post-filter counts + guard diagnostics into a report."""
     high = sum(1 for r in rows if r.tier == Tier.HIGH)
@@ -573,6 +619,7 @@ def _assemble_report(  # noqa: PLR0913 - cohesive keyword-only report payload
         total_files=total_files,
         suppressed=suppressed,
         suppressed_count=sum(suppressed_dispositions.values()),
+        container_suppressed=container_suppressed,
     )
     return MismatchReport(
         rows=rows,
@@ -585,6 +632,7 @@ def _assemble_report(  # noqa: PLR0913 - cohesive keyword-only report payload
         path_signal_suppressed=suppressed,
         summary=summary,
         suppressed=suppressed_dispositions,
+        container_suppressed=container_suppressed,
         groups=[],
         suppressed_by_folder=suppressed_by_folder,
     )
@@ -598,18 +646,26 @@ def _summarize(  # noqa: PLR0913 - cohesive keyword-only summary inputs
     total_files: int,
     suppressed: bool,
     suppressed_count: int,
+    container_suppressed: dict[str, int],
 ) -> str:
     """Build a short, plain human summary of the run.
 
-    The ``suppressed_count`` clause is appended ONLY when a disposition silenced something, so
-    with zero disposition rows the summary is byte-for-byte identical to the pre-disposition
-    detector.
+    The ``suppressed_count`` and container clauses are each appended ONLY when they silenced
+    something, so with zero dispositions and no container folders the summary is byte-for-byte
+    identical to the pre-container detector.
     """
     note = " (path signal suppressed: folder-consistency only)" if suppressed else ""
     silenced = f" ({suppressed_count} silenced by disposition)" if suppressed_count else ""
+    container_count = sum(container_suppressed.values())
+    container = (
+        f" ({container_count} file(s) in {len(container_suppressed)} container folder(s) "
+        "path-suppressed)"
+        if container_count
+        else ""
+    )
     return (
         f"Flagged {high + medium + low} of {total_files} file(s): "
-        f"{high} high, {medium} medium, {low} low{note}.{silenced}"
+        f"{high} high, {medium} medium, {low} low{note}.{silenced}{container}"
     )
 
 
@@ -712,7 +768,9 @@ def detect_mismatches(
     no network. Every non-missing tracked file is classified into a HIGH/MEDIUM/LOW confidence
     tier (or left unflagged); the library-wide path-disagreement rate drives a reliability
     guard that suppresses the HIGH/MEDIUM path tiers when the path likely does not encode
-    artist (``path_signal_suppressed``). Files with a still-fresh disposition (set via
+    artist (``path_signal_suppressed``). Files under a configured ``container_folders`` top
+    folder have their path signal suppressed and are counted in the report's
+    ``container_suppressed`` map. Files with a still-fresh disposition (set via
     :func:`set_mismatch_status`) are dropped from the flagged rows and reported in the report's
     ``suppressed`` map.
 
@@ -732,6 +790,7 @@ def detect_mismatches(
         raise ValueError(message)
 
     music_path = settings.music_path
+    container_folders = frozenset(fold(name) for name in settings.container_folders)
     connection = db.connect(settings.db_path)
     try:
         schema.apply_schema(connection)
@@ -752,7 +811,12 @@ def detect_mismatches(
     finally:
         connection.close()
 
-    report = _classify(files, music_path, dispositions=dispositions)
+    report = _classify(
+        files,
+        music_path,
+        dispositions=dispositions,
+        container_folders=container_folders,
+    )
     logger.info(
         "detect complete: total=%d flagged=%d high=%d medium=%d low=%d rate=%.3f "
         "suppressed_path=%s silenced=%d",

@@ -1,8 +1,8 @@
 # TagMend — ROADMAP (forward-looking)
 
-> Updated **2026-07-05**. This file lists only what **remains** — everything shipped has been
-> removed (through the mismatch-fix surface: schema v10, 30 MCP tools, all live-tested; see
-> `CLAUDE.md` for the shipped-state summary and `PLAN.md` for the design of record).
+> Updated **2026-08-02**. This file lists only what **remains** — everything shipped has been
+> removed (through the album-gaps detector: schema v11, 31 MCP tools; see `CLAUDE.md` for the
+> shipped-state summary and `PLAN.md` for the design of record).
 >
 > **Direction:** finish the **metadata** mission first. Filesystem moves/renames (M6) and the
 > **CLI surface** are deliberately last — CLI is pushed back until everything else is complete
@@ -35,6 +35,12 @@
   - [ ] **Tool [Discography] (2 Alice In Chains files):** genuinely misfiled →
         `misfiled_deferred` (never a tag write; the files move when M6 exists).
 
+### B1. Live album-gap fill pass (92 blank-`album` files, measured 2026-07-05)
+- [ ] Drive `detect_album_gaps` over the library: bulk-stage the `green` sibling proposals,
+      confirm each `confirm`/`review` proposal per folder, then the usual
+      `stage_tags_batch → diff_tags → commit_tags → repend_axes` spine (one commit per folder).
+      Do this before/alongside B2 so `resolve_albums` (originaldate) can see the filled albums.
+
 ### B2. First full-library resolve run over all metadata axes
 - [ ] Drive genre + artist + album over the full 11,196-file library via MCP, chunked with
       `limit`, reviewing staged diffs before each commit. **This is the goal:** clean metadata so
@@ -45,26 +51,6 @@
 ### B3. Promote the result (user action, not code)
 - [ ] Once B0 + B2 are verified perfect on the working copy, overwrite the actual library with
       the mended copy.
-
-### A4. Live Last.fm readiness check (small — slot in anywhere)
-- [ ] Add a Last.fm connectivity ping to `doctor` (one cheap `artist.getTopTags` call) so a long
-      run fails fast on a bad key / no network. `doctor.py` checks settings, music folder, and
-      ledger only — not Last.fm.
-
----
-
-## Carried-forward follow-ups (lower priority, unscheduled)
-
-- [ ] **Album-NAME blank-fill** (92 files have no `album` tag on the full library, measured
-      2026-07-05): sibling inference → folder parse → MB-by-track. Tiered design in
-      `docs/grounding-methods.md`.
-- [ ] **Shared folder-parsing primitive** (reusable for album-name fill, artist discovery,
-      unknown-artist worklists) — same doc.
-- [ ] **Container-folder detector suppression (class D):** a top-level container like
-      `Soundtracks\` is treated as an artist folder, so composer-tagged files flag with a
-      meaningless path signal. Fix idea (naming-agnostic): a top-level folder whose sub-albums
-      span many albumartists is a container → no path signal. Cuts detector noise; dispositions
-      already cover it case-by-case.
 
 ---
 
@@ -101,19 +87,11 @@
 
 ## Low-priority / defensive (no blockers today)
 
-- [ ] **No-identity worklist:** files with no `artist` AND no `albumartist` are silently skipped
-      (`skipped_no_artist`) and bucket as plain `pending`. Give them a first-class state so
-      they're visible.
 - [ ] **Bulk manual-stage convenience** for a genuine `no_match` (artist truly not on Last.fm).
       The per-file escape hatch exists (`stage_tags` + `commit_tags`); a bulk artist/folder-scoped
       manual stage would be ergonomics. *Defer until a real `no_match` appears.*
 
 ## Known limitations — deliberately deferred (revisit if they bite)
 
-- **getCorrection maps junk album-artist labels to the MusicBrainz `[unknown]` placeholder.**
-  e.g. `Original Soundtrack` → `[unknown]` (+MBID `125ec42a…`); affects ~16 soundtrack files.
-  Left as-is per decision 2026-06-16. If it bites: a parser guard rejecting corrections that
-  resolve to a MB special-purpose placeholder (`[unknown]`, `[no artist]`) → treat as
-  `no_correction`. Compilation rows are otherwise protected by the `various`/`va` sentinel skip.
 - **`list_files` reports a stored axis status even when stale** (by design — staleness affects
   skip/reprocess decisions, not display); compare the `*_source_*` fields to spot staleness.

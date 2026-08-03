@@ -16,6 +16,7 @@ from mcp.server.fastmcp import FastMCP
 from tagmend import configui
 from tagmend.config import load_settings
 from tagmend.engine import (
+    album_gaps,
     albums,
     artists,
     commits,
@@ -419,6 +420,13 @@ def detect_mismatches(
     tier) when the path likely does not encode artist — reported via ``path_signal_suppressed``
     and ``disagreement_rate``.
 
+    Configure the ``container_folders`` setting (a semicolon-delimited list via
+    ``tagmend config-set container_folders "<TopFolder>;<Other>"``) to name top-level folders
+    that hold many unrelated albumartists. Files under such a folder have their path signal
+    suppressed — they never flag on the ``path='<container>'`` signal (present and future) and
+    are counted in the ``container_suppressed`` map — while a mixed-albumartist album folder
+    INSIDE a container still surfaces as ``low`` (in-container misfile detection is preserved).
+
     Args:
         tier: Return only rows/groups in this tier (``high`` | ``medium`` | ``low``). The
             ``high``/``medium``/``low``/``flagged`` counts still describe the whole library.
@@ -432,7 +440,9 @@ def detect_mismatches(
 
     Returns:
         ``{"ok": True, rows, groups, total_files, flagged, high, medium, low,
-        disagreement_rate, path_signal_suppressed, suppressed, summary}`` — each row is
+        disagreement_rate, path_signal_suppressed, suppressed, container_suppressed, summary}``
+        — ``container_suppressed`` is a top-folder → file-count map (files whose path signal a
+        ``container_folders`` entry suppressed); each row is
         ``{file_id, folder, filename, field, tag_value, path_artist, tier, reason}`` — or
         ``{"ok": False, "error": ...}`` (e.g. no music path configured).
     """
@@ -443,6 +453,75 @@ def detect_mismatches(
             limit=limit,
             group=group,
             folder=folder,
+        )
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    return {"ok": True, **report.to_dict()}
+
+
+@mcp.tool()
+def detect_album_gaps(
+    limit: int | None = None,
+    folder: str | None = None,
+    use_musicbrainz: bool = True,  # noqa: FBT001, FBT002 - MCP tool surface, not a Python API
+) -> dict[str, object]:
+    """Find blank-``album`` files, grouped by folder, with grounded fill proposals.
+
+    The blank-``album`` companion to ``detect_mismatches``: 92-ish files carry no ``album`` at
+    all, so ``resolve_albums`` skips them and nothing else can even list them. This groups every
+    file whose ``album`` is blank (across ALL tag ordinals) by its folder and, per folder,
+    proposes a fill from one of three grounded tiers — or leaves it blank when there is no
+    defensible ground. Writes nothing to tags/status/staging; only the recording tier touches
+    the ledger (its lookup cache). Run ``scan_library`` first.
+
+    Binding guarantee: a proposal is emitted ONLY for a file whose ``album`` is blank on every
+    ordinal, so acting on the report can never overwrite a real album value.
+
+    The three tiers:
+
+    * ``sibling`` — the blank files' folder mates share a single non-blank ``album`` value
+      (unanimous). Confidence is ``green`` (safe to bulk-stage) only when there are >=2
+      witnesses AND the value is neither a known genre nor a placeholder; otherwise ``confirm``
+      with a reason (``genre_like`` — a genre string in the album field, e.g. "Reggaeton";
+      ``placeholder`` — a folder label like "Unreleased"; ``n1_weak`` — a lone witness). Mixed
+      sibling values (no unanimity) yield NO proposal — the folder stays blank.
+    * ``folder_parse`` — a folder with NO sibling values at all whose leaf name parses as
+      ``Artist - Year - Album`` / ``Artist - Album``. Proposed (always ``confirm``) only when
+      the folder's own filenames self-corroborate the parsed album above a fixed threshold, so a
+      junk folder like "Maphra - YouTube" (0 filenames corroborate) stays blank.
+    * ``mb_recording`` — a folder tiers 1-2 leave blank, per blank file carrying a non-blank
+      artist AND title. A cached, paced MusicBrainz ``(artist, title)`` recording search maps to
+      the recording's release-group title. ALWAYS ``confidence: "review"`` (never green) with
+      ``reason: "mb_recording"`` — a human must confirm every one. ``use_musicbrainz=False``
+      skips this tier for a network-free, local-only run; the client is built lazily only when
+      such candidates exist, and results are cached so re-runs are network-free.
+
+    Recommended fix flow (the human is the diff-gate for every value): start here, expand one
+    folder with ``folder="<exact folder path>"``, then per tier feed the proposals'
+    ``{file_id, proposed}`` + ``note`` to ``stage_tags_batch`` (one call per tier keeps the
+    ``note`` accurate) → review ``diff_tags(path=<folder>)`` → ``commit_tags(path=<folder>)`` →
+    ``repend_axes(commit_id)`` to re-open the filled files' derived genre/year axes.
+
+    Args:
+        limit: Cap the number of folder groups returned; the ``green``/``confirm``/``review``/
+            ``stays_blank`` counts still describe the whole library.
+        folder: Return only the group for exactly this folder (exact path equality, never a
+            prefix match).
+        use_musicbrainz: When False, skip the ``mb_recording`` review tier entirely (tiers 1-2
+            only, no network). Default True.
+
+    Returns:
+        ``{"ok": True, groups, total_blank, green, confirm, review, stays_blank, summary}`` —
+        each group is ``{folder, blank_count, total_files, sibling_histogram, tier, proposals}``
+        and each proposal is ``{file_id, filename, proposed, confidence, reason, note}`` — or
+        ``{"ok": False, "error": ...}`` (e.g. a corrupt genre vocabulary).
+    """
+    try:
+        report = album_gaps.detect_album_gaps(
+            load_settings(),
+            limit=limit,
+            folder=folder,
+            use_musicbrainz=use_musicbrainz,
         )
     except ValueError as exc:
         return {"ok": False, "error": str(exc)}

@@ -44,9 +44,13 @@ exact-folder expansion + a staleness-aware skip-filter; `set_mismatch_status`/
 `origin="manual"`); and `repend_axes(commit_id)` — the first caller of
 `store.void_auto_changes`, re-opening a fixed file's derived genre/year axes + clearing its
 stale artist status. `list_files(mismatch_status=...)` + a `library_stats['mismatch']` block
-round it out. 30 MCP tools total. Schema is **v10** (additive: adds `file_mismatch_status`;
-a v9 ledger upgrades in place). M6 organize/moves (`moves.py`) is a paper sketch (its DDL
-ships in v6; logic deferred).
+round it out. The `detect_album_gaps` tool (`album_gaps.py` + the pure, standalone
+`parsing.py`) groups blank-`album` files by folder and proposes sibling / folder-parse fills
+plus a review-only MusicBrainz `(artist, title)` recording tier (`mb_recording`, opt-out via
+`use_musicbrainz=False`, cached in `musicbrainz_recording_cache`) for the `stage_tags_batch →
+diff → commit → repend_axes` spine. 31 MCP tools total. Schema is **v11** (additive: adds
+`musicbrainz_recording_cache`; a v10 ledger upgrades in place). M6 organize/moves (`moves.py`)
+is a paper sketch (its DDL ships in v6; logic deferred).
 
 ## Python
 
@@ -138,10 +142,10 @@ src/tagmend/
   log.py            shared logger (use everywhere)
   config.py         settings.json (platformdirs) + typed Settings
   cli.py            Typer CLI (thin)
-  mcp_server.py     FastMCP server (thin) — 21 tools
+  mcp_server.py     FastMCP server (thin) — 31 tools
   engine/
     db.py           SQLite connection (WAL)
-    schema.py       all DDL + PRAGMA user_version (v10)
+    schema.py       all DDL + PRAGMA user_version (v11)
     scan.py         filesystem discovery + signatures
     doctor.py       health_check / readiness + interrupted-commit report
     store.py        pure data access: files/file_tags + tag_revisions[_staged] + genre/artist status

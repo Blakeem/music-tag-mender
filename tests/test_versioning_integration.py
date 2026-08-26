@@ -21,7 +21,7 @@ from tagmend.engine import commits, store, versioning
 from tagmend.engine.db import connect
 from tagmend.engine.library import scan_library
 from tagmend.engine.schema import apply_schema
-from tagmend.engine.tags import read_tags, write_managed_tags
+from tagmend.engine.tags import MANAGED_TAGS, read_tags, write_managed_tags
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -31,6 +31,29 @@ if TYPE_CHECKING:
 _FORMATS = [".mp3", ".flac", ".m4a", ".ogg"]
 _NOW = "2026-06-02T00:00:00+00:00"
 _LATER = "2026-06-02T01:00:00+00:00"
+
+# A value for every tag in the closed managed set, so the "revert restores emptiness" test
+# covers all 18 rather than a sample.
+_ALL_MANAGED_TAGS = {
+    "genre": ["Electronic"],
+    "artist": ["Artist"],
+    "albumartist": ["Album Artist"],
+    "originaldate": ["1985"],
+    "musicbrainz_artistid": ["mb-artist"],
+    "title": ["Title"],
+    "album": ["Album"],
+    "date": ["1999"],
+    "tracknumber": ["3/12"],
+    "discnumber": ["1/1"],
+    "artistsort": ["Artist, The"],
+    "albumartistsort": ["Album Artist, The"],
+    "musicbrainz_albumtype": ["album"],
+    "musicbrainz_albumartistid": ["mb-albumartist"],
+    "musicbrainz_albumid": ["mb-album"],
+    "musicbrainz_releasegroupid": ["mb-releasegroup"],
+    "musicbrainz_releasetrackid": ["mb-releasetrack"],
+    "musicbrainz_trackid": ["mb-track"],
+}
 
 
 def _file_id(settings: Settings, folder: Path, filename: str) -> int:
@@ -49,6 +72,20 @@ def _baseline(settings: Settings, file_id: int, managed_tags: dict[str, list[str
     try:
         apply_schema(conn)
         versioning.ensure_baseline(conn, file_id, managed_tags=managed_tags, now=_NOW)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _stamp_managed_set(settings: Settings, file_id: int, version: int, managed_set: int) -> None:
+    """Force one revision's managed-set marker, fabricating a capture under an older set."""
+    conn = connect(settings.db_path)
+    try:
+        apply_schema(conn)
+        conn.execute(
+            "UPDATE tag_revisions SET managed_set = ? WHERE file_id = ? AND version = ?",
+            (managed_set, file_id, version),
+        )
         conn.commit()
     finally:
         conn.close()
@@ -154,12 +191,12 @@ def test_revert_to_pre_widening_baseline_preserves_new_fields(
     music_dir: Path,
     suffix: str,
 ) -> None:
-    # A baseline captured BEFORE MANAGED_TAGS widened holds only the original 5-field subset
-    # (here genre+artist). The widened identity fields (title/album/track/MB id) live on disk
-    # but that snapshot never governed them, so reverting to it must NOT delete them (their
+    # A revision stamped managed-set version 1 holds only the original 5-field subset (here
+    # genre+artist). The widened identity fields (title/album/track/MB id) live on disk but
+    # that snapshot never governed them, so reverting to it must NOT delete them (their
     # absence is "not tracked then", not "delete") while the original fields still restore to
-    # the baseline values. Regression for the revert-path delete-on-absent data loss the
-    # widened MANAGED_TAGS would otherwise cause on any pre-migration revision.
+    # the baseline values. Guards the migration-compat path: every pre-v13 revision captured
+    # before the widening carries this marker.
     track = make_track(
         music_dir / f"track{suffix}",
         {
@@ -180,6 +217,9 @@ def test_revert_to_pre_widening_baseline_preserves_new_fields(
         file_id,
         {"genre": ["Original Genre"], "artist": ["Original Artist"]},
     )
+    # ensure_baseline stamps TODAY's managed set, so force version 1: the row must really be
+    # what it simulates, a snapshot taken when only the original 5 tags were managed.
+    _stamp_managed_set(engine_settings, file_id, version=0, managed_set=1)
 
     versioning.revert(engine_settings, file_id, 0)
 
@@ -231,11 +271,39 @@ def test_revert_with_no_change_still_appends(
 
     _baseline(engine_settings, file_id, {"genre": ["Electronic"]})
 
-    # Reverting to v0 while already at v0 content still records an audited revert row.
-    assert versioning.revert(engine_settings, file_id, 0).new_version == 1
+    # Reverting to v0 while already at v0 content still records an audited revert row, but
+    # reports 'noop': nothing on disk moved, so the caller is never told a change happened.
+    result = versioning.revert(engine_settings, file_id, 0)
+    assert result.new_version == 1
+    assert result.status == "noop"
     revisions = _revisions(engine_settings, file_id)
     assert revisions[-1].origin == "revert"
     assert revisions[-1].diff == {}
+
+
+def test_revert_to_empty_baseline_clears_every_managed_tag(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    # The revert-fidelity defect in full: a v0 baseline captured with NO managed tags means
+    # all 18 were empty, so reverting to it must delete all 18. Before the managed-set stamp
+    # the 13 widened fields were preserved instead and the revert reported success while the
+    # file kept them.
+    assert set(_ALL_MANAGED_TAGS) == MANAGED_TAGS
+    track = make_track(music_dir / "t.flac")
+    scan_library(engine_settings)
+    file_id = _file_id(engine_settings, music_dir, track.name)
+
+    _baseline(engine_settings, file_id, {})
+    assert _edit(engine_settings, track, file_id, _ALL_MANAGED_TAGS) == 1
+    assert set(read_tags(track).tags) >= MANAGED_TAGS  # all 18 really landed on disk
+
+    result = versioning.revert(engine_settings, file_id, 0)
+
+    assert result.status == "reverted"
+    assert set(read_tags(track).tags) & MANAGED_TAGS == set()
+    revisions = _revisions(engine_settings, file_id)
+    assert revisions[-1].managed_tags == {}
 
 
 def test_revert_unknown_target_raises(engine_settings: Settings, music_dir: Path) -> None:

@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Final, SupportsInt, cast
 
 from tagmend.engine import axis
+from tagmend.engine.tags import MANAGED_SET_VERSION, TAG_READER_VERSION
 from tagmend.log import get_logger
 
 if TYPE_CHECKING:
@@ -60,9 +61,12 @@ class FileRow:
     mtime_ns: int | None
     is_missing: bool
     tags_updated_at: str | None
+    reader_version: int
 
 
-_FILE_COLUMNS = "id, folder, filename, ext, size_bytes, mtime_ns, is_missing, tags_updated_at"
+_FILE_COLUMNS = (
+    "id, folder, filename, ext, size_bytes, mtime_ns, is_missing, tags_updated_at, reader_version"
+)
 
 
 def _row_to_file(row: tuple[object, ...]) -> FileRow:
@@ -76,6 +80,7 @@ def _row_to_file(row: tuple[object, ...]) -> FileRow:
         mtime_ns=None if row[5] is None else _as_int(row[5]),
         is_missing=bool(row[6]),
         tags_updated_at=None if row[7] is None else str(row[7]),
+        reader_version=_as_int(row[8]),
     )
 
 
@@ -113,16 +118,21 @@ def insert_file(  # noqa: PLR0913 - keyword-only insert payload, all columns req
     mtime_ns: int | None,
     now: str,
 ) -> int:
-    """Insert a new file row (tags unread) and return its assigned ``id``."""
+    """Insert a new file row (tags unread) and return its assigned ``id``.
+
+    Stamps the current :data:`TAG_READER_VERSION` even though the tags are not read yet:
+    a newly discovered file is not a leftover of an older reader, and its NULL
+    ``tags_updated_at`` already makes the next scan read it.
+    """
     cursor = conn.execute(
         """
         INSERT INTO files (
             folder, filename, ext, size_bytes, mtime_ns,
-            is_missing, first_seen_at, updated_at, tags_updated_at
+            is_missing, first_seen_at, updated_at, tags_updated_at, reader_version
         )
-        VALUES (?, ?, ?, ?, ?, 0, ?, ?, NULL)
+        VALUES (?, ?, ?, ?, ?, 0, ?, ?, NULL, ?)
         """,
-        (folder, filename, ext, size_bytes, mtime_ns, now, now),
+        (folder, filename, ext, size_bytes, mtime_ns, now, now, TAG_READER_VERSION),
     )
     new_id = cursor.lastrowid
     if new_id is None:  # pragma: no cover - defensive; INTEGER PK always assigns one
@@ -200,6 +210,19 @@ def replace_tags(
     )
 
 
+def stamp_reader_version(conn: sqlite3.Connection, file_id: int) -> None:
+    """Mark *file_id*'s stored tags as produced by the current tag reader.
+
+    Deliberately separate from :func:`replace_tags`: the scan stamps after every successful
+    read, including the ~99% that find identical tags and write nothing. Folding it into
+    :func:`replace_tags` would leave those rows stale forever and re-read them every scan.
+    """
+    conn.execute(
+        "UPDATE files SET reader_version = ? WHERE id = ?",
+        (TAG_READER_VERSION, file_id),
+    )
+
+
 def tracked_files_under(conn: sqlite3.Connection, root: Path) -> list[FileRow]:
     """Return every tracked file whose folder is *root* or nested under it.
 
@@ -265,8 +288,13 @@ def _scalar_int(conn: sqlite3.Connection, sql: str) -> int:
 _REVISION_ORIGINS: Final = frozenset({"scan", "auto", "manual", "revert"})
 
 _REVISION_COLUMNS = (
-    "file_id, version, created_at, origin, reverted_from, commit_id, managed_tags, diff, note"
+    "file_id, version, created_at, origin, reverted_from, commit_id, managed_tags, diff, note, "
+    "managed_set"
 )
+
+# Rows written before schema v13 that the migration somehow missed carry no marker. Falling
+# back to the pre-widening set keeps revert conservative (preserve, never delete).
+_FALLBACK_MANAGED_SET: Final = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -282,6 +310,7 @@ class Revision:
     managed_tags: dict[str, list[str]]
     diff: dict[str, dict[str, list[str]]]
     note: str | None
+    managed_set: int
 
 
 def _row_to_revision(row: tuple[object, ...]) -> Revision:
@@ -296,6 +325,7 @@ def _row_to_revision(row: tuple[object, ...]) -> Revision:
         managed_tags=_parse_tag_map(str(row[6])),
         diff=_parse_diff(str(row[7])),
         note=None if row[8] is None else str(row[8]),
+        managed_set=_FALLBACK_MANAGED_SET if row[9] is None else _as_int(row[9]),
     )
 
 
@@ -314,6 +344,10 @@ def insert_revision(  # noqa: PLR0913 - cohesive append-only revision payload
 ) -> None:
     """Append one revision row. Append-only — never updates or deletes.
 
+    Every row is stamped with the CURRENT
+    :data:`~tagmend.engine.tags.MANAGED_SET_VERSION`, which is what lets revert read a tag
+    omitted from the snapshot as "empty then" rather than "not tracked then".
+
     *commit_id* groups this change with the other files in the same commit; it is
     ``None`` for the version-0 baseline, which precedes any commit. Raises
     :class:`ValueError` for an unknown *origin*. The ``(file_id, version)`` PK rejects a
@@ -326,9 +360,9 @@ def insert_revision(  # noqa: PLR0913 - cohesive append-only revision payload
         """
         INSERT INTO tag_revisions (
             file_id, version, created_at, origin, reverted_from,
-            commit_id, managed_tags, diff, note
+            commit_id, managed_tags, diff, note, managed_set
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             file_id,
@@ -340,6 +374,7 @@ def insert_revision(  # noqa: PLR0913 - cohesive append-only revision payload
             _dump_json(managed_tags),
             _dump_json(diff),
             note,
+            MANAGED_SET_VERSION,
         ),
     )
 

@@ -466,6 +466,57 @@ def test_limit_caps_groups_and_reports_pending(
     assert first.more is True
 
 
+def test_two_identical_dry_runs_reprocess_the_same_groups(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    make_track(music_dir / "a.mp3", {"artist": ["A"], "album": ["One"]})
+    make_track(music_dir / "b.mp3", {"artist": ["B"], "album": ["Two"]})
+    scan_library(engine_settings)
+
+    fake = FakeMBAlbumSource({("A", "One"): _mb("1991"), ("B", "Two"): _mb("1992")})
+    first = years.resolve_years(engine_settings, client=fake, limit=1, dry_run=True)
+    second = years.resolve_years(engine_settings, client=fake, limit=1, dry_run=True)
+
+    # A dry run stages nothing and records no no_match, so the frontier is unchanged.
+    assert first.to_dict() == second.to_dict()
+    assert fake.lookups == [("A", "One"), ("A", "One")]
+    assert "call again to continue" not in second.summary
+    assert "Raise limit above 1" in second.summary
+    assert "album= / file_ids=" in second.summary
+
+    # The real path DOES advance (staged then committed), and keeps saying so.
+    real = years.resolve_years(engine_settings, client=fake, limit=1)
+    assert "call again to continue" in real.summary
+
+
+def test_summary_labels_group_and_file_counts(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    make_track(music_dir / "a.mp3", {"artist": ["A"], "album": ["One"]})
+    make_track(music_dir / "b.flac", {"artist": ["A"], "album": ["One"]})
+    make_track(music_dir / "c.mp3", {"artist": ["B"], "album": ["Two"]})
+    make_track(music_dir / "d.mp3", {"artist": ["C"], "album": ["Three"], "originaldate": ["1999"]})
+    scan_library(engine_settings)
+
+    # ("B", "Two") is absent from the table → a no_match on that group's one file.
+    fake = FakeMBAlbumSource({("A", "One"): _mb("1991")})
+    result = years.resolve_years(engine_settings, client=fake)
+
+    assert result.processed == 2  # album groups
+    assert result.staged_files == 2  # files
+    assert result.no_match == 1  # files
+    assert result.skipped_present == 1  # files
+    assert "Processed 2 album group(s):" in result.summary
+    assert "staged 2 file(s)" in result.summary
+    assert "no_match 1 file(s)" in result.summary
+    assert "Skipped 1 file(s) present" in result.summary
+    assert "0 file(s) no_album" in result.summary
+    assert "0 file(s) no_artist" in result.summary
+    assert "0 file(s) manual" in result.summary
+
+
 # --- idempotent re-run after commit --------------------------------------------------
 
 
@@ -518,7 +569,7 @@ def test_commit_then_revert_commit_restores_blank_originaldate(
     assert restored["date"] == ["2015"]  # reissue year never disturbed
 
 
-# --- list_albums: blank_originaldate + limit + year_status filter -------------------
+# --- list_albums: blank_originaldate + limit + year_status/actionable filters -------
 
 
 def test_list_albums_reports_blank_originaldate_count(
@@ -575,3 +626,52 @@ def test_list_albums_year_status_filter(
 
     pending = years.list_albums(engine_settings, year_status="pending")
     assert [row.album for row in pending] == ["B1"]
+
+
+def test_list_albums_actionable_keeps_only_groups_with_blanks(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    make_track(
+        music_dir / "full.mp3",
+        {"artist": ["Rush"], "album": ["Moving Pictures"], "originaldate": ["1981"]},
+    )
+    make_track(music_dir / "blank.mp3", {"artist": ["Yes"], "album": ["Fragile"]})
+    scan_library(engine_settings)
+
+    rows = years.list_albums(engine_settings, actionable=True)
+    assert [row.album for row in rows] == ["Fragile"]
+    assert all(row.blank_originaldate > 0 for row in rows)
+    # Unfiltered, the fully-tagged group is still listed.
+    assert len(years.list_albums(engine_settings)) == 2
+
+
+def test_list_albums_actionable_composes_with_year_status_and_precedes_limit(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    # Alpha: blank but manual. Bravo: pending, no blanks. Charlie/Delta: pending + blank.
+    manual_track = make_track(music_dir / "a.mp3", {"artist": ["Alpha"], "album": ["A1"]})
+    make_track(
+        music_dir / "b.mp3",
+        {"artist": ["Bravo"], "album": ["B1"], "originaldate": ["1999"]},
+    )
+    make_track(music_dir / "c.mp3", {"artist": ["Charlie"], "album": ["C1"]})
+    make_track(music_dir / "d.mp3", {"artist": ["Delta"], "album": ["D1"]})
+    scan_library(engine_settings)
+
+    manual_id = _file_id(engine_settings, music_dir, manual_track.name)
+    years.set_year_status(engine_settings, file_ids=[manual_id], status="manual")
+
+    both = years.list_albums(engine_settings, year_status="pending", actionable=True)
+    assert [row.album for row in both] == ["C1", "D1"]
+
+    # The filters run BEFORE limit: limit=1 keeps the first ACTIONABLE pending group,
+    # not the first pending group (B1, which has no blanks).
+    limited = years.list_albums(
+        engine_settings,
+        year_status="pending",
+        actionable=True,
+        limit=1,
+    )
+    assert [row.album for row in limited] == ["C1"]

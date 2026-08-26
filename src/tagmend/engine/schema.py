@@ -92,6 +92,25 @@ place with no data loss):
   name. :func:`apply_schema` performs a SQLite-native ``ALTER TABLE ... RENAME TO`` before the
   DDL runs, so every stored ``'no_match'`` / ``'manual'`` disposition is preserved. Nothing
   about the album *entity* changes (``musicbrainz_cache``, the ``album`` tag, ``list_albums``).
+
+The revert-fidelity pass adds one column (schema v13, no new tables — a v12 ledger upgrades in
+place with every row preserved):
+
+* ``tag_revisions.managed_set`` — which managed-tag set governed that revision (the versions in
+  :data:`tagmend.engine.tags.MANAGED_SETS`). Without it, revert cannot tell a snapshot that
+  omits a tag because it was empty from one that omits it because the set did not track it yet,
+  so it preserved every widened field on every snapshot and reported success while changing
+  nothing. :func:`_migrate_v13_managed_set` stamps pre-existing rows by capture date.
+
+The scan-staleness pass adds one column (schema v14, no new tables — a v13 ledger upgrades in
+place with every row preserved):
+
+* ``files.reader_version`` — which tag reader produced that snapshot row (the value of
+  :data:`tagmend.engine.tags.TAG_READER_VERSION` at read time). An incremental scan re-reads
+  only on a size/mtime change, so a row written by an older reader would never refresh and
+  every detector would keep reading it. :func:`_migrate_v14_reader_version` defaults
+  pre-existing rows to 0, below any real reader version, so the next incremental scan
+  re-reads each of them exactly once.
 """
 
 from __future__ import annotations
@@ -105,7 +124,7 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
-SCHEMA_VERSION: Final = 12
+SCHEMA_VERSION: Final = 14
 
 _FILES_DDL: Final = """
 CREATE TABLE IF NOT EXISTS files (
@@ -120,6 +139,7 @@ CREATE TABLE IF NOT EXISTS files (
   updated_at      TEXT NOT NULL,
   tags_updated_at TEXT,
   status          TEXT NOT NULL DEFAULT 'scanned',
+  reader_version  INTEGER NOT NULL DEFAULT 0,
   UNIQUE (folder, filename)
 )
 """
@@ -159,7 +179,10 @@ CREATE TABLE IF NOT EXISTS commits (
 # handle — ``created_at`` is display-only. ``commit_id`` groups the change with the
 # other files in the same commit (NULL for the version-0 baseline, which precedes any
 # commit). ``managed_tags`` is a FULL JSON snapshot, so any version is restorable
-# without replaying the chain. See PLAN.md §7 / §22.
+# without replaying the chain. ``managed_set`` records WHICH managed-tag set that
+# snapshot governed (:data:`tagmend.engine.tags.MANAGED_SETS`), so revert knows whether an
+# omitted tag means "empty then" (delete it) or "not tracked then" (keep it).
+# See PLAN.md §7 / §22.
 _TAG_REVISIONS_DDL: Final = """
 CREATE TABLE IF NOT EXISTS tag_revisions (
   file_id       INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
@@ -171,6 +194,7 @@ CREATE TABLE IF NOT EXISTS tag_revisions (
   managed_tags  TEXT NOT NULL,
   diff          TEXT NOT NULL,
   note          TEXT,
+  managed_set   INTEGER,
   PRIMARY KEY (file_id, version)
 )
 """
@@ -363,6 +387,13 @@ def _table_exists(connection: sqlite3.Connection, name: str) -> bool:
     return row is not None
 
 
+def _column_exists(connection: sqlite3.Connection, table: str, column: str) -> bool:
+    """Whether *table* already has a *column* (``PRAGMA table_info`` lookup)."""
+    # PRAGMA takes no bound parameters, so the table name is interpolated (never user data).
+    cursor = connection.execute(f"PRAGMA table_info({table})")
+    return any(str(row[1]) == column for row in cursor.fetchall())
+
+
 def _migrate_v12_year_status(connection: sqlite3.Connection) -> None:
     """v12: rename ``file_album_status`` → ``file_year_status``, preserving every row.
 
@@ -378,6 +409,62 @@ def _migrate_v12_year_status(connection: sqlite3.Connection) -> None:
         return
     connection.execute("ALTER TABLE file_album_status RENAME TO file_year_status")
     logger.info("schema v12: renamed file_album_status to file_year_status")
+
+
+# The date the managed set widened from 5 tags to 18 (managed-set version 1 -> 2 in
+# :data:`tagmend.engine.tags.MANAGED_SETS`). Frozen history: a later widening adds a new
+# version and never restamps rows through this constant.
+_MANAGED_SET_WIDENING_DATE: Final = "2026-07-04"
+
+
+def _migrate_v13_managed_set(connection: sqlite3.Connection) -> None:
+    """v13: add ``tag_revisions.managed_set`` and stamp existing rows by capture date.
+
+    Runs BEFORE the DDL, so the guard leads with ``_table_exists``: on a fresh ledger
+    ``tag_revisions`` does not exist yet and a bare ``ALTER TABLE`` would raise "no such
+    table" on every first run. A fresh ledger skips this and takes the column from
+    :data:`_TAG_REVISIONS_DDL` instead. Idempotent: the ``_column_exists`` half stops a
+    second application.
+
+    Capture date is the only evidence a v12 row carries about which set governed it, and
+    ``created_at`` is an ISO-8601 UTC string, so the comparison is lexicographic. Commits
+    itself, since a read-only caller would otherwise discard the stamp (see below).
+    """
+    if not _table_exists(connection, "tag_revisions"):
+        return
+    if _column_exists(connection, "tag_revisions", "managed_set"):
+        return
+    connection.execute("ALTER TABLE tag_revisions ADD COLUMN managed_set INTEGER")
+    connection.execute(
+        "UPDATE tag_revisions SET managed_set = CASE WHEN created_at >= ? THEN 2 ELSE 1 END",
+        (_MANAGED_SET_WIDENING_DATE,),
+    )
+    # The stamp is DML, so sqlite3 opens an implicit transaction for it. Every caller runs
+    # apply_schema straight after db.connect and many never commit (read-only paths), which
+    # would roll the stamp back while the autocommitted ADD COLUMN survives — leaving the
+    # column present but NULL, so the migration could never run again. Commit it here.
+    connection.commit()
+    logger.info("schema v13: stamped tag_revisions.managed_set on pre-existing rows")
+
+
+def _migrate_v14_reader_version(connection: sqlite3.Connection) -> None:
+    """v14: add ``files.reader_version``, defaulting pre-existing rows below any reader.
+
+    Runs BEFORE the DDL, so the guard leads with ``_table_exists``: on a fresh ledger
+    ``files`` does not exist yet and a bare ``ALTER TABLE`` would raise "no such table" on
+    every first run. A fresh ledger skips this and takes the column from :data:`_FILES_DDL`
+    instead. Idempotent: the ``_column_exists`` half stops a second application.
+
+    The ``DEFAULT 0`` backfills every existing row below :data:`TAG_READER_VERSION`, which is
+    the point — those rows were read by an unknown older reader, so the next incremental scan
+    must re-read each of them once. No DML follows, so unlike v13 there is no stamp to commit.
+    """
+    if not _table_exists(connection, "files"):
+        return
+    if _column_exists(connection, "files", "reader_version"):
+        return
+    connection.execute("ALTER TABLE files ADD COLUMN reader_version INTEGER NOT NULL DEFAULT 0")
+    logger.info("schema v14: added files.reader_version (pre-existing rows default to 0)")
 
 
 def apply_schema(connection: sqlite3.Connection) -> None:
@@ -396,9 +483,11 @@ def apply_schema(connection: sqlite3.Connection) -> None:
     ``batch_id``→``commit_id`` and dropped ``kind``/``plan_id``.) There is no production
     data to migrate yet.
 
-    The ONE in-place migration is v12's table rename (``file_album_status`` →
+    The in-place migrations are v12's table rename (``file_album_status`` →
     ``file_year_status``), applied by :func:`_migrate_v12_year_status` before any DDL runs so
-    a v11 ledger upgrades with its dispositions intact.
+    a v11 ledger upgrades with its dispositions intact. v13 adds
+    ``tag_revisions.managed_set`` the same way (:func:`_migrate_v13_managed_set`), and v14
+    adds ``files.reader_version`` (:func:`_migrate_v14_reader_version`).
 
     Staged rows no longer carry a ``commit_id``; a lingering ``'applying'`` commit means
     an interrupted run, recovered by simply committing again.
@@ -407,6 +496,8 @@ def apply_schema(connection: sqlite3.Connection) -> None:
     """
     logger.debug("applying schema version %d", SCHEMA_VERSION)
     _migrate_v12_year_status(connection)
+    _migrate_v13_managed_set(connection)
+    _migrate_v14_reader_version(connection)
     connection.execute(_FILES_DDL)
     connection.execute(_FILE_TAGS_DDL)
     connection.execute(_FILE_TAGS_INDEX_DDL)

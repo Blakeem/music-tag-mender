@@ -22,6 +22,7 @@ from mutagen.easymp4 import EasyMP4Tags
 from tagmend.log import get_logger
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
     from pathlib import Path
 
 logger = get_logger(__name__)
@@ -54,13 +55,9 @@ _ALIASES: Final[dict[str, str]] = {
     "band": "albumartist",
 }
 
-# The five tags TagMend managed BEFORE the mismatch-fix widening. Every revision in history
-# — down to the oldest version-0 baselines captured under the original schema — governed
-# exactly these, so a snapshot that lacks one is a genuine "this tag was empty then" and
-# delete-on-revert is unconditionally safe for it. Kept as its own set so the revert path
-# (:func:`tagmend.engine.versioning._revert_target_tags`) can tell them apart from the
-# widened fields, whose absence from a PRE-widening snapshot means "not tracked yet", not
-# "delete".
+# The five tags TagMend managed BEFORE the mismatch-fix widening: managed-set version 1 in
+# :data:`MANAGED_SETS`. A revision stamped version 1 governed exactly these, so revert
+# deletes only these when its snapshot omits them and preserves everything wider.
 ORIGINAL_MANAGED_TAGS: Final[frozenset[str]] = frozenset(
     {
         "genre",
@@ -97,12 +94,31 @@ _WIDENED_MANAGED_TAGS: Final[frozenset[str]] = frozenset(
 # The set of tags TagMend is allowed to write/revert (18 = the 5 original + 13 widened). A
 # CLOSED set: anything outside it (``comment``/``composer``/art…) is never read, written, or
 # deleted, and every key here MUST be provably writable on all four formats. The mismatch-fix
-# flow can repair a poisoned release in one commit and revert can restore every field it
-# governed — but reverting to a snapshot captured BEFORE the widening preserves the widened
-# fields instead of deleting them (see :func:`tagmend.engine.versioning._revert_target_tags`).
+# flow can repair a poisoned release in one commit, and revert restores every field the
+# target revision's own managed set governed (see
+# :func:`tagmend.engine.versioning._revert_target_tags`).
 # ``date`` (reissue year, MP4 ``©day``) and ``originaldate`` (original year, MP4 freeform) are
 # BOTH managed and kept distinct.
 MANAGED_TAGS: Final[frozenset[str]] = ORIGINAL_MANAGED_TAGS | _WIDENED_MANAGED_TAGS
+
+# Which managed set governed a given revision, so revert can tell "this tag was empty then"
+# from "this tag was not tracked then". Version 1 is the pre-widening five-tag set, version 2
+# the current eighteen. Every new revision is stamped with :data:`MANAGED_SET_VERSION`;
+# :func:`tagmend.engine.versioning._revert_target_tags` looks the stamp up here. Widening the
+# set again means a new entry and a bump — never editing an existing entry, since stored
+# revisions point at it.
+MANAGED_SET_VERSION: Final = 2
+
+MANAGED_SETS: Final[Mapping[int, frozenset[str]]] = {
+    1: ORIGINAL_MANAGED_TAGS,
+    2: MANAGED_TAGS,
+}
+
+# Which reader produced a snapshot row, so an incremental scan can spot rows left behind by
+# an older one and re-read them exactly once. BUMP THIS IN THE SAME COMMIT as any change to
+# what :func:`read_tags` produces — the managed set, an alias, a format registration — or
+# every already-scanned file keeps serving the old reader's output to every detector.
+TAG_READER_VERSION: Final = 1
 
 
 @dataclass(frozen=True, slots=True)

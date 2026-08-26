@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 import httpx
 import pytest
 
+from tagmend.engine import musicbrainz
 from tagmend.engine.musicbrainz import (
     MusicBrainzClient,
     MusicBrainzError,
@@ -115,12 +116,12 @@ def test_returns_album_original_year(db_conn: sqlite3.Connection) -> None:
 
 def test_picks_highest_scoring_album(db_conn: sqlite3.Connection) -> None:
     body = _body(
-        _group(title="Low score", first_release_date="1999", score=40, rgid="rg-lo"),
-        _group(title="High score", first_release_date="1970", score=100, rgid="rg-hi"),
+        _group(first_release_date="1999", score=40, rgid="rg-lo"),
+        _group(first_release_date="1970", score=100, rgid="rg-hi"),
     )
     client, _ = _client(db_conn, [_json_response(body)])
     with client:
-        album = client.album_first_release("Artist", "Album")
+        album = client.album_first_release("Artist", "Paranoid")
     assert album is not None
     assert album.original_date == "1970"
     assert album.release_group_id == "rg-hi"
@@ -130,17 +131,131 @@ def test_skips_non_album_primary_type(db_conn: sqlite3.Connection) -> None:
     body = _body(_group(primary_type="Single", first_release_date="1971"))
     client, _ = _client(db_conn, [_json_response(body)])
     with client:
-        assert client.album_first_release("Artist", "Album") is None
+        assert client.album_first_release("Artist", "Paranoid") is None
 
 
 def test_skips_live_and_compilation_secondary_types(db_conn: sqlite3.Connection) -> None:
     body = _body(
-        _group(title="Live one", secondary_types=["Live"], first_release_date="1975"),
-        _group(title="Comp", secondary_types=["Compilation"], first_release_date="1980"),
+        _group(secondary_types=["Live"], first_release_date="1975"),
+        _group(secondary_types=["Compilation"], first_release_date="1980"),
     )
     client, _ = _client(db_conn, [_json_response(body)])
     with client:
-        assert client.album_first_release("Artist", "Album") is None
+        assert client.album_first_release("Artist", "Paranoid") is None
+
+
+def test_skips_demo_secondary_type(db_conn: sqlite3.Connection) -> None:
+    body = _body(_group(secondary_types=["Demo"], first_release_date="2019"))
+    client, _ = _client(db_conn, [_json_response(body)])
+    with client:
+        assert client.album_first_release("Artist", "Paranoid") is None
+
+
+def test_replicas_candidate_set_is_no_match(db_conn: sqlite3.Connection) -> None:
+    # The live run's Gary Numan / Replicas candidate set: the Demo reissue outscored every
+    # other candidate and filled 2019 over the album's real 1979.
+    body = _body(
+        _group(
+            title="Replicas: The First Recordings",
+            secondary_types=["Demo"],
+            first_release_date="2019-10-04",
+            score=100,
+            rgid="rg-demo",
+        ),
+        _group(
+            title="Replicas Live",
+            secondary_types=["Live"],
+            first_release_date="2008",
+            score=95,
+            rgid="rg-live-1",
+        ),
+        _group(
+            title="Replicas (Live)",
+            secondary_types=["Live"],
+            first_release_date="2011",
+            score=90,
+            rgid="rg-live-2",
+        ),
+        _group(
+            title="Replicas",
+            secondary_types=["Compilation"],
+            first_release_date="1998",
+            score=88,
+            rgid="rg-comp",
+        ),
+    )
+    client, _ = _client(db_conn, [_json_response(body)])
+    with client:
+        assert client.album_first_release("Gary Numan", "Replicas") is None
+
+
+def test_edition_suffix_in_request_still_matches_plain_release_group(
+    db_conn: sqlite3.Connection,
+) -> None:
+    body = _body(_group(title="Fiction", first_release_date="2007-04-20", rgid="rg-fiction"))
+    client, _ = _client(db_conn, [_json_response(body)])
+    with client:
+        album = client.album_first_release("Dark Tranquillity", "Fiction (Deluxe Edition)")
+    assert album is not None
+    assert album.original_date == "2007"
+    assert album.release_group_id == "rg-fiction"
+
+
+def test_rejects_candidate_carrying_content_the_request_lacks(
+    db_conn: sqlite3.Connection,
+) -> None:
+    body = _body(_group(title="Fiction: The Demos", first_release_date="2019", rgid="rg-demos"))
+    client, _ = _client(db_conn, [_json_response(body)])
+    with client:
+        assert client.album_first_release("Dark Tranquillity", "Fiction") is None
+
+
+def test_non_ascii_title_matches_itself(db_conn: sqlite3.Connection) -> None:
+    # ``fold`` keeps only [a-z0-9], so a wholly non-Latin title folds to "" and would never
+    # match the album it names unless the loose key catches it.
+    body = _body(_group(title="Спутник", first_release_date="1985", rgid="rg-nonascii"))
+    client, _ = _client(db_conn, [_json_response(body)])
+    with client:
+        album = client.album_first_release("Artist", "Спутник")
+    assert album is not None
+    assert album.original_date == "1985"
+    assert album.release_group_id == "rg-nonascii"
+
+
+def test_different_non_ascii_titles_do_not_match(db_conn: sqlite3.Connection) -> None:
+    body = _body(_group(title="東京事変", first_release_date="2004", rgid="rg-other"))
+    client, _ = _client(db_conn, [_json_response(body)])
+    with client:
+        assert client.album_first_release("Artist", "Спутник") is None
+
+
+@pytest.mark.parametrize(
+    ("artist", "album", "year"),
+    [
+        ("36 Crazyfists", "In the Skin", "1997"),
+        ("Autolux", "Future Perfect", "2004"),
+        ("Dark Tranquillity", "Fiction", "2007"),
+        ("Imperative Reaction", "Eulogy for the Sick Child", "1999"),
+    ],
+)
+def test_live_run_album_years_stay_pinned(
+    db_conn: sqlite3.Connection,
+    artist: str,
+    album: str,
+    year: str,
+) -> None:
+    # The decoy scores as high as the real group and carries no excluded secondary type, so
+    # only the title gate can keep the year each of these resolved to in the live run.
+    body = _body(
+        _group(title=f"{album}: The Demos", first_release_date="2019", rgid="rg-decoy"),
+        _group(title=album, first_release_date=year, rgid="rg-real"),
+    )
+    client, _ = _client(db_conn, [_json_response(body)])
+    with client:
+        resolved = client.album_first_release(artist, album)
+    assert resolved is not None
+    assert resolved.original_date == year
+    assert resolved.release_group_id == "rg-real"
 
 
 def test_empty_results_is_no_match(db_conn: sqlite3.Connection) -> None:
@@ -178,6 +293,19 @@ def test_no_match_is_negative_cached(db_conn: sqlite3.Connection) -> None:
     assert cached[0] is False
 
 
+def test_selection_version_changes_request_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    before = _request_key("Gary Numan", "Replicas")
+    monkeypatch.setattr(musicbrainz, "_SELECTION_VERSION", "rules-bumped")
+    assert _request_key("Gary Numan", "Replicas") != before
+
+
+def test_selection_version_changes_recording_request_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The recording path shares the excluded-secondary-type set, so one bump must reopen both.
+    before = _recording_request_key("Black Sabbath", "War Pigs")
+    monkeypatch.setattr(musicbrainz, "_SELECTION_VERSION", "rules-bumped")
+    assert _recording_request_key("Black Sabbath", "War Pigs") != before
+
+
 # --- transient errors ----------------------------------------------------------------
 
 
@@ -211,7 +339,7 @@ def test_pacing_sleeps_between_network_requests(db_conn: sqlite3.Connection) -> 
         sleep=sleep,
     )
     with client:
-        client.album_first_release("A", "One")
+        client.album_first_release("A", "Paranoid")
         client.album_first_release("B", "Two")
 
     # The second request was paced to honor 1 req/sec.

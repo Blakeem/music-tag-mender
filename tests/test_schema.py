@@ -3,8 +3,13 @@
 from __future__ import annotations
 
 import sqlite3
+from typing import TYPE_CHECKING
 
 from tagmend.engine.schema import SCHEMA_VERSION, apply_schema
+from tagmend.engine.tags import TAG_READER_VERSION
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 def _table_names(conn: sqlite3.Connection) -> set[str]:
@@ -12,11 +17,11 @@ def _table_names(conn: sqlite3.Connection) -> set[str]:
     return {str(row[0]) for row in cursor.fetchall()}
 
 
-def test_apply_schema_stamps_version_12(db_conn: sqlite3.Connection) -> None:
-    # db_conn already applied the schema; confirm the stamped user_version is v12.
+def test_apply_schema_stamps_current_version(db_conn: sqlite3.Connection) -> None:
+    # db_conn already applied the schema; the stamp must match the constant the code ships.
     version = db_conn.execute("PRAGMA user_version").fetchone()[0]
-    assert version == 12
-    assert SCHEMA_VERSION == 12
+    assert version == SCHEMA_VERSION
+    assert SCHEMA_VERSION == 14
 
 
 def test_apply_schema_creates_genre_tables(db_conn: sqlite3.Connection) -> None:
@@ -75,7 +80,7 @@ def test_apply_schema_is_idempotent() -> None:
     try:
         apply_schema(conn)
         apply_schema(conn)  # second application must not raise
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 12
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
     finally:
         conn.close()
 
@@ -98,7 +103,7 @@ def test_v10_ledger_gains_the_recording_cache_in_place() -> None:
 
         apply_schema(conn)  # the in-place upgrade
 
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 12
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
         assert "musicbrainz_recording_cache" in _table_names(conn)
         # Pre-existing data survives the additive upgrade.
         kept = conn.execute("SELECT COUNT(*) FROM musicbrainz_cache").fetchone()[0]
@@ -128,7 +133,7 @@ def test_v11_ledger_upgrades_to_v12_in_place() -> None:
 
         apply_schema(conn)  # the in-place upgrade
 
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 12
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
         tables = _table_names(conn)
         assert "file_year_status" in tables
         assert "file_album_status" not in tables  # renamed, not copied
@@ -138,6 +143,177 @@ def test_v11_ledger_upgrades_to_v12_in_place() -> None:
             (file_id,),
         ).fetchone()
         assert row == ("no_match", "Obscure", "Demos")
+    finally:
+        conn.close()
+
+
+def _downgrade_to_v12(conn: sqlite3.Connection) -> None:
+    """Turn a freshly-applied ledger back into a v12 one (no ``managed_set`` column)."""
+    conn.execute("PRAGMA user_version = 12")
+    conn.execute("ALTER TABLE tag_revisions DROP COLUMN managed_set")
+
+
+def _insert_revision_row(
+    conn: sqlite3.Connection, file_id: int, version: int, created_at: str
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO tag_revisions (file_id, version, created_at, origin, managed_tags, diff)
+        VALUES (?, ?, ?, 'manual', '{}', '{}')
+        """,
+        (file_id, version, created_at),
+    )
+
+
+def test_v12_ledger_stamps_managed_set_by_capture_date() -> None:
+    # The widening shipped 2026-07-04: rows captured before it governed the original 5 tags
+    # (managed set 1), rows from that date on the widened 18 (managed set 2).
+    conn = sqlite3.connect(":memory:")
+    try:
+        apply_schema(conn)
+        file_id = _insert_file(conn)
+        _downgrade_to_v12(conn)
+        _insert_revision_row(conn, file_id, 0, "2026-07-03T23:59:59+00:00")
+        _insert_revision_row(conn, file_id, 1, "2026-07-04T00:00:01+00:00")
+        conn.commit()
+
+        apply_schema(conn)  # the in-place upgrade
+
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        rows = conn.execute(
+            "SELECT version, managed_set FROM tag_revisions ORDER BY version",
+        ).fetchall()
+        assert [tuple(row) for row in rows] == [(0, 1), (1, 2)]
+    finally:
+        conn.close()
+
+
+def test_v13_stamp_survives_a_caller_that_never_commits(tmp_path: Path) -> None:
+    # Every engine entry point runs apply_schema straight after connecting, and the read-only
+    # ones close without committing. The ADD COLUMN autocommits, so an uncommitted stamp would
+    # leave the column present but NULL and unfixable on the next run.
+    db_path = tmp_path / "ledger.sqlite3"
+    conn = sqlite3.connect(db_path)
+    try:
+        apply_schema(conn)
+        file_id = _insert_file(conn)
+        _downgrade_to_v12(conn)
+        _insert_revision_row(conn, file_id, 0, "2026-01-01T00:00:00+00:00")
+        conn.commit()
+    finally:
+        conn.close()
+
+    upgrading = sqlite3.connect(db_path)
+    try:
+        apply_schema(upgrading)  # a read-only caller: no commit of its own
+    finally:
+        upgrading.close()
+
+    conn = sqlite3.connect(db_path)
+    try:
+        assert conn.execute("SELECT managed_set FROM tag_revisions").fetchone()[0] == 1
+    finally:
+        conn.close()
+
+
+def test_fresh_ledger_takes_managed_set_from_the_ddl() -> None:
+    # The v13 migration runs BEFORE the DDL, so on a fresh ledger ``tag_revisions`` does not
+    # exist yet: the migration must skip rather than raise "no such table", and the column
+    # comes from _TAG_REVISIONS_DDL.
+    conn = sqlite3.connect(":memory:")
+    try:
+        apply_schema(conn)
+
+        columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(tag_revisions)")}
+        assert "managed_set" in columns
+    finally:
+        conn.close()
+
+
+def test_v13_migration_does_not_restamp_on_reapply() -> None:
+    # Idempotence that matters: a second apply_schema must not re-run the date-based stamp
+    # over rows whose marker is already set (here a pre-widening date carrying set 2).
+    conn = sqlite3.connect(":memory:")
+    try:
+        apply_schema(conn)
+        file_id = _insert_file(conn)
+        _downgrade_to_v12(conn)
+        _insert_revision_row(conn, file_id, 0, "2026-01-01T00:00:00+00:00")
+        conn.commit()
+
+        apply_schema(conn)
+        conn.execute("UPDATE tag_revisions SET managed_set = 2")
+        apply_schema(conn)  # must not raise, must not restamp
+
+        marker = conn.execute("SELECT managed_set FROM tag_revisions").fetchone()[0]
+        assert marker == 2
+    finally:
+        conn.close()
+
+
+def _downgrade_to_v13(conn: sqlite3.Connection) -> None:
+    """Turn a freshly-applied ledger back into a v13 one (no ``reader_version`` column)."""
+    conn.execute("PRAGMA user_version = 13")
+    conn.execute("ALTER TABLE files DROP COLUMN reader_version")
+
+
+def test_v13_ledger_gains_reader_version_defaulted_stale() -> None:
+    # A v13 row was written by an unknown older reader, so it must land BELOW
+    # TAG_READER_VERSION and be re-read once — with the row itself carried across intact.
+    conn = sqlite3.connect(":memory:")
+    try:
+        apply_schema(conn)
+        file_id = _insert_file(conn)
+        _downgrade_to_v13(conn)
+        conn.commit()
+
+        apply_schema(conn)  # the in-place upgrade
+
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        row = conn.execute(
+            "SELECT folder, filename, reader_version FROM files WHERE id = ?",
+            (file_id,),
+        ).fetchone()
+        assert row == ("/lib", "a.mp3", 0)
+        assert TAG_READER_VERSION > 0  # so the backfilled 0 really does read as stale
+    finally:
+        conn.close()
+
+
+def test_fresh_ledger_takes_reader_version_from_the_ddl() -> None:
+    # The v14 migration runs BEFORE the DDL, so on a fresh ledger ``files`` does not exist
+    # yet: the migration must skip rather than raise "no such table", and the column comes
+    # from _FILES_DDL.
+    conn = sqlite3.connect(":memory:")
+    try:
+        apply_schema(conn)
+
+        columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(files)")}
+        assert "reader_version" in columns
+    finally:
+        conn.close()
+
+
+def test_v14_migration_does_not_reset_a_stamped_row() -> None:
+    # Idempotence that matters: a second apply_schema must not re-add or re-default the
+    # column over a row the scan has already stamped current.
+    conn = sqlite3.connect(":memory:")
+    try:
+        apply_schema(conn)
+        file_id = _insert_file(conn)
+        conn.execute(
+            "UPDATE files SET reader_version = ? WHERE id = ?",
+            (TAG_READER_VERSION, file_id),
+        )
+        conn.commit()
+
+        apply_schema(conn)  # must not raise, must not reset
+
+        stamped = conn.execute(
+            "SELECT reader_version FROM files WHERE id = ?",
+            (file_id,),
+        ).fetchone()[0]
+        assert stamped == TAG_READER_VERSION
     finally:
         conn.close()
 

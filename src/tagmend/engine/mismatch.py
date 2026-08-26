@@ -24,6 +24,12 @@ The chosen design (see ``aipg/workflows/decide/runs/detect-mislabeled-tags/decis
   disagreement in a folder with mixed ``albumartist`` values), MEDIUM (path disagreement in a
   uniformly mis-stamped folder), LOW (folder-consistency fallback, a non-album-guarded path
   disagreement, or the ``artist`` fallback).
+* **Folder context** — a file in a mixed-``albumartist`` folder that AGREES with its own path
+  is not a defect. It is carried in the report's ``folder_context_rows`` (counted by
+  ``folder_context``), outside ``flagged`` and the tier tallies, so ``flagged`` only ever
+  counts files that need work. The split keys on the FILE's own path agreement, never on
+  which branch emitted the row: a file that disagrees, or whose path signal is nulled by the
+  reliability guard / a container folder / the library root, stays flagged.
 * **Reliability guard** — the library-wide path-disagreement rate; above
   :data:`RELIABILITY_FLOOR` the path likely does not encode artist, so the path tiers
   (HIGH/MEDIUM) are suppressed and only the naming-agnostic folder-consistency LOW is emitted.
@@ -123,6 +129,10 @@ _REASON_GUARDED: Final = (
     "albumartist disagrees with the folder path in a non-album (singles/1-file) folder"
 )
 _REASON_VARIANT: Final = "folder has mixed albumartists but this file agrees with the path"
+_REASON_SUPPRESSED: Final = (
+    "albumartist disagrees with the folder path; library-wide path signal unreliable"
+)
+_REASON_NO_SIGNAL: Final = "folder has mixed albumartists and this file has no path signal"
 _REASON_ARTIST: Final = "artist disagrees with the folder path (no albumartist tag)"
 
 
@@ -287,6 +297,7 @@ class MismatchGroup:
     path_artist: str | None
     file_count: int  # tracked files in the folder (flagged or not)
     flagged: int  # flagged (post-filter) files in the folder
+    folder_context: int  # agrees-with-path review-context files in the folder (not defects)
     tag_values: dict[str, int]  # disagreeing tag value -> count over flagged rows
     tiers: dict[str, int]  # tier -> count over flagged rows
     fields: list[str]  # the disagreeing field names present (sorted)
@@ -300,6 +311,7 @@ class MismatchGroup:
             "path_artist": self.path_artist,
             "file_count": self.file_count,
             "flagged": self.flagged,
+            "folder_context": self.folder_context,
             "tag_values": self.tag_values,
             "tiers": self.tiers,
             "fields": self.fields,
@@ -314,7 +326,11 @@ class MismatchReport:
 
     ``rows`` is the (tier-filtered, capped) worklist; the ``high``/``medium``/``low``/
     ``flagged`` counts describe the whole library MINUS files silenced by a fresh disposition
-    (so a filtered view still shows the full picture of what remains actionable). ``suppressed``
+    (so a filtered view still shows the full picture of what remains actionable), and the tier
+    counts always sum to ``flagged``. ``folder_context_rows`` (counted by ``folder_context``)
+    holds the review-context files — a mixed-albumartist folder's siblings that agree with
+    their own path — kept OUT of ``flagged`` and the tier counts because they are not defects;
+    a ``tier`` filter drops them from the payload entirely. ``suppressed``
     is a disposition-status → count map of the flagged rows a fresh disposition silenced
     (``{}`` when none), so silencing is always visible. ``container_suppressed`` is the separate
     top-folder → file-count map of files whose path signal a configured ``container_folders``
@@ -334,6 +350,8 @@ class MismatchReport:
     summary: str
     suppressed: dict[str, int] = field(default_factory=dict)
     container_suppressed: dict[str, int] = field(default_factory=dict)
+    folder_context: int = 0
+    folder_context_rows: list[MismatchRow] = field(default_factory=list)
     groups: list[MismatchGroup] = field(default_factory=list)
     suppressed_by_folder: dict[str, dict[str, int]] = field(default_factory=dict)
 
@@ -341,12 +359,14 @@ class MismatchReport:
         """JSON-serializable form for the MCP tool."""
         return {
             "rows": [row.to_dict() for row in self.rows],
+            "folder_context_rows": [row.to_dict() for row in self.folder_context_rows],
             "groups": [group.to_dict() for group in self.groups],
             "total_files": self.total_files,
             "flagged": self.flagged,
             "high": self.high,
             "medium": self.medium,
             "low": self.low,
+            "folder_context": self.folder_context,
             # Round at the serialization edge only; the engine float keeps full precision
             # for the RELIABILITY_FLOOR comparison in _reliability.
             "disagreement_rate": round(self.disagreement_rate, 4),
@@ -439,13 +459,41 @@ def _row(a: _Analysis, *, field: str, tag_value: str, tier: Tier, reason: str) -
     )
 
 
+@dataclass(frozen=True, slots=True)
+class _Classified:
+    """One emitted row plus whether it is review context (agrees with its path) or a defect."""
+
+    row: MismatchRow
+    context: bool
+
+
+def _variant_fallback(a: _Analysis, albumartist: str) -> _Classified:
+    """Classify a mixed-albumartist-folder file the tiered path branch did not claim.
+
+    Naming-agnostic fallback, so it survives the reliability guard. The context/defect split
+    keys on the FILE's own path agreement, never on which branch reached here: only a file
+    with a live path signal that it agrees with is context. A file that disagrees (the guard
+    merely denied it a path tier) or one whose path signal is nulled (container folder or
+    library root, so agreement is unknown) stays flagged, each with its own reason.
+    """
+    context = a.top_artist is not None and not a.albumartist_disagrees
+    if context:
+        reason = _REASON_VARIANT
+    elif a.albumartist_disagrees:
+        reason = _REASON_SUPPRESSED
+    else:
+        reason = _REASON_NO_SIGNAL
+    row = _row(a, field="albumartist", tag_value=albumartist, tier=Tier.LOW, reason=reason)
+    return _Classified(row=row, context=context)
+
+
 def _classify_albumartist(
     a: _Analysis,
     albumartist: str,
     stats: _FolderStats,
     *,
     suppressed: bool,
-) -> MismatchRow | None:
+) -> _Classified | None:
     """Classify a file that carries a (non-VA) ``albumartist`` into a tier, or ``None``."""
     disagree = a.albumartist_disagrees
     variant = stats.is_variant(a.file.folder)
@@ -460,13 +508,10 @@ def _classify_albumartist(
             tier, reason = Tier.HIGH, _REASON_HIGH
         else:
             tier, reason = Tier.MEDIUM, _REASON_MEDIUM
-    if tier is None and variant:
-        # Naming-agnostic fallback: a messy folder, but this file agrees with its path (or
-        # the path signal is suppressed). Survives the reliability guard.
-        tier, reason = Tier.LOW, _REASON_VARIANT
     if tier is None:
-        return None
-    return _row(a, field="albumartist", tag_value=albumartist, tier=tier, reason=reason)
+        return _variant_fallback(a, albumartist) if variant else None
+    row = _row(a, field="albumartist", tag_value=albumartist, tier=tier, reason=reason)
+    return _Classified(row=row, context=False)
 
 
 def _classify_artist_fallback(
@@ -474,7 +519,7 @@ def _classify_artist_fallback(
     artist: str,
     *,
     suppressed: bool,
-) -> MismatchRow | None:
+) -> _Classified | None:
     """Classify a file that has no ``albumartist`` via its primary ``artist`` (LOW), or ``None``.
 
     A path-based check, so it is suppressed by the reliability guard alongside HIGH/MEDIUM.
@@ -484,7 +529,8 @@ def _classify_artist_fallback(
     primary = _primary_artist(artist)
     if not _disagrees(primary, a.file.path, a.top_artist):
         return None
-    return _row(a, field="artist", tag_value=artist, tier=Tier.LOW, reason=_REASON_ARTIST)
+    row = _row(a, field="artist", tag_value=artist, tier=Tier.LOW, reason=_REASON_ARTIST)
+    return _Classified(row=row, context=False)
 
 
 def _classify_file(
@@ -492,7 +538,7 @@ def _classify_file(
     stats: _FolderStats,
     *,
     suppressed: bool,
-) -> MismatchRow | None:
+) -> _Classified | None:
     """Route one analyzed file to the albumartist classifier or the artist fallback."""
     f = a.file
     if f.albumartist is not None:
@@ -523,26 +569,28 @@ def _disposition_blocks(disposition: store.MismatchStatusRow, f: _FileInput) -> 
 
 
 def _apply_skip_filter(
-    rows: list[MismatchRow],
+    classified: list[_Classified],
     files_by_id: dict[int, _FileInput],
     dispositions: dict[int, store.MismatchStatusRow],
-) -> tuple[list[MismatchRow], dict[str, int], dict[str, dict[str, int]]]:
-    """Drop every flagged row whose file has a FRESH disposition; tally what was silenced.
+) -> tuple[list[_Classified], dict[str, int], dict[str, dict[str, int]]]:
+    """Drop every emitted row whose file has a FRESH disposition; tally what was silenced.
 
-    Returns ``(kept_rows, suppressed_by_status, suppressed_by_folder)``. A stale disposition
-    (its snapshotted tag has since changed) does not silence, so the row re-surfaces.
+    Returns ``(kept, suppressed_by_status, suppressed_by_folder)``. A stale disposition (its
+    snapshotted tag has since changed) does not silence, so the row re-surfaces. Context rows
+    are filtered alongside flagged ones, so a user disposition still applies to them.
     """
-    kept: list[MismatchRow] = []
+    kept: list[_Classified] = []
     suppressed: dict[str, int] = {}
     by_folder: dict[str, dict[str, int]] = {}
-    for row in rows:
+    for item in classified:
+        row = item.row
         disposition = dispositions.get(row.file_id)
         if disposition is not None and _disposition_blocks(disposition, files_by_id[row.file_id]):
             suppressed[disposition.status] = suppressed.get(disposition.status, 0) + 1
             folder_counts = by_folder.setdefault(row.folder, {})
             folder_counts[disposition.status] = folder_counts.get(disposition.status, 0) + 1
             continue
-        kept.append(row)
+        kept.append(item)
     return kept, suppressed, by_folder
 
 
@@ -574,21 +622,22 @@ def _classify(
                 container_suppressed.get(a.container_folder, 0) + 1
             )
 
-    rows: list[MismatchRow] = []
+    classified: list[_Classified] = []
     for a in analyses:
-        row = _classify_file(a, stats, suppressed=suppressed)
-        if row is not None:
-            rows.append(row)
-    rows.sort(key=lambda r: (_TIER_RANK[Tier(r.tier)], r.file_id))
+        result = _classify_file(a, stats, suppressed=suppressed)
+        if result is not None:
+            classified.append(result)
+    classified.sort(key=lambda c: (_TIER_RANK[Tier(c.row.tier)], c.row.file_id))
 
     files_by_id = {f.file_id: f for f in files}
     kept, suppressed_dispositions, suppressed_by_folder = _apply_skip_filter(
-        rows,
+        classified,
         files_by_id,
         dispositions or {},
     )
     return _assemble_report(
-        kept,
+        [c.row for c in kept if not c.context],
+        context_rows=[c.row for c in kept if c.context],
         total_files=len(files),
         rate=rate,
         suppressed=suppressed,
@@ -601,6 +650,7 @@ def _classify(
 def _assemble_report(  # noqa: PLR0913 - cohesive keyword-only report payload
     rows: list[MismatchRow],
     *,
+    context_rows: list[MismatchRow],
     total_files: int,
     rate: float,
     suppressed: bool,
@@ -608,7 +658,10 @@ def _assemble_report(  # noqa: PLR0913 - cohesive keyword-only report payload
     suppressed_by_folder: dict[str, dict[str, int]],
     container_suppressed: dict[str, int],
 ) -> MismatchReport:
-    """Freeze the kept rows + post-filter counts + guard diagnostics into a report."""
+    """Freeze the kept rows + post-filter counts + guard diagnostics into a report.
+
+    Only *rows* feed the tier tallies and ``flagged``; *context_rows* are counted apart.
+    """
     high = sum(1 for r in rows if r.tier == Tier.HIGH)
     medium = sum(1 for r in rows if r.tier == Tier.MEDIUM)
     low = sum(1 for r in rows if r.tier == Tier.LOW)
@@ -616,6 +669,7 @@ def _assemble_report(  # noqa: PLR0913 - cohesive keyword-only report payload
         high=high,
         medium=medium,
         low=low,
+        folder_context=len(context_rows),
         total_files=total_files,
         suppressed=suppressed,
         suppressed_count=sum(suppressed_dispositions.values()),
@@ -628,6 +682,8 @@ def _assemble_report(  # noqa: PLR0913 - cohesive keyword-only report payload
         high=high,
         medium=medium,
         low=low,
+        folder_context=len(context_rows),
+        folder_context_rows=context_rows,
         disagreement_rate=rate,
         path_signal_suppressed=suppressed,
         summary=summary,
@@ -643,6 +699,7 @@ def _summarize(  # noqa: PLR0913 - cohesive keyword-only summary inputs
     high: int,
     medium: int,
     low: int,
+    folder_context: int,
     total_files: int,
     suppressed: bool,
     suppressed_count: int,
@@ -663,9 +720,10 @@ def _summarize(  # noqa: PLR0913 - cohesive keyword-only summary inputs
         if container_count
         else ""
     )
+    context = f", plus {folder_context} folder-context file(s) that agree with their path"
     return (
         f"Flagged {high + medium + low} of {total_files} file(s): "
-        f"{high} high, {medium} medium, {low} low{note}.{silenced}{container}"
+        f"{high} high, {medium} medium, {low} low{note}{context}.{silenced}{container}"
     )
 
 
@@ -681,15 +739,22 @@ def _clean(value: str | None) -> str | None:
 
 
 def _limit_report(report: MismatchReport, *, tier: str | None, limit: int | None) -> MismatchReport:
-    """Narrow a report's ``rows`` to one *tier* and/or the first *limit*, counts unchanged."""
+    """Narrow a report's ``rows`` to one *tier* and/or the first *limit*, counts unchanged.
+
+    A *tier* query asks for defects of that tier, so it drops the context rows entirely (they
+    carry a tier but sit outside the tier tallies); *limit* caps each list on its own.
+    """
     rows = report.rows
+    context_rows = report.folder_context_rows
     if tier is not None:
         rows = [r for r in rows if r.tier == tier]
+        context_rows = []
     if limit is not None:
         rows = rows[:limit]
-    if rows is report.rows:
+        context_rows = context_rows[:limit]
+    if rows is report.rows and context_rows is report.folder_context_rows:
         return report
-    return replace(report, rows=rows)
+    return replace(report, rows=rows, folder_context_rows=context_rows)
 
 
 def _expand_folder(
@@ -701,21 +766,37 @@ def _expand_folder(
 ) -> MismatchReport:
     """Return the flat rows of EXACTLY *folder* (path equality, never LIKE), tier/limit applied."""
     rows = [r for r in report.rows if r.folder == folder]
-    return _limit_report(replace(report, rows=rows), tier=tier, limit=limit)
+    context_rows = [r for r in report.folder_context_rows if r.folder == folder]
+    narrowed = replace(report, rows=rows, folder_context_rows=context_rows)
+    return _limit_report(narrowed, tier=tier, limit=limit)
+
+
+def _group_by_folder(rows: list[MismatchRow]) -> dict[str, list[MismatchRow]]:
+    """Bucket *rows* by their folder, preserving each folder's row order."""
+    buckets: dict[str, list[MismatchRow]] = {}
+    for row in rows:
+        buckets.setdefault(row.folder, []).append(row)
+    return buckets
 
 
 def _build_groups(
     rows: list[MismatchRow],
+    context_rows: list[MismatchRow],
     stats: _FolderStats,
     suppressed_by_folder: dict[str, dict[str, int]],
 ) -> list[MismatchGroup]:
-    """Collapse flagged *rows* into one :class:`MismatchGroup` per folder (folder-sorted)."""
-    by_folder: dict[str, list[MismatchRow]] = {}
-    for row in rows:
-        by_folder.setdefault(row.folder, []).append(row)
+    """Collapse flagged *rows* + *context_rows* into one group per folder (folder-sorted).
+
+    A folder appears when either list holds a row, but ONLY the flagged rows feed
+    ``tag_values``/``tiers``/``fields``/``file_ids``, so the ``stage_tags_batch`` fix flow can
+    never pick up a context file (one that already agrees with its path).
+    """
+    by_folder = _group_by_folder(rows)
+    context_by_folder = _group_by_folder(context_rows)
     groups: list[MismatchGroup] = []
-    for folder in sorted(by_folder):
-        folder_rows = by_folder[folder]
+    for folder in sorted(by_folder.keys() | context_by_folder.keys()):
+        folder_rows = by_folder.get(folder, [])
+        folder_context = context_by_folder.get(folder, [])
         tag_values: dict[str, int] = {}
         tiers: dict[str, int] = {}
         fields: set[str] = set()
@@ -726,9 +807,10 @@ def _build_groups(
         groups.append(
             MismatchGroup(
                 folder=folder,
-                path_artist=folder_rows[0].path_artist,
+                path_artist=(folder_rows or folder_context)[0].path_artist,
                 file_count=stats.file_count.get(folder, 0),
                 flagged=len(folder_rows),
+                folder_context=len(folder_context),
                 tag_values=tag_values,
                 tiers=tiers,
                 fields=sorted(fields),
@@ -746,12 +828,16 @@ def _grouped_report(
     tier: str | None,
     limit: int | None,
 ) -> MismatchReport:
-    """Build the grouped view: tier filters rows, group by folder, then *limit* caps groups."""
+    """Build the grouped view: tier filters rows, group by folder, then *limit* caps groups.
+
+    A *tier* query drops the context rows, exactly as the flat view does.
+    """
     rows = report.rows if tier is None else [r for r in report.rows if r.tier == tier]
-    groups = _build_groups(rows, stats, report.suppressed_by_folder)
+    context_rows = report.folder_context_rows if tier is None else []
+    groups = _build_groups(rows, context_rows, stats, report.suppressed_by_folder)
     if limit is not None:
         groups = groups[:limit]
-    return replace(report, rows=[], groups=groups)
+    return replace(report, rows=[], folder_context_rows=[], groups=groups)
 
 
 def detect_mismatches(
@@ -768,7 +854,9 @@ def detect_mismatches(
     no network. Every non-missing tracked file is classified into a HIGH/MEDIUM/LOW confidence
     tier (or left unflagged); the library-wide path-disagreement rate drives a reliability
     guard that suppresses the HIGH/MEDIUM path tiers when the path likely does not encode
-    artist (``path_signal_suppressed``). Files under a configured ``container_folders`` top
+    artist (``path_signal_suppressed``). A file in a mixed-albumartist folder that agrees with
+    its own path is review context, not a defect: it lands in ``folder_context_rows`` outside
+    ``flagged`` and the tier counts. Files under a configured ``container_folders`` top
     folder have their path signal suppressed and are counted in the report's
     ``container_suppressed`` map. Files with a still-fresh disposition (set via
     :func:`set_mismatch_status`) are dropped from the flagged rows and reported in the report's
@@ -818,13 +906,14 @@ def detect_mismatches(
         container_folders=container_folders,
     )
     logger.info(
-        "detect complete: total=%d flagged=%d high=%d medium=%d low=%d rate=%.3f "
+        "detect complete: total=%d flagged=%d high=%d medium=%d low=%d context=%d rate=%.3f "
         "suppressed_path=%s silenced=%d",
         report.total_files,
         report.flagged,
         report.high,
         report.medium,
         report.low,
+        report.folder_context,
         report.disagreement_rate,
         report.path_signal_suppressed,
         sum(report.suppressed.values()),

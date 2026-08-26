@@ -424,6 +424,7 @@ def test_revert_commit_dry_run_changes_nothing(
     assert result.dry_run is True
     assert result.commit_id is None
     assert result.reverted == 1  # would-be reverted
+    assert result.noop == 0
     assert result.skipped == 1
     assert _outcome(result, b_id).status == "reverted"
     assert _outcome(result, b_id).target_version == 0
@@ -436,6 +437,70 @@ def test_revert_commit_dry_run_changes_nothing(
     assert read_tags(b).tags["genre"] == ["Metal"]
     # No revert revision was appended.
     assert [r.version for r in _revisions(engine_settings, b_id)] == [0, 1]
+
+
+# --- scenario 8b: a revert that would change nothing is reported as noop -------------
+
+
+def _stamp_managed_set(settings: Settings, file_id: int, version: int, managed_set: int) -> None:
+    """Force one revision's managed-set marker, fabricating a capture under an older set."""
+    conn = connect(settings.db_path)
+    try:
+        apply_schema(conn)
+        conn.execute(
+            "UPDATE tag_revisions SET managed_set = ? WHERE file_id = ? AND version = ?",
+            (managed_set, file_id, version),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _commit_adding_title_over_a_v1_baseline(settings: Settings, file_id: int) -> int:
+    """Commit a widened-field change whose target baseline predates the widening.
+
+    Reverting it can only preserve ``title`` (managed set 1 never governed it), so the
+    revert moves nothing - the exact shape that used to report a false ``reverted``.
+    """
+    target = _stage_and_commit(settings, {file_id: {"genre": ["Electronic"], "title": ["Added"]}})
+    _stamp_managed_set(settings, file_id, version=0, managed_set=1)
+    return target
+
+
+def test_revert_commit_dry_run_reports_noop(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    track = make_track(music_dir / "t.mp3", {"genre": ["Electronic"]})
+    scan_library(engine_settings)
+    file_id = _file_id(engine_settings, music_dir, track.name)
+    target = _commit_adding_title_over_a_v1_baseline(engine_settings, file_id)
+
+    result = versioning.revert_commit(engine_settings, target, dry_run=True)
+
+    assert _outcome(result, file_id).status == "noop"
+    assert result.noop == 1
+    assert result.reverted == 0  # a preview promising 1 revert would be the defect
+
+
+def test_revert_commit_noop_still_appends_the_revision(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    track = make_track(music_dir / "t.mp3", {"genre": ["Electronic"]})
+    scan_library(engine_settings)
+    file_id = _file_id(engine_settings, music_dir, track.name)
+    target = _commit_adding_title_over_a_v1_baseline(engine_settings, file_id)
+
+    result = versioning.revert_commit(engine_settings, target)
+
+    assert result.noop == 1
+    assert result.reverted == 0
+    outcome = _outcome(result, file_id)
+    assert outcome.status == "noop"
+    assert outcome.new_version == 2  # revert is always audited, even when nothing moved
+    assert [r.version for r in _revisions(engine_settings, file_id)] == [0, 1, 2]
+    assert read_tags(track).tags.get("title") == ["Added"]  # untouched on disk
 
 
 # --- scenario 9: crash sim (per-file disk failure, then resume-free re-run) -----------

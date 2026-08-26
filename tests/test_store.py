@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 from tagmend.engine import store
+from tagmend.engine.tags import MANAGED_SET_VERSION, TAG_READER_VERSION
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -49,6 +50,19 @@ def test_insert_get_round_trip(db_conn: sqlite3.Connection) -> None:
     assert row.mtime_ns == 1_000
     assert row.is_missing is False
     assert row.tags_updated_at is None
+    # A newly discovered file is not a leftover of an older reader, so it starts current.
+    assert row.reader_version == TAG_READER_VERSION
+
+
+def test_stamp_reader_version_marks_a_stale_row_current(db_conn: sqlite3.Connection) -> None:
+    file_id = _insert(db_conn, folder="/lib", filename="a.mp3")
+    db_conn.execute("UPDATE files SET reader_version = 0 WHERE id = ?", (file_id,))
+
+    store.stamp_reader_version(db_conn, file_id)
+
+    row = store.get_file(db_conn, "/lib", "a.mp3")
+    assert row is not None
+    assert row.reader_version == TAG_READER_VERSION
 
 
 def test_get_file_absent_returns_none(db_conn: sqlite3.Connection) -> None:
@@ -237,6 +251,9 @@ def test_insert_and_get_revision_round_trip(db_conn: sqlite3.Connection) -> None
     assert rev.managed_tags == {"genre": ["Electronic"], "artist": ["A"]}
     assert rev.diff == {}
     assert store.max_version(db_conn, file_id) == 0
+    # Every new row records the managed set it governed, so revert can read an omitted tag
+    # as "empty then" rather than "not tracked then".
+    assert rev.managed_set == MANAGED_SET_VERSION
 
 
 def test_get_revisions_orders_by_version(db_conn: sqlite3.Connection) -> None:

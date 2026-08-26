@@ -10,12 +10,13 @@ temp ledger via the ``engine_settings`` fixture, so they exercise the full loop 
 Coverage mirrors the approved acceptance criteria: the happy-path cascade, per-file
 accumulation of both name fields, genre preservation (P0), MBID-on-change-only, the
 feat/sentinel/empty + per-file multi-artist guards, idempotent re-run, the no_correction
-list, dry-run, the empty-staging precondition, the limit/more loop, and revert.
+list, dry-run, the empty-staging precondition, the limit/more loop, and revert. The
+post-lookup correction gate (case-only, credit shrink, no MBID) has its own section.
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 import pytest
 
@@ -62,6 +63,28 @@ def _file_id(settings: Settings, folder: Path, filename: str) -> int:
         return row.id
     finally:
         conn.close()
+
+
+# The per-value outcome buckets, which must always sum to ``processed``.
+_BUCKET_NAMES = (
+    "corrected_values",
+    "already_canonical",
+    "shrinks_credit",
+    "needs_review",
+    "no_correction",
+    "errors",
+)
+
+
+def _buckets(result: artists.ResolveArtistsResult) -> dict[str, int]:
+    return {
+        "corrected_values": result.corrected_values,
+        "already_canonical": result.already_canonical,
+        "shrinks_credit": result.shrinks_credit,
+        "needs_review": result.needs_review,
+        "no_correction": result.no_correction,
+        "errors": result.errors,
+    }
 
 
 # --- (1) happy-path cascade + (3) genre preserved ------------------------------------
@@ -168,7 +191,7 @@ def test_feat_sentinel_and_empty_values_are_skipped_and_reported(
     scan_library(engine_settings)
 
     fake = FakeCorrectionSource(
-        {"Miami Nights '84": ArtistCorrection("Miami Nights 1984", None)},
+        {"Miami Nights '84": ArtistCorrection("Miami Nights 1984", "mbid-1")},
     )
     result = artists.resolve_artists(engine_settings, client=fake)
 
@@ -194,7 +217,7 @@ def test_file_with_two_artist_values_is_skipped_as_multi_artist(
 
     fake = FakeCorrectionSource(
         {
-            "Miami Nights '84": ArtistCorrection("Miami Nights 1984", None),
+            "Miami Nights '84": ArtistCorrection("Miami Nights 1984", "mbid-1"),
             "Daft Punk": ArtistCorrection("Daft Punk", None),
         },
     )
@@ -228,10 +251,7 @@ def test_already_canonical_stages_nothing_and_rerun_is_noop(
     assert first.no_correction == 0
     assert first.already_canonical == 1
     assert first.already_canonical_values == ["Daft Punk"]
-    assert (
-        first.corrected_values + first.already_canonical + first.no_correction + first.errors
-        == first.processed
-    )
+    assert sum(_buckets(first).values()) == first.processed
     assert "1 already canonical" in first.summary
 
 
@@ -244,8 +264,8 @@ def test_rerun_after_commit_is_idempotent(
 
     fake = FakeCorrectionSource(
         {
-            "Miami Nights '84": ArtistCorrection("Miami Nights 1984", None),
-            "Miami Nights 1984": ArtistCorrection("Miami Nights 1984", None),
+            "Miami Nights '84": ArtistCorrection("Miami Nights 1984", "mbid-1"),
+            "Miami Nights 1984": ArtistCorrection("Miami Nights 1984", "mbid-1"),
         },
     )
     artists.resolve_artists(engine_settings, client=fake)
@@ -350,6 +370,153 @@ def test_normal_correction_still_stages_with_mbid_alongside_placeholder(
     assert read_tags(good).tags["musicbrainz_artistid"] == ["mbid-1"]
 
 
+# --- (7c) the correction gate: only substantive, MusicBrainz-backed names stage ------
+
+
+class _GateCase(NamedTuple):
+    """One correction routed through the gate, and the single bucket it must land in."""
+
+    value: str
+    canonical: str
+    mbid: str | None
+    bucket: str
+    staged: int
+
+
+_GATE_CASES = [
+    # A collapsed multi-artist credit is held whether or not MusicBrainz backs it.
+    _GateCase("Skrillex & The Doors", "Skrillex", "mbid-skrillex", "shrinks_credit", 0),
+    _GateCase("The Offspring & Redman", "The Offspring", None, "shrinks_credit", 0),
+    # Last.fm casing is not trustworthy, so a case-only difference is already canonical.
+    _GateCase("Dååth", "DÅÅTH", "mbid-daath", "already_canonical", 0),
+    _GateCase("ChthoniC", "Chthonic", None, "already_canonical", 0),
+    # A rename MusicBrainz does not corroborate is held for review, never silent.
+    _GateCase("Travis Scott", "Travi$ Scott", None, "needs_review", 0),
+    # Diacritics are a spelling fix, not casing — with an MBID it stages.
+    _GateCase("Antonio Carlos Jobim", "Antônio Carlos Jobim", "mbid-jobim", "corrected_values", 1),
+    _GateCase("Offspring", "The Offspring", "mbid-offspring", "corrected_values", 1),
+]
+
+
+@pytest.mark.parametrize("case", _GATE_CASES, ids=[c.value for c in _GATE_CASES])
+def test_correction_gate_routes_each_class_to_exactly_one_bucket(
+    engine_settings: Settings,
+    music_dir: Path,
+    case: _GateCase,
+) -> None:
+    make_track(music_dir / "t.mp3", {"artist": [case.value]})
+    scan_library(engine_settings)
+
+    fake = FakeCorrectionSource({case.value: ArtistCorrection(case.canonical, case.mbid)})
+    result = artists.resolve_artists(engine_settings, client=fake)
+
+    expected = dict.fromkeys(_BUCKET_NAMES, 0)
+    expected[case.bucket] = 1
+    assert _buckets(result) == expected
+    assert sum(_buckets(result).values()) == result.processed
+    assert result.staged_files == case.staged
+    assert len(staging.diff_tags(engine_settings)) == case.staged
+
+
+def test_held_corrections_are_reported_with_from_and_to(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    make_track(music_dir / "shrink.mp3", {"artist": ["Sepultura with Mike Patton"]})
+    make_track(music_dir / "review.mp3", {"artist": ["Travis Scott"]})
+    scan_library(engine_settings)
+
+    fake = FakeCorrectionSource(
+        {
+            "Sepultura with Mike Patton": ArtistCorrection("Sepultura", "mbid-sep"),
+            "Travis Scott": ArtistCorrection("Travi$ Scott", None),
+        },
+    )
+    result = artists.resolve_artists(engine_settings, client=fake)
+
+    assert result.shrinks_credit_values == [
+        {"from": "Sepultura with Mike Patton", "to": "Sepultura"},
+    ]
+    assert result.needs_review_values == [{"from": "Travis Scott", "to": "Travi$ Scott"}]
+    assert result.mappings == []
+    assert result.staged_files == 0
+    assert len(staging.diff_tags(engine_settings)) == 0
+
+
+# The value → correction pairs measured against the real library, one per gate outcome.
+_LIVE_CORRECTIONS: dict[str, ArtistCorrection | None] = {
+    "Kruder Dorfmeister": ArtistCorrection("Kruder & Dorfmeister", "mbid-kd"),
+    "Miami Nights '84": ArtistCorrection("Miami Nights 1984", "mbid-mn"),
+    "Offspring": ArtistCorrection("The Offspring", "mbid-off"),
+    "Orb": ArtistCorrection("The Orb", "mbid-orb"),
+    "Smashing Pumpkins": ArtistCorrection("The Smashing Pumpkins", "mbid-sp"),
+    "Antonio Carlos Jobim": ArtistCorrection("Antônio Carlos Jobim", "mbid-acj"),
+    "Skrillex & The Doors": ArtistCorrection("Skrillex", "mbid-skr"),
+    "Ellie Goulding & Madeon": ArtistCorrection("Ellie Goulding", "mbid-eg"),
+    "Dååth": ArtistCorrection("DÅÅTH", "mbid-daath"),
+    "Course of Empire": ArtistCorrection("Course Of Empire", "mbid-coe"),
+    "ChthoniC": ArtistCorrection("Chthonic", "mbid-cht"),
+    "Travis Scott": ArtistCorrection("Travi$ Scott", None),
+}
+
+_LIVE_ACCEPTED = {
+    "Kruder Dorfmeister": "Kruder & Dorfmeister",
+    "Miami Nights '84": "Miami Nights 1984",
+    "Offspring": "The Offspring",
+    "Orb": "The Orb",
+    "Smashing Pumpkins": "The Smashing Pumpkins",
+    "Antonio Carlos Jobim": "Antônio Carlos Jobim",
+}
+
+
+def _make_live_library(music_dir: Path) -> None:
+    for index, value in enumerate(_LIVE_CORRECTIONS):
+        make_track(music_dir / f"t{index}.mp3", {"artist": [value]})
+
+
+def test_gate_stages_only_the_verified_corrections_from_the_live_data(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    _make_live_library(music_dir)
+    scan_library(engine_settings)
+
+    fake = FakeCorrectionSource(dict(_LIVE_CORRECTIONS))
+    result = artists.resolve_artists(engine_settings, client=fake)
+
+    assert {m["from"]: m["to"] for m in result.mappings} == _LIVE_ACCEPTED
+    assert result.staged_files == len(_LIVE_ACCEPTED)
+    assert _buckets(result) == {
+        "corrected_values": 6,
+        "already_canonical": 3,
+        "shrinks_credit": 2,
+        "needs_review": 1,
+        "no_correction": 0,
+        "errors": 0,
+    }
+    assert sum(_buckets(result).values()) == result.processed
+
+
+def test_gate_dry_run_reports_identical_buckets_and_stages_nothing(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    _make_live_library(music_dir)
+    scan_library(engine_settings)
+    fake = FakeCorrectionSource(dict(_LIVE_CORRECTIONS))
+
+    preview = artists.resolve_artists(engine_settings, client=fake, dry_run=True)
+    assert len(staging.diff_tags(engine_settings)) == 0
+
+    applied = artists.resolve_artists(engine_settings, client=fake)
+
+    assert _buckets(preview) == _buckets(applied)
+    assert preview.staged_files == applied.staged_files
+    assert preview.mappings == applied.mappings
+    assert preview.shrinks_credit_values == applied.shrinks_credit_values
+    assert preview.needs_review_values == applied.needs_review_values
+
+
 # --- (8) dry-run ---------------------------------------------------------------------
 
 
@@ -392,7 +559,7 @@ def test_dry_run_ignores_empty_staging_precondition(
     )
 
     fake = FakeCorrectionSource(
-        {"Miami Nights '84": ArtistCorrection("Miami Nights 1984", None)},
+        {"Miami Nights '84": ArtistCorrection("Miami Nights 1984", "mbid-1")},
     )
     # dry_run must NOT raise despite pending changes.
     result = artists.resolve_artists(engine_settings, client=fake, dry_run=True)
@@ -436,15 +603,73 @@ def test_limit_caps_values_and_reports_pending(
 
     fake = FakeCorrectionSource(
         {
-            "Alpha '84": ArtistCorrection("Alpha 1984", None),
-            "Bravo '84": ArtistCorrection("Bravo 1984", None),
-            "Charlie '84": ArtistCorrection("Charlie 1984", None),
+            "Alpha '84": ArtistCorrection("Alpha 1984", "mbid-a"),
+            "Bravo '84": ArtistCorrection("Bravo 1984", "mbid-b"),
+            "Charlie '84": ArtistCorrection("Charlie 1984", "mbid-c"),
         },
     )
     first = artists.resolve_artists(engine_settings, client=fake, limit=2, dry_run=True)
     assert first.processed == 2
     assert first.pending_remaining == 1
     assert first.more is True
+
+
+def test_two_identical_dry_runs_reprocess_the_same_values(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    make_track(music_dir / "a.mp3", {"artist": ["Alpha '84"]})
+    make_track(music_dir / "b.mp3", {"artist": ["Bravo '84"]})
+    scan_library(engine_settings)
+
+    fake = FakeCorrectionSource(
+        {
+            "Alpha '84": ArtistCorrection("Alpha 1984", "mbid-a"),
+            "Bravo '84": ArtistCorrection("Bravo 1984", "mbid-b"),
+        },
+    )
+    first = artists.resolve_artists(engine_settings, client=fake, limit=1, dry_run=True)
+    second = artists.resolve_artists(engine_settings, client=fake, limit=1, dry_run=True)
+
+    # A dry run stages nothing, so the second call sees the identical frontier.
+    assert first.to_dict() == second.to_dict()
+    assert fake.lookups == ["Alpha '84", "Alpha '84"]
+    assert second.pending_remaining == 1
+    assert "call again to continue" not in second.summary
+    assert "Raise limit above 1" in second.summary
+    assert "artist= / file_ids=" in second.summary
+
+
+def test_two_non_dry_runs_with_a_commit_between_do_not_advance_the_frontier(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    make_track(music_dir / "a.mp3", {"artist": ["Alpha '84"]})
+    make_track(music_dir / "b.mp3", {"artist": ["Bravo '84"]})
+    scan_library(engine_settings)
+
+    fake = FakeCorrectionSource(
+        {
+            "Alpha '84": ArtistCorrection("Alpha 1984", "mbid-a"),
+            "Alpha 1984": ArtistCorrection("Alpha 1984", "mbid-a"),
+            "Bravo '84": ArtistCorrection("Bravo 1984", "mbid-b"),
+        },
+    )
+    first = artists.resolve_artists(engine_settings, client=fake, limit=1)
+    assert first.mappings == [{"from": "Alpha '84", "to": "Alpha 1984", "mbid": "mbid-a"}]
+    assert first.pending_remaining == 1
+    staging.commit_tags(engine_settings, origin="auto")
+
+    second = artists.resolve_artists(engine_settings, client=fake, limit=1)
+
+    # The committed value is now canonical, so the limit re-spends itself on that same
+    # value and "Bravo '84" is still out of reach.
+    assert second.already_canonical_values == ["Alpha 1984"]
+    assert second.corrected_values == 0
+    assert second.pending_remaining == 1
+    assert second.staged_files == 0
+    assert "call again to continue" not in second.summary
+    assert "Raise limit above 1" in second.summary
 
 
 # --- (11) revert round-trip across all four formats ----------------------------------
@@ -471,7 +696,7 @@ def test_manual_excluded_file_is_skipped_and_reported(
     assert affected == 1
 
     fake = FakeCorrectionSource(
-        {"Miami Nights '84": ArtistCorrection("Miami Nights 1984", None)},
+        {"Miami Nights '84": ArtistCorrection("Miami Nights 1984", "mbid-1")},
     )
     result = artists.resolve_artists(engine_settings, client=fake)
 
@@ -517,7 +742,7 @@ def test_manual_is_sticky_across_rerun(
     artists.set_artist_status(engine_settings, file_ids=[file_id], status="manual")
 
     fake = FakeCorrectionSource(
-        {"Miami Nights '84": ArtistCorrection("Miami Nights 1984", None)},
+        {"Miami Nights '84": ArtistCorrection("Miami Nights 1984", "mbid-1")},
     )
     first = artists.resolve_artists(engine_settings, client=fake)
     second = artists.resolve_artists(engine_settings, client=fake)
@@ -538,7 +763,7 @@ def test_reset_artist_status_requeues(
     assert artists.reset_artist_status(engine_settings, file_ids=[file_id]) == 1
 
     fake = FakeCorrectionSource(
-        {"Miami Nights '84": ArtistCorrection("Miami Nights 1984", None)},
+        {"Miami Nights '84": ArtistCorrection("Miami Nights 1984", "mbid-1")},
     )
     result = artists.resolve_artists(engine_settings, client=fake)
     assert result.skipped_manual == 0

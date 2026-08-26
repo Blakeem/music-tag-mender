@@ -13,10 +13,12 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from tagmend.engine import commits, store, versioning
+from tagmend.engine import commits, db, schema, staging, store, versioning
 
 if TYPE_CHECKING:
     import sqlite3
+
+    from tagmend.config import Settings
 
 _NOW = "2026-06-02T00:00:00+00:00"
 _LATER = "2026-06-02T01:00:00+00:00"
@@ -194,3 +196,88 @@ def test_append_revision_threads_commit_id(db_conn: sqlite3.Connection) -> None:
     assert v2 == 2
     assert store.get_revision(db_conn, file_id, 2).commit_id is None  # type: ignore[union-attr]
     assert store.get_revision(db_conn, file_id, 0).commit_id is None  # type: ignore[union-attr]
+
+
+# --- stage_tags_batch entry-shape validation ---------------------------------------
+
+
+def _seed_file(settings: Settings, filename: str) -> int:
+    """Insert one file row into the ledger *settings* points at; no audio on disk."""
+    conn = db.connect(settings.db_path)
+    try:
+        schema.apply_schema(conn)
+        file_id = store.insert_file(
+            conn,
+            folder=str(settings.music_path),
+            filename=filename,
+            ext=".mp3",
+            size_bytes=1,
+            mtime_ns=1,
+            now=_NOW,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return file_id
+
+
+def _staged_ids(settings: Settings) -> list[int]:
+    conn = db.connect(settings.db_path)
+    try:
+        schema.apply_schema(conn)
+        return [row.file_id for row in store.list_staged_tags(conn)]
+    finally:
+        conn.close()
+
+
+def test_stage_tags_batch_rejects_mcp_shaped_dict_entry(engine_settings: Settings) -> None:
+    file_id = _seed_file(engine_settings, "a.mp3")
+
+    with pytest.raises(ValueError, match=r"entry 0: expected a \(file_id, tags\) tuple") as excinfo:
+        staging.stage_tags_batch(
+            engine_settings,
+            entries=[{"file_id": file_id, "tags": {"genre": ["Rock"]}}],
+        )
+    # The old destructuring bug reported this shape error as a duplicate id.
+    assert "duplicate" not in str(excinfo.value)
+    assert _staged_ids(engine_settings) == []
+
+
+def test_stage_tags_batch_rejects_non_integer_file_id(engine_settings: Settings) -> None:
+    _seed_file(engine_settings, "a.mp3")
+
+    with pytest.raises(ValueError, match="entry 0: file_id must be an integer"):
+        staging.stage_tags_batch(engine_settings, entries=[("1", {"genre": ["Rock"]})])
+    assert _staged_ids(engine_settings) == []
+
+
+def test_stage_tags_batch_rejects_wrong_length_tuple(engine_settings: Settings) -> None:
+    file_id = _seed_file(engine_settings, "a.mp3")
+
+    with pytest.raises(ValueError, match=r"entry 1: expected a \(file_id, tags\) tuple of 2"):
+        staging.stage_tags_batch(
+            engine_settings,
+            entries=[(file_id, {"genre": ["Rock"]}), (file_id, {"genre": ["Metal"]}, "extra")],
+        )
+    assert _staged_ids(engine_settings) == []
+
+
+def test_stage_tags_batch_rejects_non_dict_tags(engine_settings: Settings) -> None:
+    file_id = _seed_file(engine_settings, "a.mp3")
+
+    with pytest.raises(ValueError, match=r"entry 0 .*: tags must be a dict"):
+        staging.stage_tags_batch(engine_settings, entries=[(file_id, "Rock")])
+    assert _staged_ids(engine_settings) == []
+
+
+def test_stage_tags_batch_valid_entries_still_stage(engine_settings: Settings) -> None:
+    a_id = _seed_file(engine_settings, "a.mp3")
+    b_id = _seed_file(engine_settings, "b.mp3")
+
+    staged = staging.stage_tags_batch(
+        engine_settings,
+        entries=[(a_id, {"genre": ["Rock"]}), (b_id, {"genre": ["Metal"]})],
+    )
+
+    assert staged == [a_id, b_id]
+    assert _staged_ids(engine_settings) == [a_id, b_id]

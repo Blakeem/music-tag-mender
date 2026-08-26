@@ -8,8 +8,8 @@ This is the only module here that owns transaction/commit policy and stitches to
 
 Scan modes:
 
-* ``incremental`` (default) — read tags only when the size/mtime signature changed or
-  the file has never had its tags read.
+* ``incremental`` (default) — read tags only when the size/mtime signature changed, the
+  file has never had its tags read, or an older tag reader wrote the stored row.
 * ``full`` — re-read tags for every file regardless of signature.
 * ``presence`` — only reconcile existence (added/missing/restored); never read tags.
 """
@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING
 import mutagen
 
 from tagmend.engine import db, scan, schema, store, versioning
-from tagmend.engine.tags import read_tags
+from tagmend.engine.tags import TAG_READER_VERSION, read_tags
 from tagmend.log import get_logger
 
 if TYPE_CHECKING:
@@ -477,19 +477,36 @@ def _process_existing_file(  # noqa: PLR0913 - cohesive reconcile inputs, all re
         counters.unchanged += 1
 
     tags_unread = existing.tags_updated_at is None
-    if not _should_read_tags(mode, sig_changed=sig_changed, tags_unread=tags_unread):
+    reader_stale = existing.reader_version < TAG_READER_VERSION
+    if not _should_read_tags(
+        mode,
+        sig_changed=sig_changed,
+        tags_unread=tags_unread,
+        reader_stale=reader_stale,
+    ):
         return
     current = store.get_tags(conn, existing.id)
     _try_read_and_store(conn, path, existing.id, counters, current=current)
 
 
-def _should_read_tags(mode: ScanMode, *, sig_changed: bool, tags_unread: bool) -> bool:
-    """Decide whether tags should be (re-)read for an existing file."""
+def _should_read_tags(
+    mode: ScanMode,
+    *,
+    sig_changed: bool,
+    tags_unread: bool,
+    reader_stale: bool,
+) -> bool:
+    """Decide whether tags should be (re-)read for an existing file.
+
+    *reader_stale* is the third incremental trigger: an unchanged file whose row an older
+    tag reader wrote reads correct-looking but stale, and no signature change will ever
+    refresh it. ``presence`` still reads nothing, stale reader or not.
+    """
     if mode is ScanMode.PRESENCE:
         return False
     if mode is ScanMode.FULL:
         return True
-    return sig_changed or tags_unread
+    return sig_changed or tags_unread or reader_stale
 
 
 def _try_read_and_store(
@@ -513,6 +530,10 @@ def _try_read_and_store(
         counters.errors += 1
         return
 
+    # Stamped before the identical-tags early return below: an unchanged re-read still
+    # refreshed the row with the current reader, and stamping only where replace_tags runs
+    # would leave the ~99% that match stale and re-read on every incremental scan.
+    store.stamp_reader_version(conn, file_id)
     if new_tags == current:
         return
     store.replace_tags(conn, file_id, new_tags, _utc_now())

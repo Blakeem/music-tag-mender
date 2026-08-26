@@ -160,6 +160,7 @@ def detect_mismatches(
     for group_row in report.groups:
         typer.echo(
             f"  {group_row.flagged:3}/{group_row.file_count:<3} flagged  "
+            f"{group_row.folder_context:3} context  "
             f"path={group_row.path_artist!r}  {group_row.folder}",
         )
     for row in report.rows:

@@ -174,6 +174,7 @@ def resolve_years(  # noqa: PLR0913 - cohesive keyword-only scope + injection pa
         tally,
         processed=len(to_process),
         pending_remaining=pending_remaining,
+        dry_run=dry_run,
     )
 
 
@@ -393,6 +394,7 @@ def _build_result(
     *,
     processed: int,
     pending_remaining: int,
+    dry_run: bool,
 ) -> ResolveYearsResult:
     """Freeze the run's tally + counts into the public :class:`ResolveYearsResult`."""
     mappings = [
@@ -400,7 +402,12 @@ def _build_result(
         for (artist, album), date in tally.mappings.items()
     ]
     more = pending_remaining > 0
-    summary = _summarize(tally, processed=processed, pending_remaining=pending_remaining)
+    summary = _summarize(
+        tally,
+        processed=processed,
+        pending_remaining=pending_remaining,
+        dry_run=dry_run,
+    )
     return ResolveYearsResult(
         processed=processed,
         staged_files=tally.staged_files,
@@ -421,15 +428,30 @@ def _summarize(
     *,
     processed: int,
     pending_remaining: int,
+    dry_run: bool,
 ) -> str:
-    """Build a short, plain human summary of what was and was not processed."""
+    """Build a short, plain human summary of what was and was not processed.
+
+    Every count carries its unit because the run mixes two: ``processed`` counts album
+    groups, every other count counts files. A dry run records neither a stage nor a
+    ``no_match``, so its remainder is not resumable and is worded accordingly.
+    """
     parts = [
         f"Processed {processed} album group(s): staged {tally.staged_files} file(s), "
-        f"no_match {tally.no_match}.",
-        f"Skipped present {tally.skipped_present}, no_album {tally.skipped_no_album}, "
-        f"no_artist {tally.skipped_no_artist}, manual {tally.skipped_manual}.",
+        f"no_match {tally.no_match} file(s).",
+        f"Skipped {tally.skipped_present} file(s) present, "
+        f"{tally.skipped_no_album} file(s) no_album, "
+        f"{tally.skipped_no_artist} file(s) no_artist, "
+        f"{tally.skipped_manual} file(s) manual.",
     ]
-    if pending_remaining > 0:
+    if pending_remaining > 0 and dry_run:
+        parts.append(
+            f"Processed the first {processed} of {processed + pending_remaining} album "
+            f"group(s) in scope. A dry run records nothing, so an identical call "
+            f"re-processes the same groups. Raise limit above {processed}, or scope with "
+            f"album= / file_ids=, to reach the remaining {pending_remaining} group(s).",
+        )
+    elif pending_remaining > 0:
         parts.append(f"{pending_remaining} group(s) still pending — call again to continue.")
     return " ".join(parts)
 
@@ -553,6 +575,7 @@ def list_albums(
     settings: Settings,
     *,
     year_status: str | None = None,
+    actionable: bool = False,
     limit: int | None = None,
 ) -> list[AlbumRow]:
     """Return each distinct album group with its file count + a representative status.
@@ -563,9 +586,10 @@ def list_albums(
     :func:`resolve_years` can actually fill; ``> 0`` marks an actionable group). A
     discovery aid for scoping ``resolve_years``. Read-only.
 
-    *year_status* (when given) keeps only groups whose derived status matches, applied
-    AFTER ordering and BEFORE *limit*. *limit* (when given) caps the number of rows
-    returned so a large library stays context-cheap.
+    *year_status* (when given) keeps only groups whose derived status matches. *actionable*
+    keeps only the actionable groups, those with ``blank_originaldate > 0``. The two
+    compose, and both are applied AFTER ordering and BEFORE *limit*. *limit* (when given)
+    caps the number of rows returned so a large library stays context-cheap.
     """
     connection = db.connect(settings.db_path)
     try:
@@ -598,6 +622,8 @@ def list_albums(
     ordered = sorted(rows, key=lambda r: (r.artist or "", r.album))
     if year_status is not None:
         ordered = [row for row in ordered if row.year_status == year_status]
+    if actionable:
+        ordered = [row for row in ordered if row.blank_originaldate > 0]
     if limit is not None:
         ordered = ordered[:limit]
     return ordered

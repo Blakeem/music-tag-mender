@@ -32,7 +32,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from tagmend.engine import axis, commits, db, schema, store, versioning
 from tagmend.engine.tags import MANAGED_TAGS, read_tags, write_managed_tags
@@ -40,6 +40,7 @@ from tagmend.log import get_logger
 
 if TYPE_CHECKING:
     import sqlite3
+    from collections.abc import Sequence
 
     from tagmend.config import Settings
     from tagmend.engine.commits import CommitResult
@@ -284,28 +285,72 @@ def stage_tags(
     logger.info("staged tags for file_id=%d (origin=%s)", file_id, origin)
 
 
+_BATCH_ENTRY_WIDTH = 2
+
+
+def _validate_batch_entries(entries: Sequence[object]) -> list[tuple[int, dict[str, list[str]]]]:
+    """Narrow an untyped *entries* sequence to ``(file_id, managed_tags)`` pairs, or raise.
+
+    The parameter is deliberately untyped: under mypy strict these checks would be
+    unreachable against the declared pair type, yet an engine-side caller handing over the
+    MCP-shaped ``{"file_id": .., "tags": ..}`` dict gets its two KEYS destructured instead,
+    so the shape error surfaces as a nonsense ``duplicate file_id=file_id in batch``.
+    Every message names the offending index.
+    """
+    validated: list[tuple[int, dict[str, list[str]]]] = []
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, tuple):
+            message = f"entry {index}: expected a (file_id, tags) tuple, got {type(entry).__name__}"
+            raise ValueError(message)  # noqa: TRY004 - batch rejections are uniformly ValueError
+        if len(entry) != _BATCH_ENTRY_WIDTH:
+            message = f"entry {index}: expected a (file_id, tags) tuple of 2, got {len(entry)}"
+            raise ValueError(message)
+        file_id, tags = entry
+        if not isinstance(file_id, int) or isinstance(file_id, bool):
+            message = f"entry {index}: file_id must be an integer, got {type(file_id).__name__}"
+            raise ValueError(message)  # noqa: TRY004 - batch rejections are uniformly ValueError
+        if not isinstance(tags, dict):
+            message = (
+                f"entry {index} (file_id={file_id}): tags must be a dict of "
+                f"name -> list of values, got {type(tags).__name__}"
+            )
+            raise ValueError(message)  # noqa: TRY004 - batch rejections are uniformly ValueError
+        for name, values in tags.items():
+            if not isinstance(values, list) or not all(isinstance(v, str) for v in values):
+                message = (
+                    f"entry {index} (file_id={file_id}): tags[{name!r}] must be a list of strings"
+                )
+                raise ValueError(message)
+        validated.append((file_id, cast("dict[str, list[str]]", tags)))
+    return validated
+
+
 def stage_tags_batch(
     settings: Settings,
     *,
-    entries: list[tuple[int, dict[str, list[str]]]],
+    entries: Sequence[object],
     note: str | None = None,
 ) -> list[int]:
     """Stage N files' managed-tag changes in ONE connection / ONE transaction (all-or-nothing).
 
-    *entries* is a list of ``(file_id, managed_tags)`` items. Each is validated and staged
-    through the SAME :func:`_stage_one` core as :func:`stage_tags` (unmanaged-key rejection,
-    unknown/missing-file rejection, lazy v0 baseline, merge-onto-current-subset), so single
-    and batch can never drift. The ``origin`` is hardcoded ``"manual"`` (this flow never
-    auto-stages — no origin parameter is exposed). A duplicate ``file_id`` in one batch, or any
-    invalid entry, raises :class:`ValueError` naming the offending id and NOTHING is staged
-    (the shared transaction is rolled back on close). A later :func:`commit_tags` groups the
-    whole batch into ONE revertible commit. Returns the staged file ids in input order.
+    *entries* is a sequence of ``(file_id, managed_tags)`` tuples. Every entry's SHAPE is
+    checked first by :func:`_validate_batch_entries` (a :class:`ValueError` naming the index
+    and what was wrong), then each is validated and staged through the SAME :func:`_stage_one`
+    core as :func:`stage_tags` (unmanaged-key rejection, unknown/missing-file rejection, lazy
+    v0 baseline, merge-onto-current-subset), so single and batch can never drift. The
+    ``origin`` is hardcoded ``"manual"`` (this flow never auto-stages — no origin parameter is
+    exposed). A malformed entry, a duplicate ``file_id`` in one batch, or any invalid entry
+    raises :class:`ValueError` and NOTHING is staged (the shared transaction is rolled back on
+    close). A later :func:`commit_tags` groups the whole batch into ONE revertible commit.
+    Returns the staged file ids in input order.
 
     ``tracknumber``/``discnumber`` values are staged VERBATIM (callers supply the full
     ``"n/total"`` strings); this helper never parses or computes them.
     """
+    validated = _validate_batch_entries(entries)
+
     seen: set[int] = set()
-    for file_id, _ in entries:
+    for file_id, _ in validated:
         if file_id in seen:
             message = f"duplicate file_id={file_id} in batch"
             raise ValueError(message)
@@ -315,7 +360,7 @@ def stage_tags_batch(
     try:
         schema.apply_schema(connection)
         now = _utc_now()
-        for file_id, managed_tags in entries:
+        for file_id, managed_tags in validated:
             _stage_one(
                 connection,
                 file_id=file_id,
@@ -328,7 +373,7 @@ def stage_tags_batch(
     finally:
         connection.close()
 
-    staged_ids = [file_id for file_id, _ in entries]
+    staged_ids = [file_id for file_id, _ in validated]
     logger.info("staged batch of %d file(s)", len(staged_ids))
     return staged_ids
 

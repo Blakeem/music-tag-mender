@@ -22,6 +22,7 @@ from tagmend.engine.library import (
     scan_library,
 )
 from tagmend.engine.schema import apply_schema
+from tagmend.engine.tags import TAG_READER_VERSION
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -49,6 +50,44 @@ def _stored_genre(settings: Settings, folder: Path, filename: str) -> list[str]:
         row = store.get_file(conn, str(folder), filename)
         assert row is not None
         return store.get_tags(conn, row.id).get("genre", [])
+    finally:
+        conn.close()
+
+
+def _make_snapshot_stale(settings: Settings, folder: Path, filename: str, genre: str) -> None:
+    """Rewrite one file's stored genre to *genre* and mark the row as an older reader's.
+
+    Reproduces the live-run failure: the snapshot disagrees with the file while its
+    size/mtime signature is untouched, so nothing but the reader stamp can bring an
+    incremental scan back to it.
+    """
+    conn = connect(settings.db_path)
+    try:
+        apply_schema(conn)
+        row = store.get_file(conn, str(folder), filename)
+        assert row is not None
+        conn.execute(
+            "UPDATE file_tags SET value = ? WHERE file_id = ? AND name = 'genre'",
+            (genre, row.id),
+        )
+        conn.execute("UPDATE files SET reader_version = 0 WHERE id = ?", (row.id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _mark_snapshot_wrong(settings: Settings, folder: Path, filename: str, genre: str) -> None:
+    """Rewrite one file's stored genre but leave its reader stamp current."""
+    conn = connect(settings.db_path)
+    try:
+        apply_schema(conn)
+        row = store.get_file(conn, str(folder), filename)
+        assert row is not None
+        conn.execute(
+            "UPDATE file_tags SET value = ? WHERE file_id = ? AND name = 'genre'",
+            (genre, row.id),
+        )
+        conn.commit()
     finally:
         conn.close()
 
@@ -159,6 +198,62 @@ def test_rescan_is_noop(engine_settings: Settings, music_dir: Path) -> None:
     assert result.added == 0
     assert result.updated == 0
     assert result.tags_read == 0
+
+
+def test_stale_reader_version_forces_an_incremental_reread(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    tracks = _populate(music_dir, _N)
+    scan_library(engine_settings)
+    _make_snapshot_stale(engine_settings, music_dir, tracks[0].name, "Tattooed Corpse")
+
+    reread = scan_library(engine_settings)
+
+    # No signature moved: the stale stamp alone brought the scan back to the file.
+    assert reread.updated == 0
+    assert reread.tags_read == 1
+    assert _stored_genre(engine_settings, music_dir, tracks[0].name) == ["Synthwave"]
+    assert _file_row(engine_settings, music_dir, tracks[0].name).reader_version == (
+        TAG_READER_VERSION
+    )
+
+
+def test_current_reader_version_settles_after_one_reread(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    tracks = _populate(music_dir, _N)
+    scan_library(engine_settings)
+    _make_snapshot_stale(engine_settings, music_dir, tracks[0].name, "Tattooed Corpse")
+    scan_library(engine_settings)  # the one re-read the stale stamp buys
+
+    # Corrupt the snapshot again, this time leaving the stamp current. An unchanged re-read
+    # is never tallied in tags_read, so the surviving wrong value is what proves the third
+    # scan read nothing off disk.
+    _mark_snapshot_wrong(engine_settings, music_dir, tracks[0].name, "Tattooed Corpse")
+    settled = scan_library(engine_settings)
+
+    assert settled.tags_read == 0
+    assert _stored_genre(engine_settings, music_dir, tracks[0].name) == ["Tattooed Corpse"]
+    assert _file_row(engine_settings, music_dir, tracks[0].name).reader_version == (
+        TAG_READER_VERSION
+    )
+
+
+def test_presence_mode_ignores_a_stale_reader_version(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    tracks = _populate(music_dir, _N)
+    scan_library(engine_settings)
+    _make_snapshot_stale(engine_settings, music_dir, tracks[0].name, "Tattooed Corpse")
+
+    result = scan_library(engine_settings, mode=ScanMode.PRESENCE)
+
+    assert result.tags_read == 0
+    assert _stored_genre(engine_settings, music_dir, tracks[0].name) == ["Tattooed Corpse"]
+    assert _file_row(engine_settings, music_dir, tracks[0].name).reader_version == 0
 
 
 def test_changed_tags_are_reread(engine_settings: Settings, music_dir: Path) -> None:

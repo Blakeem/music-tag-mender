@@ -371,6 +371,10 @@ def test_year_status_tools_and_list_albums(music_dir: Path) -> None:
     assert isinstance(pending_only["albums"], list)
     assert all(r["year_status"] == "pending" for r in pending_only["albums"])
     assert any(r["album"] == "Paranoid" for r in pending_only["albums"])
+    actionable_only = mcp_server.list_albums(actionable=True)
+    assert isinstance(actionable_only["albums"], list)
+    assert all(r["blank_originaldate"] > 0 for r in actionable_only["albums"])
+    assert any(r["album"] == "Paranoid" for r in actionable_only["albums"])
 
 
 def test_list_artists_limit_param(music_dir: Path) -> None:
@@ -418,6 +422,7 @@ def test_history_and_revert_roundtrip(music_dir: Path) -> None:
     assert reverted["file_id"] == file_id
     assert reverted["target_version"] == 0
     assert reverted["new_version"] == 2
+    assert reverted["status"] == "reverted"  # tags really moved on disk
     # The single-file revert now lands under its own origin='revert' commit.
     assert isinstance(reverted["commit_id"], int)
     assert mcp_server.get_commit(reverted["commit_id"])["ok"] is True
@@ -459,6 +464,7 @@ def test_revert_commit_roundtrip(music_dir: Path) -> None:
     assert reverted["ok"] is True
     assert reverted["reverted_from"] == target
     assert reverted["reverted"] == 1
+    assert reverted["noop"] == 0
     assert reverted["dry_run"] is False
     assert isinstance(reverted["commit_id"], int)
     assert reverted["commit_id"] != target

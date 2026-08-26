@@ -20,6 +20,12 @@ Design notes (the spec):
   compilation sentinels (``various artists``/``various``/``va``), and empty values are
   dropped from the distinct-value scan. The multi-value guard is separate and runs per
   file: any file whose ``artist`` or ``albumartist`` list has ``len > 1`` is skipped.
+* **Correction gate (post-lookup, held not staged):** Last.fm casing is not trustworthy, so
+  a case-only difference is already canonical. A canonical name contained in the source is
+  a collapsed multi-artist credit (``Skrillex & The Doors`` → ``Skrillex``) and is held
+  regardless of MBID — the ``&``/``with``/``vs`` family the pre-lookup ``feat`` guard cannot
+  see. A correction MusicBrainz does not corroborate (no MBID) is held for review. Held
+  values are reported, never written.
 * **"Done" is derived**, never stored — re-running after commit is a no-op because an
   already-canonical value yields no change. No new table; getCorrection results live in
   the generic ``lastfm_cache``.
@@ -98,6 +104,26 @@ def _is_placeholder(name: str) -> bool:
     return _MB_PLACEHOLDER_RE.match(name.strip()) is not None
 
 
+def _is_case_only(value: str, canonical: str) -> bool:
+    """Return whether *canonical* differs from *value* by casing alone (or not at all).
+
+    Diacritics are deliberately not folded away: ``Antonio`` → ``Antônio`` is a spelling
+    fix, not a casing opinion, and must stay eligible for staging.
+    """
+    return value.casefold() == canonical.casefold()
+
+
+def _shrinks_credit(value: str, canonical: str) -> bool:
+    """Return whether *canonical* is a strict fold-case substring of *value*.
+
+    That shape is a multi-artist credit collapsed onto one member, which no MBID can
+    justify. Equality is excluded so an already-canonical value is not read as a shrink.
+    """
+    folded_value = value.casefold()
+    folded_canonical = canonical.casefold()
+    return folded_canonical != folded_value and folded_canonical in folded_value
+
+
 # --- result types --------------------------------------------------------------------
 
 
@@ -113,6 +139,8 @@ class ResolveArtistsResult:
     skipped_manual: int
     no_correction: int
     already_canonical: int
+    shrinks_credit: int
+    needs_review: int
     errors: int
     pending_remaining: int
     more: bool
@@ -121,6 +149,8 @@ class ResolveArtistsResult:
     manual_files: list[int]
     no_correction_values: list[str]
     already_canonical_values: list[str]
+    shrinks_credit_values: list[dict[str, str]]
+    needs_review_values: list[dict[str, str]]
     error_values: list[dict[str, str]]
     summary: str
 
@@ -135,6 +165,8 @@ class ResolveArtistsResult:
             "skipped_manual": self.skipped_manual,
             "no_correction": self.no_correction,
             "already_canonical": self.already_canonical,
+            "shrinks_credit": self.shrinks_credit,
+            "needs_review": self.needs_review,
             "errors": self.errors,
             "pending_remaining": self.pending_remaining,
             "more": self.more,
@@ -143,6 +175,8 @@ class ResolveArtistsResult:
             "manual_files": list(self.manual_files),
             "no_correction_values": list(self.no_correction_values),
             "already_canonical_values": list(self.already_canonical_values),
+            "shrinks_credit_values": [dict(h) for h in self.shrinks_credit_values],
+            "needs_review_values": [dict(h) for h in self.needs_review_values],
             "error_values": [dict(e) for e in self.error_values],
             "summary": self.summary,
         }
@@ -160,8 +194,10 @@ class _Tally:
     manual_files: list[int] = field(default_factory=list)
     no_correction_values: list[str] = field(default_factory=list)
     already_canonical_values: list[str] = field(default_factory=list)
+    shrinks_credit_values: list[dict[str, str]] = field(default_factory=list)
+    needs_review_values: list[dict[str, str]] = field(default_factory=list)
     error_values: list[dict[str, str]] = field(default_factory=list)
-    # value -> correction (only those whose canonical form actually differs).
+    # value -> correction: only the substantive, MBID-backed ones the gate accepts.
     corrections: dict[str, ArtistCorrection] = field(default_factory=dict)
 
 
@@ -187,9 +223,12 @@ def resolve_artists(  # noqa: PLR0913 - cohesive keyword-only scope + injection 
     plus the correction's MBID as an ``origin='auto'`` change (only ``artist`` /
     ``albumartist`` / ``musicbrainz_artistid`` touched — every other managed tag preserved).
 
-    *limit* caps the number of distinct values processed per call; the remainder is
-    reported via ``pending_remaining`` / ``more`` so a large library chunks. A transient
-    Last.fm error leaves that value pending (not cached) and is reported, never aborting.
+    *limit* caps the number of distinct values processed per call and the remainder is
+    reported via ``pending_remaining`` / ``more``. It is a cap, not a cursor: a value that
+    needs no change leaves no trace, so an identical repeat call re-processes the same
+    values. Raise *limit*, or narrow with *artist* / *file_ids*, to reach the rest. A
+    transient Last.fm error leaves that value pending (not cached) and is reported, never
+    aborting.
 
     *dry_run* returns the proposed ``value → canonical`` mappings and the would-stage file
     count, stages nothing, and works from cache (no precondition). A non-dry-run raises
@@ -337,13 +376,15 @@ def _resolve_one_value(
     client: CorrectionSource,
     tally: _Tally,
 ) -> None:
-    """Look up one value's correction; record a change, a no-correction, or a transient error.
+    """Look up one value's correction and route it to exactly one outcome bucket.
 
     A transient :class:`LastfmError` leaves the value pending (not cached) and is reported,
-    never aborting the run. A correction equal to the current value is already canonical →
-    no change, but recorded (``already_canonical``) so the outcome buckets sum to
-    ``processed``. A correction to a MusicBrainz special-purpose placeholder (``[unknown]``,
-    ``[no artist]``, …) is not a real name and is treated exactly like no correction.
+    never aborting the run. A correction to a MusicBrainz special-purpose placeholder
+    (``[unknown]``, ``[no artist]``, …) is not a real name and is treated exactly like no
+    correction. The surviving corrections pass the gate in order — case-only (already
+    canonical), credit shrink (held), no MBID (held) — so a name is only staged when it is a
+    substantive change MusicBrainz corroborates. Every value lands in one bucket, so the
+    buckets sum to ``processed``.
     """
     try:
         correction = client.artist_correction(value)
@@ -356,10 +397,20 @@ def _resolve_one_value(
         tally.no_correction_values.append(value)
         return
 
-    if correction.name != value:
-        tally.corrections[value] = correction
-    else:
+    canonical = correction.name
+    if _is_case_only(value, canonical):
         tally.already_canonical_values.append(value)
+        return
+
+    if _shrinks_credit(value, canonical):
+        tally.shrinks_credit_values.append({"from": value, "to": canonical})
+        return
+
+    if not correction.mbid:
+        tally.needs_review_values.append({"from": value, "to": canonical})
+        return
+
+    tally.corrections[value] = correction
 
 
 # --- staging -------------------------------------------------------------------------
@@ -474,6 +525,8 @@ def _build_result(
         skipped_manual=tally.skipped_manual,
         no_correction=len(tally.no_correction_values),
         already_canonical=len(tally.already_canonical_values),
+        shrinks_credit=len(tally.shrinks_credit_values),
+        needs_review=len(tally.needs_review_values),
         errors=len(tally.error_values),
         pending_remaining=pending_remaining,
         more=more,
@@ -482,6 +535,8 @@ def _build_result(
         manual_files=list(tally.manual_files),
         no_correction_values=list(tally.no_correction_values),
         already_canonical_values=list(tally.already_canonical_values),
+        shrinks_credit_values=[dict(h) for h in tally.shrinks_credit_values],
+        needs_review_values=[dict(h) for h in tally.needs_review_values],
         error_values=list(tally.error_values),
         summary=summary,
     )
@@ -493,7 +548,12 @@ def _summarize(
     processed: int,
     pending_remaining: int,
 ) -> str:
-    """Build a short, plain human summary of what was and was not processed."""
+    """Build a short, plain human summary of what was and was not processed.
+
+    The unprocessed remainder is never described as resumable: no bucket other than an
+    accepted correction writes a row, so nothing shrinks the distinct-value list between
+    two identical calls, on the dry-run path or the real one.
+    """
     parts = [
         f"Processed {processed} value(s): {len(tally.corrections)} corrected, "
         f"staged {tally.staged_files} file(s).",
@@ -502,9 +562,17 @@ def _summarize(
         f"manual {tally.skipped_manual}; "
         f"{len(tally.already_canonical_values)} already canonical, "
         f"no correction {len(tally.no_correction_values)}.",
+        f"Held (reported, never staged): credit shrink {len(tally.shrinks_credit_values)}, "
+        f"needs review {len(tally.needs_review_values)}.",
     ]
     if pending_remaining > 0:
-        parts.append(f"{pending_remaining} value(s) still pending — call again to continue.")
+        parts.append(
+            f"Processed the first {processed} of {processed + pending_remaining} value(s) "
+            f"in scope. An identical call re-processes the same values instead of "
+            f"advancing, because a value needing no change leaves no trace. "
+            f"Raise limit above {processed}, or scope with artist= / file_ids=, to reach "
+            f"the remaining {pending_remaining} value(s).",
+        )
     if tally.error_values:
         parts.append(
             f"{len(tally.error_values)} value(s) errored and stay pending — re-run to retry.",

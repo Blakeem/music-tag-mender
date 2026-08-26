@@ -48,9 +48,12 @@ round it out. The `detect_album_gaps` tool (`album_gaps.py` + the pure, standalo
 `parsing.py`) groups blank-`album` files by folder and proposes sibling / folder-parse fills
 plus a review-only MusicBrainz `(artist, title)` recording tier (`mb_recording`, opt-out via
 `use_musicbrainz=False`, cached in `musicbrainz_recording_cache`) for the `stage_tags_batch →
-diff → commit → reopen_axes` spine. 31 MCP tools total. Schema is **v12** (additive: v11 adds
+diff → commit → reopen_axes` spine. 31 MCP tools total. Schema is **v14** (additive: v11 adds
 `musicbrainz_recording_cache`, v12 renames `file_album_status` → `file_year_status` in place —
-dispositions preserved; an older ledger upgrades in place). M6 organize/paths (`paths.py`)
+dispositions preserved; v13 adds `tag_revisions.managed_set`, stamping which managed-tag set
+governed each revision so a revert can restore emptiness on the widened fields; v14 adds
+`files.reader_version` so an incremental scan re-reads a row an older tag reader wrote. An
+older ledger upgrades in place). M6 organize/paths (`paths.py`)
 is a paper sketch (its DDL ships in v6; logic deferred).
 
 ## Python
@@ -204,7 +207,7 @@ src/tagmend/
   mcp_server.py     FastMCP server (thin) — 31 tools
   engine/
     db.py           SQLite connection (WAL)
-    schema.py       all DDL + PRAGMA user_version (v12)
+    schema.py       all DDL + PRAGMA user_version (v14)
     scan.py         filesystem discovery + signatures
     health.py       check_health / readiness + interrupted-commit report
     store.py        pure data access: files/file_tags + tag_revisions[_staged] + genre/artist status

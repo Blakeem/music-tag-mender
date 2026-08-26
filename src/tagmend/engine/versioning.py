@@ -31,12 +31,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final
 
 import mutagen
 
 from tagmend.engine import commits, db, schema, store
 from tagmend.engine.tags import (
+    MANAGED_SETS,
     MANAGED_TAGS,
     ORIGINAL_MANAGED_TAGS,
     read_tags,
@@ -162,29 +163,30 @@ def append_revision(  # noqa: PLR0913 - cohesive revision-append inputs
 def _revert_target_tags(
     path: Path,
     snapshot: dict[str, list[str]],
+    managed_set: int,
 ) -> dict[str, list[str]]:
     """Return the managed-tag dict to write when reverting *path* to *snapshot*.
 
-    Guards the widened-:data:`~tagmend.engine.tags.MANAGED_TAGS` migration hazard.
-    :func:`~tagmend.engine.tags.write_managed_tags` deletes every managed key ABSENT from
-    the dict it is given, so writing a historical snapshot verbatim is only safe for the
-    keys that snapshot actually governed. Snapshots captured before the managed set grew
-    (every pre-widening baseline/commit) structurally lack the newer identity/MusicBrainz
-    fields, and their absence there means "not tracked when captured", not "delete" —
-    writing verbatim would silently strip title/album/track/disc/sort/MB-id tags the revert
-    was never asked to touch.
+    Guards the widened-:data:`~tagmend.engine.tags.MANAGED_TAGS` migration hazard, per
+    revision rather than globally. :func:`~tagmend.engine.tags.write_managed_tags` deletes
+    every managed key ABSENT from the dict it is given, so writing a historical snapshot
+    verbatim is only safe for the keys that snapshot actually governed. *managed_set* is the
+    revision's own stamp (a key of :data:`~tagmend.engine.tags.MANAGED_SETS`), so absence is
+    read correctly in both directions: a field the set governed was genuinely empty at
+    capture and must be deleted to restore that emptiness, while a field outside it was
+    simply not tracked and is taken from the file's CURRENT on-disk value.
 
-    So the widened fields are taken from the file's CURRENT on-disk values wherever
-    *snapshot* omits them (preserve, never delete). The
-    :data:`~tagmend.engine.tags.ORIGINAL_MANAGED_TAGS` keep strict delete-on-revert: they
-    have been managed since version 0 of every file's history, so their absence is a genuine
-    "was empty then" and reverting must restore that emptiness (undo a later-added
-    genre/artist/…). This mirrors the merge-onto-current guard the staging path already
-    applies in :func:`tagmend.engine.staging.stage_tags`.
+    Stamping is what makes this exact. Before it, every snapshot was treated as
+    pre-widening, so the 13 widened fields could never be emptied by a revert and the revert
+    reported success while changing nothing. An unknown stamp falls back to the pre-widening
+    set: preserve rather than delete, since deleting is the unrecoverable direction. This
+    mirrors the merge-onto-current guard the staging path already applies in
+    :func:`tagmend.engine.staging.stage_tags`.
     """
+    governed = MANAGED_SETS.get(managed_set, ORIGINAL_MANAGED_TAGS)
     target = managed_subset(read_tags(path).tags)
     target.update(snapshot)
-    for field in ORIGINAL_MANAGED_TAGS:
+    for field in governed:
         if field not in snapshot:
             target.pop(field, None)
     return target
@@ -197,7 +199,7 @@ def _revert_file(
     *,
     note: str | None,
     commit_id: int,
-) -> int:
+) -> tuple[int, bool]:
     """Restore one file to *target_version* and append the revert revision. No commit.
 
     The shared per-file revert core (single-file revert = a group revert of one).
@@ -206,7 +208,9 @@ def _revert_file(
     ``origin='revert'`` revision (``reverted_from=target_version``) under *commit_id*.
     Unlike :func:`append_revision`, a revert is **always** recorded even when the
     managed tags did not change — it is an explicit, audited action and is what makes
-    "revert a revert" work. Returns the new version.
+    "revert a revert" work. Returns ``(new version, changed)``, where *changed* is
+    ``False`` for a revert that moved nothing on disk (an empty diff); callers report that
+    as ``noop`` rather than as a successful revert.
 
     Raises :class:`ValueError` if the target revision is unknown, the file is unknown,
     or the file is flagged missing. Leaves all DB writes in the open transaction —
@@ -225,10 +229,13 @@ def _revert_file(
         raise ValueError(message)
 
     # Disk write first, before any DB append: a write failure aborts with no row. The
-    # snapshot is merged onto the file's current widened fields so reverting to a
-    # pre-widening revision cannot delete tags it never governed (see _revert_target_tags).
+    # snapshot is merged onto the file's current values for every field OUTSIDE the target
+    # revision's own managed set, which it never governed (see _revert_target_tags).
     path = Path(file_row.folder) / file_row.filename
-    write_managed_tags(path, _revert_target_tags(path, target.managed_tags))
+    write_managed_tags(
+        path,
+        _revert_target_tags(path, target.managed_tags, target.managed_set),
+    )
 
     # Refresh the live snapshot so file_tags reflects the actual on-disk state.
     now = _utc_now()
@@ -256,6 +263,7 @@ def _revert_file(
         raise RuntimeError(message)
 
     reverted_snapshot = managed_subset(reverted_tags)
+    diff = compute_diff(previous_revision.managed_tags, reverted_snapshot)
     version = previous + 1
     store.insert_revision(
         conn,
@@ -263,13 +271,13 @@ def _revert_file(
         version=version,
         origin="revert",
         managed_tags=reverted_snapshot,
-        diff=compute_diff(previous_revision.managed_tags, reverted_snapshot),
+        diff=diff,
         now=now,
         reverted_from=target_version,
         commit_id=commit_id,
         note=note,
     )
-    return version
+    return version, bool(diff)
 
 
 @dataclass(frozen=True, slots=True)
@@ -280,6 +288,7 @@ class RevertResult:
     target_version: int
     new_version: int
     commit_id: int
+    status: str  # 'reverted' (tags moved) | 'noop' (already at the target state)
 
     def to_dict(self) -> dict[str, object]:
         """JSON-serializable form for the MCP tool."""
@@ -288,6 +297,7 @@ class RevertResult:
             "target_version": self.target_version,
             "new_version": self.new_version,
             "commit_id": self.commit_id,
+            "status": self.status,
         }
 
 
@@ -305,6 +315,10 @@ def revert(
     undone with :func:`revert_commit`. Refuses if the file has a pending staged change
     (commit or unstage it first — a staged target computed against the pre-revert
     state would silently override the revert at the next commit).
+
+    The revision is appended either way, but ``status`` reports what actually happened:
+    ``'reverted'`` when the managed tags moved, ``'noop'`` when the file already held the
+    target state and nothing on disk changed.
 
     Raises :class:`ValueError` if the target revision is unknown, the file is unknown,
     flagged missing, or staged. Owns its transaction: the commit row, the disk write,
@@ -327,7 +341,7 @@ def revert(
             message=note,
             now=_utc_now(),
         )
-        version = _revert_file(
+        version, changed = _revert_file(
             connection,
             file_id,
             target_version,
@@ -339,8 +353,10 @@ def revert(
     finally:
         connection.close()
 
+    status = "reverted" if changed else "noop"
     logger.info(
-        "reverted file_id=%d to version %d (new version %d, commit %d)",
+        "%s file_id=%d to version %d (new version %d, commit %d)",
+        status,
         file_id,
         target_version,
         version,
@@ -351,6 +367,7 @@ def revert(
         target_version=target_version,
         new_version=version,
         commit_id=commit_id,
+        status=status,
     )
 
 
@@ -364,7 +381,7 @@ class FileRevertOutcome:
     file_id: int
     target_version: int | None  # version restored (the commit's version - 1); None if not
     new_version: int | None  # the appended revert revision; None if not reverted
-    status: str  # 'reverted' | 'skipped_later_changes' | 'missing' | 'error'
+    status: str  # 'reverted' | 'noop' | 'skipped_later_changes' | 'missing' | 'error'
     detail: str | None = None
 
 
@@ -376,6 +393,7 @@ class RevertCommitResult:
     reverted_from: int  # the target commit id
     dry_run: bool
     reverted: int
+    noop: int
     skipped: int
     missing: int
     errors: int
@@ -388,6 +406,7 @@ class RevertCommitResult:
             "reverted_from": self.reverted_from,
             "dry_run": self.dry_run,
             "reverted": self.reverted,
+            "noop": self.noop,
             "skipped": self.skipped,
             "missing": self.missing,
             "errors": self.errors,
@@ -404,13 +423,39 @@ class RevertCommitResult:
         }
 
 
+# The two plan-pass kinds that go on to :func:`_revert_file`. A 'noop' file is still
+# processed (the revert revision is always appended) — only its reported status differs.
+_PROCESSABLE_KINDS: Final = frozenset({"revertable", "noop"})
+
+
+def _would_change(conn: sqlite3.Connection, revision: Revision, path: Path) -> bool:
+    """Whether reverting *revision* would actually move any managed tag on disk.
+
+    Mirrors the comparison :func:`_revert_file` makes after its write, so the dry run
+    cannot promise a revert that delivers nothing. Costs one mutagen read per planned file,
+    accepted deliberately: an honest preview is the point. An unreadable file is reported as
+    changing, leaving the real run's per-file error handling to deal with it.
+    """
+    target = store.get_revision(conn, revision.file_id, revision.version - 1)
+    if target is None:  # pragma: no cover - defensive; version-1 precedes a commit revision
+        return True
+    try:
+        planned = _revert_target_tags(path, target.managed_tags, target.managed_set)
+    except (OSError, mutagen.MutagenError) as exc:  # type: ignore[attr-defined]
+        logger.warning("revert preview: file_id=%d unreadable: %s", revision.file_id, exc)
+        return True
+    return bool(compute_diff(revision.managed_tags, planned))
+
+
 def _classify_for_revert(conn: sqlite3.Connection, revision: Revision) -> str:
-    """Classify one commit revision for revert: 'revertable' | 'skipped_later_changes' | 'missing'.
+    """Classify one commit revision: 'revertable' | 'noop' | 'skipped_later_changes' | 'missing'.
 
     Read-only (shared by the dry run and the plan pass of a real run). A file is
     revertable iff it still exists on disk and the commit's revision is its LATEST —
     skip+report semantics: later changes are never silently destroyed; revert those
-    files per-file, deliberately, if that is really wanted.
+    files per-file, deliberately, if that is really wanted. 'noop' is a revertable file
+    whose revert would move nothing (see :func:`_would_change`); it is still processed,
+    just reported honestly.
     """
     file_row = store.get_file_by_id(conn, revision.file_id)
     if file_row is None or file_row.is_missing:
@@ -421,6 +466,8 @@ def _classify_for_revert(conn: sqlite3.Connection, revision: Revision) -> str:
     latest = store.max_version(conn, revision.file_id)
     if latest != revision.version:
         return "skipped_later_changes"
+    if not _would_change(conn, revision, path):
+        return "noop"
     return "revertable"
 
 
@@ -437,6 +484,7 @@ def _summarize_revert(
         reverted_from=reverted_from,
         dry_run=dry_run,
         reverted=sum(1 for o in outcomes if o.status == "reverted"),
+        noop=sum(1 for o in outcomes if o.status == "noop"),
         skipped=sum(1 for o in outcomes if o.status == "skipped_later_changes"),
         missing=sum(1 for o in outcomes if o.status == "missing"),
         errors=sum(1 for o in outcomes if o.status == "error"),
@@ -471,8 +519,14 @@ def revert_commit(
     whatever they durably committed). The staging area must be EMPTY — commit or
     unstage pending work before rolling back (git's "commit or stash first").
 
+    A file already holding its pre-commit state is reported ``noop``: the revert revision
+    is still appended (revert is always audited), but it is not counted as ``reverted``,
+    so the summary never claims a change that did not happen.
+
     *dry_run* returns the full per-file classification without touching anything
-    (``commit_id`` is ``None``; ``status='reverted'`` means "would be reverted").
+    (``commit_id`` is ``None``; ``status='reverted'`` means "would be reverted",
+    ``noop`` means "would change nothing"). The preview reads each planned file from disk
+    to tell those two apart.
 
     Crash recovery is resume-free, like ``commit_tags``: just run it again — files
     already reverted by the crashed run now have a later revision and report as
@@ -505,13 +559,13 @@ def revert_commit(
             (revision, _classify_for_revert(connection, revision))
             for revision in store.revisions_for_commit(connection, commit_id)
         ]
-        revertable = [revision for revision, kind in planned if kind == "revertable"]
+        processable = [revision for revision, kind in planned if kind in _PROCESSABLE_KINDS]
 
-        if dry_run or not revertable:
+        if dry_run or not processable:
             outcomes = [
                 FileRevertOutcome(
                     file_id=revision.file_id,
-                    target_version=revision.version - 1 if kind == "revertable" else None,
+                    target_version=revision.version - 1 if kind in _PROCESSABLE_KINDS else None,
                     new_version=None,
                     status="reverted" if kind == "revertable" else kind,
                 )
@@ -535,7 +589,7 @@ def revert_commit(
 
         outcomes = []
         for revision, kind in planned:
-            if kind != "revertable":
+            if kind not in _PROCESSABLE_KINDS:
                 outcomes.append(
                     FileRevertOutcome(
                         file_id=revision.file_id,
@@ -546,7 +600,7 @@ def revert_commit(
                 )
                 continue
             try:
-                new_version = _revert_file(
+                new_version, changed = _revert_file(
                     connection,
                     revision.file_id,
                     revision.version - 1,
@@ -577,7 +631,7 @@ def revert_commit(
                     file_id=revision.file_id,
                     target_version=revision.version - 1,
                     new_version=new_version,
-                    status="reverted",
+                    status="reverted" if changed else "noop",
                 ),
             )
 
@@ -593,10 +647,11 @@ def revert_commit(
         outcomes=outcomes,
     )
     logger.info(
-        "revert of commit %d as commit %d: reverted=%d skipped=%d missing=%d errors=%d",
+        "revert of commit %d as commit %d: reverted=%d noop=%d skipped=%d missing=%d errors=%d",
         commit_id,
         new_commit,
         result.reverted,
+        result.noop,
         result.skipped,
         result.missing,
         result.errors,

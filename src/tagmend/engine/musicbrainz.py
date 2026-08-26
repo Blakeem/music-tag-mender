@@ -6,8 +6,9 @@ supply an album's year and has no album correction; MusicBrainz can — a *relea
 reissue *release* ``date`` (the edition year). One endpoint is used:
 
 * ``/ws/2/release-group/`` (Lucene query ``artist:"…" AND releasegroup:"…"``) — ranked
-  candidate release groups; we keep only ``primary-type == "Album"`` groups with no
-  ``Live``/``Compilation`` secondary type and pick the highest-scoring one.
+  candidate release groups; we keep only ``primary-type == "Album"`` groups that carry no
+  non-studio secondary type and whose title matches the album asked for, then pick the
+  highest-scoring one.
 * ``/ws/2/recording/`` (Lucene query ``artist:"…" AND recording:"…"``) — a review-only
   ``(artist, title)`` → album lookup feeding ``detect_album_gaps``' recording tier. Ranked
   candidate recordings; we keep only the highest-scoring recording that has a release whose
@@ -16,7 +17,9 @@ reissue *release* ``date`` (the edition year). One endpoint is used:
 
 Each release-group lookup's parsed result is cached persistently in ``musicbrainz_cache`` and
 each recording lookup's in ``musicbrainz_recording_cache`` so every unique album/recording is
-queried at most once. A no-match (no usable Album release group) is negative-cached too.
+queried at most once. Both cache keys carry a selection-rule version, so tightening those
+rules re-fetches instead of replaying a pick made under the old ones. A no-match (no
+usable Album release group) is negative-cached too.
 Transient/HTTP failures raise :class:`MusicBrainzError` and are **never** cached, so a re-run
 retries them (the caller leaves the group pending, like the genre path).
 
@@ -29,13 +32,16 @@ whole thing is unit-testable with :class:`httpx.MockTransport` and a fake clock.
 from __future__ import annotations
 
 import hashlib
+import re
 import time
+import unicodedata
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Final, Protocol, Self, cast
 
 import httpx
 
+from tagmend.engine.classify import fold
 from tagmend.engine.store import (
     get_cached_mb_album,
     get_cached_mb_recording,
@@ -54,8 +60,35 @@ logger = get_logger(__name__)
 _API_URL: Final = "https://musicbrainz.org/ws/2/release-group/"
 _RECORDING_API_URL: Final = "https://musicbrainz.org/ws/2/recording/"
 
-# Secondary release-group types that disqualify a candidate (not an original studio album).
-_EXCLUDED_SECONDARY_TYPES: Final = frozenset({"Live", "Compilation"})
+# Secondary types that disqualify a release group as an original studio album: alternate takes
+# (Live, Demo, Field recording), repackagings (Compilation, Mixtape/Street, DJ-mix, Remix) and
+# separate works (Soundtrack, Spokenword, Interview, Audiobook, Audio drama) all carry a date
+# later than, or unrelated to, the album's own first release. Spellings are MusicBrainz's own.
+_EXCLUDED_SECONDARY_TYPES: Final = frozenset(
+    {
+        "Audio drama",
+        "Audiobook",
+        "Compilation",
+        "Demo",
+        "DJ-mix",
+        "Field recording",
+        "Interview",
+        "Live",
+        "Mixtape/Street",
+        "Remix",
+        "Soundtrack",
+        "Spokenword",
+    }
+)
+
+# Folded into both cache keys so tightening the selection rules re-fetches every lookup that
+# was resolved under the old ones, instead of replaying its stale cached pick forever. The album
+# and recording paths share the excluded-secondary-type set, so one bump must invalidate both.
+_SELECTION_VERSION: Final = "2"
+
+# One trailing parenthetical/bracketed segment — the edition suffix a tag carries and a release
+# group does not (``Fiction (Deluxe Edition)``, ``The Red Album [Deluxe Edition]``).
+_EDITION_SUFFIX: Final = re.compile(r"\s*[(\[][^()\[\]]*[)\]]\s*$")
 
 # A bare four-digit year prefix length (MusicBrainz dates are ``YYYY`` / ``YYYY-MM`` / full).
 _YEAR_PREFIX_LEN: Final = 4
@@ -222,8 +255,8 @@ class MusicBrainzClient:
         # Input: one paced network request.
         body = self._request(artist, album)
 
-        # Process: pick the best usable Album release group (or None).
-        resolved = _select_album(body)
+        # Process: pick the best usable Album release group matching the request (or None).
+        resolved = _select_album(body, album)
 
         # Output: cache the result eagerly, then return it.
         if resolved is None:
@@ -363,8 +396,15 @@ class MusicBrainzClient:
 
 
 def _request_key(artist: str, album: str) -> str:
-    """Return a stable ``sha1`` over the artist+album identifying the lookup."""
-    payload = "\x00".join(["release-group", f"artist={artist}", f"album={album}"])
+    """Return a stable ``sha1`` over the selection rules + artist + album for this lookup."""
+    payload = "\x00".join(
+        [
+            "release-group",
+            f"selection={_SELECTION_VERSION}",
+            f"artist={artist}",
+            f"album={album}",
+        ]
+    )
     return hashlib.sha1(payload.encode("utf-8")).hexdigest()  # noqa: S324 - cache key, not security
 
 
@@ -373,12 +413,13 @@ def _escape(value: str) -> str:
     return value.replace("\\", "\\\\").replace('"', '\\"')
 
 
-def _select_album(body: dict[str, object]) -> MBAlbum | None:
+def _select_album(body: dict[str, object], requested_album: str) -> MBAlbum | None:
     """Pick the best usable Album release group from a release-group query response.
 
-    Keeps only ``primary-type == "Album"`` groups with no ``Live``/``Compilation``
-    secondary type and a non-empty ``first-release-date``; returns the highest-scoring one
-    (``None`` when nothing usable). The year is normalized to the four-digit prefix.
+    Keeps only ``primary-type == "Album"`` groups with no excluded secondary type, a title
+    matching *requested_album* (see :func:`_title_matches`) and a non-empty
+    ``first-release-date``; returns the highest-scoring one (``None`` when nothing usable).
+    The year is normalized to the four-digit prefix.
     """
     raw_groups = body.get("release-groups")
     if not isinstance(raw_groups, list):
@@ -387,7 +428,7 @@ def _select_album(body: dict[str, object]) -> MBAlbum | None:
     best: MBAlbum | None = None
     best_score = -1
     for entry in raw_groups:
-        candidate = _candidate(entry)
+        candidate = _candidate(entry, requested_album)
         if candidate is None:
             continue
         score = candidate[0]
@@ -397,11 +438,47 @@ def _select_album(body: dict[str, object]) -> MBAlbum | None:
     return best
 
 
-def _candidate(entry: object) -> tuple[int, MBAlbum] | None:
-    """Return ``(score, MBAlbum)`` for a usable Album release group, or ``None``."""
+def _loose_fold(value: str) -> str:
+    """Return an NFKC casefold key with whitespace removed, for titles :func:`fold` empties.
+
+    :func:`fold` strips everything outside ``[a-z0-9]``, so a title written wholly in a
+    non-Latin script or in symbols (``Спутник``, ``東京事変``, ``+``) folds to ``""`` and could
+    never match itself. This keeps those characters instead of dropping them.
+    """
+    return "".join(unicodedata.normalize("NFKC", value).casefold().split())
+
+
+def _title_key(title: str) -> str:
+    """Return *title*'s comparison key: its :func:`fold` key, or the loose one when empty."""
+    return fold(title) or _loose_fold(title)
+
+
+def _title_matches(requested_album: str, candidate_title: str) -> bool:
+    """Return whether *candidate_title* can be the release group for *requested_album*.
+
+    Asymmetric on purpose. A tag carrying an edition suffix (``Fiction (Deluxe Edition)``)
+    still matches the plain release group it was pressed from, but a candidate carrying
+    content the request lacks (``Replicas: The First Recordings`` for ``Replicas``) is a
+    different album rather than an edition of the one asked for.
+    """
+    requested_key = _title_key(requested_album)
+    candidate_key = _title_key(candidate_title)
+    if not requested_key or not candidate_key:
+        return False
+    if requested_key == candidate_key:
+        return True
+    return _title_key(_EDITION_SUFFIX.sub("", requested_album)) == candidate_key
+
+
+def _candidate(entry: object, requested_album: str) -> tuple[int, MBAlbum] | None:
+    """Return ``(score, MBAlbum)`` for a usable Album release group matching the request."""
     if not isinstance(entry, dict):
         return None
     if entry.get("primary-type") != "Album":
+        return None
+
+    title = entry.get("title")
+    if not isinstance(title, str) or not _title_matches(requested_album, title):
         return None
 
     secondary = entry.get("secondary-types")
@@ -413,10 +490,6 @@ def _candidate(entry: object) -> tuple[int, MBAlbum] | None:
         return None
     prefix = raw_date[:_YEAR_PREFIX_LEN]
     original_date = prefix if len(raw_date) >= _YEAR_PREFIX_LEN and prefix.isdigit() else raw_date
-
-    title = entry.get("title")
-    if not isinstance(title, str) or not title:
-        return None
 
     raw_score = entry.get("score")
     score = raw_score if isinstance(raw_score, int) else 0
@@ -435,8 +508,15 @@ def _candidate(entry: object) -> tuple[int, MBAlbum] | None:
 
 
 def _recording_request_key(artist: str, title: str) -> str:
-    """Return a stable ``sha1`` over the artist+title identifying the recording lookup."""
-    payload = "\x00".join(["recording", f"artist={artist}", f"title={title}"])
+    """Return a stable ``sha1`` over the selection rules + artist + title for this lookup."""
+    payload = "\x00".join(
+        [
+            "recording",
+            f"selection={_SELECTION_VERSION}",
+            f"artist={artist}",
+            f"title={title}",
+        ]
+    )
     return hashlib.sha1(payload.encode("utf-8")).hexdigest()  # noqa: S324 - cache key, not security
 
 
@@ -444,8 +524,8 @@ def _select_recording(body: dict[str, object]) -> MBRecording | None:
     """Pick the best recording whose release group is a usable Album from a search response.
 
     Keeps only recordings that have a release whose release group is ``primary-type ==
-    "Album"`` with no ``Live``/``Compilation`` secondary type; returns the highest-scoring
-    one's release-group title (+ ids), or ``None`` when nothing usable exists.
+    "Album"`` with no excluded secondary type; returns the highest-scoring one's
+    release-group title (+ ids), or ``None`` when nothing usable exists.
     """
     raw_recordings = body.get("recordings")
     if not isinstance(raw_recordings, list):
@@ -493,8 +573,8 @@ def _usable_release_group(entry: dict[str, object]) -> tuple[str, str] | None:
     """Return ``(title, release_group_id)`` for the first usable Album release, or ``None``.
 
     Scans the recording's ``releases``; a release's ``release-group`` qualifies when its
-    ``primary-type == "Album"``, it carries no ``Live``/``Compilation`` secondary type, and it
-    has a non-empty title (mirroring :func:`_candidate`'s Album gate).
+    ``primary-type == "Album"``, it carries no excluded secondary type, and it has a non-empty
+    title (sharing :func:`_candidate`'s Album gate; there is no requested title to match here).
     """
     releases = entry.get("releases")
     if not isinstance(releases, list):

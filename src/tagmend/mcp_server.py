@@ -427,20 +427,30 @@ def detect_mismatches(
     are counted in the ``container_suppressed`` map — while a mixed-albumartist album folder
     INSIDE a container still surfaces as ``low`` (in-container misfile detection is preserved).
 
+    ``flagged`` counts only files that need work. A file sitting in a mixed-albumartist folder
+    while agreeing with its OWN path is review context, not a defect: it is reported in
+    ``folder_context_rows`` and counted by ``folder_context``, outside ``flagged`` and the
+    tier counts (so the tier counts always sum to ``flagged``). Such rows usually clear
+    themselves once the folder's real mismatch is fixed. A file that disagrees, or whose path
+    signal is unavailable (reliability guard, container folder, library root), stays flagged.
+
     Args:
         tier: Return only rows/groups in this tier (``high`` | ``medium`` | ``low``). The
-            ``high``/``medium``/``low``/``flagged`` counts still describe the whole library.
+            ``high``/``medium``/``low``/``flagged``/``folder_context`` counts still describe
+            the whole library, and context rows are never returned under a tier filter.
         limit: Cap the number of rows returned (or groups, with ``group=true``); counts
             unaffected.
         group: Return one compact group per folder instead of flat rows (``rows`` is then
             empty; each group carries ``folder``, ``path_artist``, ``file_count``, ``flagged``,
-            ``tag_values``, ``tiers``, ``fields``, ``file_ids``, ``suppressed``).
+            ``folder_context``, ``tag_values``, ``tiers``, ``fields``, ``file_ids``,
+            ``suppressed`` — the per-folder ``file_ids`` list holds flagged files only).
         folder: Return the flat rows of exactly this folder (exact path equality, never a
             prefix match). Takes precedence over ``group``.
 
     Returns:
-        ``{"ok": True, rows, groups, total_files, flagged, high, medium, low,
-        disagreement_rate, path_signal_suppressed, suppressed, container_suppressed, summary}``
+        ``{"ok": True, rows, folder_context_rows, groups, total_files, flagged, high, medium,
+        low, folder_context, disagreement_rate, path_signal_suppressed, suppressed,
+        container_suppressed, summary}``
         — ``container_suppressed`` is a top-folder → file-count map (files whose path signal a
         ``container_folders`` entry suppressed); each row is
         ``{file_id, folder, filename, field, tag_value, path_artist, tier, reason}`` — or
@@ -568,9 +578,10 @@ def revert_tags(file_id: int, version: int, note: str | None = None) -> dict[str
     ``revert_commit``). Get valid versions from ``history_tags``. Refused while the file
     has a staged change — commit or unstage it first.
 
-    Returns ``{"ok": True, "new_version": int, "commit_id": int, ...}``, or
-    ``{"ok": False, "error": ...}`` if the file or version is unknown, the file is
-    missing on disk, or the file has a pending staged change.
+    Returns ``{"ok": True, "new_version": int, "commit_id": int, "status": ...}``, where
+    ``status`` is ``"reverted"`` (tags moved on disk) or ``"noop"`` (the file already held
+    the target state). Returns ``{"ok": False, "error": ...}`` if the file or version is
+    unknown, the file is missing on disk, or the file has a pending staged change.
     """
     try:
         result = versioning.revert(load_settings(), file_id, version, note=note)
@@ -603,13 +614,15 @@ def revert_commit(
         note: Optional message stored on the new revert commit and its revisions.
         dry_run: When true, classify and report only — no disk or ledger changes
             (``commit_id`` in the result is ``null``; ``status='reverted'`` means
-            "would be reverted").
+            "would be reverted", ``status='noop'`` means "would change nothing").
 
     Returns:
         ``{"ok": True, "commit_id": ..., "reverted_from": ..., "dry_run": ...,
-        "reverted"/"skipped"/"missing"/"errors": counts, "outcomes": [...]}`` with one
-        outcome per file, or ``{"ok": False, "error": ...}`` if the commit id is
-        unknown, the commit is still ``applying``, or the staging area is not empty.
+        "reverted"/"noop"/"skipped"/"missing"/"errors": counts, "outcomes": [...]}`` with
+        one outcome per file (``noop`` = the file already held its pre-commit state, so
+        the audited revert revision was appended but nothing on disk moved). Returns
+        ``{"ok": False, "error": ...}`` if the commit id is unknown, the commit is still
+        ``applying``, or the staging area is not empty.
     """
     try:
         result = versioning.revert_commit(
@@ -733,23 +746,37 @@ def resolve_artists(
     placeholder (``[unknown]``, ``[no artist]``, …) is treated as no correction — nothing
     is staged and the value is reported under ``no_correction``. A transient Last.fm error
     leaves that value pending
-    under ``error_values`` so a re-run retries it. The per-value outcome buckets
-    (``corrected_values`` + ``already_canonical`` + ``no_correction`` + ``errors``) sum to
+    under ``error_values`` so a re-run retries it.
+
+    Two further classes are **held**: reported with ``from``/``to`` so you can act on them,
+    never staged. ``shrinks_credit_values`` are corrections whose canonical name is
+    contained in the current value (``Skrillex & The Doors`` → ``Skrillex``) — a collapsed
+    multi-artist credit, held even when it carries an MBID. ``needs_review_values`` are
+    corrections MusicBrainz does not corroborate (no MBID), the "what Last.fm found that
+    MusicBrainz did not" list. Last.fm casing is ignored by design: a correction differing
+    only in case (``Dååth`` → ``DÅÅTH``) counts as ``already_canonical``. Diacritics are not
+    casing — ``Antonio`` → ``Antônio`` is a real spelling fix and stages when it has an MBID.
+    The per-value outcome buckets (``corrected_values`` + ``already_canonical`` +
+    ``no_correction`` + ``shrinks_credit`` + ``needs_review`` + ``errors``) sum to
     ``processed``.
 
     Args:
         artist: Limit to files whose ``artist`` tag equals this value.
         file_ids: Limit to these specific file ids (overrides ``artist``).
-        limit: Max distinct values to process this call. Remaining values are reported via
-            ``pending_remaining`` / ``more`` — call again to continue.
+        limit: Max distinct values to process this call. It is a cap, not a cursor: a
+            value needing no change leaves no trace, so an identical repeat call
+            re-processes the same values. Raise ``limit``, or narrow with ``artist`` /
+            ``file_ids``, to reach the values reported under ``pending_remaining`` /
+            ``more``.
         dry_run: Preview the ``value → canonical`` mappings + would-stage count without
             staging anything (works from cache, no precondition).
 
     Returns:
         ``{"ok": True, processed, staged_files, corrected_values, skipped_multi_artist,
-        skipped_sentinel, no_correction, already_canonical, errors, pending_remaining, more,
-        mappings, multi_artist_files, no_correction_values, already_canonical_values,
-        error_values, summary}``, or
+        skipped_sentinel, no_correction, already_canonical, shrinks_credit, needs_review,
+        errors, pending_remaining, more, mappings, multi_artist_files, no_correction_values,
+        already_canonical_values, shrinks_credit_values, needs_review_values, error_values,
+        summary}``, or
         ``{"ok": False, "error": ...}`` (e.g. pending changes, or no API key configured).
     """
     try:
@@ -1021,6 +1048,7 @@ def resolve_years(
 def list_albums(
     year_status: Literal["pending", "no_identity", "no_match", "manual", "staged", "done"]
     | None = None,
+    actionable: bool = False,  # noqa: FBT001, FBT002 - MCP tool surface, not a Python API
     limit: int | None = None,
 ) -> dict[str, object]:
     """List distinct album groups with file counts + status (to scope ``resolve_years``).
@@ -1030,6 +1058,7 @@ def list_albums(
     files whose ``originaldate`` is empty. A group with ``blank_originaldate > 0`` is
     actionable for ``resolve_years`` (it has years to fill); ``year_status: "pending"``
     alone does NOT mean actionable, since every file may already carry ``originaldate``.
+    Pass ``actionable=True`` to get only those groups instead of paging every group.
     Returns ``{"ok": True, "albums": [{artist, album, file_count, year_status,
     blank_originaldate}, ...]}`` in ``(artist, album)`` order. Run ``scan_library`` first to
     populate the snapshot.
@@ -1038,10 +1067,18 @@ def list_albums(
         year_status: Keep only groups in this derived year workflow state (``pending`` |
             ``no_identity`` | ``no_match`` | ``manual`` | ``staged`` | ``done``), applied
             before ``limit``.
+        actionable: Keep only the actionable groups, those with ``blank_originaldate > 0``
+            that ``resolve_years`` can actually fill. Composes with ``year_status`` and is
+            applied before ``limit``.
         limit: Cap the number of groups returned (applied after ordering + filtering).
             Keeps the payload context-cheap on a large library.
     """
-    rows = years.list_albums(load_settings(), year_status=year_status, limit=limit)
+    rows = years.list_albums(
+        load_settings(),
+        year_status=year_status,
+        actionable=actionable,
+        limit=limit,
+    )
     return {"ok": True, "albums": [row.to_dict() for row in rows]}
 
 

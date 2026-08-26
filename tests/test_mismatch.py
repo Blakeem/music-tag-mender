@@ -66,6 +66,13 @@ def _find(report: mismatch.MismatchReport, file_id: int) -> mismatch.MismatchRow
     return next((r for r in report.rows if r.file_id == file_id), None)
 
 
+def _find_context(
+    report: mismatch.MismatchReport,
+    file_id: int,
+) -> mismatch.MismatchRow | None:
+    return next((r for r in report.folder_context_rows if r.file_id == file_id), None)
+
+
 # --- fold ---------------------------------------------------------------------------
 
 
@@ -191,9 +198,8 @@ def test_classify_every_labeled_class() -> None:
     assert _find(report, 130) is None
     assert _find(report, 140) is None
 
-    # LOW: non-album guards (Singles + 1-file), artist fallback, and the mixed-folder
-    # clean sibling (folder-consistency).
-    for fid in (150, 151, 160, 101):
+    # LOW: non-album guards (Singles + 1-file) and the artist fallback.
+    for fid in (150, 151, 160):
         row = _find(report, fid)
         assert row is not None
         assert row.tier == "low"
@@ -202,9 +208,17 @@ def test_classify_every_labeled_class() -> None:
     assert fallback.tier == "low"
     assert fallback.field == "artist"
 
+    # FOLDER CONTEXT: the mixed-folder clean sibling agrees with its path -> not a defect.
+    assert _find(report, 101) is None
+    sibling = _find_context(report, 101)
+    assert sibling is not None
+    assert sibling.reason == mismatch._REASON_VARIANT
+
     assert report.high == 1
-    assert report.low == 5
-    assert report.flagged == 8
+    assert report.low == 4
+    assert report.flagged == 7
+    assert report.high + report.medium + report.low == report.flagged
+    assert report.folder_context == 1
 
 
 # --- reliability guard --------------------------------------------------------------
@@ -239,6 +253,110 @@ def test_reliability_guard_suppresses_path_tiers() -> None:
         row = _find(report, fid)
         assert row is not None
         assert row.tier == "low"
+
+
+def test_reliability_guard_keeps_disagreeing_files_flagged() -> None:
+    """The guard must not turn genuine disagreements into folder context.
+
+    When the path signal is suppressed library-wide the folder-consistency LOW tier is the
+    only surviving output, so splitting on the fallback branch alone would empty ``flagged``.
+    The split keys on the file's own path agreement instead.
+    """
+    genres = ["Rock", "Pop", "Jazz", "Metal", "Blues"]
+    performers = ["Foo Fighters", "Madonna", "Miles Davis", "Metallica", "B.B. King"]
+    files = [
+        _mk(index, _MUSIC / genre / "Album", "01.mp3", albumartist=performer)
+        for index, (genre, performer) in enumerate(zip(genres, performers, strict=True), start=1)
+    ]
+    mixed = _MUSIC / "Mixed" / "Comp"
+    agreeing = _MUSIC / "Mixed2" / "Comp"
+    files += [
+        _mk(10, mixed, "a.mp3", albumartist="X Artist"),
+        _mk(11, mixed, "b.mp3", albumartist="Y Artist"),
+        # Same messy-folder shape, but this file agrees with its own path -> context.
+        _mk(20, agreeing, "a.mp3", albumartist="Mixed2"),
+        _mk(21, agreeing, "b.mp3", albumartist="Z Artist"),
+    ]
+
+    report = mismatch._classify(files, _MUSIC)
+
+    assert report.path_signal_suppressed is True
+    # The three disagreeing files stay flagged, each with the suppressed-path reason.
+    assert report.flagged == 3
+    assert report.high + report.medium + report.low == report.flagged
+    for fid in (10, 11, 21):
+        row = _find(report, fid)
+        assert row is not None
+        assert row.tier == "low"
+        assert row.reason == mismatch._REASON_SUPPRESSED
+    # Only the file that agrees with its path is context.
+    assert report.folder_context == 1
+    context = _find_context(report, 20)
+    assert context is not None
+    assert context.reason == mismatch._REASON_VARIANT
+
+
+# --- folder context: agrees-with-path rows are not defects --------------------------
+
+
+def _singles_library() -> list[mismatch._FileInput]:
+    """The live-run shape: one mis-stamped single plus two siblings that agree with the path."""
+    singles = _MUSIC / "Blue Stahli" / "Singles"
+    files = [_mk(i, _MUSIC / f"Clean{i}", "01.mp3", albumartist=f"Clean{i}") for i in range(1, 5)]
+    files += [
+        _mk(100, singles, "a.mp3", albumartist="Celldweller"),
+        _mk(101, singles, "b.mp3", albumartist="Blue Stahli"),
+        _mk(102, singles, "c.mp3", albumartist="Blue Stahli"),
+    ]
+    return files
+
+
+def test_agreeing_siblings_are_context_not_flagged() -> None:
+    report = mismatch._classify(_singles_library(), _MUSIC)
+
+    # Only the mis-stamped file is a defect.
+    assert report.flagged == 1
+    assert report.high + report.medium + report.low == report.flagged
+    mis_stamped = _find(report, 100)
+    assert mis_stamped is not None
+    assert mis_stamped.tag_value == "Celldweller"
+
+    # Its two correct siblings are review context, out of every tier tally.
+    assert report.folder_context == 2
+    assert {r.file_id for r in report.folder_context_rows} == {101, 102}
+    for fid in (101, 102):
+        assert _find(report, fid) is None
+        row = _find_context(report, fid)
+        assert row is not None
+        assert row.reason == mismatch._REASON_VARIANT
+
+    # The summary states both numbers without calling the context files defects.
+    assert "Flagged 1 of 7 file(s)" in report.summary
+    assert "plus 2 folder-context file(s) that agree with their path" in report.summary
+
+
+def test_tier_filter_never_returns_context_rows() -> None:
+    report = mismatch._classify(_singles_library(), _MUSIC)
+    assert report.folder_context_rows  # the unfiltered view carries them
+
+    low_only = mismatch._limit_report(report, tier="low", limit=None)
+
+    assert {r.file_id for r in low_only.rows} == {100}
+    assert low_only.folder_context_rows == []
+    assert low_only.folder_context == 2  # the count stays library-wide
+
+
+def test_grouped_view_splits_flagged_and_context_per_folder() -> None:
+    files = _singles_library()
+    report = mismatch._classify(files, _MUSIC)
+
+    grouped = mismatch._grouped_report(report, mismatch._folder_stats(files), tier=None, limit=None)
+
+    singles = next(g for g in grouped.groups if g.folder == str(_MUSIC / "Blue Stahli" / "Singles"))
+    assert singles.flagged == 1
+    assert singles.folder_context == 2
+    assert singles.file_ids == [100]  # context files never enter the fix batch
+    assert singles.to_dict()["folder_context"] == 2
 
 
 # --- library-root file must not crash -----------------------------------------------
@@ -317,7 +435,9 @@ def test_detect_tier_filter_and_unknown_tier(
     assert all(r.tier == "high" for r in high_only.rows)
     # Counts stay library-wide even when rows are filtered to one tier.
     assert high_only.high == 1
-    assert high_only.low >= 1
+    assert high_only.folder_context == 1
+    # A tier query asks for defects, so it never returns the agrees-with-path context rows.
+    assert high_only.folder_context_rows == []
 
     with pytest.raises(ValueError, match="unknown tier"):
         detect_mismatches(engine_settings, tier="bogus")
@@ -346,6 +466,8 @@ def test_cli_detect_mismatches_reports_high(music_dir: Path) -> None:
     assert result.exit_code == 0
     assert "HIGH" in result.stdout
     assert "Jem" in result.stdout
+    # The context files leave `rows`, so the summary must still account for them.
+    assert "folder-context" in result.stdout
 
 
 def test_mcp_detect_tool_listed_and_callable(music_dir: Path) -> None:
@@ -360,9 +482,14 @@ def test_mcp_detect_tool_listed_and_callable(music_dir: Path) -> None:
     payload = mcp_server.detect_mismatches()
     assert payload["ok"] is True
     assert payload["high"] == 1
+    assert payload["flagged"] == 1
+    assert payload["folder_context"] == 1
     rows = payload["rows"]
     assert isinstance(rows, list)
     assert any(r["tag_value"] == "Jem" and r["tier"] == "high" for r in rows)
+    context_rows = payload["folder_context_rows"]
+    assert isinstance(context_rows, list)
+    assert [r["tag_value"] for r in context_rows] == ["Ozzy Osbourne"]
 
 
 # --- disposition skip-filter (pure classifier) --------------------------------------
@@ -386,9 +513,13 @@ def test_zero_disposition_output_is_byte_compatible() -> None:
     payload = base.to_dict()
     assert payload["suppressed"] == {}
     assert payload["groups"] == []
-    assert payload["flagged"] == 8
+    assert payload["flagged"] == 7
     assert payload["high"] == 1
-    assert payload["low"] == 5
+    assert payload["low"] == 4
+    assert payload["folder_context"] == 1
+    context_rows = payload["folder_context_rows"]
+    assert isinstance(context_rows, list)
+    assert [r["file_id"] for r in context_rows] == [101]
 
 
 def test_to_dict_rounds_disagreement_rate() -> None:
@@ -418,7 +549,7 @@ def test_fresh_disposition_suppresses_row_and_reports_it() -> None:
 
     assert _find(report, 100) is None  # the HIGH Jem row is silenced
     assert report.high == 0
-    assert report.flagged == 7  # was 8
+    assert report.flagged == 6  # was 7
     assert report.suppressed == {"legit_ignore": 1}
 
 
@@ -449,6 +580,17 @@ def test_both_disposition_statuses_suppress_when_fresh() -> None:
     assert report.suppressed == {"legit_ignore": 1, "misfiled_deferred": 1}
 
 
+def test_disposition_silences_a_context_row_too() -> None:
+    files = _singles_library()
+    dispositions = {101: _disp("legit_ignore", "albumartist", "Blue Stahli")}
+
+    report = mismatch._classify(files, _MUSIC, dispositions=dispositions)
+
+    assert _find_context(report, 101) is None
+    assert report.folder_context == 1
+    assert report.suppressed == {"legit_ignore": 1}
+
+
 # --- grouped view -------------------------------------------------------------------
 
 
@@ -463,11 +605,12 @@ def test_grouped_view_shape() -> None:
     ozzy = next(g for g in grouped.groups if g.folder == _OZZY_FOLDER)
     assert ozzy.path_artist == "Ozzy Osbourne"
     assert ozzy.file_count == 2  # two tracked files in the folder
-    assert ozzy.flagged == 2  # Jem (HIGH) + clean sibling (LOW folder-consistency)
-    assert ozzy.file_ids == [100, 101]
-    assert ozzy.tiers == {"high": 1, "low": 1}
+    assert ozzy.flagged == 1  # only the Jem (HIGH) row is a defect
+    assert ozzy.folder_context == 1  # the clean sibling, reported separately
+    assert ozzy.file_ids == [100]  # the fix flow never picks up the context file
+    assert ozzy.tiers == {"high": 1}
     assert ozzy.fields == ["albumartist"]
-    assert ozzy.tag_values == {"Jem": 1, "Ozzy Osbourne": 1}
+    assert ozzy.tag_values == {"Jem": 1}
     assert ozzy.suppressed == {}
 
 
@@ -478,8 +621,9 @@ def test_grouped_view_reports_suppressed_per_folder() -> None:
     grouped = mismatch._grouped_report(report, mismatch._folder_stats(files), tier=None, limit=None)
 
     ozzy = next(g for g in grouped.groups if g.folder == _OZZY_FOLDER)
-    assert ozzy.flagged == 1  # only the clean-sibling LOW row remains
-    assert ozzy.file_ids == [101]
+    assert ozzy.flagged == 0  # the only defect is disposition-silenced
+    assert ozzy.folder_context == 1  # the clean sibling still shows as context
+    assert ozzy.file_ids == []
     assert ozzy.suppressed == {"legit_ignore": 1}
 
 
@@ -519,7 +663,8 @@ def test_folder_expansion_is_exact_equality() -> None:
     report = mismatch._classify(files, _MUSIC)
 
     expanded = mismatch._expand_folder(report, _OZZY_FOLDER, tier=None, limit=None)
-    assert {r.file_id for r in expanded.rows} == {100, 101}
+    assert {r.file_id for r in expanded.rows} == {100}
+    assert {r.file_id for r in expanded.folder_context_rows} == {101}
     assert expanded.groups == []
 
     # A parent prefix must NOT match (equality, not substring/LIKE).
@@ -774,6 +919,7 @@ def test_cli_detect_mismatches_group_lists_folders(music_dir: Path) -> None:
     assert result.exit_code == 0
     assert "Ozzy Osbourne" in result.stdout
     assert "flagged" in result.stdout
+    assert "context" in result.stdout
 
 
 def test_mcp_stage_tags_batch_atomic_and_commits_once(music_dir: Path) -> None:
@@ -943,6 +1089,9 @@ def test_container_mixed_leaf_still_flags_variant_low() -> None:
         row = _find(report, fid)
         assert row is not None
         assert row.tier == "low"
+        # No path signal means agreement is unknown, never "agrees" -> not folder context.
+        assert row.reason == mismatch._REASON_NO_SIGNAL
+    assert report.folder_context == 0
     assert report.container_suppressed == {"Soundtracks": 2}
 
 

@@ -124,7 +124,7 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
-SCHEMA_VERSION: Final = 15
+SCHEMA_VERSION: Final = 16
 
 _FILES_DDL: Final = """
 CREATE TABLE IF NOT EXISTS files (
@@ -333,6 +333,15 @@ CREATE TABLE IF NOT EXISTS musicbrainz_cache (
 # recording; 1 = found). The found columns hold the selected recording's release-group
 # title/id + the recording MBID. Feeds ``detect_album_gaps``' review-only tier. See PLAN —
 # album-gaps recording tier.
+_MUSICBRAINZ_RELEASE_CACHE_DDL: Final = """
+CREATE TABLE IF NOT EXISTS musicbrainz_release_cache (
+  request_key TEXT PRIMARY KEY,
+  found       INTEGER NOT NULL,
+  payload     TEXT,
+  fetched_at  TEXT NOT NULL
+)
+"""
+
 _MUSICBRAINZ_ARTIST_CACHE_DDL: Final = """
 CREATE TABLE IF NOT EXISTS musicbrainz_artist_cache (
   request_key    TEXT PRIMARY KEY,
@@ -525,6 +534,7 @@ def apply_schema(connection: sqlite3.Connection) -> None:
     connection.execute(_MUSICBRAINZ_CACHE_DDL)
     connection.execute(_MUSICBRAINZ_RECORDING_CACHE_DDL)
     connection.execute(_MUSICBRAINZ_ARTIST_CACHE_DDL)
+    connection.execute(_MUSICBRAINZ_RELEASE_CACHE_DDL)
     connection.execute(_VOIDED_AUTO_DDL)
     connection.execute(_FILE_MISMATCH_STATUS_DDL)
     connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")

@@ -58,7 +58,19 @@ trusted here. Last.fm's still is not, so the Last.fm tier sees only values with 
 MBID MusicBrainz does not know. A name MusicBrainz records under neither form lands in the new
 `name_id_disagreement` bucket, held, as does a value the library pairs with two different MBIDs.
 `_build_target` now writes each field's own id field, so an `albumartist`-only correction no
-longer overwrites `musicbrainz_artistid`. 32 MCP tools total. Schema is **v15** (additive: v11 adds
+longer overwrites `musicbrainz_artistid`. The `detect_album_conflicts` tool
+(`album_conflicts.py`) is the release-level sibling of `detect_track_conflicts`. It flags files
+whose album identity differs from their folder siblings'. A file's album identity is
+`musicbrainz_albumid` when it carries one, and otherwise the display album artist, the album
+title and the year. The display album artist falls back `albumartist` → `Various
+Artists` when the `compilation` flag is set → `artist`. Comparison folds casing, typographic
+character choice and whitespace runs, and nothing else. It is deliberately NOT `mismatch.fold`,
+which strips every non-alphanumeric character and so erases the punctuation splits this
+detector exists to find. Three tiers: `high` when the release ids differ or only some files
+carry one, `medium` for a name or year disagreement with no ids involved, `low` when one title
+carries a `(disc N: …)` suffix the others do not. Only the MINORITY is flagged, and every row
+carries the majority identity. Blank-`album` files are skipped, since `detect_album_gaps`
+already owns them. 33 MCP tools total. Schema is **v15** (additive: v11 adds
 `musicbrainz_recording_cache`, v12 renames `file_album_status` → `file_year_status` in place —
 dispositions preserved; v13 adds `tag_revisions.managed_set`, stamping which managed-tag set
 governed each revision so a revert can restore emptiness on the widened fields; v14 adds
@@ -144,9 +156,11 @@ Rules, in order:
 1. All read-only findings reports are ONE `detect_*` family — defined by call shape, never split by
    problem class or by whether a disposition table exists.
 2. Reports name the **finding**, state ops name the **domain** (`stage_paths`, never `stage_moves`).
-   One distinct plural finding noun per comparison (glossary below); qualify with the field when the
-   finding lives in exactly one (`album_gaps`, `year_disagreements`, `path_deviations`), bare when
-   it spans fields (`mismatches`). Reuse the repo's word for that concept if one exists; otherwise
+   One distinct plural finding noun per comparison (glossary below). Qualify with the field when the
+   finding lives in exactly one (`album_gaps`, `year_disagreements`, `path_deviations`). Qualify with
+   the thing compared when the finding spans several fields AND a sibling tool shares the finding
+   noun (`track_conflicts` compares track slots, `album_conflicts` compares album identity). Leave it
+   bare when it spans fields and nothing shares the noun (`mismatches`). Reuse the repo's word for that concept if one exists; otherwise
    coin exactly one noun and add it to the glossary in the same commit. A token that already means
    something else in the repo is not a reuse.
 3. Prefer an existing verb over a new one.
@@ -230,7 +244,7 @@ src/tagmend/
   log.py            shared logger (use everywhere)
   config.py         settings.json (platformdirs) + typed Settings
   cli.py            Typer CLI (thin)
-  mcp_server.py     FastMCP server (thin) — 32 tools
+  mcp_server.py     FastMCP server (thin) — 33 tools
   engine/
     db.py           SQLite connection (WAL)
     schema.py       all DDL + PRAGMA user_version (v15)
@@ -244,11 +258,16 @@ src/tagmend/
     staging.py      tags domain (TagDomain) + stage/diff/commit_tags orchestration
     lastfm.py       Last.fm top-tags client: lastfm_cache + pacing (getCorrection → M4)
     musicbrainz.py  MusicBrainz client: release-group year, recording lookup, artist-by-MBID name
+    axis.py         the parameterized Axis: ONE per-file status machine for genre/artist/year/mismatch
     classify.py     genre vocab/overlay loader + fold-key index + classify.classify_genres (pure)
     genres.py       resolve_genres orchestration + file_genre_status workflow
     artists.py      resolve_artists + set/reset_artist_status: MusicBrainz-by-MBID then getCorrection cascade-stage + file_artist_status workflow
-    track_conflicts.py  detect_track_conflicts: intra-folder (disc, track) slot collisions
     years.py        resolve_years + set/reset_year_status: MusicBrainz originaldate blank-fill + file_year_status workflow
+    mismatch.py     detect_mismatches + set/reset_mismatch_status: identity tags vs folder path, tiered
+    track_conflicts.py  detect_track_conflicts: intra-folder (disc, track) slot collisions
+    album_conflicts.py  detect_album_conflicts: intra-folder album-identity splits, tiered
+    album_gaps.py   detect_album_gaps: blank-album files grouped by folder + tiered fill proposals
+    parsing.py      pure folder/filename → (artist, album) parsing for the album-gap fills
     paths.py        STUB + PathDomain paper sketch — M6 (organize/paths)
 tests/              pytest; conftest isolates config + builds temp libraries (make_track)
 ```

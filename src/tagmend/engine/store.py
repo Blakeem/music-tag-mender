@@ -827,6 +827,50 @@ def put_cached_mb_artist(  # noqa: PLR0913 - cohesive keyword-only cache payload
     )
 
 
+# --- musicbrainz_release_cache (persistent release + tracklist lookups) ---------------
+#
+# A release is a nested document (media, each with tracks), so the parsed form is stored as
+# one JSON payload rather than shredded across three tables. Nothing queries inside it: the
+# key is always the release MBID, and the caller wants the whole tracklist.
+
+
+def get_cached_mb_release(
+    conn: sqlite3.Connection,
+    request_key: str,
+) -> tuple[bool, str | None] | None:
+    """Return the cached release lookup for *request_key*, or ``None`` on a miss.
+
+    A hit is ``(found, payload)``: ``found=False`` is the negative-cache sentinel (no release
+    under that MBID), while ``found=True`` carries the parsed release as a JSON string.
+    """
+    cursor = conn.execute(
+        "SELECT found, payload FROM musicbrainz_release_cache WHERE request_key = ?",
+        (request_key,),
+    )
+    row = cursor.fetchone()
+    if row is None:
+        return None
+    return (bool(row[0]), None if row[1] is None else str(row[1]))
+
+
+def put_cached_mb_release(
+    conn: sqlite3.Connection,
+    *,
+    request_key: str,
+    found: bool,
+    payload: str | None,
+    now: str,
+) -> None:
+    """Insert or replace the cached release lookup for *request_key*."""
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO musicbrainz_release_cache (request_key, found, payload, fetched_at)
+        VALUES (?, ?, ?, ?)
+        """,
+        (request_key, 1 if found else 0, payload, now),
+    )
+
+
 # --- file_<axis>_status (per-file workflow decisions; PLAN — Status model) -----------
 #
 # The genre/artist status machinery is ONE parameterized concept; the per-axis config and

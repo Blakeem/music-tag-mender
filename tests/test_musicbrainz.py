@@ -18,6 +18,7 @@ from tagmend.engine.musicbrainz import (
     MusicBrainzError,
     _artist_request_key,
     _recording_request_key,
+    _release_request_key,
     _request_key,
 )
 from tagmend.engine.store import get_cached_mb_album, get_cached_mb_recording
@@ -658,3 +659,237 @@ def test_artist_by_mbid_paces_network_requests(db_conn: sqlite3.Connection) -> N
 
     assert len(slept) == 1
     assert slept[0] == pytest.approx(1.0)
+
+
+# --- release_by_mbid: the release's own tracklist -------------------------------------
+
+
+def _track(position: int, number: str, title: str, **overrides: object) -> dict[str, object]:
+    """Build one track entry as the release lookup shapes it."""
+    entry: dict[str, object] = {
+        "position": position,
+        "number": number,
+        "title": title,
+        "id": f"rt-{position}",
+        "length": 200000,
+        "recording": {"id": f"rec-{position}", "title": title},
+        "artist-credit": [
+            {"name": "36 Crazyfists", "joinphrase": "", "artist": {"id": "artist-1"}}
+        ],
+    }
+    entry.update(overrides)
+    return entry
+
+
+def _release_body(**overrides: object) -> dict[str, object]:
+    """Build one release lookup response as ``/ws/2/release/<mbid>?inc=recordings`` shapes it."""
+    body: dict[str, object] = {
+        "id": "rel-1",
+        "title": "In the Skin",
+        "date": "1997",
+        "country": "US",
+        "status": "Official",
+        "barcode": "12345",
+        "artist-credit": [
+            {"name": "36 Crazyfists", "joinphrase": "", "artist": {"id": "artist-1"}}
+        ],
+        "media": [
+            {
+                "position": 1,
+                "title": "",
+                "format": "CD",
+                "track-count": 2,
+                "tracks": [_track(1, "1", "Enemy Throttle"), _track(2, "2", "In the Skin")],
+            },
+        ],
+    }
+    body.update(overrides)
+    return body
+
+
+def test_release_by_mbid_returns_the_tracklist(db_conn: sqlite3.Connection) -> None:
+    client, calls = _client(db_conn, [_json_response(_release_body())])
+    with client:
+        release = client.release_by_mbid("rel-1")
+
+    assert release is not None
+    assert release.title == "In the Skin"
+    assert release.date == "1997"
+    assert release.country == "US"
+    assert release.artist_credit == "36 Crazyfists"
+    assert len(release.media) == 1
+    medium = release.media[0]
+    assert medium.position == 1
+    assert medium.track_count == 2
+    assert [t.title for t in medium.tracks] == ["Enemy Throttle", "In the Skin"]
+    assert [t.number for t in medium.tracks] == ["1", "2"]
+    assert medium.tracks[0].release_track_mbid == "rt-1"
+    assert medium.tracks[0].recording_mbid == "rec-1"
+    assert len(calls) == 1
+
+
+def test_release_by_mbid_queries_the_release_endpoint_with_recordings(
+    db_conn: sqlite3.Connection,
+) -> None:
+    seen: list[httpx.Request] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return _json_response(_release_body())
+
+    client = MusicBrainzClient(
+        "TagMend/test ( test@example.com )",
+        db_conn,
+        rate_per_sec=0.0,
+        transport=httpx.MockTransport(handle),
+    )
+    with client:
+        client.release_by_mbid("rel-1")
+
+    url = seen[0].url
+    assert url.path.endswith("/ws/2/release/rel-1")
+    assert url.params["inc"] == "recordings+artist-credits"
+    assert url.params["fmt"] == "json"
+
+
+def test_release_by_mbid_joins_a_multi_artist_credit_with_its_join_phrases(
+    db_conn: sqlite3.Connection,
+) -> None:
+    credit = [
+        {"name": "Kruder", "joinphrase": " & ", "artist": {"id": "a1"}},
+        {"name": "Dorfmeister", "joinphrase": "", "artist": {"id": "a2"}},
+    ]
+    client, _ = _client(db_conn, [_json_response(_release_body(**{"artist-credit": credit}))])
+    with client:
+        release = client.release_by_mbid("rel-1")
+
+    assert release is not None
+    assert release.artist_credit == "Kruder & Dorfmeister"
+    assert release.artist_mbids == ("a1", "a2")
+
+
+def test_release_by_mbid_carries_a_per_track_credit_that_differs_from_the_release(
+    db_conn: sqlite3.Connection,
+) -> None:
+    guest = [
+        {"name": "36 Crazyfists", "joinphrase": " feat. ", "artist": {"id": "artist-1"}},
+        {"name": "Guest", "joinphrase": "", "artist": {"id": "artist-2"}},
+    ]
+    body = _release_body()
+    media = body["media"]
+    assert isinstance(media, list)
+    media[0]["tracks"][1]["artist-credit"] = guest
+    client, _ = _client(db_conn, [_json_response(body)])
+    with client:
+        release = client.release_by_mbid("rel-1")
+
+    assert release is not None
+    assert release.media[0].tracks[1].artist_credit == "36 Crazyfists feat. Guest"
+    assert release.media[0].tracks[0].artist_credit == "36 Crazyfists"
+
+
+def test_release_by_mbid_indexes_tracks_by_the_ids_a_file_carries(
+    db_conn: sqlite3.Connection,
+) -> None:
+    client, _ = _client(db_conn, [_json_response(_release_body())])
+    with client:
+        release = client.release_by_mbid("rel-1")
+
+    assert release is not None
+    # A tagged file carries both ids, so either one finds its track without guessing.
+    by_release_track = release.track_by_release_track_mbid("rt-2")
+    by_recording = release.track_by_recording_mbid("rec-1")
+    assert by_release_track is not None
+    assert by_release_track.title == "In the Skin"
+    assert by_recording is not None
+    assert by_recording.title == "Enemy Throttle"
+    assert release.track_by_release_track_mbid("nope") is None
+
+
+def test_release_by_mbid_second_call_is_served_from_cache(db_conn: sqlite3.Connection) -> None:
+    client, calls = _client(db_conn, [_json_response(_release_body())])
+    with client:
+        first = client.release_by_mbid("rel-1")
+        second = client.release_by_mbid("rel-1")
+
+    assert first == second
+    assert len(calls) == 1
+
+
+def test_release_by_mbid_caches_a_404_as_a_negative(db_conn: sqlite3.Connection) -> None:
+    client, calls = _client(db_conn, [httpx.Response(404, json={"error": "Not Found"})])
+    with client:
+        assert client.release_by_mbid("gone") is None
+        assert client.release_by_mbid("gone") is None
+
+    assert len(calls) == 1
+
+
+def test_release_by_mbid_raises_and_does_not_cache_a_transient_failure(
+    db_conn: sqlite3.Connection,
+) -> None:
+    client, calls = _client(
+        db_conn,
+        [httpx.Response(503, text="busy"), _json_response(_release_body())],
+    )
+    with client:
+        with pytest.raises(MusicBrainzError):
+            client.release_by_mbid("rel-1")
+        assert client.release_by_mbid("rel-1") is not None
+
+    assert len(calls) == 2
+
+
+def test_release_by_mbid_returns_none_when_the_payload_has_no_title(
+    db_conn: sqlite3.Connection,
+) -> None:
+    body = _release_body()
+    del body["title"]
+    client, _ = _client(db_conn, [_json_response(body)])
+    with client:
+        assert client.release_by_mbid("rel-1") is None
+
+
+def test_release_by_mbid_tolerates_a_release_with_no_media(db_conn: sqlite3.Connection) -> None:
+    client, _ = _client(db_conn, [_json_response(_release_body(media=[]))])
+    with client:
+        release = client.release_by_mbid("rel-1")
+
+    assert release is not None
+    assert release.media == ()
+    assert release.total_tracks == 0
+
+
+def test_release_total_tracks_sums_every_medium(db_conn: sqlite3.Connection) -> None:
+    body = _release_body()
+    media = body["media"]
+    assert isinstance(media, list)
+    media.append(
+        {
+            "position": 2,
+            "title": "Bonus",
+            "format": "CD",
+            "track-count": 1,
+            "tracks": [_track(1, "1", "Extra")],
+        },
+    )
+    client, _ = _client(db_conn, [_json_response(body)])
+    with client:
+        release = client.release_by_mbid("rel-1")
+
+    assert release is not None
+    assert release.total_tracks == 3
+    assert release.media[1].title == "Bonus"
+
+
+def test_release_request_key_is_stable_and_id_scoped() -> None:
+    assert _release_request_key("abc") == _release_request_key("abc")
+    assert _release_request_key("abc") != _release_request_key("abd")
+
+
+def test_bumping_the_release_version_changes_the_request_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    before = _release_request_key("abc")
+    monkeypatch.setattr(musicbrainz, "_RELEASE_VERSION", "99")
+    assert _release_request_key("abc") != before

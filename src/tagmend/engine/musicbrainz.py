@@ -32,6 +32,7 @@ whole thing is unit-testable with :class:`httpx.MockTransport` and a fake clock.
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import time
 import unicodedata
@@ -46,9 +47,11 @@ from tagmend.engine.store import (
     get_cached_mb_album,
     get_cached_mb_artist,
     get_cached_mb_recording,
+    get_cached_mb_release,
     put_cached_mb_album,
     put_cached_mb_artist,
     put_cached_mb_recording,
+    put_cached_mb_release,
 )
 from tagmend.log import get_logger
 
@@ -62,6 +65,7 @@ logger = get_logger(__name__)
 _API_URL: Final = "https://musicbrainz.org/ws/2/release-group/"
 _RECORDING_API_URL: Final = "https://musicbrainz.org/ws/2/recording/"
 _ARTIST_API_URL: Final = "https://musicbrainz.org/ws/2/artist/"
+_RELEASE_API_URL: Final = "https://musicbrainz.org/ws/2/release/"
 
 # Secondary types that disqualify a release group as an original studio album: alternate takes
 # (Live, Demo, Field recording), repackagings (Compilation, Mixtape/Street, DJ-mix, Remix) and
@@ -93,6 +97,9 @@ _SELECTION_VERSION: Final = "2"
 # release-group rule change must not re-fetch every artist. Bump only when the fields
 # `_parse_artist` extracts change.
 _ARTIST_VERSION: Final = "1"
+
+# The release lookup's own version token, for the same reason the artist lookup has one.
+_RELEASE_VERSION: Final = "1"
 
 # One trailing parenthetical/bracketed segment — the edition suffix a tag carries and a release
 # group does not (``Fiction (Deluxe Edition)``, ``The Red Album [Deluxe Edition]``).
@@ -144,6 +151,74 @@ class MBArtist:
     aliases: tuple[str, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class MBTrack:
+    """One track on a release medium, as the release itself defines it.
+
+    ``release_track_mbid`` is Picard's ``musicbrainz_releasetrackid`` and identifies this
+    track ON THIS RELEASE. ``recording_mbid`` is Picard's ``musicbrainz_trackid`` and
+    identifies the recording, which can appear on many releases. A tagged file carries both,
+    so either one finds its track here without matching on title or position.
+    """
+
+    position: int
+    number: str
+    title: str
+    release_track_mbid: str
+    recording_mbid: str
+    artist_credit: str
+    artist_mbids: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class MBMedium:
+    """One disc of a release. ``title`` is the medium title, empty on most releases."""
+
+    position: int
+    title: str
+    format: str
+    track_count: int
+    tracks: tuple[MBTrack, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class MBRelease:
+    """A release and its full tracklist, looked up by the MBID a file already carries.
+
+    The authority for what a folder's tags SHOULD say: the album title, the album artist
+    credit, the per-track titles and numbers, and how many tracks each disc holds.
+    """
+
+    mbid: str
+    title: str
+    artist_credit: str
+    artist_mbids: tuple[str, ...]
+    date: str
+    country: str
+    status: str
+    barcode: str
+    media: tuple[MBMedium, ...]
+
+    @property
+    def total_tracks(self) -> int:
+        """Return the number of tracks across every medium."""
+        return sum(len(medium.tracks) for medium in self.media)
+
+    def track_by_release_track_mbid(self, mbid: str) -> MBTrack | None:
+        """Return the track carrying *mbid* as its release-track id, or ``None``."""
+        return next(
+            (t for m in self.media for t in m.tracks if t.release_track_mbid == mbid),
+            None,
+        )
+
+    def track_by_recording_mbid(self, mbid: str) -> MBTrack | None:
+        """Return the first track carrying *mbid* as its recording id, or ``None``."""
+        return next(
+            (t for m in self.media for t in m.tracks if t.recording_mbid == mbid),
+            None,
+        )
+
+
 class MusicBrainzError(RuntimeError):
     """A MusicBrainz lookup failed transiently (HTTP non-2xx).
 
@@ -184,6 +259,13 @@ class MBArtistSource(Protocol):
 
     def artist_by_mbid(self, mbid: str) -> MBArtist | None:
         """Return the artist MusicBrainz holds under *mbid*, or ``None`` if it holds none."""
+
+
+class MBReleaseSource(Protocol):
+    """The release+tracklist lookup a repair flow depends on (so it can use a fake in tests)."""
+
+    def release_by_mbid(self, mbid: str) -> MBRelease | None:
+        """Return the release MusicBrainz holds under *mbid*, or ``None`` if it holds none."""
 
 
 class MusicBrainzClient:
@@ -310,6 +392,24 @@ class MusicBrainzClient:
             )
 
         return self._fetch_and_cache_artist(mbid, request_key)
+
+    def release_by_mbid(self, mbid: str) -> MBRelease | None:
+        """Return the release MusicBrainz holds under *mbid*, tracklist included.
+
+        A direct lookup by id, like :meth:`artist_by_mbid`: the file supplies the identity.
+        Cache first (positive or negative), else one paced network query. A ``404`` is a real
+        answer and is negative-cached; any other non-2xx raises :class:`MusicBrainzError`.
+        """
+        request_key = _release_request_key(mbid)
+
+        cached = get_cached_mb_release(self._conn, request_key)
+        if cached is not None:
+            found, payload = cached
+            if not found or payload is None:
+                return None
+            return _release_from_json(mbid, payload)
+
+        return self._fetch_and_cache_release(mbid, request_key)
 
     # --- internals -------------------------------------------------------------------
 
@@ -502,6 +602,54 @@ class MusicBrainzClient:
         )
         self._conn.commit()
 
+    def _fetch_and_cache_release(self, mbid: str, request_key: str) -> MBRelease | None:
+        """Fetch one release lookup over the network (paced), then cache eagerly."""
+        # Input: one paced network request; None means MusicBrainz has no such release.
+        body = self._request_release(mbid)
+
+        # Process: pull the release, its media and their tracks out of the payload.
+        resolved = None if body is None else _parse_release(mbid, body)
+
+        # Output: cache the result eagerly, then return it.
+        if resolved is None:
+            put_cached_mb_release(
+                self._conn,
+                request_key=request_key,
+                found=False,
+                payload=None,
+                now=_utc_now(),
+            )
+            self._conn.commit()
+            return None
+        put_cached_mb_release(
+            self._conn,
+            request_key=request_key,
+            found=True,
+            payload=_release_to_json(resolved),
+            now=_utc_now(),
+        )
+        self._conn.commit()
+        return resolved
+
+    def _request_release(self, mbid: str) -> dict[str, object] | None:
+        """Pace, then GET one release by id; ``None`` on a 404 (a real "no such release")."""
+        if self._client is None:  # pragma: no cover - guard against misuse outside `with`
+            message = "MusicBrainzClient must be used as a context manager"
+            raise RuntimeError(message)
+
+        self._pace()
+        logger.debug("musicbrainz release request mbid=%r", mbid)
+        response = self._client.get(
+            f"{_RELEASE_API_URL}{mbid}",
+            params={"inc": "recordings+artist-credits", "fmt": "json"},
+        )
+        if response.status_code == _HTTP_NOT_FOUND:
+            return None
+        if response.is_error:
+            message = f"MusicBrainz HTTP {response.status_code} for release lookup"
+            raise MusicBrainzError(message)
+        return cast("dict[str, object]", response.json())
+
     def _pace(self) -> None:
         """Sleep just enough so consecutive network requests honor ``rate_per_sec``.
 
@@ -567,6 +715,206 @@ def _parse_artist(mbid: str, body: dict[str, object]) -> MBArtist | None:
         sort_name=sort_name if isinstance(sort_name, str) and sort_name else name,
         disambiguation=disambiguation if isinstance(disambiguation, str) else "",
         aliases=tuple(aliases),
+    )
+
+
+def _release_request_key(mbid: str) -> str:
+    """Return a stable ``sha1`` over the release-parse rules + the MBID for this lookup."""
+    payload = "\x00".join(["release", f"release_version={_RELEASE_VERSION}", f"mbid={mbid}"])
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()  # noqa: S324 - cache key, not security
+
+
+def _credit(entries: object) -> tuple[str, tuple[str, ...]]:
+    """Return an artist credit's display string and its artist MBIDs, in credit order.
+
+    MusicBrainz splits a credit into named parts each carrying the phrase that joins it to
+    the next (``Kruder`` + ``" & "`` then ``Dorfmeister``), which is how the display string
+    keeps the collaboration visible while the ids stay separable.
+    """
+    if not isinstance(entries, list):
+        return ("", ())
+    display: list[str] = []
+    mbids: list[str] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("name")
+        if isinstance(name, str):
+            display.append(name)
+        join = entry.get("joinphrase")
+        if isinstance(join, str):
+            display.append(join)
+        artist = entry.get("artist")
+        if isinstance(artist, dict):
+            artist_id = artist.get("id")
+            if isinstance(artist_id, str):
+                mbids.append(artist_id)
+    return ("".join(display), tuple(mbids))
+
+
+def _parse_track(entry: object, medium_credit: tuple[str, tuple[str, ...]]) -> MBTrack | None:
+    """Pull one track out of a medium's track list, or ``None`` when it carries no title."""
+    if not isinstance(entry, dict):
+        return None
+    title = entry.get("title")
+    if not isinstance(title, str) or not title.strip():
+        return None
+
+    recording = entry.get("recording")
+    recording_mbid = ""
+    if isinstance(recording, dict):
+        found = recording.get("id")
+        recording_mbid = found if isinstance(found, str) else ""
+
+    credit = _credit(entry.get("artist-credit"))
+    if not credit[0]:
+        credit = medium_credit
+
+    position = entry.get("position")
+    number = entry.get("number")
+    release_track_mbid = entry.get("id")
+    return MBTrack(
+        position=position if isinstance(position, int) else 0,
+        number=number if isinstance(number, str) else str(number or ""),
+        title=title,
+        release_track_mbid=release_track_mbid if isinstance(release_track_mbid, str) else "",
+        recording_mbid=recording_mbid,
+        artist_credit=credit[0],
+        artist_mbids=credit[1],
+    )
+
+
+def _parse_release(mbid: str, body: dict[str, object]) -> MBRelease | None:
+    """Pull the release, its media and their tracks out of one release payload.
+
+    ``None`` when the payload carries no usable title, which is negative-cached like a 404.
+    """
+    title = body.get("title")
+    if not isinstance(title, str) or not title.strip():
+        return None
+
+    release_credit = _credit(body.get("artist-credit"))
+    media: list[MBMedium] = []
+    raw_media = body.get("media")
+    if isinstance(raw_media, list):
+        for raw_medium in raw_media:
+            if not isinstance(raw_medium, dict):
+                continue
+            tracks = [
+                track
+                for track in (
+                    _parse_track(entry, release_credit)
+                    for entry in (raw_medium.get("tracks") or [])
+                )
+                if track is not None
+            ]
+            media.append(
+                MBMedium(
+                    position=_as_int(raw_medium.get("position")),
+                    title=_as_str(raw_medium.get("title")),
+                    format=_as_str(raw_medium.get("format")),
+                    track_count=_as_int(raw_medium.get("track-count")),
+                    tracks=tuple(tracks),
+                ),
+            )
+
+    return MBRelease(
+        mbid=mbid,
+        title=title,
+        artist_credit=release_credit[0],
+        artist_mbids=release_credit[1],
+        date=_as_str(body.get("date")),
+        country=_as_str(body.get("country")),
+        status=_as_str(body.get("status")),
+        barcode=_as_str(body.get("barcode")),
+        media=tuple(media),
+    )
+
+
+def _as_str(value: object) -> str:
+    """Return *value* as a string, or empty when it is absent or not a string."""
+    return value if isinstance(value, str) else ""
+
+
+def _as_int(value: object) -> int:
+    """Return *value* as an int, or 0 when it is absent or not an int."""
+    return value if isinstance(value, int) else 0
+
+
+def _release_to_json(release: MBRelease) -> str:
+    """Serialize a parsed release for the cache column."""
+    return json.dumps(
+        {
+            "title": release.title,
+            "artist_credit": release.artist_credit,
+            "artist_mbids": list(release.artist_mbids),
+            "date": release.date,
+            "country": release.country,
+            "status": release.status,
+            "barcode": release.barcode,
+            "media": [
+                {
+                    "position": m.position,
+                    "title": m.title,
+                    "format": m.format,
+                    "track_count": m.track_count,
+                    "tracks": [
+                        {
+                            "position": t.position,
+                            "number": t.number,
+                            "title": t.title,
+                            "release_track_mbid": t.release_track_mbid,
+                            "recording_mbid": t.recording_mbid,
+                            "artist_credit": t.artist_credit,
+                            "artist_mbids": list(t.artist_mbids),
+                        }
+                        for t in m.tracks
+                    ],
+                }
+                for m in release.media
+            ],
+        },
+    )
+
+
+def _release_from_json(mbid: str, payload: str) -> MBRelease | None:
+    """Rebuild a release from its cache column, or ``None`` when the row is unreadable."""
+    try:
+        data = json.loads(payload)
+    except json.JSONDecodeError:  # pragma: no cover - only a hand-corrupted row reaches this
+        return None
+    if not isinstance(data, dict):  # pragma: no cover - same
+        return None
+    return MBRelease(
+        mbid=mbid,
+        title=str(data.get("title", "")),
+        artist_credit=str(data.get("artist_credit", "")),
+        artist_mbids=tuple(data.get("artist_mbids") or ()),
+        date=str(data.get("date", "")),
+        country=str(data.get("country", "")),
+        status=str(data.get("status", "")),
+        barcode=str(data.get("barcode", "")),
+        media=tuple(
+            MBMedium(
+                position=int(m.get("position", 0)),
+                title=str(m.get("title", "")),
+                format=str(m.get("format", "")),
+                track_count=int(m.get("track_count", 0)),
+                tracks=tuple(
+                    MBTrack(
+                        position=int(t.get("position", 0)),
+                        number=str(t.get("number", "")),
+                        title=str(t.get("title", "")),
+                        release_track_mbid=str(t.get("release_track_mbid", "")),
+                        recording_mbid=str(t.get("recording_mbid", "")),
+                        artist_credit=str(t.get("artist_credit", "")),
+                        artist_mbids=tuple(t.get("artist_mbids") or ()),
+                    )
+                    for t in (m.get("tracks") or [])
+                ),
+            )
+            for m in (data.get("media") or [])
+        ),
     )
 
 

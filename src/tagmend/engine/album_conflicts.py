@@ -13,12 +13,15 @@ agrees on:
 * ``musicbrainz_albumid`` when present. It is an explicit claim about which release this is,
   and it settles the file on its own.
 * otherwise the display album artist, the album title and the year. The display album artist
-  is ``albumartist``, falling back to ``artist``, falling back to a compilation marker, which
-  is the same fallback chain the servers use.
+  is ``albumartist``, falling back to ``Various Artists`` when the compilation flag is set,
+  then to ``artist``. The compilation marker outranks the track artist, which is what keeps a
+  various-artists release with no album artist from scattering across every track's artist.
 
-Titles and names are compared under :func:`tagmend.engine.mismatch.fold`, so casing, spacing
-and punctuation never split a folder on their own. A year is compared verbatim, because
-``2005`` and ``2005-06-01`` really are different grouping keys downstream.
+Titles and names are compared under :func:`_group_key`, which folds casing, typographic
+character choice and whitespace runs and nothing else. Punctuation is deliberately
+significant: ``The Crow: City of Angels`` and ``The Crow- City Of Angels`` are two albums
+downstream. A year is compared verbatim, because ``2005`` and ``2005-06-01`` are two grouping
+keys as well.
 
 The report names the **minority**: the files whose identity differs from the one most of the
 folder shares, and every row carries that majority identity so a reviewer can see what the

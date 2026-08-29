@@ -348,6 +348,9 @@ def _process_one_group(  # noqa: PLR0913 - cohesive per-group inputs
             tally.staged_files += 1
         return
 
+    # The lookup already happened, so a preview can and must report the miss; only the
+    # sticky status row is withheld until the real run.
+    tally.no_match += len(file_ids)
     if dry_run:
         return
     now = _utc_now()
@@ -360,7 +363,6 @@ def _process_one_group(  # noqa: PLR0913 - cohesive per-group inputs
             source_album=identity.album,
             now=now,
         )
-        tally.no_match += 1
     conn.commit()
 
 

@@ -675,3 +675,25 @@ def test_list_albums_actionable_composes_with_year_status_and_precedes_limit(
         limit=1,
     )
     assert [row.album for row in limited] == ["C1"]
+
+
+def test_dry_run_counts_no_match_without_recording_it(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    # A preview exists to show what the real run will do. The lookup happens either way, so
+    # a group MusicBrainz cannot resolve must be COUNTED in the preview; only the sticky
+    # status row is withheld until the real run.
+    make_track(music_dir / "a.mp3", {"artist": ["Obscure"], "album": ["Demos"]})
+    scan_library(engine_settings)
+    file_id = _file_id(engine_settings, music_dir, "a.mp3")
+
+    fake = FakeMBAlbumSource({("Obscure", "Demos"): None})
+    result = years.resolve_years(engine_settings, client=fake, dry_run=True)
+
+    assert result.no_match == 1
+    assert result.staged_files == 0
+
+    # ...but nothing is recorded, so the real run still has the group to do.
+    view = next(v for v in library_list(engine_settings) if v.file_id == file_id)
+    assert view.year_status == "pending"

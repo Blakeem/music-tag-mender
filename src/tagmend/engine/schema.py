@@ -327,12 +327,12 @@ CREATE TABLE IF NOT EXISTS musicbrainz_cache (
 )
 """
 
-# Persistent cache of MusicBrainz recording-search lookups, keyed by a request hash (so it
-# survives MCP restarts), mirroring ``musicbrainz_cache`` for the ``(artist, title)`` axis.
-# ``found`` is the negative-cache sentinel (0 = no usable Album release group for the
-# recording; 1 = found). The found columns hold the selected recording's release-group
-# title/id + the recording MBID. Feeds ``detect_album_gaps``' review-only tier. See PLAN —
-# album-gaps recording tier.
+# Persistent cache of MusicBrainz release lookups by release MBID, keyed by a request hash
+# carrying its own parse-rule version. ``found`` is the negative-cache sentinel (0 = no
+# release under that id; 1 = found). A release is a nested document (media, each with
+# tracks), so the parsed form is one JSON ``payload`` rather than three shredded tables:
+# nothing queries inside it, since the key is always the MBID and the caller wants the whole
+# tracklist. Feeds ``detect_disagreements``.
 _MUSICBRAINZ_RELEASE_CACHE_DDL: Final = """
 CREATE TABLE IF NOT EXISTS musicbrainz_release_cache (
   request_key TEXT PRIMARY KEY,
@@ -342,6 +342,11 @@ CREATE TABLE IF NOT EXISTS musicbrainz_release_cache (
 )
 """
 
+# Persistent cache of MusicBrainz artist lookups by artist MBID, keyed by a request hash
+# carrying its own parse-rule version. ``found`` is the negative-cache sentinel (0 = no
+# artist under that id; 1 = found). The found columns hold the canonical name, the sort name
+# and the alias set, which is what tells a name worth merging from a per-track credit.
+# Feeds ``resolve_artists``' MusicBrainz tier.
 _MUSICBRAINZ_ARTIST_CACHE_DDL: Final = """
 CREATE TABLE IF NOT EXISTS musicbrainz_artist_cache (
   request_key    TEXT PRIMARY KEY,
@@ -354,6 +359,12 @@ CREATE TABLE IF NOT EXISTS musicbrainz_artist_cache (
 )
 """
 
+# Persistent cache of MusicBrainz recording-search lookups, keyed by a request hash (so it
+# survives MCP restarts), mirroring ``musicbrainz_cache`` for the ``(artist, title)`` axis.
+# ``found`` is the negative-cache sentinel (0 = no usable Album release group for the
+# recording; 1 = found). The found columns hold the selected recording's release-group
+# title/id + the recording MBID. Feeds ``detect_album_gaps``' review-only tier. See PLAN —
+# album-gaps recording tier.
 _MUSICBRAINZ_RECORDING_CACHE_DDL: Final = """
 CREATE TABLE IF NOT EXISTS musicbrainz_recording_cache (
   request_key      TEXT PRIMARY KEY,

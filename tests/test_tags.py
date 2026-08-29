@@ -16,7 +16,10 @@ from conftest import make_track
 # Import tags so its module-load RegisterFreeformKey runs before make_track writes any
 # ``originaldate`` via raw mutagen easy mode (the M4A freeform atom must be registered).
 from tagmend.engine.tags import (
+    MANAGED_SET_VERSION,
+    MANAGED_SETS,
     MANAGED_TAGS,
+    ORIGINAL_MANAGED_TAGS,
     TAG_READER_VERSION,
     read_tags,
     write_managed_tags,
@@ -118,6 +121,13 @@ _EXPECTED_MANAGED = frozenset(
         "musicbrainz_releasegroupid",
         "musicbrainz_releasetrackid",
         "musicbrainz_trackid",
+        "musicbrainz_albumstatus",
+        "media",
+        "releasecountry",
+        "barcode",
+        "catalognumber",
+        "isrc",
+        "asin",
     },
 )
 _NEW_FIELD_VALUES: dict[str, list[str]] = {
@@ -137,7 +147,7 @@ _NEW_FIELD_VALUES: dict[str, list[str]] = {
 }
 
 
-def test_managed_tags_is_exactly_the_widened_set() -> None:
+def test_managed_tags_is_exactly_the_declared_set() -> None:
     assert MANAGED_TAGS == _EXPECTED_MANAGED
     # Each newly-managed field is a member (the fix flow + revert can touch all of them).
     for field in _NEW_FIELD_VALUES:
@@ -347,12 +357,6 @@ def test_vorbis_native_spelling_wins_when_both_present(tmp_path: Path) -> None:
     assert read_tags(track).tags["musicbrainz_albumtype"] == ["album"]
 
 
-def test_reader_version_bumped_with_the_reader_change() -> None:
-    # The three registration/mapping fixes change what read_tags produces for ~90% of the
-    # library, so already-scanned rows must be re-read exactly once.
-    assert TAG_READER_VERSION == 2
-
-
 def test_vorbis_write_uses_uppercase_field_names(tmp_path: Path) -> None:
     # Picard uppercases Vorbis field names, so writing lowercase left a Picard-tagged file
     # carrying a mix of cases for no reason. Names are case-insensitive per the spec, so this
@@ -371,3 +375,81 @@ def test_vorbis_write_uses_uppercase_field_names(tmp_path: Path) -> None:
     assert "ARTIST" in stored
     assert "releasetype" not in stored
     assert "artist" not in stored
+
+
+# --- managed-set version 3: the release/recording provenance stamp -------------------
+# After an identity fix rewrites artist/album/title, the WRONG release's provenance block
+# stays behind: a file reading "Alice in Chains - Greatest Hits" while its albumstatus says
+# "bootleg" and its country says "RU" is still wrong. These eight fields make that block
+# fixable and revertible instead of invisible.
+
+_RELEASE_STAMP = {
+    "musicbrainz_albumstatus": ["official"],
+    "media": ["CD"],
+    "releasecountry": ["US"],
+    "barcode": ["0123456789012"],
+    "catalognumber": ["CAT-001"],
+    "isrc": ["USRC17607839"],
+    "asin": ["B000001"],
+}
+
+
+@pytest.mark.parametrize("field", sorted(_RELEASE_STAMP))
+def test_release_stamp_fields_are_managed(field: str) -> None:
+    assert field in MANAGED_TAGS
+
+
+@pytest.mark.parametrize("suffix", _ALL_FORMATS)
+def test_release_stamp_round_trips(tmp_path: Path, suffix: str) -> None:
+    # The closed-set rule: every managed key must be provably writable on all four containers.
+    track = make_track(tmp_path / f"stamp{suffix}")
+    write_managed_tags(track, dict(_RELEASE_STAMP))
+
+    tags = read_tags(track).tags
+    for field, expected in _RELEASE_STAMP.items():
+        assert tags.get(field) == expected, f"{field} on {suffix}"
+
+
+def test_label_and_organization_stay_distinct_on_flac(tmp_path: Path) -> None:
+    # 245 FLACs in the real library carry a DIFFERENT value in each, so collapsing them
+    # would pick one and let a later write delete the other. Both stay their own tag.
+    track = make_track(tmp_path / "picard.flac")
+    audio = FLAC(track)
+    audio["ORGANIZATION"] = ["Gashed!"]
+    audio["LABEL"] = ["Metropolis Records"]
+    audio.save()
+
+    tags = read_tags(track).tags
+    assert tags.get("organization") == ["Gashed!"]
+    assert tags.get("label") == ["Metropolis Records"]
+    assert "organization" not in MANAGED_TAGS
+    assert "label" not in MANAGED_TAGS
+
+
+def test_reads_releasestatus_as_albumstatus_on_flac(tmp_path: Path) -> None:
+    track = make_track(tmp_path / "picard.flac")
+    audio = FLAC(track)
+    audio["RELEASESTATUS"] = ["bootleg"]
+    audio.save()
+
+    assert read_tags(track).tags.get("musicbrainz_albumstatus") == ["bootleg"]
+
+
+def test_reads_releasecountry_from_picard_atom_on_m4a(tmp_path: Path) -> None:
+    # mutagen maps releasecountry to the atom "MusicBrainz Release Country"; Picard writes
+    # "MusicBrainz Album Release Country". One word apart, and invisible without the override.
+    track = make_track(tmp_path / "picard.m4a")
+    raw = MP4(track)  # type: ignore[no-untyped-call]
+    raw["----:com.apple.iTunes:MusicBrainz Album Release Country"] = [b"GB"]
+    raw.save()  # type: ignore[no-untyped-call]
+
+    assert read_tags(track).tags.get("releasecountry") == ["GB"]
+
+
+def test_managed_set_version_3_registered() -> None:
+    assert MANAGED_SET_VERSION == 3
+    assert MANAGED_SETS[3] == MANAGED_TAGS
+    # Older stamps must stay frozen: stored revisions point at them.
+    assert MANAGED_SETS[1] == ORIGINAL_MANAGED_TAGS
+    assert len(MANAGED_SETS[2]) == 18
+    assert TAG_READER_VERSION == 4

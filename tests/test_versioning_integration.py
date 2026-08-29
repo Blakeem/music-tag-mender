@@ -33,7 +33,7 @@ _NOW = "2026-06-02T00:00:00+00:00"
 _LATER = "2026-06-02T01:00:00+00:00"
 
 # A value for every tag in the closed managed set, so the "revert restores emptiness" test
-# covers all 18 rather than a sample.
+# covers all 25 rather than a sample.
 _ALL_MANAGED_TAGS = {
     "genre": ["Electronic"],
     "artist": ["Artist"],
@@ -53,6 +53,13 @@ _ALL_MANAGED_TAGS = {
     "musicbrainz_releasegroupid": ["mb-releasegroup"],
     "musicbrainz_releasetrackid": ["mb-releasetrack"],
     "musicbrainz_trackid": ["mb-track"],
+    "musicbrainz_albumstatus": ["official"],
+    "media": ["CD"],
+    "releasecountry": ["US"],
+    "barcode": ["0123456789012"],
+    "catalognumber": ["CAT-001"],
+    "isrc": ["USRC17607839"],
+    "asin": ["B000001"],
 }
 
 
@@ -286,7 +293,7 @@ def test_revert_to_empty_baseline_clears_every_managed_tag(
     music_dir: Path,
 ) -> None:
     # The revert-fidelity defect in full: a v0 baseline captured with NO managed tags means
-    # all 18 were empty, so reverting to it must delete all 18. Before the managed-set stamp
+    # all 25 were empty, so reverting to it must delete all 25. Before the managed-set stamp
     # the 13 widened fields were preserved instead and the revert reported success while the
     # file kept them.
     assert set(_ALL_MANAGED_TAGS) == MANAGED_TAGS
@@ -296,7 +303,7 @@ def test_revert_to_empty_baseline_clears_every_managed_tag(
 
     _baseline(engine_settings, file_id, {})
     assert _edit(engine_settings, track, file_id, _ALL_MANAGED_TAGS) == 1
-    assert set(read_tags(track).tags) >= MANAGED_TAGS  # all 18 really landed on disk
+    assert set(read_tags(track).tags) >= MANAGED_TAGS  # all 25 really landed on disk
 
     result = versioning.revert(engine_settings, file_id, 0)
 
@@ -372,3 +379,37 @@ def test_write_managed_tags_rejects_unmanaged_key(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="non-managed"):
         write_managed_tags(track, {"composer": ["Nope"]})
+
+
+@pytest.mark.parametrize("suffix", _FORMATS)
+def test_revert_to_version_2_baseline_preserves_release_stamp(
+    engine_settings: Settings,
+    music_dir: Path,
+    suffix: str,
+) -> None:
+    # The version-3 widening's compat guarantee, the twin of the version-1 case above. A
+    # revision stamped managed-set version 2 governed the 18 identity fields but not the 8
+    # release-stamp ones, so reverting to it restores identity and leaves the stamp alone.
+    track = make_track(
+        music_dir / f"track{suffix}",
+        {
+            "artist": ["Wrong Artist"],
+            "album": ["Wrong Album"],
+            "barcode": ["0123456789012"],
+            "musicbrainz_albumstatus": ["bootleg"],
+        },
+    )
+    scan_library(engine_settings)
+    file_id = _file_id(engine_settings, music_dir, track.name)
+
+    _baseline(engine_settings, file_id, {"artist": ["Original"], "album": ["Original Album"]})
+    _stamp_managed_set(engine_settings, file_id, version=0, managed_set=2)
+
+    versioning.revert(engine_settings, file_id, 0)
+
+    reverted = read_tags(track).tags
+    assert reverted["artist"] == ["Original"]
+    assert reverted["album"] == ["Original Album"]
+    # The release stamp was outside version 2's set, so its absence there means "not tracked".
+    assert reverted.get("barcode") == ["0123456789012"]
+    assert reverted.get("musicbrainz_albumstatus") == ["bootleg"]

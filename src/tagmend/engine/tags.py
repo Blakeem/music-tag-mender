@@ -63,6 +63,25 @@ EasyMP4Tags.RegisterFreeformKey(  # type: ignore[no-untyped-call]
     "MusicBrainz Release Track Id",
 )
 
+# The release-stamp fields MP4 needs mapped. ``organization`` is registered for READING only
+# (it is not in the managed set — see the note beside _VORBIS_SPELLINGS), which costs nothing
+# and beats leaving the atom invisible. All but ``releasecountry`` simply have no built-in
+# EasyMP4 entry; ``releasecountry`` HAS one and it points at the wrong atom — mutagen says
+# ``MusicBrainz Release Country`` while Picard writes ``MusicBrainz Album Release Country``, one
+# word apart and invisible without this override. Every name here was read off a real
+# Picard-tagged ``.m4a`` in the library except ``CATALOGNUMBER``, which no sample carried and
+# which follows the uppercase convention the other five share.
+for _key, _atom in (
+    ("organization", "LABEL"),
+    ("media", "MEDIA"),
+    ("barcode", "BARCODE"),
+    ("catalognumber", "CATALOGNUMBER"),
+    ("isrc", "ISRC"),
+    ("asin", "ASIN"),
+    ("releasecountry", "MusicBrainz Album Release Country"),
+):
+    EasyMP4Tags.RegisterFreeformKey(_key, _atom)  # type: ignore[no-untyped-call]
+
 # Raw (already-lowercased) key -> canonical key. Kept deliberately small.
 _ALIASES: Final[dict[str, str]] = {
     "album artist": "albumartist",
@@ -76,7 +95,15 @@ _ALIASES: Final[dict[str, str]] = {
 # needed ONLY where the two names differ.
 _VORBIS_SPELLINGS: Final[Mapping[str, str]] = {
     "musicbrainz_albumtype": "releasetype",
+    "musicbrainz_albumstatus": "releasestatus",
 }
+
+# NOT here, deliberately: ``organization`` <-> ``label``. Measured on this library, 479 FLACs
+# carry BOTH Vorbis names and on 245 of them the values DIFFER (an original label in
+# ORGANIZATION, the reissue label in LABEL). Collapsing them would pick one and let a later
+# write delete the other, with the baseline holding only the survivor — irreversible. The two
+# above have zero such overlap, so collapsing them is lossless. Until the label pair has a
+# decided rule, both names stay unmapped and unmanaged.
 
 # Derived, never hand-written twice: a second literal could drift out of step with the map above.
 _VORBIS_TO_CANONICAL: Final[Mapping[str, str]] = {v: k for k, v in _VORBIS_SPELLINGS.items()}
@@ -123,34 +150,55 @@ _WIDENED_MANAGED_TAGS: Final[frozenset[str]] = frozenset(
     },
 )
 
-# The set of tags TagMend is allowed to write/revert (18 = the 5 original + 13 widened). A
-# CLOSED set: anything outside it (``comment``/``composer``/art…) is never read, written, or
-# deleted, and every key here MUST be provably writable on all four formats. The mismatch-fix
-# flow can repair a poisoned release in one commit, and revert restores every field the
-# target revision's own managed set governed (see
+# The release/recording provenance stamp: WHICH PRESSING a file's tags came from. An identity
+# fix rewrites artist/album/title but leaves this block behind, so a rebound file reads
+# "Alice in Chains - Greatest Hits" while its albumstatus still says "bootleg" and its country
+# "RU" — from the Russian bootleg it was wrongly matched to. Managed so the fix flow can clear
+# or replace it in the same commit, and so revert governs it like everything else.
+_RELEASE_STAMP_TAGS: Final[frozenset[str]] = frozenset(
+    {
+        "musicbrainz_albumstatus",
+        "media",
+        "releasecountry",
+        "barcode",
+        "catalognumber",
+        "isrc",
+        "asin",
+    },
+)
+
+# The set of tags TagMend is allowed to write/revert (25 = 5 original + 13 identity + 7 release
+# stamp). A CLOSED set: anything outside it (``comment``/``composer``/art…) is never read,
+# written, or deleted, and every key here MUST be provably writable on all four formats. The
+# mismatch-fix flow can repair a poisoned release in one commit, and revert restores every field
+# the target revision's own managed set governed (see
 # :func:`tagmend.engine.versioning._revert_target_tags`).
 # ``date`` (reissue year, MP4 ``©day``) and ``originaldate`` (original year, MP4 freeform) are
 # BOTH managed and kept distinct.
-MANAGED_TAGS: Final[frozenset[str]] = ORIGINAL_MANAGED_TAGS | _WIDENED_MANAGED_TAGS
+MANAGED_TAGS: Final[frozenset[str]] = (
+    ORIGINAL_MANAGED_TAGS | _WIDENED_MANAGED_TAGS | _RELEASE_STAMP_TAGS
+)
 
 # Which managed set governed a given revision, so revert can tell "this tag was empty then"
 # from "this tag was not tracked then". Version 1 is the pre-widening five-tag set, version 2
-# the current eighteen. Every new revision is stamped with :data:`MANAGED_SET_VERSION`;
+# adds the thirteen identity fields, version 3 the seven release-stamp fields. Every new
+# revision is stamped with :data:`MANAGED_SET_VERSION`;
 # :func:`tagmend.engine.versioning._revert_target_tags` looks the stamp up here. Widening the
 # set again means a new entry and a bump — never editing an existing entry, since stored
 # revisions point at it.
-MANAGED_SET_VERSION: Final = 2
+MANAGED_SET_VERSION: Final = 3
 
 MANAGED_SETS: Final[Mapping[int, frozenset[str]]] = {
     1: ORIGINAL_MANAGED_TAGS,
-    2: MANAGED_TAGS,
+    2: ORIGINAL_MANAGED_TAGS | _WIDENED_MANAGED_TAGS,
+    3: MANAGED_TAGS,
 }
 
 # Which reader produced a snapshot row, so an incremental scan can spot rows left behind by
 # an older one and re-read them exactly once. BUMP THIS IN THE SAME COMMIT as any change to
 # what :func:`read_tags` produces — the managed set, an alias, a format registration — or
 # every already-scanned file keeps serving the old reader's output to every detector.
-TAG_READER_VERSION: Final = 2
+TAG_READER_VERSION: Final = 4
 
 
 @dataclass(frozen=True, slots=True)

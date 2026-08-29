@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING
 
 from conftest import make_track
 from tagmend.engine import album_conflicts
-from tagmend.engine.album_conflicts import _classify, _FileInput
+from tagmend.engine.album_conflicts import _REASON_NO_ALBUMARTIST, _classify, _FileInput
 from tagmend.engine.library import scan_library
 
 if TYPE_CHECKING:
@@ -174,6 +174,8 @@ def test_a_missing_albumartist_falls_back_to_the_track_artist() -> None:
     )
     assert coherent.flagged == 0
 
+    # Band holds two of the three files, so this is Band's album with one guest track, not a
+    # compilation. Only the guest file has to move.
     mixed = _classify(
         [
             _f(1, albumartist=None, artist="Band"),
@@ -183,6 +185,7 @@ def test_a_missing_albumartist_falls_back_to_the_track_artist() -> None:
     )
     assert mixed.flagged == 1
     assert mixed.rows[0].file_id == 3
+    assert mixed.rows[0].reason != _REASON_NO_ALBUMARTIST
 
 
 def test_a_compilation_flag_stands_in_for_a_missing_album_artist() -> None:
@@ -393,3 +396,89 @@ def test_a_parenthetical_without_the_word_disc_is_not_a_disc_set() -> None:
 
     assert report.low == 0
     assert report.medium == 1
+
+
+# --- the compilation shape: one album, many artists, no album artist -----------------
+
+
+def test_one_album_many_artists_and_no_albumartist_flags_every_file() -> None:
+    # Three real soundtrack folders look exactly like this: all 14 files agree on the album
+    # title and none carries an albumartist, so each file falls back to its own track artist
+    # and the one album shows as fourteen. Every file needs the same fix, so every file is a
+    # row, and naming a "majority" track artist here would point the fix at one guest artist.
+    report = _classify(
+        [
+            _f(
+                i,
+                filename=f"{i}.mp3",
+                album="Hackers Soundtrack",
+                albumartist=None,
+                artist=f"Artist {i}",
+            )
+            for i in range(1, 8)
+        ],
+    )
+
+    assert report.flagged == 7
+    assert report.high == 7
+    assert report.rows[0].reason == _REASON_NO_ALBUMARTIST
+    assert report.groups[0].majority_identity == "Hackers Soundtrack"
+
+
+def test_the_compilation_shape_needs_more_than_one_track_artist() -> None:
+    report = _classify(
+        [
+            _f(1, album="One Album", albumartist=None, artist="Band"),
+            _f(2, filename="b.mp3", album="One Album", albumartist=None, artist="Band"),
+        ],
+    )
+
+    assert report.flagged == 0
+
+
+def test_a_folder_where_some_files_have_an_albumartist_is_not_the_compilation_shape() -> None:
+    # One file already carries an album artist, so the folder has a majority to normalize
+    # toward and the ordinary minority rule applies.
+    report = _classify(
+        [
+            _f(1, album="One Album", albumartist="Real Band", artist="A"),
+            _f(2, filename="b.mp3", album="One Album", albumartist="Real Band", artist="B"),
+            _f(3, filename="c.mp3", album="One Album", albumartist=None, artist="C"),
+        ],
+    )
+
+    assert report.flagged == 1
+    assert report.rows[0].file_id == 3
+    assert report.rows[0].reason != _REASON_NO_ALBUMARTIST
+
+
+def test_the_compilation_shape_needs_one_shared_album_title() -> None:
+    # Different album titles as well as different artists is an ordinary split, not a
+    # compilation missing its album artist.
+    report = _classify(
+        [
+            _f(1, album="One Album", albumartist=None, artist="A"),
+            _f(2, filename="b.mp3", album="Another Album", albumartist=None, artist="B"),
+            _f(3, filename="c.mp3", album="Third Album", albumartist=None, artist="C"),
+        ],
+    )
+
+    assert all(r.reason != _REASON_NO_ALBUMARTIST for r in report.rows)
+
+
+def test_a_compilation_flag_already_set_is_not_the_missing_albumartist_shape() -> None:
+    report = _classify(
+        [
+            _f(1, album="One Album", albumartist=None, artist="A", compilation="1"),
+            _f(
+                2,
+                filename="b.mp3",
+                album="One Album",
+                albumartist=None,
+                artist="B",
+                compilation="1",
+            ),
+        ],
+    )
+
+    assert report.flagged == 0

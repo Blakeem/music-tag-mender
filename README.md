@@ -18,7 +18,7 @@ Pull community top-tags for each artist (optionally each album), fold them throu
 
 ### 🎤 Artist-name normalization (MusicBrainz + Last.fm)
 
-Resolve name variants to a single canonical spelling across both `artist` and `albumartist`. A file that already carries a MusicBrainz artist ID is settled by a direct lookup of that ID, against the artist's canonical name and registered aliases. Values with no ID fall through to Last.fm `artist.getCorrection`. Feat/sentinel/empty values and multi-value fields are guarded so nothing ambiguous gets rewritten. A name that disagrees with the ID its own file carries is reported, never rewritten.
+Resolve name variants to a single canonical spelling across both `artist` and `albumartist`. A file that already carries a MusicBrainz artist ID is settled by a direct lookup of that ID, against the artist's canonical name and registered aliases. A rewritten name carries MusicBrainz's sort name to its own sort field, `artistsort` for `artist` and `albumartistsort` for `albumartist`. Values with no ID fall through to Last.fm `artist.getCorrection`. That tier leaves the sort field alone, because Last.fm publishes no sort name. Feat/sentinel/empty values and multi-value fields are guarded so nothing ambiguous gets rewritten. A name that disagrees with the ID its own file carries is reported, never rewritten.
 
 ### 📅 Album year fill (MusicBrainz)
 
@@ -118,7 +118,7 @@ Edits apply on the next tool call; every command and MCP tool re-reads `settings
 
 ## Tools
 
-The MCP server exposes 33 tools. All tag edits are staged in memory and only written to disk on `commit_tags`, and everything is revertible.
+The MCP server exposes 34 tools. All tag edits are staged in memory and only written to disk on `commit_tags`, and everything is revertible.
 
 ### Core & Library
 
@@ -133,6 +133,7 @@ The MCP server exposes 33 tools. All tag edits are staged in memory and only wri
 | `detect_album_gaps` | Find files with a blank `album` tag, grouped by folder, with tiered fill proposals (read-only report) |
 | `detect_track_conflicts` | Find files sharing a `(disc, track)` slot with a folder sibling, tiered by how the titles and containers compare (read-only report) |
 | `detect_album_conflicts` | Find files whose album identity differs from their folder siblings', tiered by whether a release ID, a name or year, or a disc suffix splits the folder (read-only report) |
+| `detect_disagreements` | Find files whose tags contradict the MusicBrainz release their own `musicbrainz_albumid` names, reporting the value the release says each tag should hold (read-only report) |
 
 ### Staging & Commits
 

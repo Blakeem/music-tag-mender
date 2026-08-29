@@ -57,8 +57,11 @@ musicbrainz`) or a registered alias (`source: musicbrainz_alias`). MusicBrainz c
 trusted here. Last.fm's still is not, so the Last.fm tier sees only values with no MBID, or an
 MBID MusicBrainz does not know. A name MusicBrainz records under neither form lands in the new
 `name_id_disagreement` bucket, held, as does a value the library pairs with two different MBIDs.
-`_build_target` now writes each field's own id field, so an `albumartist`-only correction no
-longer overwrites `musicbrainz_artistid`. The `detect_album_conflicts` tool
+`_build_target` now writes each field's own id field AND its own sort field, so an
+`albumartist`-only correction no longer overwrites `musicbrainz_artistid`, and a rewritten name
+no longer leaves `artistsort` describing the old spelling. Only the MusicBrainz tier supplies a
+sort name. Last.fm publishes none, so its tier leaves the sort field untouched rather than
+guessing at or destroying a value. The `detect_album_conflicts` tool
 (`album_conflicts.py`) is the release-level sibling of `detect_track_conflicts`. It flags files
 whose album identity differs from their folder siblings'. A file's album identity is
 `musicbrainz_albumid` when it carries one, and otherwise the display album artist, the album
@@ -70,13 +73,32 @@ detector exists to find. Three tiers: `high` when the release ids differ or only
 carry one, `medium` for a name or year disagreement with no ids involved, `low` when one title
 carries a `(disc N: …)` suffix the others do not. Only the MINORITY is flagged, and every row
 carries the majority identity. Blank-`album` files are skipped, since `detect_album_gaps`
-already owns them. 33 MCP tools total. Schema is **v15** (additive: v11 adds
+already owns them. `musicbrainz.py` then gained `release_by_mbid`, a direct
+`/ws/2/release/<mbid>?inc=recordings+artist-credits` lookup behind the `MBReleaseSource`
+Protocol. It returns an `MBRelease` (the album title, the album-artist credit, and every
+`MBMedium`'s `MBTrack` tracklist), cached in `musicbrainz_release_cache` as one JSON payload
+because a release is a nested document and nothing queries inside it. The
+`detect_disagreements` tool (`disagreements.py`) is the third comparison in the coherence
+family: `detect_mismatches` compares a file's tags against the folder PATH,
+`detect_album_conflicts` and `detect_track_conflicts` compare a file against its folder
+SIBLINGS, and this compares a file against an EXTERNAL authority, the release its own
+`musicbrainz_albumid` names. That id is what lets it say what a tag SHOULD be rather than only
+that something is wrong. Inside the release a file finds its track by
+`musicbrainz_releasetrackid`, or failing that by `musicbrainz_trackid`. Position is never a
+fallback, because a wrong track number is one of the defects reported here. Release-level
+fields (`album`, `albumartist`, `date`, `releasecountry`, `musicbrainz_albumstatus`) are
+checked even for a file carrying no track id. Track-level fields (`title`, `tracknumber`,
+`discnumber`) need a matched track and are skipped without one. A blank field is a **fill**,
+not a disagreement: `flagged` counts only fields where the file says one thing and the release
+says another, while `fill_rows` collects what the release can supply for free.
+34 MCP tools total. Schema is **v16** (additive: v11 adds
 `musicbrainz_recording_cache`, v12 renames `file_album_status` → `file_year_status` in place —
 dispositions preserved; v13 adds `tag_revisions.managed_set`, stamping which managed-tag set
 governed each revision so a revert can restore emptiness on the widened fields; v14 adds
 `files.reader_version` so an incremental scan re-reads a row an older tag reader wrote. v15 adds
-`musicbrainz_artist_cache`, the by-MBID artist lookup's cache. An
-older ledger upgrades in place). M6 organize/paths (`paths.py`)
+`musicbrainz_artist_cache`, the by-MBID artist lookup's cache. v16 adds
+`musicbrainz_release_cache`, the by-MBID release lookup's cache, holding the parsed release as
+one JSON payload. An older ledger upgrades in place). M6 organize/paths (`paths.py`)
 is a paper sketch (its DDL ships in v6; logic deferred).
 
 **The canonical tag namespace is TagMend's, not mutagen's.** mutagen's "easy" layer is an
@@ -244,10 +266,10 @@ src/tagmend/
   log.py            shared logger (use everywhere)
   config.py         settings.json (platformdirs) + typed Settings
   cli.py            Typer CLI (thin)
-  mcp_server.py     FastMCP server (thin) — 33 tools
+  mcp_server.py     FastMCP server (thin) — 34 tools
   engine/
     db.py           SQLite connection (WAL)
-    schema.py       all DDL + PRAGMA user_version (v15)
+    schema.py       all DDL + PRAGMA user_version (v16)
     scan.py         filesystem discovery + signatures
     health.py       check_health / readiness + interrupted-commit report
     store.py        pure data access: files/file_tags + tag_revisions[_staged] + genre/artist status
@@ -257,7 +279,7 @@ src/tagmend/
     commits.py      domain-neutral commit core: commits table + RevisionDomain + run_commit
     staging.py      tags domain (TagDomain) + stage/diff/commit_tags orchestration
     lastfm.py       Last.fm top-tags client: lastfm_cache + pacing (getCorrection → M4)
-    musicbrainz.py  MusicBrainz client: release-group year, recording lookup, artist-by-MBID name
+    musicbrainz.py  MusicBrainz client: release-group year, recording lookup, artist-by-MBID name, release-by-MBID tracklist
     axis.py         the parameterized Axis: ONE per-file status machine for genre/artist/year/mismatch
     classify.py     genre vocab/overlay loader + fold-key index + classify.classify_genres (pure)
     genres.py       resolve_genres orchestration + file_genre_status workflow
@@ -266,6 +288,7 @@ src/tagmend/
     mismatch.py     detect_mismatches + set/reset_mismatch_status: identity tags vs folder path, tiered
     track_conflicts.py  detect_track_conflicts: intra-folder (disc, track) slot collisions
     album_conflicts.py  detect_album_conflicts: intra-folder album-identity splits, tiered
+    disagreements.py  detect_disagreements: tags vs the MusicBrainz release the file's album id names, tiered
     album_gaps.py   detect_album_gaps: blank-album files grouped by folder + tiered fill proposals
     parsing.py      pure folder/filename → (artist, album) parsing for the album-gap fills
     paths.py        STUB + PathDomain paper sketch — M6 (organize/paths)

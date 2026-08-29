@@ -28,6 +28,12 @@ folder shares, and every row carries that majority identity so a reviewer can se
 folder mostly says. A count is not a verdict, so the majority is a starting point and never a
 proposal. Read-only, like every ``detect_*`` tool. It writes nothing.
 
+One shape gets its own treatment, because the minority rule is actively misleading on it.
+When every file in a folder agrees on the album title, none carries an ``albumartist``, and
+the track artists differ, the folder is a compilation missing its album artist. Every file
+falls back to its own artist, so the one album shows as one card per track. Every file is
+flagged, because every file needs the same fix.
+
 A file with a blank ``album`` is skipped. It has no release identity to contradict, it is a
 gap rather than a conflict, and :mod:`tagmend.engine.album_gaps` already reports it. Counting
 it here would double-report it and let a blank identity win the majority vote.
@@ -113,6 +119,10 @@ _REASON_MEDIUM: Final = (
     "this file's album artist, album title or year differs from the rest of the folder's"
 )
 _REASON_LOW: Final = "this file's album carries a different disc suffix on the same release title"
+_REASON_NO_ALBUMARTIST: Final = (
+    "the folder agrees on one album title but no file carries an album artist, so each is "
+    "filed under its own track artist"
+)
 _REASON_NON_ALBUM: Final = (
     "folder name says it is not one album, so several releases here are expected"
 )
@@ -297,6 +307,36 @@ def _base_title(album: str | None) -> str:
     return _group_key(_DISC_SUFFIX.sub("", album or ""))
 
 
+def _is_compilation_missing_its_album_artist(files: list[_FileInput]) -> bool:
+    """Return whether this folder is one album whose files have no album artist between them.
+
+    Three real soundtrack folders take this shape: every file agrees on the album title, none
+    carries an ``albumartist``, and the track artists all differ, so each file falls back to
+    its own artist and the one album shows as one card per track. The ordinary minority rule
+    is actively misleading here. It would name whichever guest artist appears most as the
+    identity to normalize toward, when the real fix is the same on every file: give them all
+    an album artist.
+    """
+    minimum = 2
+    if len(files) < minimum:
+        return False
+    if any((f.albumartist or "").strip() for f in files):
+        return False
+    if any((f.compilation or "").strip() in _COMPILATION_TRUE for f in files):
+        return False
+    if len({_group_key(f.album or "") for f in files}) != 1:
+        return False
+
+    # A dominant track artist means this is that artist's album with a guest or two, and the
+    # album artist to fill in is theirs. Only when no artist holds half the folder is it a
+    # compilation, where the album artist is a various-artists marker instead. Without this,
+    # a normal album carrying one guest track would be read as a compilation.
+    artists = Counter(_group_key(f.artist or "") for f in files)
+    if not artists:
+        return False
+    return artists.most_common(1)[0][1] * 2 < len(files)
+
+
 def _is_context_folder(files: list[_FileInput]) -> str | None:
     """Return the context reason when this folder is not meant to hold one album.
 
@@ -353,6 +393,27 @@ def _rows_for_folder(files: list[_FileInput]) -> tuple[list[AlbumConflictRow], _
     return (rows, majority, counts[best])
 
 
+def _compilation_rows(files: list[_FileInput]) -> list[AlbumConflictRow]:
+    """Return one row per file for a folder that is one album with no album artist at all."""
+    shared = files[0].album or ""
+    return [
+        AlbumConflictRow(
+            file_id=f.file_id,
+            folder=f.folder,
+            filename=f.filename,
+            album=f.album,
+            albumartist=f.albumartist,
+            release_id=f.release_id,
+            year=f.year,
+            identity=f.identity_label,
+            majority_identity=shared,
+            tier=Tier.HIGH.value,
+            reason=_REASON_NO_ALBUMARTIST,
+        )
+        for f in files
+    ]
+
+
 def _first_index(files: list[_FileInput], identity: tuple[str, ...]) -> int:
     """Return the position of the first file carrying *identity* (for stable tie-breaking)."""
     return next(i for i, f in enumerate(files) if f.identity == identity)
@@ -374,7 +435,13 @@ def _classify(files: list[_FileInput]) -> AlbumConflictsReport:
     for folder, members in by_folder.items():
         if len({f.identity for f in members}) < 2:  # noqa: PLR2004 - one identity is coherent
             continue
-        folder_rows, majority, majority_files = _rows_for_folder(members)
+        if _is_compilation_missing_its_album_artist(members):
+            folder_rows = _compilation_rows(members)
+            majority_label = members[0].album or ""
+            majority_files = 0
+        else:
+            folder_rows, majority, majority_files = _rows_for_folder(members)
+            majority_label = majority.identity_label
         context_reason = _is_context_folder(members)
         if context_reason is not None:
             folder_rows = [replace(r, reason=context_reason) for r in folder_rows]
@@ -388,7 +455,7 @@ def _classify(files: list[_FileInput]) -> AlbumConflictsReport:
                 flagged=0 if context_reason else len(folder_rows),
                 folder_context=len(folder_rows) if context_reason else 0,
                 identities=len({f.identity for f in members}),
-                majority_identity=majority.identity_label,
+                majority_identity=majority_label,
                 majority_files=majority_files,
                 tiers=dict(Counter(r.tier for r in folder_rows)) if not context_reason else {},
                 file_ids=[f.file_id for f in members],

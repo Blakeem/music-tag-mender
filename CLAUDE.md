@@ -48,11 +48,22 @@ round it out. The `detect_album_gaps` tool (`album_gaps.py` + the pure, standalo
 `parsing.py`) groups blank-`album` files by folder and proposes sibling / folder-parse fills
 plus a review-only MusicBrainz `(artist, title)` recording tier (`mb_recording`, opt-out via
 `use_musicbrainz=False`, cached in `musicbrainz_recording_cache`) for the `stage_tags_batch →
-diff → commit → reopen_axes` spine. 32 MCP tools total. Schema is **v14** (additive: v11 adds
+diff → commit → reopen_axes` spine. `resolve_artists` then gained a **MusicBrainz name tier**
+ahead of the Last.fm one. `musicbrainz.py`'s `artist_by_mbid` looks an artist up directly by
+the `musicbrainz_artistid` (or `musicbrainz_albumartistid`) the file already carries, a lookup
+by id and never a search, cached in `musicbrainz_artist_cache`. A fold over casing, typography
+and dash-vs-space then settles the value against that artist's canonical name (`source:
+musicbrainz`) or a registered alias (`source: musicbrainz_alias`). MusicBrainz casing is
+trusted here. Last.fm's still is not, so the Last.fm tier sees only values with no MBID, or an
+MBID MusicBrainz does not know. A name MusicBrainz records under neither form lands in the new
+`name_id_disagreement` bucket, held, as does a value the library pairs with two different MBIDs.
+`_build_target` now writes each field's own id field, so an `albumartist`-only correction no
+longer overwrites `musicbrainz_artistid`. 32 MCP tools total. Schema is **v15** (additive: v11 adds
 `musicbrainz_recording_cache`, v12 renames `file_album_status` → `file_year_status` in place —
 dispositions preserved; v13 adds `tag_revisions.managed_set`, stamping which managed-tag set
 governed each revision so a revert can restore emptiness on the widened fields; v14 adds
-`files.reader_version` so an incremental scan re-reads a row an older tag reader wrote. An
+`files.reader_version` so an incremental scan re-reads a row an older tag reader wrote. v15 adds
+`musicbrainz_artist_cache`, the by-MBID artist lookup's cache. An
 older ledger upgrades in place). M6 organize/paths (`paths.py`)
 is a paper sketch (its DDL ships in v6; logic deferred).
 
@@ -222,7 +233,7 @@ src/tagmend/
   mcp_server.py     FastMCP server (thin) — 32 tools
   engine/
     db.py           SQLite connection (WAL)
-    schema.py       all DDL + PRAGMA user_version (v14)
+    schema.py       all DDL + PRAGMA user_version (v15)
     scan.py         filesystem discovery + signatures
     health.py       check_health / readiness + interrupted-commit report
     store.py        pure data access: files/file_tags + tag_revisions[_staged] + genre/artist status
@@ -232,9 +243,10 @@ src/tagmend/
     commits.py      domain-neutral commit core: commits table + RevisionDomain + run_commit
     staging.py      tags domain (TagDomain) + stage/diff/commit_tags orchestration
     lastfm.py       Last.fm top-tags client: lastfm_cache + pacing (getCorrection → M4)
+    musicbrainz.py  MusicBrainz client: release-group year, recording lookup, artist-by-MBID name
     classify.py     genre vocab/overlay loader + fold-key index + classify.classify_genres (pure)
     genres.py       resolve_genres orchestration + file_genre_status workflow
-    artists.py      resolve_artists + set/reset_artist_status: getCorrection cascade-stage + file_artist_status workflow
+    artists.py      resolve_artists + set/reset_artist_status: MusicBrainz-by-MBID then getCorrection cascade-stage + file_artist_status workflow
     track_conflicts.py  detect_track_conflicts: intra-folder (disc, track) slot collisions
     years.py        resolve_years + set/reset_year_status: MusicBrainz originaldate blank-fill + file_year_status workflow
     paths.py        STUB + PathDomain paper sketch — M6 (organize/paths)

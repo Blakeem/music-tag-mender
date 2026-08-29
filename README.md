@@ -1,6 +1,6 @@
 # TagMend
 
-TagMend cleans up the **genre** and **artist-name** tags in your music library using **Last.fm**, and fills in album original-release years from **MusicBrainz**. Every change is staged first and committed as a revertible unit, so nothing touches your files until you say so, and any change can be rolled back. It ships as both a command-line tool and an MCP server, so you can drive it yourself or hand it to an AI assistant like Claude. Built to make [Navidrome MCP](https://github.com/Blakeem/Navidrome-MCP) more useful by giving it accurate names and genres.
+TagMend cleans up the **genre** and **artist-name** tags in your music library using **Last.fm** and **MusicBrainz**, and fills in album original-release years. Every change is staged first and committed as a revertible unit, so nothing touches your files until you say so, and any change can be rolled back. It ships as both a command-line tool and an MCP server, so you can drive it yourself or hand it to an AI assistant like Claude. Built to make [Navidrome MCP](https://github.com/Blakeem/Navidrome-MCP) more useful by giving it accurate names and genres.
 
 ## Table of Contents
 
@@ -16,9 +16,9 @@ TagMend cleans up the **genre** and **artist-name** tags in your music library u
 
 Pull community top-tags for each artist (optionally each album), fold them through a curated genre vocabulary, and stage clean, consistent genres. Per-file controls let you re-run, skip, or re-queue specific tracks.
 
-### 🎤 Artist-name normalization (Last.fm)
+### 🎤 Artist-name normalization (MusicBrainz + Last.fm)
 
-Resolve name variants to a single canonical spelling via `artist.getCorrection`, including the MusicBrainz artist ID, applied across both `artist` and `albumartist`. Feat/sentinel/empty values and multi-value fields are guarded so nothing ambiguous gets rewritten.
+Resolve name variants to a single canonical spelling across both `artist` and `albumartist`. A file that already carries a MusicBrainz artist ID is settled by a direct lookup of that ID, against the artist's canonical name and registered aliases. Values with no ID fall through to Last.fm `artist.getCorrection`. Feat/sentinel/empty values and multi-value fields are guarded so nothing ambiguous gets rewritten. A name that disagrees with the ID its own file carries is reported, never rewritten.
 
 ### 📅 Album year fill (MusicBrainz)
 
@@ -161,12 +161,12 @@ The MCP server exposes 32 tools. All tag edits are staged in memory and only wri
 | `set_genre_status` | Exclude files from genre tagging (`manual`) or re-queue them (`pending`) |
 | `reset_genre_status` | Clear any genre status row for in-scope files, returning them to `pending` |
 
-### Artist Names (Last.fm)
+### Artist Names (MusicBrainz + Last.fm)
 
 | Tool | Description |
 |------|-------------|
 | `list_artists` | List distinct `artist` values with file counts (to scope a run) |
-| `resolve_artists` | Normalize artist names via Last.fm `getCorrection` and stage the result (no disk write) |
+| `resolve_artists` | Normalize artist names against MusicBrainz (by the ID the file carries), then Last.fm `getCorrection`, and stage the result (no disk write) |
 | `set_artist_status` | Exclude files from artist-name normalization (`manual`) or re-queue them (`pending`) |
 | `reset_artist_status` | Clear any artist status row for in-scope files, returning them to `pending` |
 

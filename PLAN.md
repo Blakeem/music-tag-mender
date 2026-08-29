@@ -178,7 +178,7 @@ The valuable, risky work is deterministic and must not live inside an LLM. Build
 ## 7. Data model (SQLite)
 
 WAL mode. **Versioning is the heart of the safety story.** `PRAGMA user_version`
-tracks the applied schema version (**currently 12**: the read-path snapshot landed at
+tracks the applied schema version (**currently 15**: the read-path snapshot landed at
 M1; the `commits` / `tag_revisions` / `tag_revisions_staged` change-tracking tables
 shipped at M3; `lastfm_cache` + `file_genre_status` shipped at M2). The model is
 **resume-free** — a crash just leaves work staged for the next commit to sweep up; see
@@ -519,7 +519,7 @@ commit inspection (`list_commits`, `get_commit`).
 
 | Tool | Purpose |
 |---|---|
-| `resolve_artists()` | Query `artist.getCorrection` (cached/paced), classify auto vs needs_review. |
+| `resolve_artists()` | Look the artist up by the MusicBrainz id the file carries, then fall back to `artist.getCorrection` (both cached/paced), and classify auto vs needs_review. |
 | `list_pending_review()` | Artists/files needing a human/LLM decision. |
 | `get_artist_candidate(name)` | Full Last.fm context for one artist (tags, correction, similar). |
 | `approve_mapping(input_name, canonical_name)` | Record an approved artist-level decision. |
@@ -555,7 +555,7 @@ music-tag-mender/             # GitHub repo slug (SEO)
 │   ├── config.py            # settings.json in OS config dir via platformdirs (§19)
 │   ├── engine/
 │   │   ├── db.py             # SQLite connection (WAL); schema added per-feature
-│   │   ├── schema.py         # DDL for all tables + PRAGMA user_version (v12)
+│   │   ├── schema.py         # DDL for all tables + PRAGMA user_version (v15)
 │   │   ├── health.py         # check_health: settings + music + db + interrupted-commit (M0/M3)
 │   │   ├── scan.py           # filesystem discovery + signatures (size/mtime)
 │   │   ├── store.py          # pure data access for files/file_tags + tag_revisions[_staged] (M1/M3)

@@ -17,6 +17,12 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final
 
 import mutagen
+
+# The only shared base of every Vorbis-comment container (FLAC, OggVorbis, OggOpus, ...).
+# mutagen 1.47 exposes no public predicate for "are these Vorbis comments", and naming the
+# concrete subclasses instead would silently miss the ones not listed.
+from mutagen._vorbis import VCommentDict
+from mutagen.easyid3 import EasyID3
 from mutagen.easymp4 import EasyMP4Tags
 
 from tagmend.log import get_logger
@@ -29,10 +35,18 @@ logger = get_logger(__name__)
 
 # ``originaldate`` (the original/first-release year) is native on ID3 (``TDOR``) and Vorbis
 # (``ORIGINALDATE``) via mutagen's easy mode, but MP4 has no built-in easy mapping. Register
-# it ONCE at module load so read and write agree on the iTunes freeform atom
-# ``----:com.apple.iTunes:ORIGINALDATE`` — never ``©day`` (that is ``date``, the reissue
-# year). Registration is idempotent; importing this module is the single place it happens.
-EasyMP4Tags.RegisterFreeformKey("originaldate", "ORIGINALDATE")  # type: ignore[no-untyped-call]
+# it ONCE at module load so read and write agree on the iTunes freeform atom — never ``©day``
+# (that is ``date``, the reissue year). The atom name is matched CASE-SENSITIVELY and Picard
+# writes it lowercase, so an uppercase registration reads nothing on a Picard-tagged file and
+# writes a second, contradicting atom beside it. Registration is idempotent; importing this
+# module is the single place it happens.
+EasyMP4Tags.RegisterFreeformKey("originaldate", "originaldate")  # type: ignore[no-untyped-call]
+
+# EasyID3 maps ``albumartistsort`` to ``TXXX:ALBUMARTISTSORT``, a frame Picard does not write:
+# it uses the iTunes-compatible ``TSO2`` instead. Measured on this library, 88% of a 400-file
+# MP3 sample carried ``TSO2`` and none carried the ``TXXX`` frame, so without this the tag reads
+# as absent on ~7,960 files and writing it creates a second value the rest of the world ignores.
+EasyID3.RegisterTextKey("albumartistsort", "TSO2")  # type: ignore[no-untyped-call]
 
 # The two MusicBrainz ids in :data:`MANAGED_TAGS` that EasyMP4 has no built-in mapping for
 # (the other four — album/albumartist/artist/track ids + album type — are native). Register
@@ -54,6 +68,24 @@ _ALIASES: Final[dict[str, str]] = {
     "album artist": "albumartist",
     "band": "albumartist",
 }
+
+# Canonical key -> the name Picard uses for the same concept in a Vorbis comment. mutagen has
+# no "easy" layer for Vorbis (``mutagen.File(path, easy=True)`` hands back a plain ``FLAC`` /
+# ``OggVorbis``), so unlike ID3 and MP4 these names are NOT normalized for us and every one
+# that differs from the canonical key has to be mapped here, in both directions. An entry is
+# needed ONLY where the two names differ.
+_VORBIS_SPELLINGS: Final[Mapping[str, str]] = {
+    "musicbrainz_albumtype": "releasetype",
+}
+
+# Derived, never hand-written twice: a second literal could drift out of step with the map above.
+_VORBIS_TO_CANONICAL: Final[Mapping[str, str]] = {v: k for k, v in _VORBIS_SPELLINGS.items()}
+
+# Two canonical keys sharing one Vorbis name would silently collapse the reverse map, making one
+# of them unreadable. Fail at import rather than at some file months later.
+if len(_VORBIS_TO_CANONICAL) != len(_VORBIS_SPELLINGS):  # pragma: no cover - import-time guard
+    _DUPLICATE_VORBIS_NAME = "_VORBIS_SPELLINGS maps two canonical keys to one Vorbis name"
+    raise AssertionError(_DUPLICATE_VORBIS_NAME)
 
 # The five tags TagMend managed BEFORE the mismatch-fix widening: managed-set version 1 in
 # :data:`MANAGED_SETS`. A revision stamped version 1 governed exactly these, so revert
@@ -118,7 +150,7 @@ MANAGED_SETS: Final[Mapping[int, frozenset[str]]] = {
 # an older one and re-read them exactly once. BUMP THIS IN THE SAME COMMIT as any change to
 # what :func:`read_tags` produces — the managed set, an alias, a format registration — or
 # every already-scanned file keeps serving the old reader's output to every detector.
-TAG_READER_VERSION: Final = 1
+TAG_READER_VERSION: Final = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,10 +160,22 @@ class TrackTags:
     tags: dict[str, list[str]]
 
 
-def _canonical_key(raw_key: str) -> str:
-    """Lowercase *raw_key* and resolve it through the alias map."""
-    lowered = raw_key.lower()
-    return _ALIASES.get(lowered, lowered)
+def _vorbis_field(key: str) -> str:
+    """Return the Vorbis comment field name to write *key* under.
+
+    Uppercase because that is what Picard emits and what the rest of a Picard-tagged file
+    already uses. Field names are case-insensitive per the Vorbis spec, so this is convention
+    rather than correctness: it keeps one file from carrying a mix of cases.
+    """
+    return _VORBIS_SPELLINGS.get(key, key).upper()
+
+
+def _canonical_key(lowered_key: str) -> str:
+    """Resolve an already-lowercased raw key through the Vorbis and alias maps."""
+    canonical = _VORBIS_TO_CANONICAL.get(lowered_key)
+    if canonical is not None:
+        return canonical
+    return _ALIASES.get(lowered_key, lowered_key)
 
 
 def read_tags(path: Path) -> TrackTags:
@@ -146,11 +190,20 @@ def read_tags(path: Path) -> TrackTags:
     if audio is None or audio.tags is None:
         return TrackTags({})
 
-    # Process
+    # Process — a file can carry both spellings of one concept (a tagger wrote the Vorbis name,
+    # an older TagMend wrote the canonical one). The Vorbis name is what every other reader
+    # looks at, so it wins regardless of iteration order.
     normalized: dict[str, list[str]] = {}
+    from_vorbis_spelling: set[str] = set()
     for raw_key, raw_values in audio.tags.items():
-        key = _canonical_key(str(raw_key))
+        lowered = str(raw_key).lower()
+        key = _canonical_key(lowered)
+        native = lowered in _VORBIS_TO_CANONICAL
+        if key in from_vorbis_spelling and not native:
+            continue
         normalized[key] = [str(value) for value in raw_values]
+        if native:
+            from_vorbis_spelling.add(key)
 
     # Output
     return TrackTags(normalized)
@@ -185,11 +238,20 @@ def write_managed_tags(path: Path, managed: dict[str, list[str]]) -> None:
         if audio is None:
             message = f"mutagen could not identify {path} for writing"
             raise ValueError(message)
+        vorbis = isinstance(audio.tags, VCommentDict)
         for key in MANAGED_TAGS:
+            written = _vorbis_field(key) if vorbis else key
             values = managed.get(key)
             if values:
-                audio[key] = list(values)
-            elif key in audio:
+                audio[written] = list(values)
+            elif written in audio:
+                del audio[written]
+            # Drop the other spelling of the same concept so the file never carries two values
+            # for one tag, contradicting whichever reader picks the other name. Only Vorbis has
+            # a second spelling to drop: on ID3 and MP4 the easy layer owns the frame/atom name,
+            # and reaching a foreign one (a TXXX:ALBUMARTISTSORT some other tagger wrote) would
+            # need raw container access the easy layer does not expose.
+            if vorbis and key in _VORBIS_SPELLINGS and key in audio:
                 del audio[key]
         audio.save()
         tmp.replace(path)

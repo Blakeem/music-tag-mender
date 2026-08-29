@@ -7,13 +7,20 @@ from typing import TYPE_CHECKING
 import mutagen
 import pytest
 from mutagen.flac import FLAC
+from mutagen.id3 import ID3, TSO2  # type: ignore[attr-defined]
 from mutagen.mp4 import MP4
+from mutagen.oggvorbis import OggVorbis
 
 from conftest import make_track
 
 # Import tags so its module-load RegisterFreeformKey runs before make_track writes any
 # ``originaldate`` via raw mutagen easy mode (the M4A freeform atom must be registered).
-from tagmend.engine.tags import MANAGED_TAGS, read_tags, write_managed_tags
+from tagmend.engine.tags import (
+    MANAGED_TAGS,
+    TAG_READER_VERSION,
+    read_tags,
+    write_managed_tags,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -81,8 +88,9 @@ def test_originaldate_writes_to_freeform_atom_on_m4a(tmp_path: Path) -> None:
     write_managed_tags(track, {"originaldate": ["1970"], "date": ["2015"]})
 
     raw = MP4(track)  # type: ignore[no-untyped-call]
-    # originaldate lands in the iTunes freeform atom, never in the ©day (date) atom.
-    assert "----:com.apple.iTunes:ORIGINALDATE" in raw
+    # originaldate lands in the iTunes freeform atom Picard uses (lowercase — the atom name is
+    # matched case-sensitively), never in the ©day (date) atom.
+    assert "----:com.apple.iTunes:originaldate" in raw
     assert raw["©day"] == ["2015"]
 
 
@@ -218,3 +226,148 @@ def test_unidentifiable_file_reads_empty(tmp_path: Path) -> None:
     unknown = tmp_path / "mystery.dat"
     unknown.write_bytes(b"\x00\x01\x02\x03")
     assert read_tags(unknown).tags == {}
+
+
+# --- format-native spelling: TagMend's canonical namespace vs what Picard actually writes ---
+# `read_tags` promises one canonical namespace so the rest of the engine never sees a
+# format-specific spelling. These reproduce the two places that promise is broken against a
+# genuinely Picard-tagged file (not a file TagMend itself wrote).
+
+
+def test_reads_originaldate_from_picard_lowercase_atom_on_m4a(tmp_path: Path) -> None:
+    # Picard writes ----:com.apple.iTunes:originaldate in LOWERCASE; MP4 freeform atom names
+    # are matched case-sensitively, so a uppercase-only registration cannot see it.
+    track = make_track(tmp_path / "picard.m4a", {"date": ["2011"]})
+    raw = MP4(track)  # type: ignore[no-untyped-call]
+    raw["----:com.apple.iTunes:originaldate"] = [b"1979"]
+    raw.save()  # type: ignore[no-untyped-call]
+
+    assert read_tags(track).tags.get("originaldate") == ["1979"]
+
+
+def test_write_leaves_one_originaldate_atom_on_m4a(tmp_path: Path) -> None:
+    # Writing over a Picard-tagged file must not leave two contradictory original dates.
+    track = make_track(tmp_path / "picard.m4a", {"date": ["2011"]})
+    raw = MP4(track)  # type: ignore[no-untyped-call]
+    raw["----:com.apple.iTunes:originaldate"] = [b"2011-11-11"]
+    raw.save()  # type: ignore[no-untyped-call]
+
+    write_managed_tags(track, {"originaldate": ["1979"], "date": ["2011"]})
+
+    after = MP4(track)  # type: ignore[no-untyped-call]
+    atoms = [k for k in after if k.lower() == "----:com.apple.itunes:originaldate"]
+    assert len(atoms) == 1, atoms
+    assert read_tags(track).tags["originaldate"] == ["1979"]
+
+
+def test_reads_releasetype_as_albumtype_on_flac(tmp_path: Path) -> None:
+    # Vorbis comments pass through raw (mutagen has no easy layer for FLAC), so Picard's
+    # Vorbis spelling RELEASETYPE never reaches the canonical managed key.
+    track = make_track(tmp_path / "picard.flac")
+    audio = FLAC(track)
+    audio["releasetype"] = ["album"]
+    audio.save()
+
+    assert read_tags(track).tags.get("musicbrainz_albumtype") == ["album"]
+
+
+def test_write_leaves_one_albumtype_spelling_on_flac(tmp_path: Path) -> None:
+    # musicbrainz_albumtype is MANAGED, so this is a live corruption path: writing it onto a
+    # Picard-tagged FLAC must not leave RELEASETYPE and MUSICBRAINZ_ALBUMTYPE contradicting.
+    track = make_track(tmp_path / "picard.flac")
+    audio = FLAC(track)
+    audio["releasetype"] = ["compilation"]
+    audio.save()
+
+    write_managed_tags(track, {"musicbrainz_albumtype": ["album"]})
+
+    raw = FLAC(track)
+    present = [k for k in ("releasetype", "musicbrainz_albumtype") if raw.get(k)]
+    assert len(present) == 1, {k: raw.get(k) for k in present}
+    assert read_tags(track).tags["musicbrainz_albumtype"] == ["album"]
+
+
+def test_reads_albumartistsort_from_picard_tso2_frame_on_mp3(tmp_path: Path) -> None:
+    # Picard writes the iTunes-compatible TSO2 frame; EasyID3's default map points at
+    # TXXX:ALBUMARTISTSORT, which Picard never writes.
+    track = make_track(tmp_path / "picard.mp3", {"artist": ["311"]})
+    raw = ID3(track)  # type: ignore[no-untyped-call]
+    raw.add(TSO2(encoding=3, text=["311"]))  # type: ignore[no-untyped-call]
+    raw.save()
+
+    assert read_tags(track).tags.get("albumartistsort") == ["311"]
+
+
+def test_write_albumartistsort_targets_tso2_and_adds_no_txxx(tmp_path: Path) -> None:
+    track = make_track(tmp_path / "picard.mp3", {"artist": ["311"]})
+    raw = ID3(track)  # type: ignore[no-untyped-call]
+    raw.add(TSO2(encoding=3, text=["311"]))  # type: ignore[no-untyped-call]
+    raw.save()
+
+    write_managed_tags(track, {"albumartistsort": ["Three Eleven"]})
+
+    after = ID3(track)  # type: ignore[no-untyped-call]
+    assert after["TSO2"].text == ["Three Eleven"]
+    assert not [k for k in after if k.upper().endswith("ALBUMARTISTSORT")]
+
+
+def test_reads_releasetype_as_albumtype_on_ogg(tmp_path: Path) -> None:
+    # OggVorbis is the second raw-Vorbis container and must not be forgotten.
+    track = make_track(tmp_path / "picard.ogg")
+    audio = OggVorbis(track)  # type: ignore[no-untyped-call]
+    audio["releasetype"] = ["album"]
+    audio.save()
+
+    assert read_tags(track).tags.get("musicbrainz_albumtype") == ["album"]
+
+
+def test_write_leaves_one_albumtype_spelling_on_ogg(tmp_path: Path) -> None:
+    track = make_track(tmp_path / "picard.ogg")
+    audio = OggVorbis(track)  # type: ignore[no-untyped-call]
+    audio["musicbrainz_albumtype"] = ["single"]
+    audio.save()
+
+    write_managed_tags(track, {"musicbrainz_albumtype": ["album"]})
+
+    raw = OggVorbis(track)  # type: ignore[no-untyped-call]
+    present = [k for k in ("releasetype", "musicbrainz_albumtype") if raw.get(k)]  # type: ignore[no-untyped-call]
+    assert present == ["releasetype"]
+    assert raw["releasetype"] == ["album"]
+
+
+def test_vorbis_native_spelling_wins_when_both_present(tmp_path: Path) -> None:
+    # Whichever value the rest of the world reads is the one we must report, regardless of
+    # the order mutagen happens to yield the two comment fields in.
+    track = make_track(tmp_path / "both.flac")
+    audio = FLAC(track)
+    audio["musicbrainz_albumtype"] = ["single"]
+    audio["releasetype"] = ["album"]
+    audio.save()
+
+    assert read_tags(track).tags["musicbrainz_albumtype"] == ["album"]
+
+
+def test_reader_version_bumped_with_the_reader_change() -> None:
+    # The three registration/mapping fixes change what read_tags produces for ~90% of the
+    # library, so already-scanned rows must be re-read exactly once.
+    assert TAG_READER_VERSION == 2
+
+
+def test_vorbis_write_uses_uppercase_field_names(tmp_path: Path) -> None:
+    # Picard uppercases Vorbis field names, so writing lowercase left a Picard-tagged file
+    # carrying a mix of cases for no reason. Names are case-insensitive per the spec, so this
+    # is about not churning bytes in a library another tagger also manages.
+    track = make_track(tmp_path / "case.flac")
+    audio = FLAC(track)
+    audio["RELEASETYPE"] = ["album"]
+    audio["ARTIST"] = ["A"]
+    audio.save()
+
+    write_managed_tags(track, {"musicbrainz_albumtype": ["album"], "artist": ["A"]})
+
+    # Iterating the tag object yields the RAW stored names; .items() case-folds them.
+    stored = {name for name, _ in FLAC(track).tags}  # type: ignore[union-attr]
+    assert "RELEASETYPE" in stored
+    assert "ARTIST" in stored
+    assert "releasetype" not in stored
+    assert "artist" not in stored

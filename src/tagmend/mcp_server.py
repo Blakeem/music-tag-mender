@@ -224,9 +224,18 @@ def unstage_tags(file_id: int) -> dict[str, object]:
 def diff_tags(path: str | None = None) -> dict[str, object]:
     """Show staged-but-uncommitted tag changes, enriched with the current→target diff.
 
-    This is ``git diff --staged`` (staged-vs-snapshot), not working-tree: ``current`` is
-    the last committed/scanned snapshot and may lag the file on disk after an interrupted
-    commit. A no-op stage still appears, with ``diff == {}``.
+    This is ``git diff --staged``. ``current`` is read from the FILE, so ``diff`` is exactly
+    what the commit will change on disk. A no-op stage still appears, with ``diff == {}``.
+
+    ``stale_identity`` is the one thing to read before committing an identity fix. Staging
+    merges onto the file's current tags, so a change that rewrites ``artist`` but omits
+    ``musicbrainz_artistid`` keeps the OLD artist's id — the file then names one artist and
+    points at another, and Picard or Navidrome will re-link it to the wrong one. Each entry is
+    ``{changed, stale_field, stale_value}``: the coupled field this change leaves behind, and
+    the value it keeps. It is a REPORT, never a block — supply the matching id (or an empty
+    list to clear it) and re-stage if the retained value is wrong. Coupled groups are
+    artist/albumartist and their MB ids, album with its album + release-group ids, and title
+    with its track + release-track ids.
 
     Args:
         path: When given, only staged changes for files at this folder or nested under it
@@ -234,7 +243,7 @@ def diff_tags(path: str | None = None) -> dict[str, object]:
 
     Returns:
         ``{"ok": True, "changes": [{file_id, folder, filename, is_missing, origin, note,
-        staged_at, current, target, diff}, ...]}``.
+        staged_at, current, target, diff, stale_identity}, ...]}``.
     """
     changes = staging.diff_tags(
         load_settings(),

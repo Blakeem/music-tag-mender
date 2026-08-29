@@ -29,10 +29,10 @@ connection and commit; the building blocks in :mod:`tagmend.engine.store` never 
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Final, cast
 
 import mutagen
 
@@ -54,6 +54,18 @@ logger = get_logger(__name__)
 # revision the commit appends.
 _STAGED_ORIGINS = frozenset({"auto", "manual"})
 
+# A name and the ids that name the same thing. Rewriting one member of a group while leaving
+# another in place is how a file ends up reading "Alice in Chains" with Linkin Park's MBID
+# still attached — 118 files across 8 folders went that way in the 2026-08-25 run, because
+# staging merges onto the file's current tags and silently keeps whatever the caller omitted.
+# Reported on the diff for review; never blocked, never auto-changed.
+_IDENTITY_GROUPS: Final[tuple[tuple[str, ...], ...]] = (
+    ("artist", "musicbrainz_artistid"),
+    ("albumartist", "musicbrainz_albumartistid"),
+    ("album", "musicbrainz_albumid", "musicbrainz_releasegroupid"),
+    ("title", "musicbrainz_trackid", "musicbrainz_releasetrackid"),
+)
+
 
 def _utc_now() -> str:
     """Return the current time as an ISO-8601 UTC string."""
@@ -74,6 +86,7 @@ class TagDiffView:
     current: dict[str, list[str]]
     target: dict[str, list[str]]
     diff: dict[str, dict[str, list[str]]]
+    stale_identity: list[dict[str, object]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, object]:
         """JSON-serializable form for the MCP tool."""
@@ -88,6 +101,7 @@ class TagDiffView:
             "current": self.current,
             "target": self.target,
             "diff": self.diff,
+            "stale_identity": self.stale_identity,
         }
 
 
@@ -412,6 +426,54 @@ def unstage_tags(settings: Settings, *, file_id: int) -> bool:
     return removed
 
 
+def _current_managed(
+    conn: sqlite3.Connection,
+    file_row: store.FileRow,
+) -> dict[str, list[str]]:
+    """Return the file's current managed tags, from DISK when it can be read.
+
+    The staged target is built from disk, so comparing it against the snapshot mirror would
+    render a field the mirror merely lacks as an addition — a review surface inventing changes
+    that will not happen. The mirror is the fallback for a file that is gone or unreadable,
+    which is the only case where nothing better exists.
+    """
+    if not file_row.is_missing:
+        try:
+            return versioning.managed_subset(
+                read_tags(Path(file_row.folder) / file_row.filename).tags,
+            )
+        except (mutagen.MutagenError, OSError):  # type: ignore[attr-defined]
+            logger.warning("diff: unreadable file_id=%s, falling back to snapshot", file_row.id)
+    return versioning.managed_subset(store.get_tags(conn, file_row.id))
+
+
+def _stale_identity(
+    diff: dict[str, dict[str, list[str]]],
+    target: dict[str, list[str]],
+) -> list[dict[str, object]]:
+    """Report coupled identity fields this change rewrites one half of.
+
+    A group's name and its MusicBrainz ids describe the same thing, so changing the name while
+    keeping the old id leaves the file naming one entity and pointing at another.
+    """
+    stale: list[dict[str, object]] = []
+    for group in _IDENTITY_GROUPS:
+        changed = [field_name for field_name in group if field_name in diff]
+        if not changed:
+            continue
+        for field_name in group:
+            retained = target.get(field_name)
+            if field_name not in diff and retained:
+                stale.append(
+                    {
+                        "changed": changed[0],
+                        "stale_field": field_name,
+                        "stale_value": retained,
+                    },
+                )
+    return stale
+
+
 def diff_tags(settings: Settings, *, root: Path | None = None) -> list[TagDiffView]:
     """Return staged-but-uncommitted tag changes enriched with the current→target diff.
 
@@ -435,8 +497,9 @@ def diff_tags(settings: Settings, *, root: Path | None = None) -> list[TagDiffVi
             file_row = store.get_file_by_id(connection, staged.file_id)
             if file_row is None:  # pragma: no cover - staged FK guarantees the file row
                 continue
-            current = versioning.managed_subset(store.get_tags(connection, staged.file_id))
+            current = _current_managed(connection, file_row)
             target = staged.managed_tags
+            diff = versioning.compute_diff(current, target)
             views.append(
                 TagDiffView(
                     file_id=staged.file_id,
@@ -448,7 +511,8 @@ def diff_tags(settings: Settings, *, root: Path | None = None) -> list[TagDiffVi
                     staged_at=staged.staged_at,
                     current=current,
                     target=target,
-                    diff=versioning.compute_diff(current, target),
+                    diff=diff,
+                    stale_identity=_stale_identity(diff, target),
                 ),
             )
         return views

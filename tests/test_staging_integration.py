@@ -783,3 +783,108 @@ def test_stage_rejects_a_file_that_vanished_from_disk(
             managed_tags={"genre": ["Rock"]},
             origin="manual",
         )
+
+
+def test_diff_reads_current_from_disk_not_the_stale_snapshot(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    # The staged target is built from disk, so reading `current` from the snapshot mirror
+    # would show a field the mirror happens to lack as an ADDITION when nothing changes on
+    # disk. A review surface that invents changes is worse than no review surface.
+    track = make_track(
+        music_dir / "t.mp3",
+        {"artist": ["A"], "musicbrainz_albumtype": ["album"]},
+    )
+    scan_library(engine_settings)
+    file_id = _file_id(engine_settings, music_dir, "t.mp3")
+
+    conn = connect(engine_settings.db_path)
+    try:
+        apply_schema(conn)
+        conn.execute(
+            "DELETE FROM file_tags WHERE file_id=? AND name='musicbrainz_albumtype'",
+            (file_id,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    staging.stage_tags(
+        engine_settings,
+        file_id=file_id,
+        managed_tags={"genre": ["Industrial"]},
+        origin="manual",
+    )
+
+    view = staging.diff_tags(engine_settings)[0]
+    assert view.current["musicbrainz_albumtype"] == ["album"]
+    assert set(view.diff) == {"genre"}
+    assert read_tags(track).tags["artist"] == ["A"]
+
+
+def test_diff_flags_a_name_changed_without_its_id(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    # The merge-onto-current trap: rewriting artist while omitting musicbrainz_artistid
+    # leaves the OLD artist's id in place, so the file names one artist and points at
+    # another. Reported for review, never blocked and never auto-changed.
+    make_track(
+        music_dir / "t.mp3",
+        {"artist": ["Linkin Park"], "musicbrainz_artistid": ["lp-id"]},
+    )
+    scan_library(engine_settings)
+    file_id = _file_id(engine_settings, music_dir, "t.mp3")
+
+    staging.stage_tags(
+        engine_settings,
+        file_id=file_id,
+        managed_tags={"artist": ["Alice in Chains"]},
+        origin="manual",
+    )
+
+    view = staging.diff_tags(engine_settings)[0]
+    assert view.stale_identity == [
+        {"changed": "artist", "stale_field": "musicbrainz_artistid", "stale_value": ["lp-id"]},
+    ]
+
+
+def test_diff_does_not_flag_a_name_changed_with_its_id(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    make_track(
+        music_dir / "t.mp3",
+        {"artist": ["Linkin Park"], "musicbrainz_artistid": ["lp-id"]},
+    )
+    scan_library(engine_settings)
+    file_id = _file_id(engine_settings, music_dir, "t.mp3")
+
+    staging.stage_tags(
+        engine_settings,
+        file_id=file_id,
+        managed_tags={"artist": ["Alice in Chains"], "musicbrainz_artistid": ["aic-id"]},
+        origin="manual",
+    )
+
+    assert staging.diff_tags(engine_settings)[0].stale_identity == []
+
+
+def test_diff_does_not_flag_when_the_coupled_field_is_empty(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    # Nothing stale about an id that was never there.
+    make_track(music_dir / "t.mp3", {"artist": ["Linkin Park"]})
+    scan_library(engine_settings)
+    file_id = _file_id(engine_settings, music_dir, "t.mp3")
+
+    staging.stage_tags(
+        engine_settings,
+        file_id=file_id,
+        managed_tags={"artist": ["Alice in Chains"]},
+        origin="manual",
+    )
+
+    assert staging.diff_tags(engine_settings)[0].stale_identity == []

@@ -90,6 +90,14 @@ _ID_FIELDS: Final[Mapping[str, str]] = {
     "albumartist": "musicbrainz_albumartistid",
 }
 
+# Each name field's own sort field. A rewritten name leaves its sort name describing the OLD
+# spelling, and a library server keeps a stored sort name even after the tag goes empty, so a
+# stale one has to be REPLACED in the same commit rather than cleared later.
+_SORT_FIELDS: Final[Mapping[str, str]] = {
+    "artist": "artistsort",
+    "albumartist": "albumartistsort",
+}
+
 # Characters that separate the same name into different spellings. MusicBrainz writes real
 # typography (``Static\u2010X`` carries U+2010, not a hyphen-minus) while taggers and
 # filesystems substitute ASCII, and a word break is written as a dash by one source and a
@@ -245,6 +253,9 @@ class _Resolution:
     name: str
     mbid: str | None
     source: str
+    # Only MusicBrainz publishes a sort name. Last.fm leaves this None, and the file's own
+    # sort field is then left untouched rather than guessed at or destroyed.
+    sort_name: str | None = None
 
 
 @dataclass(slots=True)
@@ -536,11 +547,21 @@ def _classify_against_mb(value: str, artist: MBArtist, tally: _Tally) -> None:
 
     folded = _name_fold(value)
     if folded == _name_fold(artist.name):
-        tally.corrections[value] = _Resolution(artist.name, artist.mbid, _SOURCE_MB)
+        tally.corrections[value] = _Resolution(
+            artist.name,
+            artist.mbid,
+            _SOURCE_MB,
+            sort_name=artist.sort_name,
+        )
         return
 
     if any(folded == _name_fold(alias) for alias in artist.aliases):
-        tally.corrections[value] = _Resolution(artist.name, artist.mbid, _SOURCE_MB_ALIAS)
+        tally.corrections[value] = _Resolution(
+            artist.name,
+            artist.mbid,
+            _SOURCE_MB_ALIAS,
+            sort_name=artist.sort_name,
+        )
         return
 
     if _shrinks_credit(value, artist.name):
@@ -677,9 +698,10 @@ def _build_target(
 
     Starts from the file's managed subset (P0 — every other managed tag preserved), and for
     each single-valued ``artist``/``albumartist`` whose value has a resolution, replaces it
-    with the canonical name (accumulating both fields). Each field's MBID rides along on its
-    OWN id field, name-change only: writing ``musicbrainz_artistid`` for an ``albumartist``
-    correction would rebind the track artist to the album artist.
+    with the canonical name (accumulating both fields). Each field's MBID and sort name ride
+    along on that field's OWN id and sort fields, name-change only: writing
+    ``musicbrainz_artistid`` for an ``albumartist`` correction would rebind the track artist to
+    the album artist, and writing ``artistsort`` there would misfile it in a browse list.
     """
     target = dict(versioning.managed_subset(tags))
     note = ""
@@ -695,6 +717,8 @@ def _build_target(
         changed = True
         if resolution.mbid:
             target[_ID_FIELDS[field_name]] = [resolution.mbid]
+        if resolution.sort_name:
+            target[_SORT_FIELDS[field_name]] = [resolution.sort_name]
         if not note:
             note = f"{resolution.source}: {resolution.name}"
 

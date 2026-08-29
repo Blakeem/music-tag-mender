@@ -1269,3 +1269,96 @@ def test_mb_tier_still_refuses_a_name_that_is_not_this_artist(
 
     assert result.name_id_disagreement == 1
     assert result.staged_files == 0
+
+
+# --- the sort name travels with the name it sorts ------------------------------------
+
+
+def test_mb_tier_writes_the_sort_name_alongside_the_name(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    # A rewritten name leaves its sort name describing the OLD spelling, and a server keeps a
+    # stored sort name even after the tag goes empty, so the stale one has to be replaced in
+    # the same commit rather than cleared later.
+    make_track(
+        music_dir / "a.mp3",
+        {
+            "artist": ["Smashing Pumpkins"],
+            "artistsort": ["Smashing Pumpkins"],
+            "musicbrainz_artistid": ["m1"],
+        },
+    )
+    scan_library(engine_settings)
+
+    mb = FakeArtistSource(
+        {
+            "m1": _mb(
+                "The Smashing Pumpkins",
+                "Smashing Pumpkins",
+                mbid="m1",
+                sort_name="Smashing Pumpkins, The",
+            ),
+        },
+    )
+    result = artists.resolve_artists(
+        engine_settings,
+        client=FakeCorrectionSource({}),
+        mb_client=mb,
+    )
+
+    assert result.staged_files == 1
+    view = next(iter(staging.diff_tags(engine_settings)))
+    assert view.diff["artist"]["to"] == ["The Smashing Pumpkins"]
+    assert view.diff["artistsort"]["to"] == ["Smashing Pumpkins, The"]
+
+
+def test_mb_tier_writes_the_albumartist_sort_name_to_its_own_field(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    make_track(
+        music_dir / "a.mp3",
+        {
+            "artist": ["Guest"],
+            "albumartist": ["Smashing Pumpkins"],
+            "musicbrainz_albumartistid": ["m1"],
+        },
+    )
+    scan_library(engine_settings)
+
+    mb = FakeArtistSource(
+        {
+            "m1": _mb(
+                "The Smashing Pumpkins",
+                "Smashing Pumpkins",
+                mbid="m1",
+                sort_name="Smashing Pumpkins, The",
+            ),
+        },
+    )
+    artists.resolve_artists(engine_settings, client=FakeCorrectionSource({}), mb_client=mb)
+
+    view = next(iter(staging.diff_tags(engine_settings)))
+    assert view.diff["albumartistsort"]["to"] == ["Smashing Pumpkins, The"]
+    assert "artistsort" not in view.diff
+
+
+def test_the_lastfm_tier_leaves_the_sort_name_alone(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    # Last.fm has no sort name, so it has no authority to replace one. Guessing, or clearing
+    # what is there, would destroy a value on nothing.
+    make_track(
+        music_dir / "a.mp3",
+        {"artist": ["Offspring"], "artistsort": ["Offspring"]},
+    )
+    scan_library(engine_settings)
+
+    lastfm = FakeCorrectionSource({"Offspring": ArtistCorrection("The Offspring", "m9")})
+    artists.resolve_artists(engine_settings, client=lastfm, mb_client=FakeArtistSource({}))
+
+    view = next(iter(staging.diff_tags(engine_settings)))
+    assert view.diff["artist"]["to"] == ["The Offspring"]
+    assert "artistsort" not in view.diff

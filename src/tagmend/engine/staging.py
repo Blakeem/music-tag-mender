@@ -34,6 +34,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
+import mutagen
+
 from tagmend.engine import axis, commits, db, schema, store, versioning
 from tagmend.engine.tags import MANAGED_TAGS, read_tags, write_managed_tags
 from tagmend.log import get_logger
@@ -140,11 +142,13 @@ class TagDomain:
             message = f"staged row vanished for file_id={file_id}"
             raise RuntimeError(message)
 
-        # Baseline (version 0) is captured at stage time; this is a defensive no-op.
+        # Baseline (version 0) is captured at stage time; this is a defensive no-op. It reads
+        # disk for the same reason stage time does — a baseline is what a revert restores, so
+        # it can never come from the snapshot mirror, which may lag the file.
         versioning.ensure_baseline(
             conn,
             file_id,
-            managed_tags=store.get_tags(conn, file_id),
+            managed_tags=read_tags(path).tags,
             now=now,
         )
 
@@ -216,7 +220,19 @@ def _stage_one(  # noqa: PLR0913 - cohesive keyword-only per-file staging payloa
         message = f"cannot stage a missing file (file_id={file_id})"
         raise ValueError(message)
 
-    current = store.get_tags(conn, file_id)
+    # Disk, not the snapshot mirror. The mirror can lag the file (an older tag reader wrote
+    # the row, or nothing rescanned after an upgrade), and BOTH things derived here are
+    # delete-on-absent: the commit removes every managed key missing from the target, and the
+    # baseline is what a revert restores. A stale mirror therefore destroyed a tag the caller
+    # never mentioned, unrecoverably.
+    path = Path(file_row.folder) / file_row.filename
+    try:
+        current = read_tags(path).tags
+    except (mutagen.MutagenError, OSError) as exc:  # type: ignore[attr-defined]
+        # Reject at the boundary rather than staging a target built from nothing: the file
+        # vanished or turned unreadable since the scan that wrote its row.
+        message = f"cannot read tags from disk for file_id={file_id} ({path}): {exc}"
+        raise ValueError(message) from exc
 
     # Capture v0 now (resume-free model): freeze the true original before any commit.
     if store.max_version(conn, file_id) is None:

@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from conftest import make_track
 from tagmend.engine import commits, db, schema, staging, store, versioning
 
 if TYPE_CHECKING:
@@ -202,7 +203,13 @@ def test_append_revision_threads_commit_id(db_conn: sqlite3.Connection) -> None:
 
 
 def _seed_file(settings: Settings, filename: str) -> int:
-    """Insert one file row into the ledger *settings* points at; no audio on disk."""
+    """Create a real audio file under *settings*' music path and insert its ledger row.
+
+    The audio has to exist: staging reads the file's current managed tags from DISK, never
+    from the snapshot mirror, so a row pointing at nothing cannot be staged.
+    """
+    assert settings.music_path is not None
+    make_track(settings.music_path / filename)
     conn = db.connect(settings.db_path)
     try:
         schema.apply_schema(conn)

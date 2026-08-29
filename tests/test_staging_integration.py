@@ -714,3 +714,72 @@ def test_reopen_axes_ignores_noop_files(
     assert reopen.files == 0  # the noop file has no revision in this commit
     # Genre stays done because nothing was voided.
     assert _derived(engine_settings, file_id) == ("done", "done")
+
+
+def test_stale_snapshot_does_not_delete_a_managed_tag_from_disk(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    # The v0 baseline and the staged target were both built from the snapshot mirror, which
+    # can lag the file (an older tag reader wrote the row, or nothing rescanned after an
+    # upgrade). Since the commit deletes every managed key absent from the staged target,
+    # a stale row silently destroyed a tag the caller never mentioned — and the baseline,
+    # taken from the same stale source, could not bring it back. Disk is the only truth
+    # at stage time.
+    track = make_track(
+        music_dir / "t.mp3",
+        {"artist": ["A"], "album": ["Alb"], "musicbrainz_albumtype": ["album"]},
+    )
+    scan_library(engine_settings)
+    file_id = _file_id(engine_settings, music_dir, "t.mp3")
+
+    conn = connect(engine_settings.db_path)
+    try:
+        apply_schema(conn)
+        conn.execute(
+            "DELETE FROM file_tags WHERE file_id=? AND name='musicbrainz_albumtype'",
+            (file_id,),
+        )
+        conn.commit()
+        assert "musicbrainz_albumtype" not in store.get_tags(conn, file_id)
+    finally:
+        conn.close()
+
+    staging.stage_tags(
+        engine_settings,
+        file_id=file_id,
+        managed_tags={"genre": ["Industrial"]},
+        origin="manual",
+    )
+    staging.commit_tags(engine_settings, message="unrelated field")
+
+    assert read_tags(track).tags["musicbrainz_albumtype"] == ["album"]
+
+    conn = connect(engine_settings.db_path)
+    try:
+        apply_schema(conn)
+        baseline = store.get_revision(conn, file_id, 0)
+        assert baseline is not None
+        assert baseline.managed_tags["musicbrainz_albumtype"] == ["album"]
+    finally:
+        conn.close()
+
+
+def test_stage_rejects_a_file_that_vanished_from_disk(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    # Staging reads the file to build its target and baseline, so a row whose file is gone
+    # has to be rejected by name rather than surfacing a raw mutagen traceback.
+    track = make_track(music_dir / "gone.mp3", {"artist": ["A"]})
+    scan_library(engine_settings)
+    file_id = _file_id(engine_settings, music_dir, "gone.mp3")
+    track.unlink()
+
+    with pytest.raises(ValueError, match=f"cannot read tags from disk for file_id={file_id}"):
+        staging.stage_tags(
+            engine_settings,
+            file_id=file_id,
+            managed_tags={"genre": ["Rock"]},
+            origin="manual",
+        )

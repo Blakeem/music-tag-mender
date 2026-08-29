@@ -86,7 +86,7 @@ _DISC_SUFFIX: Final = re.compile(r"\s*[(\[][^()\[\]]*\bdisc\b[^()\[\]]*[)\]]\s*$
 # would erase ``The Crow: City of Angels`` against ``The Crow- City Of Angels``, which really
 # are two albums downstream and are exactly what this detector exists to find. Case and
 # surrounding or repeated whitespace are cosmetic. Punctuation is not.
-_TYPOGRAPHIC: Final[Mapping[str, str]] = {
+TYPOGRAPHIC: Final[Mapping[str, str]] = {
     chr(codepoint): plain
     for codepoints, plain in (
         ((0x2010, 0x2011, 0x2012, 0x2013, 0x2014, 0x2212), "-"),
@@ -171,8 +171,8 @@ class _FileInput:
             return ("release", release_id)
         return (
             "name",
-            _group_key(self.display_album_artist),
-            _group_key(self.album or ""),
+            group_key(self.display_album_artist),
+            group_key(self.album or ""),
             (self.year or "").strip(),
         )
 
@@ -292,19 +292,21 @@ class AlbumConflictsReport:
 # --- pure classifier -----------------------------------------------------------------
 
 
-def _group_key(value: str) -> str:
-    """Return the grouping key for an album or artist string.
+def group_key(value: str) -> str:
+    """Return the comparison key for an album or artist string.
 
     Casing, typographic character choice and whitespace runs are cosmetic. Every other
-    difference separates two albums for anything reading these tags.
+    difference separates two albums for anything reading these tags. Shared with
+    :mod:`tagmend.engine.disagreements`, which needs the same judgement about what is
+    cosmetic when it compares the same fields against MusicBrainz.
     """
-    folded = "".join(_TYPOGRAPHIC.get(ch, ch) for ch in value)
+    folded = "".join(TYPOGRAPHIC.get(ch, ch) for ch in value)
     return " ".join(folded.casefold().split())
 
 
 def _base_title(album: str | None) -> str:
     """Return *album* with a trailing ``(disc N …)`` segment removed, folded."""
-    return _group_key(_DISC_SUFFIX.sub("", album or ""))
+    return group_key(_DISC_SUFFIX.sub("", album or ""))
 
 
 def _is_compilation_missing_its_album_artist(files: list[_FileInput]) -> bool:
@@ -324,14 +326,14 @@ def _is_compilation_missing_its_album_artist(files: list[_FileInput]) -> bool:
         return False
     if any((f.compilation or "").strip() in _COMPILATION_TRUE for f in files):
         return False
-    if len({_group_key(f.album or "") for f in files}) != 1:
+    if len({group_key(f.album or "") for f in files}) != 1:
         return False
 
     # A dominant track artist means this is that artist's album with a guest or two, and the
     # album artist to fill in is theirs. Only when no artist holds half the folder is it a
     # compilation, where the album artist is a various-artists marker instead. Without this,
     # a normal album carrying one guest track would be read as a compilation.
-    artists = Counter(_group_key(f.artist or "") for f in files)
+    artists = Counter(group_key(f.artist or "") for f in files)
     if not artists:
         return False
     return artists.most_common(1)[0][1] * 2 < len(files)

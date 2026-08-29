@@ -39,6 +39,7 @@ from enum import StrEnum
 from typing import TYPE_CHECKING, Final
 
 from tagmend.engine import db, schema, store
+from tagmend.engine.album_conflicts import group_key
 from tagmend.engine.musicbrainz import MusicBrainzClient, MusicBrainzError
 from tagmend.log import get_logger
 
@@ -232,12 +233,15 @@ class DisagreementsReport:
 
 
 def _text_key(value: str) -> str:
-    """Return the comparison key for a free-text tag: casing and whitespace runs are cosmetic.
+    """Return the comparison key for a free-text tag.
 
-    Punctuation stays significant for the same reason it does in
-    :mod:`tagmend.engine.album_conflicts`: it changes the grouping key downstream.
+    Shares :func:`tagmend.engine.album_conflicts.group_key`, so the two detectors agree on
+    what is cosmetic: casing, typographic character choice and whitespace runs. MusicBrainz
+    writes typographic punctuation and taggers write ASCII, and no consumer distinguishes the
+    two, so a curly apostrophe against a straight one is not a finding. Other punctuation
+    stays significant: a colon against a hyphen is a real difference.
     """
-    return " ".join(value.casefold().split())
+    return group_key(value)
 
 
 def _position(value: str | None) -> str:
@@ -246,6 +250,16 @@ def _position(value: str | None) -> str:
         return ""
     head = value.split(_SLASH, 1)[0].strip()
     return str(int(head)) if head.isdigit() else head
+
+
+def _track_number_agrees(have: str, track: MBTrack) -> bool:
+    """Return whether the file's track number names this track, in either spelling.
+
+    A vinyl medium numbers its tracks by side (``A1``, ``B7``) while Picard writes the
+    sequential position, so the two strings differ on every file of such a release without
+    anything being wrong. Either spelling is a defensible reading, so either is accepted.
+    """
+    return have in {_position(track.number), _position(str(track.position))}
 
 
 def _date_agrees(have: str, want: str) -> bool:
@@ -346,17 +360,55 @@ def _compare_one(
     if track is None:
         return rows
 
+    rows.extend(_compare_track(file, release, track))
+    return rows
+
+
+def _compare_track(
+    file: _FileInput,
+    release: MBRelease,
+    track: MBTrack,
+) -> list[DisagreementRow]:
+    """Return every track-level field on *file* that contradicts its matched *track*."""
+    rows: list[DisagreementRow] = []
+
+    def add(field_name: str, have: str, want: str, reason: str) -> None:
+        rows.append(
+            DisagreementRow(
+                file_id=file.file_id,
+                folder=file.folder,
+                filename=file.filename,
+                release_id=release.mbid,
+                release_title=release.title,
+                field=field_name,
+                have=have,
+                want=want,
+                tier=_tier_for(field_name).value,
+                reason=reason,
+            ),
+        )
+
+    have_number = _position(file.tracknumber)
+    if have_number and not _track_number_agrees(have_number, track):
+        add(
+            "tracknumber",
+            have_number,
+            _position(track.number),
+            f"the release says {track.number!r}",
+        )
+    elif not have_number and track.number:
+        add("tracknumber", "", _position(track.number), "")
+
     for field_name, have_raw, want in (
         ("title", file.title, track.title),
         # The credit is per track, not per release: a guest track carries its own, and that
         # is the one the file should name.
         ("artist", file.artist, track.artist_credit),
-        ("tracknumber", _position(file.tracknumber), _position(track.number)),
         ("discnumber", _position(file.discnumber), str(_medium_of(release, track))),
     ):
         have = (have_raw or "").strip()
         if want and _text_key(have) != _text_key(want):
-            add(field_name, have, want, _tier_for(field_name), f"the release says {want!r}")
+            add(field_name, have, want, f"the release says {want!r}")
 
     return rows
 

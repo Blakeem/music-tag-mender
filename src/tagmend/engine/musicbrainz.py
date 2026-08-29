@@ -111,6 +111,13 @@ _YEAR_PREFIX_LEN: Final = 4
 # A 404 from the artist endpoint is a real answer (no such artist), not a transient failure.
 _HTTP_NOT_FOUND: Final = 404
 
+# MusicBrainz answers 503 when it is throttling and asks clients to back off and retry. A
+# sweep of 876 releases lost 52 of them to this before the retry existed. Every other
+# non-2xx is a real failure and is raised on the first attempt.
+_HTTP_THROTTLED: Final = 503
+_THROTTLE_ATTEMPTS: Final = 3
+_THROTTLE_BACKOFF_SECONDS: Final = 1.0
+
 
 @dataclass(frozen=True, slots=True)
 class MBAlbum:
@@ -561,11 +568,10 @@ class MusicBrainzClient:
             message = "MusicBrainzClient must be used as a context manager"
             raise RuntimeError(message)
 
-        self._pace()
         logger.debug("musicbrainz artist request mbid=%r", mbid)
-        response = self._client.get(
+        response = self._get_with_backoff(
             f"{_ARTIST_API_URL}{mbid}",
-            params={"inc": "aliases", "fmt": "json"},
+            {"inc": "aliases", "fmt": "json"},
         )
         if response.status_code == _HTTP_NOT_FOUND:
             return None
@@ -637,11 +643,10 @@ class MusicBrainzClient:
             message = "MusicBrainzClient must be used as a context manager"
             raise RuntimeError(message)
 
-        self._pace()
         logger.debug("musicbrainz release request mbid=%r", mbid)
-        response = self._client.get(
+        response = self._get_with_backoff(
             f"{_RELEASE_API_URL}{mbid}",
-            params={"inc": "recordings+artist-credits", "fmt": "json"},
+            {"inc": "recordings+artist-credits", "fmt": "json"},
         )
         if response.status_code == _HTTP_NOT_FOUND:
             return None
@@ -649,6 +654,28 @@ class MusicBrainzClient:
             message = f"MusicBrainz HTTP {response.status_code} for release lookup"
             raise MusicBrainzError(message)
         return cast("dict[str, object]", response.json())
+
+    def _get_with_backoff(self, url: str, params: dict[str, str]) -> httpx.Response:
+        """Pace, then GET *url*, retrying only while MusicBrainz answers with its throttle code.
+
+        The backoff doubles between attempts. After the last one the 503 is raised like any
+        other failure, so it is reported and never cached, and a re-run retries it.
+        """
+        if self._client is None:  # pragma: no cover - guard against misuse outside `with`
+            message = "MusicBrainzClient must be used as a context manager"
+            raise RuntimeError(message)
+
+        delay = _THROTTLE_BACKOFF_SECONDS
+        for attempt in range(_THROTTLE_ATTEMPTS):
+            self._pace()
+            response = self._client.get(url, params=params)
+            if response.status_code != _HTTP_THROTTLED:
+                return response
+            if attempt < _THROTTLE_ATTEMPTS - 1:
+                logger.debug("musicbrainz throttled, backing off %ss", delay)
+                self._sleep(delay)
+                delay *= 2
+        return response
 
     def _pace(self) -> None:
         """Sleep just enough so consecutive network requests honor ``rate_per_sec``.

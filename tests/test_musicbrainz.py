@@ -584,7 +584,7 @@ def test_artist_by_mbid_raises_and_does_not_cache_a_transient_failure(
 ) -> None:
     client, calls = _client(
         db_conn,
-        [httpx.Response(503, text="busy"), _json_response(_artist_body())],
+        [httpx.Response(500, text="broken"), _json_response(_artist_body())],
     )
     with client:
         with pytest.raises(MusicBrainzError):
@@ -830,7 +830,7 @@ def test_release_by_mbid_raises_and_does_not_cache_a_transient_failure(
 ) -> None:
     client, calls = _client(
         db_conn,
-        [httpx.Response(503, text="busy"), _json_response(_release_body())],
+        [httpx.Response(500, text="broken"), _json_response(_release_body())],
     )
     with client:
         with pytest.raises(MusicBrainzError):
@@ -893,3 +893,75 @@ def test_bumping_the_release_version_changes_the_request_key(
     before = _release_request_key("abc")
     monkeypatch.setattr(musicbrainz, "_RELEASE_VERSION", "99")
     assert _release_request_key("abc") != before
+
+
+# --- 503 backoff: MusicBrainz's own rate-limit signal ---------------------------------
+
+
+def test_a_503_is_retried_after_a_backoff(db_conn: sqlite3.Connection) -> None:
+    # MusicBrainz returns 503 when it is throttling, and asks clients to back off and retry.
+    # A 876-release sweep lost 52 releases to this before the retry existed.
+    slept: list[float] = []
+    client, calls = _client(
+        db_conn,
+        [httpx.Response(503, text="busy"), _json_response(_release_body())],
+        sleep=slept.append,
+    )
+    with client:
+        release = client.release_by_mbid("rel-1")
+
+    assert release is not None
+    assert len(calls) == 2
+    assert slept == [pytest.approx(1.0)]
+
+
+def test_the_backoff_grows_between_attempts(db_conn: sqlite3.Connection) -> None:
+    slept: list[float] = []
+    client, calls = _client(
+        db_conn,
+        [
+            httpx.Response(503, text="busy"),
+            httpx.Response(503, text="busy"),
+            _json_response(_release_body()),
+        ],
+        sleep=slept.append,
+    )
+    with client:
+        assert client.release_by_mbid("rel-1") is not None
+
+    assert len(calls) == 3
+    assert slept == [pytest.approx(1.0), pytest.approx(2.0)]
+
+
+def test_a_503_that_never_clears_raises_and_caches_nothing(
+    db_conn: sqlite3.Connection,
+) -> None:
+    responses = [httpx.Response(503, text="busy") for _ in range(4)]
+    client, calls = _client(db_conn, responses, sleep=lambda _s: None)
+    with client, pytest.raises(MusicBrainzError):
+        client.release_by_mbid("rel-1")
+
+    # Three attempts, then it gives up rather than hammering.
+    assert len(calls) == 3
+
+
+def test_a_non_throttle_error_is_not_retried(db_conn: sqlite3.Connection) -> None:
+    client, calls = _client(db_conn, [httpx.Response(500, text="broken")], sleep=lambda _s: None)
+    with client, pytest.raises(MusicBrainzError):
+        client.release_by_mbid("rel-1")
+
+    assert len(calls) == 1
+
+
+def test_the_artist_lookup_backs_off_the_same_way(db_conn: sqlite3.Connection) -> None:
+    slept: list[float] = []
+    client, calls = _client(
+        db_conn,
+        [httpx.Response(503, text="busy"), _json_response(_artist_body())],
+        sleep=slept.append,
+    )
+    with client:
+        assert client.artist_by_mbid("mbid-1") is not None
+
+    assert len(calls) == 2
+    assert slept == [pytest.approx(1.0)]

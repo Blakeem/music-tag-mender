@@ -1,8 +1,8 @@
 # TagMend — ROADMAP (forward-looking)
 
-> Updated **2026-08-02**. This file lists only what **remains** — everything shipped has been
-> removed (through the album-gaps detector: schema v12, 31 MCP tools; see `CLAUDE.md` for the
-> shipped-state summary and `PLAN.md` for the design of record).
+> Updated **2026-08-29**. This file lists only what **remains**. Everything shipped has been
+> removed (through `detect_disagreements`: schema v16, 34 MCP tools). See `CLAUDE.md` for the
+> shipped-state summary and `PLAN.md` for the design of record.
 >
 > **Direction (updated 2026-08-02):** finish the **metadata** mission (Phase B), then the
 > **path-canonicalization** mission (Phase C: prove path↔tag coherence for every path-encoded
@@ -20,19 +20,31 @@
 > promoting the mended copy over the actual library once everything is verified (B3).
 
 ### B0. Live mismatch fix pass (next up)
-- [ ] Drive the fix flow over the **19 flagged folders / 144 files**: grouped detect → research
-      the correct release per folder → `stage_tags_batch` → review `diff_tags` →
-      `commit_tags(path=folder)` (one revertible commit per release) → `reopen_axes`.
+- [ ] Drive the fix flow over the **19 flagged folders / 130 files** (re-measured 2026-08-29,
+      unchanged on disk: the `folder_context` bucket moved 14 of the original 144 out of
+      `flagged`): grouped detect → research the correct release per folder → `stage_tags_batch`
+      → review `diff_tags` → `commit_tags(path=folder)` (one revertible commit per release) →
+      `reopen_axes`.
       **Do this BEFORE the full resolve run (B2)** — identity fixes re-pend derived genre/year,
       so fixing identity first avoids resolving axes against wrong artists.
+- New tooling for the research step, shipped since 2026-08-02, replacing the out-of-band script:
+  `release_by_mbid` returns the release a file names, tracklist included. `detect_disagreements`
+  reports every field where the file contradicts that release. `diff_tags` flags `stale_identity`
+  before the commit. The seven release-stamp fields are now managed, so one commit can replace the
+  whole wrong-release block.
 - Known per-folder routing from live testing (2026-07-04):
   - [ ] **Skrillex/Gypsyhook ("Sonny", 8 files):** Last.fm `getCorrection("Sonny")` returns
-        *already canonical* — the alias will NOT be fixed by `resolve_artists`. Fix flow
-        (research the Gypsyhook EP identity) or `legit_ignore` if the Sonny credit is wanted.
-  - [ ] **Soundtracks folders (Crow: City of Angels, Freddy vs. Jason — 23 files):** deeper than
+        *already canonical*, so the Last.fm tier leaves the alias alone. The MusicBrainz name
+        tier now runs ahead of it, and all 8 files carry Skrillex's `musicbrainz_artistid`.
+        Re-check `resolve_artists` first. It stages the correction if MusicBrainz records "Sonny"
+        as an alias of that id, and holds `name_id_disagreement` if it does not. Otherwise the fix
+        flow (research the Gypsyhook EP identity), or `legit_ignore` if the Sonny credit is wanted.
+  - [ ] **Soundtracks folders (Crow: City of Angels, Freddy vs. Jason — 35 files):** deeper than
         the container false positive — files carry the *score* release's titles/tracknumbers/
         MB-IDs over soundtrack audio (e.g. filename "Hole - Gold Dust Woman" stamped
         `title="La Masquera"`). Needs per-file re-identity via the fix flow, not `legit_ignore`.
+        `detect_disagreements` cannot route this one: the files agree with the release they name,
+        because the id they carry is itself the wrong release.
         (Dispositions set during testing were reset — both folders are `pending` again.)
   - [ ] **Tool [Discography] (2 Alice In Chains files):** genuinely misfiled →
         `misfiled_deferred` (never a tag write; the files move when M6 exists).
@@ -65,14 +77,26 @@
       field: top folder ↔ artist/albumartist (exists today), release-folder leaf ↔ album +
       year-in-leaf (via `parsing.parse_folder`), filename ↔ tracknumber + title (via
       `parsing.parse_filename_track`). Reuses `fold` matching + the fix-or-ignore disposition
-      pattern (`file_mismatch_status`). The C4 gate is ZERO unresolved rows: every
-      disagreement fixed through the stage→commit flow or explicitly ignored.
+      pattern (`file_mismatch_status`). The C4 gate is ZERO unresolved rows: every row fixed
+      through the stage→commit flow or explicitly ignored.
+      Three coherence detectors shipped since 2026-08-02: `detect_track_conflicts`,
+      `detect_album_conflicts` and `detect_disagreements`. They compare a file against its folder
+      siblings and against MusicBrainz, never against the path, so this widening is still the
+      missing comparison.
 
 ### C2. Year-disagreement report (review-only) — `detect_year_disagreements`
 - [ ] Report files whose stored `date`/`originaldate` disagrees with the MusicBrainz
       release-group first-release date (the comparator `resolve_years` already fetches and
       caches). Review-only, never auto-staged: re-releases and soundtracks make a wrong
       `(artist, album)` → release-group match plausible, so a human confirms every correction.
+      `detect_disagreements` (shipped) is a different comparison. It checks the specific release
+      that `musicbrainz_albumid` names, not the release group's first-release date, so this report
+      is still open.
+- [ ] **Naming decision, pending.** `detect_disagreements` shipped with the bare noun, and naming
+      rule 2 allows bare only while nothing else shares it. Shipping this report as
+      `detect_year_disagreements` forces one of two changes: a different finding noun here, or a
+      qualifier on the shipped tool (`detect_release_disagreements` names the comparison it makes).
+      Decide before building.
 
 ### C3. Song axis — AcoustID fingerprint verification (title + tracknumber)
 - [ ] The audio-truth tier (promoted from deferred 2026-08-02 — track numbers must be proven
@@ -80,9 +104,11 @@
       subprocess, prebuilt static Windows binary) via MIT `pyacoustid` → **AcoustID** web
       service (free app API key, ~3 req/s) → MB recording IDs → canonical title +, via the
       chosen MB release's tracklist, tracknumber. Covers both flavors: blank-fill (61
-      no-title / 203 no-tracknumber / 2 placeholder titles, measured 2026-08-02; re-measure
-      after B0/B2 — wrong-release fixes rewrite these) and wrong-value verification that text
-      cannot do (the tags lie consistently; only the audio is independent). New axis on the
+      no-title / 203 no-tracknumber / 2 placeholder titles, measured 2026-08-02 and unchanged
+      2026-08-29) and wrong-value verification that text cannot do (the tags lie consistently;
+      only the audio is independent). Re-measure the blank-fill counts after B0/B2, since
+      wrong-release fixes rewrite them. The MusicBrainz release lookup does not reach those
+      files: none of them carries any MusicBrainz id, measured 2026-08-29. New axis on the
       existing `Axis` abstraction (`file_song_status`, `resolve_songs`, `set_song_status`/
       `reset_song_status`, filter/stats; no `list_songs`) + persistent
       fingerprint/lookup caches so re-runs are network-free. **Spec the

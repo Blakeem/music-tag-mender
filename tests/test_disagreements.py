@@ -35,15 +35,26 @@ class FakeReleaseSource:
         return self._table.get(mbid)
 
 
-def _track(
-    number: str, title: str, *, rt: str = "", rec: str = "", credit: str = "Band"
+def _track(  # noqa: PLR0913 - one keyword per track field, cohesive by design
+    number: str,
+    title: str,
+    *,
+    position: int | None = None,
+    rt: str = "",
+    rec: str = "",
+    credit: str = "Band",
 ) -> MBTrack:
+    """Build one track. *position* defaults to *number* when that is a plain integer.
+
+    A vinyl medium numbers by side (``A1``), so those cases pass *position* explicitly.
+    """
+    resolved = position if position is not None else (int(number) if number.isdigit() else 0)
     return MBTrack(
-        position=int(number) if number.isdigit() else 0,
+        position=resolved,
         number=number,
         title=title,
-        release_track_mbid=rt or f"rt-{number}",
-        recording_mbid=rec or f"rec-{number}",
+        release_track_mbid=rt or f"rt-{resolved}",
+        recording_mbid=rec or f"rec-{resolved}",
         artist_credit=credit,
         artist_mbids=("artist-1",),
     )
@@ -412,3 +423,61 @@ def test_the_artist_is_not_checked_without_a_matched_track() -> None:
     report = _run([_f(release_track_id=None, recording_id=None, artist="Somebody Else")])
 
     assert "artist" not in {r.field for r in report.rows}
+
+
+# --- vinyl numbering and typography are not disagreements ----------------------------
+
+
+def test_a_vinyl_side_number_agrees_with_the_sequential_position() -> None:
+    # 30 releases in the library number their tracks A1..B12 for a vinyl medium, and Picard
+    # writes the sequential position, not the side designation. Comparing the two strings
+    # flagged every file on every one of those releases.
+    vinyl = _release(
+        _track("A1", "Song One", position=1),
+        _track("A2", "Song Two", position=2),
+    )
+    report = _run([_f(tracknumber="1")], vinyl)
+
+    assert report.flagged == 0
+
+
+def test_a_file_numbered_with_the_side_designation_also_agrees() -> None:
+    # Either spelling is accepted, because either is a defensible reading of the release.
+    vinyl = _release(_track("A1", "Song One", position=1))
+    report = _run([_f(tracknumber="A1")], vinyl)
+
+    assert report.flagged == 0
+
+
+def test_a_genuinely_wrong_number_on_a_vinyl_release_still_disagrees() -> None:
+    vinyl = _release(
+        _track("A1", "Song One", position=1),
+        _track("A2", "Song Two", position=2),
+    )
+    report = _run([_f(tracknumber="7")], vinyl)
+
+    assert report.medium == 1
+    assert report.rows[0].field == "tracknumber"
+
+
+def test_a_curly_apostrophe_is_not_a_disagreement() -> None:
+    # MusicBrainz writes typographic punctuation. No consumer distinguishes the two forms,
+    # and folding them keeps the report about differences that matter.
+    curly = _release(_track("1", "Someone\u2019s Standing on My Chest"))
+    report = _run([_f(title="Someone's Standing on My Chest")], curly)
+
+    assert report.flagged == 0
+
+
+def test_a_dash_variant_is_not_a_disagreement() -> None:
+    dashed = _release(_track("1", "Song One"), title="1994\u20132006 Chaos Years")
+    report = _run([_f(album="1994-2006 Chaos Years")], dashed)
+
+    assert report.flagged == 0
+
+
+def test_other_punctuation_still_disagrees() -> None:
+    # A colon against a hyphen is a real difference, not a typographic variant of one.
+    report = _run([_f(album="Real: Album")])
+
+    assert report.medium == 1

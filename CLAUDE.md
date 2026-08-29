@@ -48,7 +48,7 @@ round it out. The `detect_album_gaps` tool (`album_gaps.py` + the pure, standalo
 `parsing.py`) groups blank-`album` files by folder and proposes sibling / folder-parse fills
 plus a review-only MusicBrainz `(artist, title)` recording tier (`mb_recording`, opt-out via
 `use_musicbrainz=False`, cached in `musicbrainz_recording_cache`) for the `stage_tags_batch →
-diff → commit → reopen_axes` spine. 31 MCP tools total. Schema is **v14** (additive: v11 adds
+diff → commit → reopen_axes` spine. 32 MCP tools total. Schema is **v14** (additive: v11 adds
 `musicbrainz_recording_cache`, v12 renames `file_album_status` → `file_year_status` in place —
 dispositions preserved; v13 adds `tag_revisions.managed_set`, stamping which managed-tag set
 governed each revision so a revert can restore emptiness on the widened fields; v14 adds
@@ -151,8 +151,9 @@ Rules, in order:
    module/function/class names, `Axis.name` values, status tables, and prose.
 
 Glossary — the comparison behind each finding noun: `mismatch` = tags ↔ folder path · `gap` = tag ↔
-absent · `disagreement` = tag ↔ external source (MusicBrainz) · `deviation` = current path ↔
-canonical path generated from tags by the naming pattern (coined).
+absent · `disagreement` = tag ↔ external source (MusicBrainz) · `conflict` = tag ↔ sibling tags in
+the same folder (coined) · `deviation` = current path ↔ canonical path generated from tags by the
+naming pattern (coined).
 
 ## Quality gates — all four must pass before anything is "done"
 
@@ -218,7 +219,7 @@ src/tagmend/
   log.py            shared logger (use everywhere)
   config.py         settings.json (platformdirs) + typed Settings
   cli.py            Typer CLI (thin)
-  mcp_server.py     FastMCP server (thin) — 31 tools
+  mcp_server.py     FastMCP server (thin) — 32 tools
   engine/
     db.py           SQLite connection (WAL)
     schema.py       all DDL + PRAGMA user_version (v14)
@@ -234,6 +235,7 @@ src/tagmend/
     classify.py     genre vocab/overlay loader + fold-key index + classify.classify_genres (pure)
     genres.py       resolve_genres orchestration + file_genre_status workflow
     artists.py      resolve_artists + set/reset_artist_status: getCorrection cascade-stage + file_artist_status workflow
+    track_conflicts.py  detect_track_conflicts: intra-folder (disc, track) slot collisions
     years.py        resolve_years + set/reset_year_status: MusicBrainz originaldate blank-fill + file_year_status workflow
     paths.py        STUB + PathDomain paper sketch — M6 (organize/paths)
 tests/              pytest; conftest isolates config + builds temp libraries (make_track)

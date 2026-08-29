@@ -24,6 +24,7 @@ from tagmend.engine import (
     library,
     mismatch,
     staging,
+    track_conflicts,
     versioning,
     years,
 )
@@ -467,6 +468,71 @@ def detect_mismatches(
     """
     try:
         report = mismatch.detect_mismatches(
+            load_settings(),
+            tier=tier,
+            limit=limit,
+            group=group,
+            folder=folder,
+        )
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    return {"ok": True, **report.to_dict()}
+
+
+@mcp.tool()
+def detect_track_conflicts(
+    tier: Literal["high", "medium", "low"] | None = None,
+    limit: int | None = None,
+    group: bool = False,  # noqa: FBT001, FBT002 - MCP tool surface, not a Python API
+    folder: str | None = None,
+) -> dict[str, object]:
+    """Find files that share a ``(disc, track)`` slot with a sibling in the same folder.
+
+    The intra-folder half of tag coherence, and the sibling of ``detect_mismatches`` (which
+    compares tags against the folder PATH). A folder holding one album describes ONE tracklist,
+    so no two files in it may claim the same track number. When two do, one is wrong: a bulk
+    tagger stamped a whole folder with one track's numbers, a duplicate was never renumbered,
+    or two takes matched the same MusicBrainz recording. Pure read over the snapshot: writes
+    nothing, stages nothing, no network. Run ``scan_library`` first.
+
+    Recommended workflow: start with ``group=true`` for one line per folder, then expand a
+    single folder with ``folder="<exact folder path>"`` to see its rows, research the correct
+    tracklist, and fix with ``stage_tags_batch`` -> ``diff_tags`` -> ``commit_tags(path=<folder>)``
+    -> ``reopen_axes``. Read ``diff_tags``' ``stale_identity`` before committing.
+
+    Tiers, matching the shapes a real library contains:
+
+    * ``high`` — the colliding files carry DIFFERENT titles. Two distinct songs cannot both be
+      track 7, so the numbering is wrong.
+    * ``medium`` — same title, same container: a genuine duplicate track stamp.
+    * ``low`` — same title, different container (an ``.mp3`` and a ``.flac`` of one song),
+      usually a deliberate duplicate encode rather than a defect.
+
+    A folder holding more than one album, or named ``Singles``/``Remixes``/``Featured``/etc.,
+    legitimately repeats track numbers — every single is track 1. Those rows are reported under
+    ``folder_context`` instead, outside ``flagged`` and outside the tier counts, so ``flagged``
+    keeps meaning "files that are wrong". The guard is derived from the folder's own ``album``
+    values, so it needs no configuration.
+
+    Track TOTALS are deliberately not reported: a folder of 10 files whose tags say ``/12`` is
+    either missing two tracks or carrying a wrong total, and only a MusicBrainz release
+    tracklist can tell which.
+
+    Args:
+        tier: Keep only rows in this tier (``high`` | ``medium`` | ``low``).
+        limit: Cap the rows returned, or the groups with ``group=true``.
+        group: Return one compact line per folder instead of flat rows.
+        folder: Expand exactly this folder's rows (exact path, never a prefix).
+
+    Returns:
+        ``{"ok": True, rows, total_files, flagged, high, medium, low, folder_context,
+        folder_context_rows, groups, summary}`` — each row is ``{file_id, folder, filename,
+        disc, track, title, tier, reason, peers}`` where ``peers`` names the other file ids in
+        that slot, and each group is ``{folder, file_count, flagged, folder_context, slots,
+        tiers, file_ids}`` — or ``{"ok": False, "error": ...}``.
+    """
+    try:
+        report = track_conflicts.detect_track_conflicts(
             load_settings(),
             tier=tier,
             limit=limit,

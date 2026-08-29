@@ -118,7 +118,7 @@ Edits apply on the next tool call; every command and MCP tool re-reads `settings
 
 ## Tools
 
-The MCP server exposes 31 tools. All tag edits are staged in memory and only written to disk on `commit_tags`, and everything is revertible.
+The MCP server exposes 32 tools. All tag edits are staged in memory and only written to disk on `commit_tags`, and everything is revertible.
 
 ### Core & Library
 
@@ -131,6 +131,7 @@ The MCP server exposes 31 tools. All tag edits are staged in memory and only wri
 | `get_file` | Return one tracked file with its managed tags, by stable `file_id` |
 | `detect_mismatches` | Detect files whose identity tags disagree with their folder path (read-only report) |
 | `detect_album_gaps` | Find files with a blank `album` tag, grouped by folder, with tiered fill proposals (read-only report) |
+| `detect_track_conflicts` | Find files sharing a `(disc, track)` slot with a folder sibling, tiered by how the titles and containers compare (read-only report) |
 
 ### Staging & Commits
 

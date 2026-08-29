@@ -56,6 +56,20 @@ governed each revision so a revert can restore emptiness on the widened fields; 
 older ledger upgrades in place). M6 organize/paths (`paths.py`)
 is a paper sketch (its DDL ships in v6; logic deferred).
 
+**The canonical tag namespace is TagMend's, not mutagen's.** mutagen's "easy" layer is an
+incomplete normalizer, so `tags.py` owns the mapping wherever it is wrong: `EasyID3` points
+`albumartistsort` at a `TXXX` frame Picard never writes (it uses `TSO2`), `EasyMP4` freeform atom
+names are case-sensitive and its `releasecountry` atom is a word off from Picard's, and Vorbis has
+**no easy layer at all** so FLAC/OGG names pass through raw. Read accepts every known spelling and
+prefers the container-native one; write emits the native one and drops the alternate, so a file
+never carries two contradicting values for one concept. Collapse a pair ONLY after measuring that
+the two names never disagree in the wild — `organization`/`label` is left unmapped and unmanaged
+because 245 real FLACs hold a different label in each. **`MANAGED_TAGS` is 25** (5 original + 13
+identity + 7 release-stamp = managed-set version 3; `MANAGED_SETS` keeps every older set frozen
+because stored revisions point at them). Any change to what `read_tags` produces bumps
+`TAG_READER_VERSION` in the same commit, which is what makes the next incremental scan re-read a
+stale row exactly once.
+
 ## Python
 
 - **Target Python 3.12** (`requires-python = ">=3.12"`). Write 3.12 code: built-in

@@ -20,6 +20,7 @@ from tagmend.engine import (
     album_gaps,
     artists,
     commits,
+    disagreements,
     genres,
     health,
     library,
@@ -539,6 +540,78 @@ def detect_track_conflicts(
             limit=limit,
             group=group,
             folder=folder,
+        )
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    return {"ok": True, **report.to_dict()}
+
+
+@mcp.tool()
+def detect_disagreements(
+    tier: Literal["high", "medium", "low"] | None = None,
+    folder: str | None = None,
+    file_ids: list[int] | None = None,
+    limit: int | None = None,
+    group: bool = False,  # noqa: FBT001, FBT002 - MCP tool surface, not a Python API
+) -> dict[str, object]:
+    """Find files whose tags contradict the MusicBrainz release their album id names.
+
+    The third comparison in the coherence family. ``detect_mismatches`` compares a file's tags
+    against the folder PATH, ``detect_album_conflicts`` and ``detect_track_conflicts`` compare
+    a file against its folder SIBLINGS, and this compares a file against an EXTERNAL
+    authority: the release its own ``musicbrainz_albumid`` names. That id makes it a direct
+    lookup with nothing to guess, which is what lets it say what a tag SHOULD be rather than
+    only that something is wrong.
+
+    Inside the release, a file finds its own track by ``musicbrainz_releasetrackid`` (which
+    names a track on this release) or, failing that, ``musicbrainz_trackid`` (the recording).
+    Position is deliberately never used to match: a file whose numbering is wrong is exactly
+    what this reports, so matching on it would hide the defect.
+
+    Release-level fields (``album``, ``albumartist``, ``date``, ``releasecountry``,
+    ``musicbrainz_albumstatus``) are checked even for a file carrying no track id.
+    Track-level fields (``title``, ``tracknumber``, ``discnumber``) need a matched track and
+    are skipped without one.
+
+    **A blank field is a fill, not a disagreement.** ``flagged`` counts only fields where the
+    file says one thing and the release says another. Fields the file simply lacks are
+    collected under ``fill_rows``/``fills``, outside ``flagged`` and outside the tier counts.
+
+    Tiers: ``high`` when the file's release-track id is not on the release at all (a broken
+    identity), ``medium`` for a field that decides how a library groups, names or orders the
+    file, ``low`` for release provenance.
+
+    Each distinct release is fetched once and cached, paced at MusicBrainz's requested one
+    request per second. ``limit`` caps the releases fetched this call (default 200, about
+    three minutes) and the rest are reported under ``releases_remaining``/``more``. Reads the
+    snapshot, so run ``scan_library`` first. Writes no tags and stages nothing.
+
+    Recommended workflow: ``group=true`` for one line per folder, then expand one folder with
+    ``folder="<exact folder path>"``, then fix with ``stage_tags_batch`` -> ``diff_tags`` ->
+    ``commit_tags(path=<folder>)`` -> ``reopen_axes``.
+
+    Args:
+        tier: Keep only rows in this tier (``high`` | ``medium`` | ``low``).
+        folder: Limit to exactly this folder (exact path, never a prefix).
+        file_ids: Limit to these specific file ids.
+        limit: Max distinct releases to fetch this call.
+        group: Return one compact line per folder instead of flat rows.
+
+    Returns:
+        ``{"ok": True, rows, fill_rows, total_files, flagged, high, medium, low, fills,
+        releases_checked, releases_remaining, more, skipped_no_release_id, unknown_releases,
+        unmatched_tracks, errors, error_releases, groups, summary}`` — each row is
+        ``{file_id, folder, filename, release_id, release_title, field, have, want, tier,
+        reason}`` — or ``{"ok": False, "error": ...}``.
+    """
+    try:
+        report = disagreements.detect_disagreements(
+            load_settings(),
+            tier=tier,
+            folder=folder,
+            file_ids=file_ids,
+            limit=limit,
+            group=group,
         )
     except ValueError as exc:
         return {"ok": False, "error": str(exc)}

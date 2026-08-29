@@ -18,6 +18,7 @@ import sqlite3
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import httpx
 import mutagen
 import pytest
 
@@ -67,6 +68,35 @@ def make_track(
         audio.save()
 
     return dest
+
+
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
+@pytest.fixture(autouse=True)
+def _block_external_network(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fail any test that reaches a real host off this machine instead of an injected fake.
+
+    Every network-facing engine builds its own real client when none is injected, so a
+    fixture that merely grows a ``musicbrainz_artistid`` can silently start calling the live
+    API from the unit suite. Loopback stays open because the config-UI tests drive a real
+    local server over it; ``httpx.MockTransport`` is a different class and is untouched.
+    """
+    real_handle = httpx.HTTPTransport.handle_request
+
+    def guarded(
+        self: httpx.HTTPTransport,
+        request: httpx.Request,
+    ) -> httpx.Response:
+        if request.url.host not in _LOOPBACK_HOSTS:
+            message = (
+                f"a test reached the real network ({request.url.host}); "
+                f"inject a fake client or an httpx.MockTransport"
+            )
+            raise RuntimeError(message)
+        return real_handle(self, request)
+
+    monkeypatch.setattr(httpx.HTTPTransport, "handle_request", guarded)
 
 
 @pytest.fixture(autouse=True)

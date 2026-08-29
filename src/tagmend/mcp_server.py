@@ -803,37 +803,51 @@ def resolve_artists(
     limit: int | None = None,
     dry_run: bool = False,  # noqa: FBT001, FBT002 - MCP tool surface, not a Python API
 ) -> dict[str, object]:
-    """Normalize artist names via Last.fm getCorrection and stage the result (writes no disk).
+    """Normalize artist names against MusicBrainz, then Last.fm, and stage the result.
 
-    For each distinct ``artist``/``albumartist`` value in scope this looks up the canonical
-    name on Last.fm and, where it differs, cascade-stages the corrected name across every
-    file carrying that value (rewriting ``artist`` and/or ``albumartist``, exact-match only)
-    plus the correction's ``musicbrainz_artistid`` — as an ``auto`` change replacing ONLY
-    those fields (every other managed tag, incl. ``genre``, is preserved). Review with
-    ``diff_tags`` and apply with ``commit_tags``; ``revert_commit``/``revert_tags`` undo it.
+    Two tiers, tried in that order, so the strongest evidence decides first.
+
+    **The MusicBrainz name tier** handles every value whose files already carry a
+    ``musicbrainz_artistid`` (or ``musicbrainz_albumartistid`` for ``albumartist``). That id
+    is the file's own claim about who the artist is, so this is a direct lookup with no
+    search and no candidate ranking. The canonical name and the artist's registered aliases
+    then settle the value: a spelling differing only in casing, typography or a dash-vs-space
+    word break is the same name (staged, ``source: musicbrainz``); a name MusicBrainz records
+    as an alias of this artist is merged onto the canonical one (staged,
+    ``source: musicbrainz_alias``). MusicBrainz casing IS trusted here, unlike Last.fm's.
+
+    **The Last.fm correction tier** sees only what is left: values carrying no MBID anywhere,
+    and values whose MBID MusicBrainz does not know. Its gate is unchanged and stricter,
+    because Last.fm has no id to anchor it (``source: lastfm``).
+
+    Where a value resolves, the canonical name cascade-stages across every file carrying it
+    (rewriting ``artist`` and/or ``albumartist``, exact-match only) plus that field's OWN id
+    field, as an ``auto`` change replacing ONLY those fields (every other managed tag, incl.
+    ``genre``, is preserved). Review with ``diff_tags`` and apply with ``commit_tags``;
+    ``revert_commit``/``revert_tags`` undo it.
 
     It deliberately **skips** (and reports) values in the ``feat``/``ft``/``featuring``
     family, compilation sentinels (``various artists``/``various``/``va``), and empty
-    values; and any file whose ``artist``/``albumartist`` is multi-value. Values Last.fm
-    confirms are already canonical stage nothing but are counted under ``already_canonical``
-    (a useful signal, distinct from "nothing happened"); values with no Last.fm correction
-    are reported under ``no_correction``. A correction to a MusicBrainz special-purpose
-    placeholder (``[unknown]``, ``[no artist]``, …) is treated as no correction — nothing
-    is staged and the value is reported under ``no_correction``. A transient Last.fm error
-    leaves that value pending
-    under ``error_values`` so a re-run retries it.
+    values; and any file whose ``artist``/``albumartist`` is multi-value. Values already
+    exactly canonical stage nothing but are counted under ``already_canonical``; values with
+    no Last.fm correction are reported under ``no_correction``. A correction to a MusicBrainz
+    special-purpose placeholder (``[unknown]``, ``[no artist]``, …) is treated as no
+    correction. A transient lookup error leaves that value pending under ``error_values`` so
+    a re-run retries it.
 
-    Two further classes are **held**: reported with ``from``/``to`` so you can act on them,
-    never staged. ``shrinks_credit_values`` are corrections whose canonical name is
-    contained in the current value (``Skrillex & The Doors`` → ``Skrillex``) — a collapsed
-    multi-artist credit, held even when it carries an MBID. ``needs_review_values`` are
-    corrections MusicBrainz does not corroborate (no MBID), the "what Last.fm found that
-    MusicBrainz did not" list. Last.fm casing is ignored by design: a correction differing
-    only in case (``Dååth`` → ``DÅÅTH``) counts as ``already_canonical``. Diacritics are not
-    casing — ``Antonio`` → ``Antônio`` is a real spelling fix and stages when it has an MBID.
+    Three classes are **held**: reported so you can act on them, never staged.
+    ``shrinks_credit_values`` are names whose canonical form is contained in the current
+    value (``Skrillex & The Doors`` → ``Skrillex``) — a real multi-artist credit, held even
+    when it carries an MBID. ``needs_review_values`` are Last.fm corrections MusicBrainz does
+    not corroborate (no MBID), the "what Last.fm found that MusicBrainz did not" list.
+    ``name_id_disagreement_values`` are the forensic case: the file names one artist while
+    its own MBID names another, and the name is neither a credit nor any alias MusicBrainz
+    records — each entry carries ``from``/``to``/``mbid``/``reason``. A value the library
+    pairs with more than one MBID lands there too, and neither tier touches it.
+
     The per-value outcome buckets (``corrected_values`` + ``already_canonical`` +
-    ``no_correction`` + ``shrinks_credit`` + ``needs_review`` + ``errors``) sum to
-    ``processed``.
+    ``no_correction`` + ``shrinks_credit`` + ``needs_review`` + ``name_id_disagreement`` +
+    ``errors``) sum to ``processed``.
 
     Args:
         artist: Limit to files whose ``artist`` tag equals this value.
@@ -849,9 +863,10 @@ def resolve_artists(
     Returns:
         ``{"ok": True, processed, staged_files, corrected_values, skipped_multi_artist,
         skipped_sentinel, no_correction, already_canonical, shrinks_credit, needs_review,
-        errors, pending_remaining, more, mappings, multi_artist_files, no_correction_values,
-        already_canonical_values, shrinks_credit_values, needs_review_values, error_values,
-        summary}``, or
+        name_id_disagreement, errors, pending_remaining, more, mappings (each with
+        ``from``/``to``/``mbid``/``source``), multi_artist_files, no_correction_values,
+        already_canonical_values, shrinks_credit_values, needs_review_values,
+        name_id_disagreement_values, error_values, summary}``, or
         ``{"ok": False, "error": ...}`` (e.g. pending changes, or no API key configured).
     """
     try:

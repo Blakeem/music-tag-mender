@@ -44,8 +44,10 @@ import httpx
 from tagmend.engine.classify import fold
 from tagmend.engine.store import (
     get_cached_mb_album,
+    get_cached_mb_artist,
     get_cached_mb_recording,
     put_cached_mb_album,
+    put_cached_mb_artist,
     put_cached_mb_recording,
 )
 from tagmend.log import get_logger
@@ -59,6 +61,7 @@ logger = get_logger(__name__)
 
 _API_URL: Final = "https://musicbrainz.org/ws/2/release-group/"
 _RECORDING_API_URL: Final = "https://musicbrainz.org/ws/2/recording/"
+_ARTIST_API_URL: Final = "https://musicbrainz.org/ws/2/artist/"
 
 # Secondary types that disqualify a release group as an original studio album: alternate takes
 # (Live, Demo, Field recording), repackagings (Compilation, Mixtape/Street, DJ-mix, Remix) and
@@ -86,12 +89,20 @@ _EXCLUDED_SECONDARY_TYPES: Final = frozenset(
 # and recording paths share the excluded-secondary-type set, so one bump must invalidate both.
 _SELECTION_VERSION: Final = "2"
 
+# The artist lookup runs its own version token: it has no selection rules to tighten, so a
+# release-group rule change must not re-fetch every artist. Bump only when the fields
+# `_parse_artist` extracts change.
+_ARTIST_VERSION: Final = "1"
+
 # One trailing parenthetical/bracketed segment — the edition suffix a tag carries and a release
 # group does not (``Fiction (Deluxe Edition)``, ``The Red Album [Deluxe Edition]``).
 _EDITION_SUFFIX: Final = re.compile(r"\s*[(\[][^()\[\]]*[)\]]\s*$")
 
 # A bare four-digit year prefix length (MusicBrainz dates are ``YYYY`` / ``YYYY-MM`` / full).
 _YEAR_PREFIX_LEN: Final = 4
+
+# A 404 from the artist endpoint is a real answer (no such artist), not a transient failure.
+_HTTP_NOT_FOUND: Final = 404
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,6 +126,22 @@ class MBRecording:
     album_title: str
     release_group_id: str
     recording_mbid: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class MBArtist:
+    """A MusicBrainz artist's canonical name, looked up by the MBID a file already carries.
+
+    ``aliases`` is every alternate name MusicBrainz records for this artist (former names,
+    misspellings, search hints). It is the evidence that separates a name worth merging onto
+    ``name`` from a per-track credit MusicBrainz has never heard of.
+    """
+
+    mbid: str
+    name: str
+    sort_name: str
+    disambiguation: str
+    aliases: tuple[str, ...]
 
 
 class MusicBrainzError(RuntimeError):
@@ -146,6 +173,17 @@ class MBRecordingSource(Protocol):
 
     def recording_search(self, artist: str, title: str) -> MBRecording | None:
         """Return the recording's resolved album, or ``None`` if none usable."""
+
+
+class MBArtistSource(Protocol):
+    """The artist-by-MBID lookup the artist axis depends on (so it can use a fake in tests).
+
+    Deliberately separate from the album/recording protocols for the same reason those are
+    separate from each other: a fake implementing one gains no obligation to the others.
+    """
+
+    def artist_by_mbid(self, mbid: str) -> MBArtist | None:
+        """Return the artist MusicBrainz holds under *mbid*, or ``None`` if it holds none."""
 
 
 class MusicBrainzClient:
@@ -247,6 +285,31 @@ class MusicBrainzClient:
             )
 
         return self._fetch_and_cache_recording(artist, title, request_key)
+
+    def artist_by_mbid(self, mbid: str) -> MBArtist | None:
+        """Return the artist MusicBrainz holds under *mbid*, or ``None`` if it holds none.
+
+        A direct lookup by id, never a search: the file already supplies the identity, so
+        there is no candidate ranking and no ambiguity. Cache first (positive or negative),
+        else one paced network query. A ``404`` is a real answer (no such artist) and is
+        negative-cached; any other non-2xx raises :class:`MusicBrainzError` and caches nothing.
+        """
+        request_key = _artist_request_key(mbid)
+
+        cached = get_cached_mb_artist(self._conn, request_key)
+        if cached is not None:
+            found, row = cached
+            if not found or row.name is None:
+                return None
+            return MBArtist(
+                mbid=mbid,
+                name=row.name,
+                sort_name=row.sort_name or row.name,
+                disambiguation=row.disambiguation or "",
+                aliases=row.aliases,
+            )
+
+        return self._fetch_and_cache_artist(mbid, request_key)
 
     # --- internals -------------------------------------------------------------------
 
@@ -377,6 +440,68 @@ class MusicBrainzClient:
         )
         self._conn.commit()
 
+    def _fetch_and_cache_artist(self, mbid: str, request_key: str) -> MBArtist | None:
+        """Fetch one artist lookup over the network (paced), then cache eagerly."""
+        # Input: one paced network request; None means MusicBrainz has no such artist.
+        body = self._request_artist(mbid)
+
+        # Process: pull the canonical name + aliases out of the payload.
+        resolved = None if body is None else _parse_artist(mbid, body)
+
+        # Output: cache the result eagerly, then return it.
+        if resolved is None:
+            self._store_negative_artist(request_key)
+            return None
+        self._store_positive_artist(request_key, resolved)
+        return resolved
+
+    def _request_artist(self, mbid: str) -> dict[str, object] | None:
+        """Pace, then GET one artist by id; ``None`` on a 404 (a real "no such artist")."""
+        if self._client is None:  # pragma: no cover - guard against misuse outside `with`
+            message = "MusicBrainzClient must be used as a context manager"
+            raise RuntimeError(message)
+
+        self._pace()
+        logger.debug("musicbrainz artist request mbid=%r", mbid)
+        response = self._client.get(
+            f"{_ARTIST_API_URL}{mbid}",
+            params={"inc": "aliases", "fmt": "json"},
+        )
+        if response.status_code == _HTTP_NOT_FOUND:
+            return None
+        if response.is_error:
+            message = f"MusicBrainz HTTP {response.status_code} for artist lookup"
+            raise MusicBrainzError(message)
+        return cast("dict[str, object]", response.json())
+
+    def _store_negative_artist(self, request_key: str) -> None:
+        """Negative-cache an MBID MusicBrainz does not know, and commit immediately."""
+        put_cached_mb_artist(
+            self._conn,
+            request_key=request_key,
+            found=False,
+            name=None,
+            sort_name=None,
+            disambiguation=None,
+            aliases=(),
+            now=_utc_now(),
+        )
+        self._conn.commit()
+
+    def _store_positive_artist(self, request_key: str, artist: MBArtist) -> None:
+        """Cache a resolved artist lookup and commit immediately."""
+        put_cached_mb_artist(
+            self._conn,
+            request_key=request_key,
+            found=True,
+            name=artist.name,
+            sort_name=artist.sort_name,
+            disambiguation=artist.disambiguation,
+            aliases=artist.aliases,
+            now=_utc_now(),
+        )
+        self._conn.commit()
+
     def _pace(self) -> None:
         """Sleep just enough so consecutive network requests honor ``rate_per_sec``.
 
@@ -406,6 +531,43 @@ def _request_key(artist: str, album: str) -> str:
         ]
     )
     return hashlib.sha1(payload.encode("utf-8")).hexdigest()  # noqa: S324 - cache key, not security
+
+
+def _artist_request_key(mbid: str) -> str:
+    """Return a stable ``sha1`` over the artist-parse rules + the MBID for this lookup."""
+    payload = "\x00".join(["artist", f"artist_version={_ARTIST_VERSION}", f"mbid={mbid}"])
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()  # noqa: S324 - cache key, not security
+
+
+def _parse_artist(mbid: str, body: dict[str, object]) -> MBArtist | None:
+    """Pull the canonical name, sort name and alias set out of one artist payload.
+
+    ``None`` when the payload carries no usable name, which is not a transient failure and
+    so is negative-cached like a 404.
+    """
+    name = body.get("name")
+    if not isinstance(name, str) or not name.strip():
+        return None
+
+    sort_name = body.get("sort-name")
+    disambiguation = body.get("disambiguation")
+    raw_aliases = body.get("aliases")
+    aliases: list[str] = []
+    if isinstance(raw_aliases, list):
+        for entry in raw_aliases:
+            if not isinstance(entry, dict):
+                continue
+            alias_name = entry.get("name")
+            if isinstance(alias_name, str) and alias_name.strip():
+                aliases.append(alias_name)
+
+    return MBArtist(
+        mbid=mbid,
+        name=name,
+        sort_name=sort_name if isinstance(sort_name, str) and sort_name else name,
+        disambiguation=disambiguation if isinstance(disambiguation, str) else "",
+        aliases=tuple(aliases),
+    )
 
 
 def _escape(value: str) -> str:

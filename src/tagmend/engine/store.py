@@ -735,6 +735,98 @@ def put_cached_mb_recording(  # noqa: PLR0913 - cohesive keyword-only cache payl
     )
 
 
+# --- musicbrainz_artist_cache (persistent MBID -> canonical-name lookups) --------------
+
+
+@dataclass(frozen=True, slots=True)
+class MBArtistRow:
+    """One cached MusicBrainz artist lookup (the canonical name + its alias set)."""
+
+    name: str | None
+    sort_name: str | None
+    disambiguation: str | None
+    aliases: tuple[str, ...]
+
+
+def get_cached_mb_artist(
+    conn: sqlite3.Connection,
+    request_key: str,
+) -> tuple[bool, MBArtistRow] | None:
+    """Return the cached artist lookup for *request_key*, or ``None`` on a miss.
+
+    ``None`` distinguishes a never-cached key from a cached negative result. A hit is
+    ``(found, row)``: ``found=False`` is the negative-cache sentinel (MusicBrainz has no
+    artist under that MBID), while ``found=True`` carries the resolved fields on *row*.
+    """
+    cursor = conn.execute(
+        """
+        SELECT found, name, sort_name, disambiguation, aliases
+        FROM musicbrainz_artist_cache WHERE request_key = ?
+        """,
+        (request_key,),
+    )
+    row = cursor.fetchone()
+    if row is None:
+        return None
+    return (
+        bool(row[0]),
+        MBArtistRow(
+            name=None if row[1] is None else str(row[1]),
+            sort_name=None if row[2] is None else str(row[2]),
+            disambiguation=None if row[3] is None else str(row[3]),
+            aliases=_decode_aliases(row[4]),
+        ),
+    )
+
+
+def _decode_aliases(raw: object) -> tuple[str, ...]:
+    """Decode the stored alias JSON array, tolerating a null or malformed column."""
+    if raw is None:
+        return ()
+    try:
+        decoded = json.loads(str(raw))
+    except json.JSONDecodeError:
+        return ()
+    if not isinstance(decoded, list):
+        return ()
+    return tuple(str(name) for name in decoded)
+
+
+def put_cached_mb_artist(  # noqa: PLR0913 - cohesive keyword-only cache payload
+    conn: sqlite3.Connection,
+    *,
+    request_key: str,
+    found: bool,
+    name: str | None,
+    sort_name: str | None,
+    disambiguation: str | None,
+    aliases: tuple[str, ...],
+    now: str,
+) -> None:
+    """Insert or replace the cached artist lookup for *request_key*.
+
+    Pass ``found=False`` with the resolved columns empty to negative-cache an MBID
+    MusicBrainz does not know.
+    """
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO musicbrainz_artist_cache (
+            request_key, found, name, sort_name, disambiguation, aliases, fetched_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            request_key,
+            1 if found else 0,
+            name,
+            sort_name,
+            disambiguation,
+            json.dumps(list(aliases)),
+            now,
+        ),
+    )
+
+
 # --- file_<axis>_status (per-file workflow decisions; PLAN — Status model) -----------
 #
 # The genre/artist status machinery is ONE parameterized concept; the per-axis config and

@@ -43,13 +43,16 @@ from typing import TYPE_CHECKING, Final
 
 from tagmend.engine import axis, db, schema, staging, store, versioning
 from tagmend.engine.lastfm import LastfmClient, LastfmError
+from tagmend.engine.musicbrainz import MusicBrainzClient, MusicBrainzError
 from tagmend.log import get_logger
 
 if TYPE_CHECKING:
     import sqlite3
+    from collections.abc import Mapping
 
     from tagmend.config import Settings
-    from tagmend.engine.lastfm import ArtistCorrection, CorrectionSource
+    from tagmend.engine.lastfm import CorrectionSource
+    from tagmend.engine.musicbrainz import MBArtist, MBArtistSource
 
 logger = get_logger(__name__)
 
@@ -77,6 +80,46 @@ _MB_PLACEHOLDER_RE: Final = re.compile(r"^\[.*\]$")
 # exclusion row; ``pending`` deletes it (re-queue). There is no engine-owned ``no_match``
 # on this axis.
 _USER_STATUSES: Final = frozenset({"manual", "pending"})
+
+# Each name field's own MusicBrainz id field. The pairing is positional in the file, not
+# global: ``artist`` is the per-track credit and ``albumartist`` the per-release one, and the
+# two routinely name different artists. Writing one field's id onto the other rebinds a file
+# to an artist nobody asked for.
+_ID_FIELDS: Final[Mapping[str, str]] = {
+    "artist": "musicbrainz_artistid",
+    "albumartist": "musicbrainz_albumartistid",
+}
+
+# Characters that separate the same name into different spellings. MusicBrainz writes real
+# typography (``Static\u2010X`` carries U+2010, not a hyphen-minus) while taggers and
+# filesystems substitute ASCII, and a word break is written as a dash by one source and a
+# space by another (``Mindless Self\u2010Indulgence`` against MusicBrainz's spaced
+# spelling). Folding decides SAMENESS only, and only against names MusicBrainz records for
+# the id the file already carries, so it can never merge two different artists. The staged
+# value is always MusicBrainz's own spelling.
+_NAME_FOLD_MAP: Final[Mapping[str, str]] = {
+    "-": " ",
+    "\u2010": " ",
+    "\u2011": " ",
+    "\u2012": " ",
+    "\u2013": " ",
+    "\u2014": " ",
+    "\u2212": " ",
+    "\u2018": "'",
+    "\u2019": "'",
+    "\u201a": "'",
+    "\u201c": '"',
+    "\u201d": '"',
+    "\u00a0": " ",
+    "\u2009": " ",
+    "\u202f": " ",
+}
+
+# The three ways a value can reach `tally.corrections`, reported per mapping so a reviewer
+# can tell an id-backed MusicBrainz fact from a Last.fm suggestion.
+_SOURCE_MB: Final = "musicbrainz"
+_SOURCE_MB_ALIAS: Final = "musicbrainz_alias"
+_SOURCE_LASTFM: Final = "lastfm"
 
 
 def _utc_now() -> str:
@@ -113,6 +156,15 @@ def _is_case_only(value: str, canonical: str) -> bool:
     return value.casefold() == canonical.casefold()
 
 
+def _name_fold(value: str) -> str:
+    """Fold *value* to a key ignoring casing, typography and dash-vs-space word breaks.
+
+    Used only to decide whether two spellings are the same name. Never used as a value.
+    """
+    folded = "".join(_NAME_FOLD_MAP.get(ch, ch) for ch in value)
+    return " ".join(folded.casefold().split())
+
+
 def _shrinks_credit(value: str, canonical: str) -> bool:
     """Return whether *canonical* is a strict fold-case substring of *value*.
 
@@ -141,6 +193,7 @@ class ResolveArtistsResult:
     already_canonical: int
     shrinks_credit: int
     needs_review: int
+    name_id_disagreement: int
     errors: int
     pending_remaining: int
     more: bool
@@ -151,6 +204,7 @@ class ResolveArtistsResult:
     already_canonical_values: list[str]
     shrinks_credit_values: list[dict[str, str]]
     needs_review_values: list[dict[str, str]]
+    name_id_disagreement_values: list[dict[str, str]]
     error_values: list[dict[str, str]]
     summary: str
 
@@ -167,6 +221,7 @@ class ResolveArtistsResult:
             "already_canonical": self.already_canonical,
             "shrinks_credit": self.shrinks_credit,
             "needs_review": self.needs_review,
+            "name_id_disagreement": self.name_id_disagreement,
             "errors": self.errors,
             "pending_remaining": self.pending_remaining,
             "more": self.more,
@@ -177,9 +232,19 @@ class ResolveArtistsResult:
             "already_canonical_values": list(self.already_canonical_values),
             "shrinks_credit_values": [dict(h) for h in self.shrinks_credit_values],
             "needs_review_values": [dict(h) for h in self.needs_review_values],
+            "name_id_disagreement_values": [dict(d) for d in self.name_id_disagreement_values],
             "error_values": [dict(e) for e in self.error_values],
             "summary": self.summary,
         }
+
+
+@dataclass(frozen=True, slots=True)
+class _Resolution:
+    """One accepted value -> canonical-name change, tagged with the tier that decided it."""
+
+    name: str
+    mbid: str | None
+    source: str
 
 
 @dataclass(slots=True)
@@ -196,9 +261,10 @@ class _Tally:
     already_canonical_values: list[str] = field(default_factory=list)
     shrinks_credit_values: list[dict[str, str]] = field(default_factory=list)
     needs_review_values: list[dict[str, str]] = field(default_factory=list)
+    name_id_disagreement_values: list[dict[str, str]] = field(default_factory=list)
     error_values: list[dict[str, str]] = field(default_factory=list)
-    # value -> correction: only the substantive, MBID-backed ones the gate accepts.
-    corrections: dict[str, ArtistCorrection] = field(default_factory=dict)
+    # value -> resolution: only the substantive ones a tier's gate accepts.
+    corrections: dict[str, _Resolution] = field(default_factory=dict)
 
 
 # --- public entry --------------------------------------------------------------------
@@ -212,6 +278,7 @@ def resolve_artists(  # noqa: PLR0913 - cohesive keyword-only scope + injection 
     limit: int | None = None,
     dry_run: bool = False,
     client: CorrectionSource | None = None,
+    mb_client: MBArtistSource | None = None,
 ) -> ResolveArtistsResult:
     """Normalize artist names: look up canonical forms and cascade-stage the changes.
 
@@ -259,7 +326,17 @@ def resolve_artists(  # noqa: PLR0913 - cohesive keyword-only scope + injection 
         pending_remaining = len(values) - len(to_process)
 
         if to_process:
-            _resolve_values(settings, connection, to_process, client, tally)
+            pairing = _value_mbids(connection, candidate_ids)
+            unresolved = _resolve_by_mbid(
+                settings,
+                connection,
+                to_process,
+                pairing,
+                mb_client,
+                tally,
+            )
+            if unresolved:
+                _resolve_values(settings, connection, unresolved, client, tally)
 
         _stage_files(settings, connection, candidate_ids, tally, dry_run=dry_run)
     finally:
@@ -343,7 +420,144 @@ def _distinct_values(
     return ordered
 
 
-# --- lookup --------------------------------------------------------------------------
+# --- value -> MBID pairing -----------------------------------------------------------
+
+
+def _value_mbids(
+    conn: sqlite3.Connection,
+    candidate_ids: list[int],
+) -> dict[str, set[str]]:
+    """Map each name value in scope to the set of MusicBrainz ids the library pairs with it.
+
+    The pairing is per field (``artist`` with ``musicbrainz_artistid``, ``albumartist`` with
+    ``musicbrainz_albumartistid``) and only from single-valued fields, where the value and the
+    id unambiguously describe each other. An empty set means the value carries no id anywhere;
+    a set larger than one means the library disagrees with itself about who this is.
+    """
+    pairing: dict[str, set[str]] = {}
+    for fid in candidate_ids:
+        tags = store.get_tags(conn, fid)
+        for field_name, id_field in _ID_FIELDS.items():
+            names = tags.get(field_name, [])
+            if len(names) != 1:
+                continue
+            ids = tags.get(id_field, [])
+            bucket = pairing.setdefault(names[0], set())
+            if len(ids) == 1 and ids[0].strip():
+                bucket.add(ids[0].strip())
+    return pairing
+
+
+# --- the MusicBrainz name tier -------------------------------------------------------
+
+
+def _resolve_by_mbid(  # noqa: PLR0913 - cohesive scope + injection params, mirrors _resolve_values
+    settings: Settings,
+    conn: sqlite3.Connection,
+    values: list[str],
+    pairing: dict[str, set[str]],
+    client: MBArtistSource | None,
+    tally: _Tally,
+) -> list[str]:
+    """Settle every value whose files already carry an MBID; return the rest for Last.fm.
+
+    The MBID is the file's own claim about who the artist is, so this tier is a direct
+    lookup with no candidate ranking and no ambiguity. A value MusicBrainz cannot settle
+    (no id, an id it does not know) is handed back for the Last.fm tier.
+    """
+    with_ids = [value for value in values if pairing.get(value)]
+    if not with_ids:
+        return values
+
+    ambiguous = [value for value in with_ids if len(pairing[value]) > 1]
+    for value in ambiguous:
+        tally.name_id_disagreement_values.append(
+            {
+                "from": value,
+                "to": "",
+                "mbid": ", ".join(sorted(pairing[value])),
+                "reason": "the library pairs this name with more than one MusicBrainz id",
+            },
+        )
+
+    settled = set(ambiguous)
+    lookups = [value for value in with_ids if len(pairing[value]) == 1]
+    if lookups:
+        if client is not None:
+            settled |= _lookup_each(lookups, pairing, client, tally)
+        else:
+            with MusicBrainzClient(
+                settings.musicbrainz_user_agent,
+                conn,
+                rate_per_sec=settings.musicbrainz_rate_per_sec,
+            ) as owned:
+                settled |= _lookup_each(lookups, pairing, owned, tally)
+
+    return [value for value in values if value not in settled]
+
+
+def _lookup_each(
+    values: list[str],
+    pairing: dict[str, set[str]],
+    client: MBArtistSource,
+    tally: _Tally,
+) -> set[str]:
+    """Look each value's single MBID up and bucket it; return the values this tier settled."""
+    settled: set[str] = set()
+    for value in values:
+        mbid = next(iter(pairing[value]))
+        try:
+            artist = client.artist_by_mbid(mbid)
+        except MusicBrainzError as exc:
+            logger.warning("musicbrainz artist error for mbid=%r: %s", mbid, exc)
+            tally.error_values.append({"value": value, "message": str(exc)})
+            settled.add(value)
+            continue
+        if artist is None:
+            continue  # MusicBrainz does not know this id — let Last.fm try the name.
+        _classify_against_mb(value, artist, tally)
+        settled.add(value)
+    return settled
+
+
+def _classify_against_mb(value: str, artist: MBArtist, tally: _Tally) -> None:
+    """Route one value to exactly one bucket against the artist its own MBID names.
+
+    The ladder, in order. Exact canonical is already right. A difference in casing or
+    typographic glyphs alone is the same name spelled differently, and MusicBrainz's casing
+    IS trusted (unlike Last.fm's), so it is staged. A value MusicBrainz registers as an
+    alias is a name for this artist, so merging it onto the canonical name is what makes one
+    artist appear once. Anything else is either a credit that collapses onto one member, or
+    a name MusicBrainz has never heard of for this id — both reported, never staged.
+    """
+    if value == artist.name:
+        tally.already_canonical_values.append(value)
+        return
+
+    folded = _name_fold(value)
+    if folded == _name_fold(artist.name):
+        tally.corrections[value] = _Resolution(artist.name, artist.mbid, _SOURCE_MB)
+        return
+
+    if any(folded == _name_fold(alias) for alias in artist.aliases):
+        tally.corrections[value] = _Resolution(artist.name, artist.mbid, _SOURCE_MB_ALIAS)
+        return
+
+    if _shrinks_credit(value, artist.name):
+        tally.shrinks_credit_values.append({"from": value, "to": artist.name})
+        return
+
+    tally.name_id_disagreement_values.append(
+        {
+            "from": value,
+            "to": artist.name,
+            "mbid": artist.mbid,
+            "reason": "no name MusicBrainz records for this id",
+        },
+    )
+
+
+# --- the Last.fm correction tier -----------------------------------------------------
 
 
 def _resolve_values(
@@ -410,7 +624,7 @@ def _resolve_one_value(
         tally.needs_review_values.append({"from": value, "to": canonical})
         return
 
-    tally.corrections[value] = correction
+    tally.corrections[value] = _Resolution(canonical, correction.mbid, _SOURCE_LASTFM)
 
 
 # --- staging -------------------------------------------------------------------------
@@ -447,52 +661,60 @@ def _is_multi_value(tags: dict[str, list[str]]) -> bool:
     return any(len(tags.get(field_name, [])) > 1 for field_name in _NAME_FIELDS)
 
 
+@dataclass(frozen=True, slots=True)
+class _Target:
+    """One file's staged tag target plus the provenance note describing why."""
+
+    tags: dict[str, list[str]]
+    note: str
+
+
 def _build_target(
     tags: dict[str, list[str]],
-    corrections: dict[str, ArtistCorrection],
-) -> dict[str, list[str]] | None:
+    corrections: dict[str, _Resolution],
+) -> _Target | None:
     """Build the staged target for one file, or ``None`` when nothing changes.
 
     Starts from the file's managed subset (P0 — every other managed tag preserved), and for
-    each single-valued ``artist``/``albumartist`` whose value has a correction, replaces it
-    with the canonical name (accumulating both fields). The MBID rides along, name-change
-    only: it is written only when the file is actually being changed.
+    each single-valued ``artist``/``albumartist`` whose value has a resolution, replaces it
+    with the canonical name (accumulating both fields). Each field's MBID rides along on its
+    OWN id field, name-change only: writing ``musicbrainz_artistid`` for an ``albumartist``
+    correction would rebind the track artist to the album artist.
     """
     target = dict(versioning.managed_subset(tags))
-    mbid: str | None = None
+    note = ""
     changed = False
     for field_name in _NAME_FIELDS:
         current = tags.get(field_name, [])
         if len(current) != 1:
             continue
-        correction = corrections.get(current[0])
-        if correction is None:
+        resolution = corrections.get(current[0])
+        if resolution is None:
             continue
-        target[field_name] = [correction.name]
+        target[field_name] = [resolution.name]
         changed = True
-        if correction.mbid:
-            mbid = correction.mbid
+        if resolution.mbid:
+            target[_ID_FIELDS[field_name]] = [resolution.mbid]
+        if not note:
+            note = f"{resolution.source}: {resolution.name}"
 
     if not changed:
         return None
-    if mbid is not None:
-        target["musicbrainz_artistid"] = [mbid]
-    return target
+    return _Target(tags=target, note=note)
 
 
 def _stage_target(
     settings: Settings,
     file_id: int,
-    target: dict[str, list[str]],
+    target: _Target,
 ) -> None:
     """Stage *target* for *file_id* as an ``origin='auto'`` change. ``stage_tags`` owns its conn."""
-    canonical = target["artist"][0] if target.get("artist") else target.get("albumartist", [""])[0]
     staging.stage_tags(
         settings,
         file_id=file_id,
-        managed_tags=target,
+        managed_tags=target.tags,
         origin="auto",
-        note=f"lastfm: {canonical}",
+        note=target.note,
     )
 
 
@@ -507,8 +729,13 @@ def _build_result(
 ) -> ResolveArtistsResult:
     """Freeze the run's tally + counts into the public :class:`ResolveArtistsResult`."""
     mappings = [
-        {"from": value, "to": correction.name, "mbid": correction.mbid}
-        for value, correction in tally.corrections.items()
+        {
+            "from": value,
+            "to": resolution.name,
+            "mbid": resolution.mbid,
+            "source": resolution.source,
+        }
+        for value, resolution in tally.corrections.items()
     ]
     more = pending_remaining > 0
     summary = _summarize(
@@ -527,6 +754,7 @@ def _build_result(
         already_canonical=len(tally.already_canonical_values),
         shrinks_credit=len(tally.shrinks_credit_values),
         needs_review=len(tally.needs_review_values),
+        name_id_disagreement=len(tally.name_id_disagreement_values),
         errors=len(tally.error_values),
         pending_remaining=pending_remaining,
         more=more,
@@ -537,6 +765,7 @@ def _build_result(
         already_canonical_values=list(tally.already_canonical_values),
         shrinks_credit_values=[dict(h) for h in tally.shrinks_credit_values],
         needs_review_values=[dict(h) for h in tally.needs_review_values],
+        name_id_disagreement_values=[dict(d) for d in tally.name_id_disagreement_values],
         error_values=list(tally.error_values),
         summary=summary,
     )
@@ -563,7 +792,8 @@ def _summarize(
         f"{len(tally.already_canonical_values)} already canonical, "
         f"no correction {len(tally.no_correction_values)}.",
         f"Held (reported, never staged): credit shrink {len(tally.shrinks_credit_values)}, "
-        f"needs review {len(tally.needs_review_values)}.",
+        f"needs review {len(tally.needs_review_values)}, "
+        f"name/id disagreement {len(tally.name_id_disagreement_values)}.",
     ]
     if pending_remaining > 0:
         parts.append(

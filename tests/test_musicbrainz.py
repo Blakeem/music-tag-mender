@@ -16,6 +16,7 @@ from tagmend.engine import musicbrainz
 from tagmend.engine.musicbrainz import (
     MusicBrainzClient,
     MusicBrainzError,
+    _artist_request_key,
     _recording_request_key,
     _request_key,
 )
@@ -492,3 +493,168 @@ def test_recording_pacing_sleeps_between_network_requests(db_conn: sqlite3.Conne
 
     # The shared pacer honors 1 req/sec for the recording endpoint too.
     assert slept == [1.0]
+
+
+# --- artist_by_mbid: the MBID -> canonical-name authority ----------------------------
+
+
+def _artist_body(**overrides: object) -> dict[str, object]:
+    """Build one artist lookup response as ``/ws/2/artist/<mbid>?inc=aliases`` shapes it."""
+    body: dict[str, object] = {
+        "id": "24ee4021-50ac-4285-b76e-860082d0d731",
+        "name": "Lusine",
+        "sort-name": "Lusine",
+        "disambiguation": "",
+        "aliases": [
+            {"name": "Lusine ICL", "type": "Artist name"},
+            {"name": "L\u2019Usine", "type": "Artist name"},
+        ],
+    }
+    rename = {"sort_name": "sort-name"}
+    for key, value in overrides.items():
+        mb_key = rename.get(key, key)
+        if value is None:
+            body.pop(mb_key, None)
+        else:
+            body[mb_key] = value
+    return body
+
+
+def test_artist_by_mbid_returns_canonical_name_and_aliases(db_conn: sqlite3.Connection) -> None:
+    client, calls = _client(db_conn, [_json_response(_artist_body())])
+    with client:
+        artist = client.artist_by_mbid("24ee4021-50ac-4285-b76e-860082d0d731")
+
+    assert artist is not None
+    assert artist.name == "Lusine"
+    assert artist.sort_name == "Lusine"
+    assert artist.aliases == ("Lusine ICL", "L\u2019Usine")
+    assert len(calls) == 1
+
+
+def test_artist_by_mbid_queries_the_artist_endpoint_by_id(db_conn: sqlite3.Connection) -> None:
+    seen: list[httpx.Request] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return _json_response(_artist_body())
+
+    client = MusicBrainzClient(
+        "TagMend/test ( test@example.com )",
+        db_conn,
+        rate_per_sec=0.0,
+        transport=httpx.MockTransport(handle),
+    )
+    with client:
+        client.artist_by_mbid("24ee4021-50ac-4285-b76e-860082d0d731")
+
+    url = seen[0].url
+    # A direct lookup by id, never a search: the file already supplies the identity.
+    assert url.path.endswith("/ws/2/artist/24ee4021-50ac-4285-b76e-860082d0d731")
+    assert url.params["inc"] == "aliases"
+    assert url.params["fmt"] == "json"
+    assert "query" not in url.params
+
+
+def test_artist_by_mbid_second_call_is_served_from_cache(db_conn: sqlite3.Connection) -> None:
+    client, calls = _client(db_conn, [_json_response(_artist_body())])
+    with client:
+        first = client.artist_by_mbid("24ee4021-50ac-4285-b76e-860082d0d731")
+        second = client.artist_by_mbid("24ee4021-50ac-4285-b76e-860082d0d731")
+
+    assert first == second
+    assert len(calls) == 1
+
+
+def test_artist_by_mbid_caches_a_404_as_a_negative(db_conn: sqlite3.Connection) -> None:
+    client, calls = _client(
+        db_conn,
+        [httpx.Response(404, json={"error": "Not Found"})],
+    )
+    with client:
+        assert client.artist_by_mbid("00000000-0000-0000-0000-000000000000") is None
+        assert client.artist_by_mbid("00000000-0000-0000-0000-000000000000") is None
+
+    assert len(calls) == 1  # the negative is cached, so no second request
+
+
+def test_artist_by_mbid_raises_and_does_not_cache_a_transient_failure(
+    db_conn: sqlite3.Connection,
+) -> None:
+    client, calls = _client(
+        db_conn,
+        [httpx.Response(503, text="busy"), _json_response(_artist_body())],
+    )
+    with client:
+        with pytest.raises(MusicBrainzError):
+            client.artist_by_mbid("24ee4021-50ac-4285-b76e-860082d0d731")
+        # Not cached, so the retry goes back to the network and succeeds.
+        artist = client.artist_by_mbid("24ee4021-50ac-4285-b76e-860082d0d731")
+
+    assert artist is not None
+    assert len(calls) == 2
+
+
+def test_artist_by_mbid_tolerates_a_response_with_no_aliases(db_conn: sqlite3.Connection) -> None:
+    client, _ = _client(db_conn, [_json_response(_artist_body(aliases=None))])
+    with client:
+        artist = client.artist_by_mbid("24ee4021-50ac-4285-b76e-860082d0d731")
+
+    assert artist is not None
+    assert artist.aliases == ()
+
+
+def test_artist_by_mbid_returns_none_when_the_payload_has_no_name(
+    db_conn: sqlite3.Connection,
+) -> None:
+    client, _ = _client(db_conn, [_json_response(_artist_body(name=None))])
+    with client:
+        assert client.artist_by_mbid("24ee4021-50ac-4285-b76e-860082d0d731") is None
+
+
+def test_artist_by_mbid_carries_disambiguation(db_conn: sqlite3.Connection) -> None:
+    client, _ = _client(
+        db_conn,
+        [_json_response(_artist_body(disambiguation="industrial metal band"))],
+    )
+    with client:
+        artist = client.artist_by_mbid("24ee4021-50ac-4285-b76e-860082d0d731")
+
+    assert artist is not None
+    assert artist.disambiguation == "industrial metal band"
+
+
+def test_artist_request_key_is_stable_and_id_scoped() -> None:
+    assert _artist_request_key("abc") == _artist_request_key("abc")
+    assert _artist_request_key("abc") != _artist_request_key("abd")
+
+
+def test_bumping_the_artist_version_changes_the_request_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    before = _artist_request_key("abc")
+    monkeypatch.setattr(musicbrainz, "_ARTIST_VERSION", "99")
+    assert _artist_request_key("abc") != before
+
+
+def test_artist_by_mbid_paces_network_requests(db_conn: sqlite3.Connection) -> None:
+    slept: list[float] = []
+    now = [0.0]
+
+    def fake_sleep(seconds: float) -> None:
+        slept.append(seconds)
+        now[0] += seconds
+
+    client, _ = _client(
+        db_conn,
+        [_json_response(_artist_body()), _json_response(_artist_body(id="other"))],
+        rate_per_sec=1.0,
+        monotonic=lambda: now[0],
+        sleep=fake_sleep,
+    )
+    with client:
+        client.artist_by_mbid("mbid-one")
+        client.artist_by_mbid("mbid-two")
+
+    assert len(slept) == 1
+    assert slept[0] == pytest.approx(1.0)

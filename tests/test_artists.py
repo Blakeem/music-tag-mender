@@ -26,6 +26,7 @@ from tagmend.engine.db import connect
 from tagmend.engine.lastfm import ArtistCorrection
 from tagmend.engine.library import list_files as library_list
 from tagmend.engine.library import scan_library
+from tagmend.engine.musicbrainz import MBArtist
 from tagmend.engine.schema import apply_schema
 from tagmend.engine.tags import read_tags
 
@@ -71,6 +72,7 @@ _BUCKET_NAMES = (
     "already_canonical",
     "shrinks_credit",
     "needs_review",
+    "name_id_disagreement",
     "no_correction",
     "errors",
 )
@@ -82,6 +84,7 @@ def _buckets(result: artists.ResolveArtistsResult) -> dict[str, int]:
         "already_canonical": result.already_canonical,
         "shrinks_credit": result.shrinks_credit,
         "needs_review": result.needs_review,
+        "name_id_disagreement": result.name_id_disagreement,
         "no_correction": result.no_correction,
         "errors": result.errors,
     }
@@ -268,12 +271,14 @@ def test_rerun_after_commit_is_idempotent(
             "Miami Nights 1984": ArtistCorrection("Miami Nights 1984", "mbid-1"),
         },
     )
-    artists.resolve_artists(engine_settings, client=fake)
+    # The commit stamps mbid-1 onto the file, so the re-run reaches the MusicBrainz tier.
+    mb = FakeArtistSource({"mbid-1": _mb("Miami Nights 1984", mbid="mbid-1")})
+    artists.resolve_artists(engine_settings, client=fake, mb_client=mb)
     staging.commit_tags(engine_settings, origin="auto")
     scan_library(engine_settings)
 
     # The canonical value now equals the correction → no further change.
-    second = artists.resolve_artists(engine_settings, client=fake)
+    second = artists.resolve_artists(engine_settings, client=fake, mb_client=mb)
     assert second.staged_files == 0
     assert len(staging.diff_tags(engine_settings)) == 0
 
@@ -491,6 +496,7 @@ def test_gate_stages_only_the_verified_corrections_from_the_live_data(
         "already_canonical": 3,
         "shrinks_credit": 2,
         "needs_review": 1,
+        "name_id_disagreement": 0,
         "no_correction": 0,
         "errors": 0,
     }
@@ -536,7 +542,12 @@ def test_dry_run_returns_mappings_but_stages_nothing(
     assert result.corrected_values == 1
     assert result.staged_files == 2  # would-stage count
     assert result.mappings == [
-        {"from": "Miami Nights '84", "to": "Miami Nights 1984", "mbid": "mbid-1"},
+        {
+            "from": "Miami Nights '84",
+            "to": "Miami Nights 1984",
+            "mbid": "mbid-1",
+            "source": "lastfm",
+        },
     ]
     assert len(staging.diff_tags(engine_settings)) == 0  # nothing actually staged
 
@@ -655,12 +666,17 @@ def test_two_non_dry_runs_with_a_commit_between_do_not_advance_the_frontier(
             "Bravo '84": ArtistCorrection("Bravo 1984", "mbid-b"),
         },
     )
-    first = artists.resolve_artists(engine_settings, client=fake, limit=1)
-    assert first.mappings == [{"from": "Alpha '84", "to": "Alpha 1984", "mbid": "mbid-a"}]
+    # The commit stamps mbid-a onto the file, so the second run reaches the MusicBrainz
+    # tier: it must be faked too, or the test would call the live API.
+    mb = FakeArtistSource({"mbid-a": _mb("Alpha 1984", mbid="mbid-a")})
+    first = artists.resolve_artists(engine_settings, client=fake, mb_client=mb, limit=1)
+    assert first.mappings == [
+        {"from": "Alpha '84", "to": "Alpha 1984", "mbid": "mbid-a", "source": "lastfm"},
+    ]
     assert first.pending_remaining == 1
     staging.commit_tags(engine_settings, origin="auto")
 
-    second = artists.resolve_artists(engine_settings, client=fake, limit=1)
+    second = artists.resolve_artists(engine_settings, client=fake, mb_client=mb, limit=1)
 
     # The committed value is now canonical, so the limit re-spends itself on that same
     # value and "Bravo '84" is still out of reach.
@@ -822,3 +838,434 @@ def test_commit_then_revert_commit_restores_original_name(
     restored = read_tags(track).tags
     assert restored["artist"] == ["Miami Nights '84"]
     assert restored["genre"] == ["synthwave"]
+
+
+# --- (11) the MusicBrainz name tier ---------------------------------------------------
+#
+# The tier that runs BEFORE Last.fm. Its key is the ``musicbrainz_artistid`` the file
+# already carries, so it is a direct lookup with no candidate ranking. Unlike Last.fm, its
+# casing IS trusted, so a case-only difference from the canonical name is staged here and
+# ignored there.
+
+
+class FakeArtistSource:
+    """An in-memory :class:`tagmend.engine.musicbrainz.MBArtistSource` for DI in tests.
+
+    Maps an MBID -> :class:`MBArtist` (or ``None`` for "MusicBrainz has no such artist").
+    Records the lookups it received so tests can assert what was queried.
+    """
+
+    def __init__(self, table: dict[str, MBArtist | None]) -> None:
+        self._table = table
+        self.lookups: list[str] = []
+
+    def artist_by_mbid(self, mbid: str) -> MBArtist | None:
+        self.lookups.append(mbid)
+        return self._table.get(mbid)
+
+
+def _mb(name: str, *aliases: str, mbid: str = "mbid-1", sort_name: str = "") -> MBArtist:
+    """Build an :class:`MBArtist` with *name* canonical and *aliases* registered."""
+    return MBArtist(
+        mbid=mbid,
+        name=name,
+        sort_name=sort_name or name,
+        disambiguation="",
+        aliases=tuple(aliases),
+    )
+
+
+def test_mb_tier_fixes_casing_that_the_lastfm_tier_would_ignore(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    make_track(
+        music_dir / "a.mp3",
+        {"artist": ["SOLAR FIELDS"], "musicbrainz_artistid": ["mbid-1"]},
+    )
+    scan_library(engine_settings)
+
+    mb = FakeArtistSource({"mbid-1": _mb("Solar Fields")})
+    lastfm = FakeCorrectionSource({})
+    result = artists.resolve_artists(engine_settings, client=lastfm, mb_client=mb)
+
+    assert result.corrected_values == 1
+    assert result.staged_files == 1
+    assert result.mappings == [
+        {"from": "SOLAR FIELDS", "to": "Solar Fields", "mbid": "mbid-1", "source": "musicbrainz"},
+    ]
+    # The MBID answered it, so Last.fm was never asked.
+    assert lastfm.lookups == []
+
+
+def test_mb_tier_merges_a_registered_alias_onto_the_canonical_name(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    make_track(
+        music_dir / "a.mp3",
+        {"artist": ["Smashing Pumpkins"], "musicbrainz_artistid": ["mbid-1"]},
+    )
+    scan_library(engine_settings)
+
+    mb = FakeArtistSource({"mbid-1": _mb("The Smashing Pumpkins", "Smashing Pumpkins")})
+    result = artists.resolve_artists(
+        engine_settings,
+        client=FakeCorrectionSource({}),
+        mb_client=mb,
+    )
+
+    assert result.corrected_values == 1
+    assert result.mappings[0]["to"] == "The Smashing Pumpkins"
+    assert result.mappings[0]["source"] == "musicbrainz_alias"
+
+
+def test_mb_tier_matches_an_alias_under_typographic_folding(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    # The tag carries an ASCII hyphen where MusicBrainz's alias uses U+2010, and lowercases
+    # a letter. Same name, different glyphs, so it merges onto MusicBrainz's spelling.
+    make_track(
+        music_dir / "a.mp3",
+        {"artist": ["jean-michel jarre"], "musicbrainz_artistid": ["mbid-1"]},
+    )
+    scan_library(engine_settings)
+
+    mb = FakeArtistSource({"mbid-1": _mb("Jean\u2010Michel Jarre", "Jean Michel Jarre")})
+    result = artists.resolve_artists(
+        engine_settings,
+        client=FakeCorrectionSource({}),
+        mb_client=mb,
+    )
+
+    assert result.corrected_values == 1
+    assert result.mappings[0]["to"] == "Jean\u2010Michel Jarre"
+    assert result.mappings[0]["source"] == "musicbrainz"
+
+
+def test_mb_tier_leaves_an_exactly_canonical_name_alone(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    make_track(
+        music_dir / "a.mp3",
+        {"artist": ["Solar Fields"], "musicbrainz_artistid": ["mbid-1"]},
+    )
+    scan_library(engine_settings)
+
+    mb = FakeArtistSource({"mbid-1": _mb("Solar Fields")})
+    result = artists.resolve_artists(
+        engine_settings,
+        client=FakeCorrectionSource({}),
+        mb_client=mb,
+    )
+
+    assert result.already_canonical == 1
+    assert result.staged_files == 0
+
+
+def test_mb_tier_holds_a_credit_that_collapses_onto_one_member(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    # "Linkin Park & Adema" carries Linkin Park's MBID and is not a registered alias, so the
+    # canonical name is a strict substring: a real multi-artist credit, never auto-collapsed.
+    make_track(
+        music_dir / "a.mp3",
+        {"artist": ["Linkin Park & Adema"], "musicbrainz_artistid": ["mbid-1"]},
+    )
+    scan_library(engine_settings)
+
+    mb = FakeArtistSource({"mbid-1": _mb("Linkin Park")})
+    result = artists.resolve_artists(
+        engine_settings,
+        client=FakeCorrectionSource({}),
+        mb_client=mb,
+    )
+
+    assert result.shrinks_credit == 1
+    assert result.staged_files == 0
+    assert result.shrinks_credit_values == [
+        {"from": "Linkin Park & Adema", "to": "Linkin Park"},
+    ]
+
+
+def test_mb_tier_reports_a_name_that_is_no_name_for_its_own_mbid(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    # The forensic case: the file names one artist and points its MBID at another. Neither a
+    # credit nor an alias, so it is reported and never staged.
+    make_track(
+        music_dir / "a.mp3",
+        {"artist": ["Tattooed Corpse"], "musicbrainz_artistid": ["mbid-1"]},
+    )
+    scan_library(engine_settings)
+
+    mb = FakeArtistSource({"mbid-1": _mb("Emily Browning")})
+    result = artists.resolve_artists(
+        engine_settings,
+        client=FakeCorrectionSource({}),
+        mb_client=mb,
+    )
+
+    assert result.name_id_disagreement == 1
+    assert result.staged_files == 0
+    assert result.name_id_disagreement_values == [
+        {
+            "from": "Tattooed Corpse",
+            "to": "Emily Browning",
+            "mbid": "mbid-1",
+            "reason": "no name MusicBrainz records for this id",
+        },
+    ]
+
+
+def test_a_value_with_no_mbid_still_falls_through_to_the_lastfm_tier(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    make_track(music_dir / "a.mp3", {"artist": ["Offspring"]})
+    scan_library(engine_settings)
+
+    mb = FakeArtistSource({})
+    lastfm = FakeCorrectionSource({"Offspring": ArtistCorrection("The Offspring", "mbid-9")})
+    result = artists.resolve_artists(engine_settings, client=lastfm, mb_client=mb)
+
+    assert result.corrected_values == 1
+    assert result.mappings[0]["source"] == "lastfm"
+    assert lastfm.lookups == ["Offspring"]
+    assert mb.lookups == []
+
+
+def test_an_mbid_musicbrainz_does_not_know_falls_through_to_the_lastfm_tier(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    make_track(
+        music_dir / "a.mp3",
+        {"artist": ["Offspring"], "musicbrainz_artistid": ["mbid-gone"]},
+    )
+    scan_library(engine_settings)
+
+    mb = FakeArtistSource({"mbid-gone": None})
+    lastfm = FakeCorrectionSource({"Offspring": ArtistCorrection("The Offspring", "mbid-9")})
+    result = artists.resolve_artists(engine_settings, client=lastfm, mb_client=mb)
+
+    assert mb.lookups == ["mbid-gone"]
+    assert lastfm.lookups == ["Offspring"]
+    assert result.corrected_values == 1
+    assert result.mappings[0]["source"] == "lastfm"
+
+
+def test_a_value_carrying_two_different_mbids_is_reported_not_staged(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    make_track(music_dir / "a.mp3", {"artist": ["Ambiguous"], "musicbrainz_artistid": ["mbid-1"]})
+    make_track(music_dir / "b.mp3", {"artist": ["Ambiguous"], "musicbrainz_artistid": ["mbid-2"]})
+    scan_library(engine_settings)
+
+    mb = FakeArtistSource({"mbid-1": _mb("One"), "mbid-2": _mb("Two", mbid="mbid-2")})
+    lastfm = FakeCorrectionSource({"Ambiguous": ArtistCorrection("Something Else", "mbid-3")})
+    result = artists.resolve_artists(engine_settings, client=lastfm, mb_client=mb)
+
+    assert result.staged_files == 0
+    assert result.name_id_disagreement == 1
+    # Neither tier may act on a value the library cannot even identify consistently.
+    assert mb.lookups == []
+    assert lastfm.lookups == []
+
+
+def test_mb_tier_pairs_albumartist_with_the_albumartist_mbid(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    make_track(
+        music_dir / "a.mp3",
+        {
+            "artist": ["Solo Act"],
+            "musicbrainz_artistid": ["mbid-track"],
+            "albumartist": ["VARIOUS BAND"],
+            "musicbrainz_albumartistid": ["mbid-album"],
+        },
+    )
+    scan_library(engine_settings)
+
+    mb = FakeArtistSource(
+        {
+            "mbid-track": _mb("Solo Act", mbid="mbid-track"),
+            "mbid-album": _mb("Various Band", mbid="mbid-album"),
+        },
+    )
+    result = artists.resolve_artists(
+        engine_settings,
+        client=FakeCorrectionSource({}),
+        mb_client=mb,
+    )
+
+    assert sorted(mb.lookups) == ["mbid-album", "mbid-track"]
+    assert result.corrected_values == 1
+    view = next(iter(staging.diff_tags(engine_settings)))
+    assert view.diff["albumartist"] == {"from": ["VARIOUS BAND"], "to": ["Various Band"]}
+    assert "artist" not in view.diff
+
+
+def test_an_albumartist_only_correction_never_stamps_the_track_artist_id(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    # The two id fields describe different artists. A correction to one must never write the
+    # other's id, which would silently rebind the track artist.
+    make_track(
+        music_dir / "a.mp3",
+        {
+            "artist": ["Guest Singer"],
+            "musicbrainz_artistid": ["mbid-track"],
+            "albumartist": ["Headline Act"],
+        },
+    )
+    scan_library(engine_settings)
+
+    lastfm = FakeCorrectionSource(
+        {
+            "Guest Singer": None,
+            "Headline Act": ArtistCorrection("The Headline Act", "mbid-album"),
+        },
+    )
+    result = artists.resolve_artists(
+        engine_settings,
+        client=lastfm,
+        mb_client=FakeArtistSource({}),
+    )
+
+    assert result.staged_files == 1
+    view = next(iter(staging.diff_tags(engine_settings)))
+    assert view.diff["albumartist"] == {"from": ["Headline Act"], "to": ["The Headline Act"]}
+    assert view.diff["musicbrainz_albumartistid"] == {"from": [], "to": ["mbid-album"]}
+    assert "musicbrainz_artistid" not in view.diff
+
+
+def test_mb_tier_buckets_still_sum_to_processed(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    make_track(music_dir / "a.mp3", {"artist": ["SOLAR FIELDS"], "musicbrainz_artistid": ["m1"]})
+    make_track(music_dir / "b.mp3", {"artist": ["Solar Fields"], "musicbrainz_artistid": ["m1"]})
+    make_track(music_dir / "c.mp3", {"artist": ["Korn & Nas"], "musicbrainz_artistid": ["m2"]})
+    make_track(music_dir / "d.mp3", {"artist": ["Wrong Name"], "musicbrainz_artistid": ["m3"]})
+    make_track(music_dir / "e.mp3", {"artist": ["No Identity Here"]})
+    scan_library(engine_settings)
+
+    mb = FakeArtistSource(
+        {
+            "m1": _mb("Solar Fields", mbid="m1"),
+            "m2": _mb("Korn", mbid="m2"),
+            "m3": _mb("Somebody Else", mbid="m3"),
+        },
+    )
+    result = artists.resolve_artists(
+        engine_settings,
+        client=FakeCorrectionSource({}),
+        mb_client=mb,
+    )
+
+    buckets = _buckets(result)
+    assert sum(buckets.values()) == result.processed
+    assert buckets["corrected_values"] == 1
+    assert buckets["already_canonical"] == 1
+    assert buckets["shrinks_credit"] == 1
+    assert buckets["name_id_disagreement"] == 1
+    assert buckets["no_correction"] == 1
+
+
+def test_mb_tier_dry_run_reports_the_same_buckets_and_stages_nothing(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    make_track(music_dir / "a.mp3", {"artist": ["SOLAR FIELDS"], "musicbrainz_artistid": ["m1"]})
+    scan_library(engine_settings)
+
+    mb = FakeArtistSource({"m1": _mb("Solar Fields", mbid="m1")})
+    preview = artists.resolve_artists(
+        engine_settings,
+        client=FakeCorrectionSource({}),
+        mb_client=mb,
+        dry_run=True,
+    )
+
+    assert preview.corrected_values == 1
+    assert preview.staged_files == 1
+    assert list(staging.diff_tags(engine_settings)) == []
+
+    real = artists.resolve_artists(
+        engine_settings,
+        client=FakeCorrectionSource({}),
+        mb_client=FakeArtistSource({"m1": _mb("Solar Fields", mbid="m1")}),
+    )
+    assert _buckets(real) == _buckets(preview)
+    assert real.staged_files == preview.staged_files
+
+
+def test_mb_tier_skips_a_manual_file_like_every_other_tier(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    make_track(music_dir / "a.mp3", {"artist": ["SOLAR FIELDS"], "musicbrainz_artistid": ["m1"]})
+    scan_library(engine_settings)
+    file_id = _file_id(engine_settings, music_dir, "a.mp3")
+    artists.set_artist_status(engine_settings, status="manual", file_ids=[file_id])
+
+    mb = FakeArtistSource({"m1": _mb("Solar Fields", mbid="m1")})
+    result = artists.resolve_artists(
+        engine_settings,
+        client=FakeCorrectionSource({}),
+        mb_client=mb,
+    )
+
+    assert result.skipped_manual == 1
+    assert result.staged_files == 0
+    assert mb.lookups == []
+
+
+def test_mb_tier_treats_a_dash_and_a_space_as_the_same_separator(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    # 16 real files carry U+2010 HYPHEN where MusicBrainz writes a space.
+    # Navidrome folds the dash to ASCII but never to a space, so the two stay two artists.
+    make_track(
+        music_dir / "a.mp3",
+        {"artist": ["Mindless Self\u2010Indulgence"], "musicbrainz_artistid": ["m1"]},
+    )
+    scan_library(engine_settings)
+
+    mb = FakeArtistSource({"m1": _mb("Mindless Self Indulgence", mbid="m1")})
+    result = artists.resolve_artists(
+        engine_settings,
+        client=FakeCorrectionSource({}),
+        mb_client=mb,
+    )
+
+    assert result.corrected_values == 1
+    assert result.mappings[0]["to"] == "Mindless Self Indulgence"
+
+
+def test_mb_tier_still_refuses_a_name_that_is_not_this_artist(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    # The widened separator fold must not turn an unrelated name into a match.
+    make_track(music_dir / "a.mp3", {"artist": ["ATOI"], "musicbrainz_artistid": ["m1"]})
+    scan_library(engine_settings)
+
+    mb = FakeArtistSource({"m1": _mb("Ambient Temple of Imagination", mbid="m1")})
+    result = artists.resolve_artists(
+        engine_settings,
+        client=FakeCorrectionSource({}),
+        mb_client=mb,
+    )
+
+    assert result.name_id_disagreement == 1
+    assert result.staged_files == 0

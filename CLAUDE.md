@@ -145,9 +145,11 @@ stale row exactly once.
 
 Every MCP tool is `verb_object[_qualifier]`, lowercase snake_case, **verb always first, no
 exceptions**. The verb names the operation; the object names the domain, axis, entity, or finding
-(compound nouns allowed: `album_gaps`, `library_stats`). The CLI mirrors the MCP name with `-` for
-`_` (`check_health` → `tagmend check-health`); no aliases. CLI-only program commands (`mcp`,
-`version`, `config*`) sit outside the grammar.
+(compound nouns allowed: `album_gaps`, `library_stats`). MCP is the primary surface. The CLI
+carries only the four commands worth running by hand (`check-health`, `scan-library`,
+`get-library-stats`, `detect-mismatches`), and each mirrors its MCP name with `-` for `_`. A new
+tool needs no CLI command. Adding one means mirroring the MCP name exactly, with no aliases.
+CLI-only program commands (`mcp`, `version`, `config*`) sit outside the grammar.
 
 **The verb set is closed.** A tool is **mutating** if it changes any persisted state other than the
 snapshot mirror (`files`/`file_tags`): staged rows, commits, status rows, watermarks, or the music

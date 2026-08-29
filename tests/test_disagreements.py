@@ -372,3 +372,43 @@ def test_detect_disagreements_end_to_end(
         "discnumber",
     }
     assert all(r.have == "" for r in report.fill_rows)
+
+
+# --- the track's own artist credit ---------------------------------------------------
+
+
+def test_a_wrong_artist_is_medium_against_the_track_credit() -> None:
+    report = _run([_f(artist="Somebody Else")])
+
+    assert report.medium == 1
+    assert report.rows[0].field == "artist"
+    assert report.rows[0].want == "Band"
+
+
+def test_the_track_credit_wins_over_the_release_credit() -> None:
+    # A guest track carries its own credit. The file should name the track's, not the album's.
+    guest = _track("2", "Song Two", credit="Band feat. Guest")
+    release = _release(_track("1", "Song One"), guest)
+    report = _run(
+        [
+            _f(
+                release_track_id="rt-2",
+                recording_id="rec-2",
+                title="Song Two",
+                tracknumber="2",
+                artist="Band",
+            )
+        ],
+        release,
+    )
+
+    assert report.medium == 1
+    assert report.rows[0].field == "artist"
+    assert report.rows[0].want == "Band feat. Guest"
+
+
+def test_the_artist_is_not_checked_without_a_matched_track() -> None:
+    # The credit is per track, so with no track matched there is nothing to compare against.
+    report = _run([_f(release_track_id=None, recording_id=None, artist="Somebody Else")])
+
+    assert "artist" not in {r.field for r in report.rows}

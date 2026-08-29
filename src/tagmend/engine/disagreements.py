@@ -17,8 +17,9 @@ Two levels of field are checked, and they fail independently:
 * **release-level** (``album``, ``albumartist``, ``date``, ``releasecountry``,
   ``musicbrainz_albumstatus``) need only the release, so they are checked even for a file
   carrying no track id at all.
-* **track-level** (``title``, ``tracknumber``, ``discnumber``) need a matched track, and are
-  skipped when there is none.
+* **track-level** (``title``, ``artist``, ``tracknumber``, ``discnumber``) need a matched
+  track, and are skipped when there is none. ``artist`` is track-level because a credit is per
+  track: a guest track carries its own, and that is the one the file should name.
 
 A blank field is a **fill**, not a disagreement. The repo's glossary separates the two
 (``gap`` is tag against absent, ``disagreement`` is tag against an external source), and so
@@ -85,7 +86,7 @@ _TIERS: Final = frozenset(t.value for t in Tier)
 # Fields that decide how a library groups, names and orders this file. A disagreement here is
 # visible to anyone browsing.
 _MEDIUM_FIELDS: Final = frozenset(
-    {"album", "albumartist", "title", "tracknumber", "discnumber"},
+    {"album", "albumartist", "artist", "title", "tracknumber", "discnumber"},
 )
 
 _REASON_UNMATCHED: Final = "this file's release-track id is not on the release its album id names"
@@ -347,6 +348,9 @@ def _compare_one(
 
     for field_name, have_raw, want in (
         ("title", file.title, track.title),
+        # The credit is per track, not per release: a guest track carries its own, and that
+        # is the one the file should name.
+        ("artist", file.artist, track.artist_credit),
         ("tracknumber", _position(file.tracknumber), _position(track.number)),
         ("discnumber", _position(file.discnumber), str(_medium_of(release, track))),
     ):

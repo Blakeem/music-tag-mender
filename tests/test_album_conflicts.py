@@ -7,6 +7,7 @@ end-to-end path through the real tool is covered once at the bottom via ``make_t
 
 from __future__ import annotations
 
+import unicodedata
 from typing import TYPE_CHECKING
 
 from conftest import make_track
@@ -422,7 +423,7 @@ def test_one_album_many_artists_and_no_albumartist_flags_every_file() -> None:
     assert report.flagged == 7
     assert report.high == 7
     assert report.rows[0].reason == _REASON_NO_ALBUMARTIST
-    assert report.groups[0].majority_identity == "Hackers Soundtrack"
+    assert report.groups[0].majority_identity == "Various Artists - Hackers Soundtrack"
 
 
 def test_the_compilation_shape_needs_more_than_one_track_artist() -> None:
@@ -482,3 +483,154 @@ def test_a_compilation_flag_already_set_is_not_the_missing_albumartist_shape() -
     )
 
     assert report.flagged == 0
+
+
+# --- narrowing must not leak other folders' rows -------------------------------------
+
+
+def _three_folder_report() -> album_conflicts.AlbumConflictsReport:
+    return _classify(
+        [
+            _f(1, folder=r"C:\m\A\Album", album="One"),
+            _f(2, folder=r"C:\m\A\Album", filename="b.mp3", album="Two"),
+            _f(11, folder=r"C:\m\B\Singles", album="X"),
+            _f(12, folder=r"C:\m\B\Singles", filename="b.mp3", album="Y"),
+            _f(21, folder=r"C:\m\C\Remixes", album="P"),
+            _f(22, folder=r"C:\m\C\Remixes", filename="b.mp3", album="Q"),
+        ],
+    )
+
+
+def test_a_folder_narrowing_also_narrows_the_context_rows() -> None:
+    view = album_conflicts._narrow(
+        _three_folder_report(),
+        tier=None,
+        folder=r"C:\m\A\Album",
+        limit=None,
+    )
+
+    assert {r.folder for r in view.rows} == {r"C:\m\A\Album"}
+    assert view.folder_context_rows == []
+
+
+def test_a_limit_caps_the_context_rows_too() -> None:
+    view = album_conflicts._narrow(_three_folder_report(), tier=None, folder=None, limit=1)
+
+    assert len(view.rows) == 1
+    assert len(view.folder_context_rows) == 1
+
+
+def test_groups_are_returned_only_for_the_grouped_view() -> None:
+    report = _three_folder_report()
+    flat = album_conflicts._narrow(report, tier=None, folder=None, limit=None)
+    grouped = album_conflicts._narrow(report, tier=None, folder=None, limit=None, group=True)
+
+    assert flat.groups == []
+    assert len(grouped.groups) == 3
+
+
+def test_a_limit_caps_the_groups_in_the_grouped_view() -> None:
+    view = album_conflicts._narrow(
+        _three_folder_report(),
+        tier=None,
+        folder=None,
+        limit=2,
+        group=True,
+    )
+
+    assert len(view.groups) == 2
+
+
+# --- the low tier means a disc suffix and nothing else -------------------------------
+
+
+def test_an_albumartist_split_is_not_reported_as_a_disc_suffix() -> None:
+    # The raw album strings differ only in case here, so a raw inequality test read this as a
+    # disc-suffix split and gave a reason that is factually false.
+    report = _classify(
+        [
+            _f(1, album="FICTION", albumartist="Band"),
+            _f(2, filename="b.mp3", album="Fiction", albumartist="Band"),
+            _f(3, filename="c.mp3", album="Fiction", albumartist="Other Band"),
+        ],
+    )
+
+    assert report.medium == 1
+    assert report.low == 0
+    assert "disc" not in report.rows[0].reason
+
+
+def test_a_year_split_with_a_stray_space_is_not_a_disc_suffix() -> None:
+    report = _classify(
+        [
+            _f(1, album="Fiction ", year="2005"),
+            _f(2, filename="b.mp3", album="Fiction", year="2005"),
+            _f(3, filename="c.mp3", album="Fiction", year="2006"),
+        ],
+    )
+
+    assert report.medium == 1
+    assert report.low == 0
+
+
+# --- a two-file compilation is still a compilation -----------------------------------
+
+
+def test_two_files_two_artists_and_no_albumartist_is_the_compilation_shape() -> None:
+    # No artist dominates when every artist appears once, whatever the folder size.
+    report = _classify(
+        [
+            _f(1, album="One Album", albumartist=None, artist="A"),
+            _f(2, filename="b.mp3", album="One Album", albumartist=None, artist="B"),
+        ],
+    )
+
+    assert report.flagged == 2
+    assert report.rows[0].reason == _REASON_NO_ALBUMARTIST
+
+
+def test_a_two_file_folder_sharing_one_artist_is_not_the_compilation_shape() -> None:
+    report = _classify(
+        [
+            _f(1, album="One Album", albumartist=None, artist="Band", year="2005"),
+            _f(
+                2, filename="b.mp3", album="One Album", albumartist=None, artist="Band", year="2006"
+            ),
+        ],
+    )
+
+    assert all(r.reason != _REASON_NO_ALBUMARTIST for r in report.rows)
+
+
+def test_the_compilation_rows_name_the_identity_the_same_way_as_every_other_row() -> None:
+    report = _classify(
+        [
+            _f(1, album="One Album", albumartist=None, artist="A"),
+            _f(2, filename="b.mp3", album="One Album", albumartist=None, artist="B"),
+            _f(3, filename="c.mp3", album="One Album", albumartist=None, artist="C"),
+        ],
+    )
+
+    assert report.rows[0].majority_identity == "Various Artists - One Album"
+
+
+# --- unicode normalization -----------------------------------------------------------
+
+
+def test_the_same_accented_title_in_two_unicode_forms_agrees() -> None:
+    # MusicBrainz serves NFC. Some taggers write NFD. The two look identical, so reporting
+    # them gives a reviewer nothing to act on.
+    nfc = unicodedata.normalize("NFC", "Café Bleu")
+    nfd = unicodedata.normalize("NFD", "Café Bleu")
+    assert nfc != nfd
+
+    report = _classify([_f(1, album=nfc), _f(2, filename="b.mp3", album=nfd)])
+
+    assert report.flagged == 0
+
+
+def test_normalization_does_not_fold_the_accent_away() -> None:
+    # Navidrome does not fold accents, so these really are two albums.
+    report = _classify([_f(1, album="Café"), _f(2, filename="b.mp3", album="Cafe")])
+
+    assert report.flagged == 1

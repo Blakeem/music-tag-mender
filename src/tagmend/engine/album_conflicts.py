@@ -42,6 +42,7 @@ it here would double-report it and let a blank identity win the majority vote.
 from __future__ import annotations
 
 import re
+import unicodedata
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
@@ -300,7 +301,10 @@ def group_key(value: str) -> str:
     :mod:`tagmend.engine.disagreements`, which needs the same judgement about what is
     cosmetic when it compares the same fields against MusicBrainz.
     """
-    folded = "".join(TYPOGRAPHIC.get(ch, ch) for ch in value)
+    # NFC first, so the two byte-forms of one accented string compare equal. Deliberately not
+    # NFKD-with-marks-stripped like :func:`tagmend.engine.mismatch.fold`: that folds an accent
+    # away, and an accent really does separate two albums for anything reading these tags.
+    folded = "".join(TYPOGRAPHIC.get(ch, ch) for ch in unicodedata.normalize("NFC", value))
     return " ".join(folded.casefold().split())
 
 
@@ -336,7 +340,11 @@ def _is_compilation_missing_its_album_artist(files: list[_FileInput]) -> bool:
     artists = Counter(group_key(f.artist or "") for f in files)
     if not artists:
         return False
-    return artists.most_common(1)[0][1] * 2 < len(files)
+    top = artists.most_common(1)[0][1]
+    # No artist dominates when every one of them appears exactly once, whatever the folder
+    # size. The proportional test alone can never be true for a two-file folder, which would
+    # leave the smallest compilation with the misleading verdict this case exists to prevent.
+    return top == 1 or top * 2 < len(files)
 
 
 def _is_context_folder(files: list[_FileInput]) -> str | None:
@@ -357,9 +365,14 @@ def _tier_for(minority: _FileInput, majority: _FileInput) -> tuple[Tier, str]:
     majority_id = (majority.release_id or "").strip()
     if minority_id or majority_id:
         return (Tier.HIGH, _REASON_HIGH)
+    # Both tests run at fold level. Comparing the raw strings for inequality made a folder
+    # split by album artist or year, whose album strings differ only cosmetically, report a
+    # disc suffix that is not there.
+    minority_album = group_key(minority.album or "")
+    majority_album = group_key(majority.album or "")
     if (
         _base_title(minority.album) == _base_title(majority.album)
-        and minority.album != majority.album
+        and minority_album != majority_album
     ):
         return (Tier.LOW, _REASON_LOW)
     return (Tier.MEDIUM, _REASON_MEDIUM)
@@ -396,8 +409,12 @@ def _rows_for_folder(files: list[_FileInput]) -> tuple[list[AlbumConflictRow], _
 
 
 def _compilation_rows(files: list[_FileInput]) -> list[AlbumConflictRow]:
-    """Return one row per file for a folder that is one album with no album artist at all."""
-    shared = files[0].album or ""
+    """Return one row per file for a folder that is one album with no album artist at all.
+
+    ``majority_identity`` names the identity these files should share once they carry an album
+    artist, in the same shape every other row uses, so a consumer parses one form.
+    """
+    shared = _VARIOUS_ARTISTS + " - " + (files[0].album or "")
     return [
         AlbumConflictRow(
             file_id=f.file_id,
@@ -439,7 +456,7 @@ def _classify(files: list[_FileInput]) -> AlbumConflictsReport:
             continue
         if _is_compilation_missing_its_album_artist(members):
             folder_rows = _compilation_rows(members)
-            majority_label = members[0].album or ""
+            majority_label = _VARIOUS_ARTISTS + " - " + (members[0].album or "")
             majority_files = 0
         else:
             folder_rows, majority, majority_files = _rows_for_folder(members)
@@ -519,18 +536,30 @@ def _narrow(
     limit: int | None,
     group: bool = False,
 ) -> AlbumConflictsReport:
-    """Return *report* with its rows filtered for display; the library counts never change."""
+    """Return *report* with its rows filtered for display; the library counts never change.
+
+    Every filter applies to the context rows as well as the flagged ones. Without that, a
+    caller expanding one folder also received every ``Singles``/``Remixes`` context row in the
+    library. Groups ride only on the grouped view, which is what ``detect_track_conflicts``
+    does, so a flat call does not also ship a line per folder.
+    """
     rows = report.rows
+    context_rows = report.folder_context_rows
     if tier is not None:
         rows = [r for r in rows if r.tier == tier]
+        context_rows = []
     if folder is not None:
         rows = [r for r in rows if r.folder == folder]
+        context_rows = [r for r in context_rows if r.folder == folder]
     if limit is not None:
         rows = rows[:limit]
+        context_rows = context_rows[:limit]
 
     groups = report.groups
     if folder is not None:
         groups = [g for g in groups if g.folder == folder]
+    if limit is not None:
+        groups = groups[:limit]
 
     return AlbumConflictsReport(
         rows=[] if group else rows,
@@ -541,8 +570,8 @@ def _narrow(
         low=report.low,
         summary=report.summary,
         folder_context=report.folder_context,
-        folder_context_rows=[] if (group or tier is not None) else report.folder_context_rows,
-        groups=groups,
+        folder_context_rows=[] if group else context_rows,
+        groups=groups if group else [],
     )
 
 

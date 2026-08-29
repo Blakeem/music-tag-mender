@@ -7,13 +7,14 @@ path through the real tool is covered once at the bottom via ``make_track``.
 
 from __future__ import annotations
 
+import unicodedata
 from typing import TYPE_CHECKING
 
 from conftest import make_track
 from tagmend.engine import disagreements
 from tagmend.engine.disagreements import Tier, _classify, _FileInput
 from tagmend.engine.library import scan_library
-from tagmend.engine.musicbrainz import MBMedium, MBRelease, MBTrack
+from tagmend.engine.musicbrainz import MBMedium, MBRelease, MBTrack, MusicBrainzError
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -377,10 +378,12 @@ def test_detect_disagreements_end_to_end(
     assert report.rows[0].have == "Wrong Album"
     assert report.rows[0].want == "Real Album"
     assert report.rows[0].tier == Tier.MEDIUM.value
-    assert {r.field for r in report.fill_rows} >= {
+    # No discnumber: the release has one medium, so there is nothing to say about the disc.
+    assert {r.field for r in report.fill_rows} == {
+        "artist",
+        "date",
         "releasecountry",
         "musicbrainz_albumstatus",
-        "discnumber",
     }
     assert all(r.have == "" for r in report.fill_rows)
 
@@ -481,3 +484,142 @@ def test_other_punctuation_still_disagrees() -> None:
     report = _run([_f(album="Real: Album")])
 
     assert report.medium == 1
+
+
+# --- findings from the adversarial review --------------------------------------------
+
+
+def test_a_blank_date_is_a_fill_like_every_other_blank() -> None:
+    # date is the only release-level field routed through its own comparison, and its blank
+    # was being read as agreement, so the most useful fill of all was silently dropped.
+    report = _run([_f(date=None, releasecountry=None, musicbrainz_albumstatus=None)])
+
+    assert {r.field for r in report.fill_rows} == {
+        "date",
+        "releasecountry",
+        "musicbrainz_albumstatus",
+    }
+
+
+def test_a_date_is_only_lenient_when_the_tag_is_the_more_precise_one() -> None:
+    # MusicBrainz carrying a bare year under a full tag date is agreement. The reverse is a
+    # real difference, and so is a shorter prefix that is not a whole date component.
+    precise = _run([_f(date="1997-09-18")], _release(_track("1", "Song One"), date="1997"))
+    assert precise.flagged == 0
+
+    truncated = _run([_f(date="19")], _release(_track("1", "Song One"), date="1997"))
+    assert truncated.flagged == 1
+
+    wrong_month = _run(
+        [_f(date="1997-1")],
+        _release(_track("1", "Song One"), date="1997-10-05"),
+    )
+    assert wrong_month.flagged == 1
+
+
+def test_group_flagged_counts_rows_like_the_headline_does() -> None:
+    # One file with two wrong fields is two rows. The report and the group must not disagree
+    # about what the word counts.
+    report = _run([_f(album="Wrong Album", releasecountry="RU")])
+
+    assert report.flagged == 2
+    assert sum(g.flagged for g in report.groups) == report.flagged
+    assert report.groups[0].flagged_files == 1
+
+
+def test_releases_checked_counts_what_was_actually_fetched() -> None:
+    class Raiser:
+        def __init__(self) -> None:
+            self.lookups: list[str] = []
+
+        def release_by_mbid(self, mbid: str) -> MBRelease | None:
+            self.lookups.append(mbid)
+            if mbid == "rel-a":
+                message = "boom"
+                raise MusicBrainzError(message)
+            return _release(_track("1", "Song One"), mbid="rel-b")
+
+    report = _classify(
+        [_f(1, release_id="rel-a"), _f(2, release_id="rel-b", album="Wrong")],
+        Raiser(),
+        limit=None,
+    )
+
+    assert report.errors == 1
+    assert report.releases_checked == 1
+    assert report.releases_attempted == 2
+
+
+def test_a_single_disc_release_does_not_propose_a_disc_number() -> None:
+    # Picard routinely omits discnumber on a single-disc release, and proposing 1 on every
+    # such file would bury the report in thousands of rows that mean nothing.
+    report = _run([_f(discnumber=None)])
+
+    assert "discnumber" not in {r.field for r in report.fill_rows}
+
+
+def test_a_multi_disc_release_still_proposes_the_disc_number() -> None:
+    two_discs = _release(
+        _track("1", "Song One"),
+        media=(
+            MBMedium(1, "", "CD", 1, (_track("1", "Song One"),)),
+            MBMedium(
+                2, "", "CD", 1, (_track("1", "Song Two", position=1, rt="rt-9", rec="rec-9"),)
+            ),
+        ),
+    )
+    report = _run(
+        [_f(release_track_id="rt-9", recording_id="rec-9", discnumber=None, title="Song Two")],
+        two_discs,
+    )
+
+    assert ("discnumber", "", "2") in {(r.field, r.have, r.want) for r in report.fill_rows}
+
+
+def test_a_row_limit_caps_both_row_lists() -> None:
+    report = _run(
+        [
+            _f(1, album="Wrong", releasecountry="RU", date=None),
+            _f(2, album="Wrong Too", releasecountry="XX", date=None),
+        ]
+    )
+    view = disagreements._narrow(report, tier=None, folder=None, limit=1, group=False)
+
+    assert len(view.rows) == 1
+    assert len(view.fill_rows) == 1
+    assert view.flagged == report.flagged
+
+
+def test_a_lowercase_vinyl_side_still_agrees() -> None:
+    vinyl = _release(_track("A1", "Song One", position=1))
+    report = _run([_f(tracknumber="a1")], vinyl)
+
+    assert report.flagged == 0
+
+
+def test_the_same_accented_title_in_two_unicode_forms_agrees() -> None:
+    nfd = unicodedata.normalize("NFD", "Café Song")
+    nfc = unicodedata.normalize("NFC", "Café Song")
+    assert nfc != nfd
+
+    report = _run([_f(title=nfc)], _release(_track("1", nfd)))
+
+    assert report.flagged == 0
+
+
+def test_a_medium_position_of_zero_is_not_proposed() -> None:
+    # A payload missing a medium position parses as 0, and disc zero is not a real answer.
+    broken = _release(
+        _track("1", "Song One"),
+        media=(MBMedium(0, "", "CD", 1, (_track("1", "Song One"),)),),
+    )
+    report = _run([_f(discnumber="1")], broken)
+
+    assert "discnumber" not in {r.field for r in report.rows}
+
+
+def test_an_exotic_digit_does_not_abort_the_run() -> None:
+    # str.isdigit accepts characters int() rejects, which crashed the whole detect run.
+    report = _run([_f(2, tracknumber="⑧")])
+
+    assert report.total_files == 1

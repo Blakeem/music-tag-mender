@@ -72,6 +72,9 @@ _DEFAULT_LIMIT: Final = 200
 
 _SLASH: Final = "/"
 
+# MusicBrainz dates are ``YYYY`` / ``YYYY-MM`` / ``YYYY-MM-DD``.
+_DATE_SEPARATOR: Final = "-"
+
 
 class Tier(StrEnum):
     """How much the disagreement costs a listener."""
@@ -155,13 +158,18 @@ class DisagreementRow:
 
 @dataclass(frozen=True, slots=True)
 class DisagreementGroup:
-    """One folder's disagreements, compact enough to scan a whole library at a glance."""
+    """One folder's disagreements, compact enough to scan a whole library at a glance.
+
+    ``flagged`` counts ROWS, matching the headline count, so the groups sum to it. One file
+    with two wrong fields is two. ``flagged_files`` is the distinct-file count beside it.
+    """
 
     folder: str
     release_id: str
     release_title: str
     file_count: int
     flagged: int
+    flagged_files: int
     fills: int
     fields: dict[str, int]
     tiers: dict[str, int]
@@ -175,6 +183,7 @@ class DisagreementGroup:
             "release_title": self.release_title,
             "file_count": self.file_count,
             "flagged": self.flagged,
+            "flagged_files": self.flagged_files,
             "fills": self.fills,
             "fields": self.fields,
             "tiers": self.tiers,
@@ -193,6 +202,7 @@ class DisagreementsReport:
     medium: int
     low: int
     fills: int
+    releases_attempted: int
     releases_checked: int
     releases_remaining: int
     more: bool
@@ -216,6 +226,7 @@ class DisagreementsReport:
             "low": self.low,
             "fills": self.fills,
             "fill_rows": [r.to_dict() for r in self.fill_rows],
+            "releases_attempted": self.releases_attempted,
             "releases_checked": self.releases_checked,
             "releases_remaining": self.releases_remaining,
             "more": self.more,
@@ -249,7 +260,9 @@ def _position(value: str | None) -> str:
     if not value:
         return ""
     head = value.split(_SLASH, 1)[0].strip()
-    return str(int(head)) if head.isdigit() else head
+    # isdecimal, not isdigit: isdigit accepts superscripts and enclosed digits that int()
+    # rejects, and one such tag would abort the whole run.
+    return str(int(head)) if head.isdecimal() else head
 
 
 def _track_number_agrees(have: str, track: MBTrack) -> bool:
@@ -259,19 +272,28 @@ def _track_number_agrees(have: str, track: MBTrack) -> bool:
     sequential position, so the two strings differ on every file of such a release without
     anything being wrong. Either spelling is a defensible reading, so either is accepted.
     """
-    return have in {_position(track.number), _position(str(track.position))}
+    return _text_key(have) in {
+        _text_key(_position(track.number)),
+        _text_key(_position(str(track.position))),
+    }
 
 
 def _date_agrees(have: str, want: str) -> bool:
-    """Return whether two dates agree, allowing the tag to be more precise than MusicBrainz.
+    """Return whether two dates agree, allowing the TAG to be the more precise of the two.
 
     MusicBrainz often carries a bare year where the tag carries the full date it came from,
-    so ``1997-09-18`` against ``1997`` is agreement, not a defect.
+    so ``1997-09-18`` against ``1997`` is agreement. The leniency is one-directional and
+    component-aware: a shorter tag is not evidence, and ``1997-1`` is January, not a prefix of
+    October. A blank tag is not agreement either, or the most useful fill of all would never
+    be reported.
     """
     if not want:
         return True
-    longer, shorter = (have, want) if len(have) >= len(want) else (want, have)
-    return longer.startswith(shorter)
+    if not have:
+        return False
+    if have == want:
+        return True
+    return have.startswith(want) and have[len(want)] == _DATE_SEPARATOR
 
 
 def _match_track(file: _FileInput, release: MBRelease) -> MBTrack | None:
@@ -404,7 +426,7 @@ def _compare_track(
         # The credit is per track, not per release: a guest track carries its own, and that
         # is the one the file should name.
         ("artist", file.artist, track.artist_credit),
-        ("discnumber", _position(file.discnumber), str(_medium_of(release, track))),
+        ("discnumber", _position(file.discnumber), _disc_expectation(release, track)),
     ):
         have = (have_raw or "").strip()
         if want and _text_key(have) != _text_key(want):
@@ -414,11 +436,29 @@ def _compare_track(
 
 
 def _medium_of(release: MBRelease, track: MBTrack) -> int:
-    """Return the 1-based disc position of the medium holding *track*."""
+    """Return the 1-based disc position of the medium holding *track*, or 0 if unknown.
+
+    Identity, not equality: :class:`MBTrack` is a frozen dataclass, so two equal-valued tracks
+    on different media would otherwise resolve to whichever medium came first.
+    """
     return next(
-        (m.position for m in release.media if track in m.tracks),
-        1,
+        (m.position for m in release.media if any(t is track for t in m.tracks)),
+        0,
     )
+
+
+def _disc_expectation(release: MBRelease, track: MBTrack) -> str:
+    """Return the disc number this track should carry, or empty when there is nothing to say.
+
+    A single-medium release says nothing: Picard routinely omits ``discnumber`` there, and
+    proposing 1 on every such file would bury the report. A medium whose position did not
+    parse says nothing either, because disc zero is not an answer.
+    """
+    single_medium = 1
+    if len(release.media) <= single_medium:
+        return ""
+    position = _medium_of(release, track)
+    return str(position) if position > 0 else ""
 
 
 def _classify(
@@ -447,6 +487,7 @@ def _classify(
     errors: list[dict[str, str]] = []
     unknown = 0
     unmatched = 0
+    fetched = 0
     titles: dict[str, str] = {}
     for release_id in to_check:
         try:
@@ -455,6 +496,7 @@ def _classify(
             logger.warning("musicbrainz release error for mbid=%r: %s", release_id, exc)
             errors.append({"release_id": release_id, "message": str(exc)})
             continue
+        fetched += 1
         if release is None:
             unknown += 1
             continue
@@ -477,7 +519,8 @@ def _classify(
         medium=tiers.get(Tier.MEDIUM.value, 0),
         low=tiers.get(Tier.LOW.value, 0),
         fills=len(fills),
-        releases_checked=len(to_check),
+        releases_attempted=len(to_check),
+        releases_checked=fetched,
         releases_remaining=len(order) - len(to_check),
         more=len(order) > len(to_check),
         skipped_no_release_id=skipped,
@@ -488,7 +531,7 @@ def _classify(
             rows=contradictions,
             fills=len(fills),
             tiers=tiers,
-            checked=len(to_check),
+            checked=fetched,
             remaining=len(order) - len(to_check),
             unknown=unknown,
             unmatched=unmatched,
@@ -526,7 +569,8 @@ def _build_groups(
             release_id=release_id,
             release_title=titles.get(release_id, ""),
             file_count=counts[(folder, release_id)],
-            flagged=len({r.file_id for r in group_rows if not r.is_fill}),
+            flagged=len([r for r in group_rows if not r.is_fill]),
+            flagged_files=len({r.file_id for r in group_rows if not r.is_fill}),
             fills=len([r for r in group_rows if r.is_fill]),
             fields=dict(Counter(r.field for r in group_rows if not r.is_fill)),
             tiers=dict(Counter(r.tier for r in group_rows if not r.is_fill)),
@@ -578,6 +622,7 @@ def _narrow(
     *,
     tier: str | None,
     folder: str | None,
+    limit: int | None,
     group: bool,
 ) -> DisagreementsReport:
     """Return *report* with its rows filtered for display; the run counts never change."""
@@ -589,10 +634,15 @@ def _narrow(
     if folder is not None:
         rows = [r for r in rows if r.folder == folder]
         fill_rows = [r for r in fill_rows if r.folder == folder]
+    if limit is not None:
+        rows = rows[:limit]
+        fill_rows = fill_rows[:limit]
 
     groups = report.groups
     if folder is not None:
         groups = [g for g in groups if g.folder == folder]
+    if limit is not None:
+        groups = groups[:limit]
 
     return DisagreementsReport(
         rows=[] if group else rows,
@@ -602,6 +652,7 @@ def _narrow(
         medium=report.medium,
         low=report.low,
         fills=report.fills,
+        releases_attempted=report.releases_attempted,
         releases_checked=report.releases_checked,
         releases_remaining=report.releases_remaining,
         more=report.more,
@@ -660,14 +711,20 @@ def detect_disagreements(  # noqa: PLR0913 - cohesive keyword-only scope + injec
     folder: str | None = None,
     file_ids: list[int] | None = None,
     limit: int | None = None,
+    row_limit: int | None = None,
     group: bool = False,
     client: MBReleaseSource | None = None,
 ) -> DisagreementsReport:
     """Report files whose tags contradict the MusicBrainz release their album id names.
 
-    Reads the snapshot, so run ``scan_library`` first. *limit* caps the number of distinct
-    releases fetched this call (default 200, about three minutes at MusicBrainz's requested
-    one request per second) and the remainder is reported via ``releases_remaining``/``more``.
+    Reads the snapshot, so run ``scan_library`` first.
+
+    *folder* and *file_ids* scope the RUN, not the view: the counts then describe only that
+    scope, and no release outside it is fetched. *tier* narrows the view alone, so the counts
+    still describe the whole run. *limit* caps the number of distinct releases fetched this
+    call (default 200, about three minutes at MusicBrainz's requested one request per second)
+    and the remainder is reported via ``releases_remaining``/``more``. *row_limit* caps the
+    rows returned without changing any count.
     *client* injects an :class:`tagmend.engine.musicbrainz.MBReleaseSource` for tests. Raises
     :class:`ValueError` for an unknown *tier*.
     """
@@ -702,4 +759,4 @@ def detect_disagreements(  # noqa: PLR0913 - cohesive keyword-only scope + injec
         report.releases_checked,
         report.total_files,
     )
-    return _narrow(report, tier=tier, folder=folder, group=group)
+    return _narrow(report, tier=tier, folder=folder, limit=row_limit, group=group)

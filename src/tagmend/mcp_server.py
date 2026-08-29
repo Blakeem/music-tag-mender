@@ -547,11 +547,12 @@ def detect_track_conflicts(
 
 
 @mcp.tool()
-def detect_disagreements(
+def detect_disagreements(  # noqa: PLR0913 - one parameter per scope/view knob, cohesive
     tier: Literal["high", "medium", "low"] | None = None,
     folder: str | None = None,
     file_ids: list[int] | None = None,
     limit: int | None = None,
+    row_limit: int | None = None,
     group: bool = False,  # noqa: FBT001, FBT002 - MCP tool surface, not a Python API
 ) -> dict[str, object]:
     """Find files whose tags contradict the MusicBrainz release their album id names.
@@ -570,8 +571,10 @@ def detect_disagreements(
 
     Release-level fields (``album``, ``albumartist``, ``date``, ``releasecountry``,
     ``musicbrainz_albumstatus``) are checked even for a file carrying no track id.
-    Track-level fields (``title``, ``tracknumber``, ``discnumber``) need a matched track and
-    are skipped without one.
+    Track-level fields (``title``, ``artist``, ``tracknumber``, ``discnumber``) need a matched
+    track and are skipped without one. ``artist`` is track-level because a credit belongs to a
+    track: a guest track carries its own. No ``discnumber`` is proposed for a single-medium
+    release, since Picard routinely omits it there.
 
     **A blank field is a fill, not a disagreement.** ``flagged`` counts only fields where the
     file says one thing and the release says another. Fields the file simply lacks are
@@ -594,15 +597,19 @@ def detect_disagreements(
         tier: Keep only rows in this tier (``high`` | ``medium`` | ``low``).
         folder: Limit to exactly this folder (exact path, never a prefix).
         file_ids: Limit to these specific file ids.
-        limit: Max distinct releases to fetch this call.
+        limit: Max distinct releases to FETCH this call. ``folder`` and ``file_ids`` scope
+            the run, so the counts then describe only that scope and no release outside it is
+            fetched. ``tier`` narrows the view alone.
+        row_limit: Cap the rows returned without changing any count.
         group: Return one compact line per folder instead of flat rows.
 
     Returns:
         ``{"ok": True, rows, fill_rows, total_files, flagged, high, medium, low, fills,
-        releases_checked, releases_remaining, more, skipped_no_release_id, unknown_releases,
-        unmatched_tracks, errors, error_releases, groups, summary}`` — each row is
-        ``{file_id, folder, filename, release_id, release_title, field, have, want, tier,
-        reason}`` — or ``{"ok": False, "error": ...}``.
+        releases_attempted, releases_checked, releases_remaining, more, skipped_no_release_id,
+        unknown_releases, unmatched_tracks, errors, error_releases, groups, summary}`` — each
+        row is ``{file_id, folder, filename, release_id, release_title, field, have, want,
+        tier, reason}``, and each group's ``flagged`` counts ROWS like the headline does with
+        ``flagged_files`` beside it — or ``{"ok": False, "error": ...}``.
     """
     try:
         report = disagreements.detect_disagreements(
@@ -611,6 +618,7 @@ def detect_disagreements(
             folder=folder,
             file_ids=file_ids,
             limit=limit,
+            row_limit=row_limit,
             group=group,
         )
     except ValueError as exc:
@@ -657,9 +665,15 @@ def detect_album_conflicts(
       That is deliberate Picard output for a titled multi-disc medium. It still shows as
       several albums, so you may still want to normalize it.
 
+    One shape gets its own case. When every file in a folder agrees on the album title, none
+    carries an ``albumartist``, and no track artist holds half the folder, it is a compilation
+    missing its album artist. Every file falls back to its own artist, so the one album shows
+    as one card per track. Every file is flagged, because every file needs the same fix.
+
     A folder named ``Singles``/``Remixes``/``Featured``/etc. holds several releases by design.
     Its rows are reported under ``folder_context`` instead, outside ``flagged`` and outside the
-    tier counts, so ``flagged`` keeps meaning "files that are wrong".
+    tier counts, so ``flagged`` keeps meaning "files that are wrong". Every filter applies to
+    those rows too, and ``groups`` are returned only with ``group=true``.
 
     Recommended workflow: start with ``group=true`` for one line per folder, then expand a
     single folder with ``folder="<exact folder path>"``, then fix with ``stage_tags_batch`` ->

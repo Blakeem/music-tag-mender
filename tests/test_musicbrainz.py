@@ -312,7 +312,8 @@ def test_selection_version_changes_recording_request_key(monkeypatch: pytest.Mon
 
 
 def test_http_error_raises_and_caches_nothing(db_conn: sqlite3.Connection) -> None:
-    client, _ = _client(db_conn, [_json_response({}, status_code=503)])
+    # 500, not 503: 503 is MusicBrainz's throttle signal and is retried.
+    client, _ = _client(db_conn, [_json_response({}, status_code=500)])
     with client, pytest.raises(MusicBrainzError):
         client.album_first_release("Artist", "Album")
     # Nothing cached → a re-run would retry.
@@ -463,7 +464,8 @@ def test_recording_no_match_is_negative_cached(db_conn: sqlite3.Connection) -> N
 
 
 def test_recording_http_error_raises_and_caches_nothing(db_conn: sqlite3.Connection) -> None:
-    client, _ = _client(db_conn, [_json_response({}, status_code=503)])
+    # 500, not 503: 503 is MusicBrainz's throttle signal and is retried.
+    client, _ = _client(db_conn, [_json_response({}, status_code=500)])
     with client, pytest.raises(MusicBrainzError):
         client.recording_search("Artist", "Title")
     # Nothing cached → a re-run would retry.
@@ -965,3 +967,102 @@ def test_the_artist_lookup_backs_off_the_same_way(db_conn: sqlite3.Connection) -
 
     assert len(calls) == 2
     assert slept == [pytest.approx(1.0)]
+
+
+# --- transport failures are transient too ---------------------------------------------
+
+
+def _raising_client(
+    db_conn: sqlite3.Connection,
+    outcomes: list[httpx.Response | Exception],
+) -> tuple[MusicBrainzClient, list[int]]:
+    """Build a client whose transport raises for an exception entry and responds otherwise."""
+    calls: list[int] = []
+
+    def handle(_request: httpx.Request) -> httpx.Response:
+        outcome = outcomes[len(calls)]
+        calls.append(len(calls))
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    client = MusicBrainzClient(
+        "TagMend/test ( test@example.com )",
+        db_conn,
+        rate_per_sec=0.0,
+        transport=httpx.MockTransport(handle),
+        sleep=lambda _s: None,
+    )
+    return client, calls
+
+
+def test_a_dropped_connection_is_retried(db_conn: sqlite3.Connection) -> None:
+    # A real 370-lookup run died here: the server dropped the connection partway and the raw
+    # httpx error escaped the client, aborting the whole run instead of leaving one value
+    # pending.
+    client, calls = _raising_client(
+        db_conn,
+        [httpx.RemoteProtocolError("Server disconnected"), _json_response(_artist_body())],
+    )
+    with client:
+        artist = client.artist_by_mbid("mbid-1")
+
+    assert artist is not None
+    assert len(calls) == 2
+
+
+def test_a_connection_error_that_never_clears_raises_musicbrainz_error(
+    db_conn: sqlite3.Connection,
+) -> None:
+    # It must surface as the engine's own error type, so the caller's existing handling
+    # reports the value as pending instead of the traceback escaping.
+    client, calls = _raising_client(db_conn, [httpx.ConnectError("no route") for _ in range(4)])
+    with client, pytest.raises(MusicBrainzError):
+        client.artist_by_mbid("mbid-1")
+
+    assert len(calls) == 3
+
+
+def test_a_transport_failure_caches_nothing(db_conn: sqlite3.Connection) -> None:
+    client, calls = _raising_client(
+        db_conn,
+        [
+            httpx.ConnectError("down"),
+            httpx.ConnectError("down"),
+            httpx.ConnectError("down"),
+            _json_response(_artist_body()),
+        ],
+    )
+    with client:
+        with pytest.raises(MusicBrainzError):
+            client.artist_by_mbid("mbid-1")
+        # Nothing was cached, so the retry reaches the network and succeeds.
+        assert client.artist_by_mbid("mbid-1") is not None
+
+    assert len(calls) == 4
+
+
+def test_a_dropped_connection_is_retried_on_the_release_lookup(
+    db_conn: sqlite3.Connection,
+) -> None:
+    client, calls = _raising_client(
+        db_conn,
+        [httpx.ReadTimeout("timed out"), _json_response(_release_body())],
+    )
+    with client:
+        assert client.release_by_mbid("rel-1") is not None
+
+    assert len(calls) == 2
+
+
+def test_a_dropped_connection_is_retried_on_the_release_group_search(
+    db_conn: sqlite3.Connection,
+) -> None:
+    client, calls = _raising_client(
+        db_conn,
+        [httpx.ConnectError("down"), _json_response(_body(_group()))],
+    )
+    with client:
+        assert client.album_first_release("Black Sabbath", "Paranoid") is not None
+
+    assert len(calls) == 2

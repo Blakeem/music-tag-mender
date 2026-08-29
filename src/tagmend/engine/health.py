@@ -215,6 +215,9 @@ def _check_musicbrainz(
             settings.musicbrainz_user_agent,
             conn,
             transport=transport,
+            # A readiness probe answers on the first attempt. Retrying here would turn a
+            # down service into a multi-second wait.
+            max_attempts=1,
         ) as client:
             client.album_first_release(_MB_PING_ARTIST, _MB_PING_ALBUM)
     except (MusicBrainzError, httpx.HTTPError) as exc:

@@ -296,6 +296,7 @@ class MusicBrainzClient:
         transport: httpx.BaseTransport | None = None,
         monotonic: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
+        max_attempts: int = _THROTTLE_ATTEMPTS,
     ) -> None:
         """Configure the client; injectables default to the real httpx transport + clock."""
         self._user_agent = user_agent
@@ -304,6 +305,9 @@ class MusicBrainzClient:
         self._transport = transport
         self._monotonic = monotonic
         self._sleep = sleep
+        # A readiness probe wants one attempt and a fast answer. A long sweep wants the
+        # retries, because it meets a throttle or a dropped connection sooner or later.
+        self._max_attempts = max(1, max_attempts)
         self._last_request_at: float | None = None
         self._client: httpx.Client | None = None
 
@@ -445,10 +449,8 @@ class MusicBrainzClient:
             raise RuntimeError(message)
 
         query = f'artist:"{_escape(artist)}" AND releasegroup:"{_escape(album)}"'
-        params = {"query": query, "fmt": "json"}
-        self._pace()
         logger.debug("musicbrainz request artist=%r album=%r", artist, album)
-        response = self._client.get(_API_URL, params=params)
+        response = self._get_with_backoff(_API_URL, {"query": query, "fmt": "json"})
         if response.is_error:
             message = f"MusicBrainz HTTP {response.status_code} for release-group query"
             raise MusicBrainzError(message)
@@ -512,10 +514,8 @@ class MusicBrainzClient:
             raise RuntimeError(message)
 
         query = f'artist:"{_escape(artist)}" AND recording:"{_escape(title)}"'
-        params = {"query": query, "fmt": "json"}
-        self._pace()
         logger.debug("musicbrainz recording request artist=%r title=%r", artist, title)
-        response = self._client.get(_RECORDING_API_URL, params=params)
+        response = self._get_with_backoff(_RECORDING_API_URL, {"query": query, "fmt": "json"})
         if response.is_error:
             message = f"MusicBrainz HTTP {response.status_code} for recording query"
             raise MusicBrainzError(message)
@@ -666,15 +666,29 @@ class MusicBrainzClient:
             raise RuntimeError(message)
 
         delay = _THROTTLE_BACKOFF_SECONDS
-        for attempt in range(_THROTTLE_ATTEMPTS):
+        last_error: httpx.HTTPError | None = None
+        for attempt in range(self._max_attempts):
             self._pace()
-            response = self._client.get(url, params=params)
-            if response.status_code != _HTTP_THROTTLED:
-                return response
-            if attempt < _THROTTLE_ATTEMPTS - 1:
+            try:
+                response = self._client.get(url, params=params)
+            except httpx.HTTPError as exc:
+                # A dropped connection or a timeout is as transient as the throttle code, and
+                # a long sweep meets both. Letting it escape aborts the whole run over one
+                # lookup, which is what happened to a 370-lookup artist pass.
+                last_error = exc
+                logger.debug("musicbrainz transport error, backing off %ss: %s", delay, exc)
+            else:
+                if response.status_code != _HTTP_THROTTLED:
+                    return response
+                last_error = None
                 logger.debug("musicbrainz throttled, backing off %ss", delay)
+            if attempt < self._max_attempts - 1:
                 self._sleep(delay)
                 delay *= 2
+
+        if last_error is not None:
+            message = f"MusicBrainz transport failure after {self._max_attempts} attempt(s)"
+            raise MusicBrainzError(message) from last_error
         return response
 
     def _pace(self) -> None:

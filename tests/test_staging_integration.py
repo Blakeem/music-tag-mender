@@ -12,6 +12,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import pytest
+from mutagen.flac import FLAC
 
 from conftest import make_track
 from tagmend.engine import artists, commits, staging, store, versioning
@@ -888,3 +889,36 @@ def test_diff_does_not_flag_when_the_coupled_field_is_empty(
     )
 
     assert staging.diff_tags(engine_settings)[0].stale_identity == []
+
+
+@pytest.mark.parametrize("lookalike", ["BAND", "ALBUM ARTIST"])
+def test_albumartist_lookalike_survives_commit_and_revert(
+    engine_settings: Settings,
+    music_dir: Path,
+    lookalike: str,
+) -> None:
+    # A blank look-alike beside a real ALBUMARTIST is a live-library shape. An artist-only change
+    # and its revert must leave both raw fields exactly as found.
+    track = make_track(music_dir / "track.flac")
+    raw = FLAC(track)
+    raw[lookalike] = [""]
+    raw["ALBUMARTIST"] = ["Smashing Pumpkins"]
+    raw["ARTIST"] = ["Smashing Pumpkins"]
+    raw.save()
+    scan_library(engine_settings)
+    file_id = _file_id(engine_settings, music_dir, track.name)
+
+    staging.stage_tags(
+        engine_settings, file_id=file_id, managed_tags={"artist": ["The Smashing Pumpkins"]}
+    )
+    assert staging.commit_tags(engine_settings).committed == 1
+    committed = FLAC(track)
+    assert committed["ARTIST"] == ["The Smashing Pumpkins"]
+    assert committed["ALBUMARTIST"] == ["Smashing Pumpkins"]
+    assert committed[lookalike] == [""]
+
+    versioning.revert(engine_settings, file_id, 0)
+    reverted = FLAC(track)
+    assert reverted["ALBUMARTIST"] == ["Smashing Pumpkins"]
+    assert reverted["ARTIST"] == ["Smashing Pumpkins"]
+    assert reverted[lookalike] == [""]

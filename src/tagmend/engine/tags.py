@@ -2,8 +2,8 @@
 
 Tags are read in mutagen's "easy" mode and normalized into a single canonical,
 lowercase namespace so the rest of the engine never has to care about format-specific
-key spellings (ID3 vs Vorbis vs MP4). A small alias map collapses a few well-known
-synonyms; everything else passes through lowercased unchanged.
+key spellings (ID3 vs Vorbis vs MP4). A Vorbis spelling map collapses the Picard names
+mutagen leaves raw. Everything else passes through lowercased unchanged.
 
 The write path (:func:`write_managed_tags`, M3) touches only the narrow
 :data:`MANAGED_TAGS` set and writes atomically (temp copy + ``os.replace``) so a
@@ -82,12 +82,6 @@ for _key, _atom in (
 ):
     EasyMP4Tags.RegisterFreeformKey(_key, _atom)  # type: ignore[no-untyped-call]
 
-# Raw (already-lowercased) key -> canonical key. Kept deliberately small.
-_ALIASES: Final[dict[str, str]] = {
-    "album artist": "albumartist",
-    "band": "albumartist",
-}
-
 # Canonical key -> the name Picard uses for the same concept in a Vorbis comment. mutagen has
 # no "easy" layer for Vorbis (``mutagen.File(path, easy=True)`` hands back a plain ``FLAC`` /
 # ``OggVorbis``), so unlike ID3 and MP4 these names are NOT normalized for us and every one
@@ -104,6 +98,8 @@ _VORBIS_SPELLINGS: Final[Mapping[str, str]] = {
 # write delete the other, with the baseline holding only the survivor — irreversible. The two
 # above have zero such overlap, so collapsing them is lossless. Until the label pair has a
 # decided rule, both names stay unmapped and unmanaged.
+# The same holds for ``BAND`` and ``ALBUM ARTIST`` against ``ALBUMARTIST``: library FLACs carry a
+# different value in each, and none carries either without ``ALBUMARTIST``.
 
 # Derived, never hand-written twice: a second literal could drift out of step with the map above.
 _VORBIS_TO_CANONICAL: Final[Mapping[str, str]] = {v: k for k, v in _VORBIS_SPELLINGS.items()}
@@ -196,9 +192,9 @@ MANAGED_SETS: Final[Mapping[int, frozenset[str]]] = {
 
 # Which reader produced a snapshot row, so an incremental scan can spot rows left behind by
 # an older one and re-read them exactly once. BUMP THIS IN THE SAME COMMIT as any change to
-# what :func:`read_tags` produces — the managed set, an alias, a format registration — or
+# what :func:`read_tags` produces (the managed set, a Vorbis spelling, a format registration), or
 # every already-scanned file keeps serving the old reader's output to every detector.
-TAG_READER_VERSION: Final = 4
+TAG_READER_VERSION: Final = 5
 
 
 @dataclass(frozen=True, slots=True)
@@ -216,14 +212,6 @@ def _vorbis_field(key: str) -> str:
     rather than correctness: it keeps one file from carrying a mix of cases.
     """
     return _VORBIS_SPELLINGS.get(key, key).upper()
-
-
-def _canonical_key(lowered_key: str) -> str:
-    """Resolve an already-lowercased raw key through the Vorbis and alias maps."""
-    canonical = _VORBIS_TO_CANONICAL.get(lowered_key)
-    if canonical is not None:
-        return canonical
-    return _ALIASES.get(lowered_key, lowered_key)
 
 
 def read_tags(path: Path) -> TrackTags:
@@ -245,7 +233,7 @@ def read_tags(path: Path) -> TrackTags:
     from_vorbis_spelling: set[str] = set()
     for raw_key, raw_values in audio.tags.items():
         lowered = str(raw_key).lower()
-        key = _canonical_key(lowered)
+        key = _VORBIS_TO_CANONICAL.get(lowered, lowered)
         native = lowered in _VORBIS_TO_CANONICAL
         if key in from_vorbis_spelling and not native:
             continue
@@ -287,7 +275,8 @@ def write_managed_tags(path: Path, managed: dict[str, list[str]]) -> None:
             message = f"mutagen could not identify {path} for writing"
             raise ValueError(message)
         vorbis = isinstance(audio.tags, VCommentDict)
-        for key in MANAGED_TAGS:
+        # Sorted because a Vorbis assignment appends the field, so set order would shuffle them.
+        for key in sorted(MANAGED_TAGS):
             written = _vorbis_field(key) if vorbis else key
             values = managed.get(key)
             if values:

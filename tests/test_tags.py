@@ -201,24 +201,85 @@ def test_vorbis_separate_tracknumber_and_total_reads_number_only(tmp_path: Path)
     assert tags["tracktotal"] == ["12"]  # unmanaged total preserved
 
 
-def test_alias_band_maps_to_albumartist(tmp_path: Path) -> None:
-    track = make_track(tmp_path / "band.flac")
-    audio = FLAC(track)
-    audio["band"] = ["The Band"]  # raw vorbis comment, not the canonical key
-    audio.save()
-
-    tags = read_tags(track).tags
-    assert tags["albumartist"] == ["The Band"]
-
-
-def test_alias_album_artist_maps_to_albumartist(tmp_path: Path) -> None:
+@pytest.mark.parametrize("raw_key", ["band", "album artist"])
+def test_albumartist_lookalikes_pass_through_unmapped(tmp_path: Path, raw_key: str) -> None:
+    # Library FLACs hold a different value here than in ALBUMARTIST, so the pair is never merged.
     track = make_track(tmp_path / "aa.flac")
     audio = FLAC(track)
-    audio["album artist"] = ["The AA"]  # raw vorbis comment with a space
+    audio[raw_key] = ["Other"]
+    audio["albumartist"] = ["Real"]
     audio.save()
 
     tags = read_tags(track).tags
-    assert tags["albumartist"] == ["The AA"]
+    assert tags["albumartist"] == ["Real"]
+    assert tags[raw_key] == ["Other"]
+
+
+class _StubTags:
+    """A tag container whose ``items()`` order the test controls (Vorbis order is hash order)."""
+
+    def __init__(self, pairs: list[tuple[str, list[str]]]) -> None:
+        self._pairs = pairs
+
+    def items(self) -> list[tuple[str, list[str]]]:
+        return list(self._pairs)
+
+
+class _StubAudio:
+    def __init__(self, pairs: list[tuple[str, list[str]]]) -> None:
+        self.tags = _StubTags(pairs)
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+@pytest.mark.parametrize(
+    ("pairs", "want"),
+    [
+        # A look-alike never competes with the canonical key, whichever comes first.
+        ([("ALBUMARTIST", ["Real"]), ("BAND", [""])], ("albumartist", ["Real"])),
+        (
+            [("ALBUMARTIST", ["Tattooed Corpse"]), ("ALBUM ARTIST", ["Various"])],
+            ("albumartist", ["Tattooed Corpse"]),
+        ),
+        # The native Vorbis spelling beats the canonical name.
+        (
+            [("RELEASETYPE", ["album"]), ("MUSICBRAINZ_ALBUMTYPE", ["single"])],
+            ("musicbrainz_albumtype", ["album"]),
+        ),
+    ],
+)
+def test_read_ignores_iteration_order(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    pairs: list[tuple[str, list[str]]],
+    want: tuple[str, list[str]],
+    *,
+    reverse: bool,
+) -> None:
+    ordered = list(reversed(pairs)) if reverse else pairs
+    monkeypatch.setattr(mutagen, "File", lambda *_a, **_k: _StubAudio(ordered))
+
+    key, expected = want
+    assert read_tags(tmp_path / "any.flac").tags[key] == expected
+
+
+def test_write_keeps_albumartist_beside_a_blank_band(tmp_path: Path) -> None:
+    # BAND='' beside a real ALBUMARTIST is a live-library shape. A write that changes only ARTIST
+    # must leave both raw fields exactly as they were.
+    track = make_track(tmp_path / "band.flac")
+    audio = FLAC(track)
+    audio["BAND"] = [""]
+    audio["ALBUMARTIST"] = ["Smashing Pumpkins"]
+    audio.save()
+
+    target = read_tags(track).tags
+    target = {k: v for k, v in target.items() if k in MANAGED_TAGS}
+    target["artist"] = ["The Smashing Pumpkins"]
+    write_managed_tags(track, target)
+
+    raw = FLAC(track)
+    assert raw["ALBUMARTIST"] == ["Smashing Pumpkins"]
+    assert raw["BAND"] == [""]
+    assert raw["ARTIST"] == ["The Smashing Pumpkins"]
 
 
 def test_corrupt_mp3_raises_mutagen_error(tmp_path: Path) -> None:
@@ -452,4 +513,4 @@ def test_managed_set_version_3_registered() -> None:
     # Older stamps must stay frozen: stored revisions point at them.
     assert MANAGED_SETS[1] == ORIGINAL_MANAGED_TAGS
     assert len(MANAGED_SETS[2]) == 18
-    assert TAG_READER_VERSION == 4
+    assert TAG_READER_VERSION == 5

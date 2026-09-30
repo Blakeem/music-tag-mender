@@ -117,7 +117,7 @@ def test_commit_applies_and_records(
     scan_library(engine_settings)
     file_id = _file_id(engine_settings, music_dir, track.name)
 
-    staging.stage_tags(engine_settings, file_id=file_id, managed_tags={"genre": ["Synthwave"]})
+    staging.stage_tags(engine_settings, file_id=file_id, tags={"genre": ["Synthwave"]})
     assert len(staging.diff_tags(engine_settings)) == 1
 
     result = staging.commit_tags(engine_settings, message="reclassify")
@@ -151,7 +151,7 @@ def test_commit_noop_when_target_equals_current(
     scan_library(engine_settings)
     file_id = _file_id(engine_settings, music_dir, track.name)
 
-    staging.stage_tags(engine_settings, file_id=file_id, managed_tags={"genre": ["Electronic"]})
+    staging.stage_tags(engine_settings, file_id=file_id, tags={"genre": ["Electronic"]})
     before_bytes = track.read_bytes()
     before_mtime = track.stat().st_mtime_ns
     result = staging.commit_tags(engine_settings)
@@ -175,7 +175,7 @@ def test_commit_missing_file_is_flagged_and_dropped(
     scan_library(engine_settings)
     file_id = _file_id(engine_settings, music_dir, track.name)
 
-    staging.stage_tags(engine_settings, file_id=file_id, managed_tags={"genre": ["Synthwave"]})
+    staging.stage_tags(engine_settings, file_id=file_id, tags={"genre": ["Synthwave"]})
     track.unlink()  # disappears after staging, before commit
 
     result = staging.commit_tags(engine_settings)
@@ -201,8 +201,8 @@ def test_commit_groups_multiple_files_under_one_commit_id(
     a_id = _file_id(engine_settings, music_dir, a.name)
     b_id = _file_id(engine_settings, music_dir, b.name)
 
-    staging.stage_tags(engine_settings, file_id=a_id, managed_tags={"genre": ["Synthwave"]})
-    staging.stage_tags(engine_settings, file_id=b_id, managed_tags={"genre": ["Metal"]})
+    staging.stage_tags(engine_settings, file_id=a_id, tags={"genre": ["Synthwave"]})
+    staging.stage_tags(engine_settings, file_id=b_id, tags={"genre": ["Metal"]})
 
     result = staging.commit_tags(engine_settings)
 
@@ -223,7 +223,7 @@ def test_commit_refreshes_signature_so_next_scan_is_unchanged(
     scan_library(engine_settings)
     file_id = _file_id(engine_settings, music_dir, track.name)
 
-    staging.stage_tags(engine_settings, file_id=file_id, managed_tags={"genre": ["Synthwave"]})
+    staging.stage_tags(engine_settings, file_id=file_id, tags={"genre": ["Synthwave"]})
     staging.commit_tags(engine_settings)
 
     result = scan_library(engine_settings)
@@ -245,7 +245,7 @@ def test_revert_refreshes_signature_so_next_scan_is_unchanged(
     scan_library(engine_settings)
     file_id = _file_id(engine_settings, music_dir, track.name)
 
-    staging.stage_tags(engine_settings, file_id=file_id, managed_tags={"genre": ["Synthwave"]})
+    staging.stage_tags(engine_settings, file_id=file_id, tags={"genre": ["Synthwave"]})
     staging.commit_tags(engine_settings)
     versioning.revert(engine_settings, file_id, 0)
 
@@ -274,7 +274,7 @@ def test_baseline_captured_at_stage_survives_rescan(
     file_id = _file_id(engine_settings, music_dir, track.name)
 
     # Stage -> v0 = Electronic captured now.
-    staging.stage_tags(engine_settings, file_id=file_id, managed_tags={"genre": ["Synthwave"]})
+    staging.stage_tags(engine_settings, file_id=file_id, tags={"genre": ["Synthwave"]})
 
     # Simulate an interrupted commit: disk advances to the target, but nothing is
     # committed. A FULL rescan then advances the live snapshot to the half-written state.
@@ -282,7 +282,7 @@ def test_baseline_captured_at_stage_survives_rescan(
     scan_library(engine_settings, mode=ScanMode.FULL)
 
     # Re-stage a different target; v0 already exists so no new baseline is captured.
-    staging.stage_tags(engine_settings, file_id=file_id, managed_tags={"genre": ["Darksynth"]})
+    staging.stage_tags(engine_settings, file_id=file_id, tags={"genre": ["Darksynth"]})
 
     staging.commit_tags(engine_settings)
 
@@ -300,7 +300,7 @@ def test_commit_continues_past_an_unwritable_file(
     scan_library(engine_settings)
     file_ids = [_file_id(engine_settings, music_dir, track.name) for track in tracks]
     for file_id in file_ids:
-        staging.stage_tags(engine_settings, file_id=file_id, managed_tags={"genre": ["Jazz"]})
+        staging.stage_tags(engine_settings, file_id=file_id, tags={"genre": ["Jazz"]})
     locked = tracks[1]
     real_write = write_managed_tags
 
@@ -372,7 +372,7 @@ def test_commit_refuses_a_file_edited_after_staging(
     track = make_track(music_dir / "t.mp3", {"genre": ["Rock"], "title": ["Song"]})
     scan_library(engine_settings)
     file_id = _file_id(engine_settings, music_dir, track.name)
-    staging.stage_tags(engine_settings, file_id=file_id, managed_tags={"genre": ["Jazz"]})
+    staging.stage_tags(engine_settings, file_id=file_id, tags={"genre": ["Jazz"]})
     edited_title = "Song (Picard Edit With A Much Longer Title)"
     _edit_on_disk(track, "title", edited_title)
 
@@ -388,7 +388,7 @@ def test_commit_refuses_a_file_edited_after_staging(
     assert on_disk["genre"] == ["Rock"]
     assert _staged(engine_settings, file_id) is not None
 
-    staging.stage_tags(engine_settings, file_id=file_id, managed_tags={"genre": ["Jazz"]})
+    staging.stage_tags(engine_settings, file_id=file_id, tags={"genre": ["Jazz"]})
     retry = staging.commit_tags(engine_settings)
 
     assert retry.committed == 1
@@ -404,7 +404,7 @@ def test_commit_completes_a_write_that_landed_before_a_crash(
     track = make_track(music_dir / "t.flac", {"genre": ["Rock"]})
     scan_library(engine_settings)
     file_id = _file_id(engine_settings, music_dir, track.name)
-    staging.stage_tags(engine_settings, file_id=file_id, managed_tags={"genre": ["Jazz"]})
+    staging.stage_tags(engine_settings, file_id=file_id, tags={"genre": ["Jazz"]})
     staged = _staged(engine_settings, file_id)
     assert staged is not None
     # The crash window: the disk write landed and the DB commit did not.
@@ -467,8 +467,8 @@ def test_split_batch_recovery_under_new_commit(
     a_id = _file_id(engine_settings, music_dir, a.name)
     b_id = _file_id(engine_settings, music_dir, b.name)
 
-    staging.stage_tags(engine_settings, file_id=a_id, managed_tags={"genre": ["Synthwave"]})
-    staging.stage_tags(engine_settings, file_id=b_id, managed_tags={"genre": ["Metal"]})
+    staging.stage_tags(engine_settings, file_id=a_id, tags={"genre": ["Synthwave"]})
+    staging.stage_tags(engine_settings, file_id=b_id, tags={"genre": ["Metal"]})
 
     # Simulate a crash: A is committed under C0 (still 'applying'); B stays staged.
     conn = connect(engine_settings.db_path)
@@ -514,16 +514,37 @@ def test_commit_root_scope_limits_to_subtree(
     rock_id = _file_id(engine_settings, music_dir / "rock", rock.name)
     jazz_id = _file_id(engine_settings, music_dir / "jazz", jazz.name)
 
-    staging.stage_tags(engine_settings, file_id=rock_id, managed_tags={"genre": ["Synthwave"]})
-    staging.stage_tags(engine_settings, file_id=jazz_id, managed_tags={"genre": ["Metal"]})
+    staging.stage_tags(engine_settings, file_id=rock_id, tags={"genre": ["Synthwave"]})
+    staging.stage_tags(engine_settings, file_id=jazz_id, tags={"genre": ["Metal"]})
 
-    result = staging.commit_tags(engine_settings, root=music_dir / "rock")
+    result = staging.commit_tags(engine_settings, path=music_dir / "rock")
 
     assert result.committed == 1
     assert read_tags(rock).tags["genre"] == ["Synthwave"]  # in scope, committed
     assert _staged(engine_settings, rock_id) is None
     assert _staged(engine_settings, jazz_id) is not None  # out of scope, still staged
     assert read_tags(jazz).tags["genre"] == ["Rock"]  # untouched on disk
+
+
+def test_commit_path_scope_includes_nested_folders(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    # The detector workflows expand one exact folder, yet a folder-scoped commit also sweeps
+    # every nested folder. The MCP docs state this rule, and this pins it.
+    album = make_track(music_dir / "album" / "a.mp3", {"genre": ["Rock"]})
+    disc_two = make_track(music_dir / "album" / "CD2" / "b.mp3", {"genre": ["Rock"]})
+    scan_library(engine_settings)
+    album_id = _file_id(engine_settings, music_dir / "album", album.name)
+    disc_two_id = _file_id(engine_settings, music_dir / "album" / "CD2", disc_two.name)
+    staging.stage_tags(engine_settings, file_id=album_id, tags={"genre": ["Metal"]})
+    staging.stage_tags(engine_settings, file_id=disc_two_id, tags={"genre": ["Metal"]})
+
+    result = staging.commit_tags(engine_settings, path=music_dir / "album")
+
+    assert result.committed == 2
+    assert _staged(engine_settings, album_id) is None
+    assert _staged(engine_settings, disc_two_id) is None
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="NTFS is case-insensitive")
@@ -533,12 +554,12 @@ def test_commit_path_scope_ignores_case(engine_settings: Settings, music_dir: Pa
     scan_library(engine_settings)
     rock_id = _file_id(engine_settings, music_dir / "Rock", rock.name)
     jazz_id = _file_id(engine_settings, music_dir / "Jazz", jazz.name)
-    staging.stage_tags(engine_settings, file_id=rock_id, managed_tags={"genre": ["Synthwave"]})
-    staging.stage_tags(engine_settings, file_id=jazz_id, managed_tags={"genre": ["Metal"]})
+    staging.stage_tags(engine_settings, file_id=rock_id, tags={"genre": ["Synthwave"]})
+    staging.stage_tags(engine_settings, file_id=jazz_id, tags={"genre": ["Metal"]})
     shouted = Path(str(music_dir / "Rock").upper())
 
-    diffs = staging.diff_tags(engine_settings, root=shouted)
-    result = staging.commit_tags(engine_settings, root=shouted)
+    diffs = staging.diff_tags(engine_settings, path=shouted)
+    result = staging.commit_tags(engine_settings, path=shouted)
 
     assert [d.file_id for d in diffs] == [rock_id]
     assert result.committed == 1
@@ -557,7 +578,7 @@ def test_stage_strips_and_nfc_normalises_values(
     staging.stage_tags(
         engine_settings,
         file_id=file_id,
-        managed_tags={"album": ["  ", "Cafe\u0301 "]},
+        tags={"album": ["  ", "Cafe\u0301 "]},
     )
     staging.commit_tags(engine_settings)
 
@@ -572,7 +593,7 @@ def test_stage_rejects_control_characters(engine_settings: Settings, music_dir: 
     bad_id = _file_id(engine_settings, music_dir, bad.name)
 
     with pytest.raises(ValueError, match="contains a NUL, CR or LF"):
-        staging.stage_tags(engine_settings, file_id=bad_id, managed_tags={"title": ["a\nb"]})
+        staging.stage_tags(engine_settings, file_id=bad_id, tags={"title": ["a\nb"]})
     with pytest.raises(ValueError, match="contains a NUL, CR or LF"):
         staging.stage_tags_batch(
             engine_settings,
@@ -596,7 +617,7 @@ def test_stage_refuses_a_container_the_writer_cannot_verify(
     wav_id = _file_id(engine_settings, music_dir, wav.name)
 
     with pytest.raises(ValueError, match="no layout for the WAVE container"):
-        staging.stage_tags(engine_settings, file_id=wav_id, managed_tags={"title": ["Clip"]})
+        staging.stage_tags(engine_settings, file_id=wav_id, tags={"title": ["Clip"]})
 
     assert _staged(engine_settings, wav_id) is None
 
@@ -610,7 +631,7 @@ def test_stage_refuses_a_file_whose_audio_payload_cannot_be_located(
     monkeypatch.setattr(tags, "_audio_ranges", lambda *_args: None)
 
     with pytest.raises(ValueError, match="audio payload could not be located"):
-        staging.stage_tags(engine_settings, file_id=file_id, managed_tags={"title": ["Found"]})
+        staging.stage_tags(engine_settings, file_id=file_id, tags={"title": ["Found"]})
 
     assert _staged(engine_settings, file_id) is None
 
@@ -623,8 +644,8 @@ def test_diff_tags_enrichment(engine_settings: Settings, music_dir: Path) -> Non
     changed_id = _file_id(engine_settings, music_dir, changed.name)
     noop_id = _file_id(engine_settings, music_dir, noop.name)
 
-    staging.stage_tags(engine_settings, file_id=changed_id, managed_tags={"genre": ["Synthwave"]})
-    staging.stage_tags(engine_settings, file_id=noop_id, managed_tags={"genre": ["Rock"]})
+    staging.stage_tags(engine_settings, file_id=changed_id, tags={"genre": ["Synthwave"]})
+    staging.stage_tags(engine_settings, file_id=noop_id, tags={"genre": ["Rock"]})
 
     views = {v.file_id: v for v in staging.diff_tags(engine_settings)}
     assert set(views) == {changed_id, noop_id}
@@ -646,12 +667,12 @@ def test_stage_tags_rejects_unmanaged_key(engine_settings: Settings, music_dir: 
     file_id = _file_id(engine_settings, music_dir, track.name)
 
     with pytest.raises(ValueError, match="non-managed"):
-        staging.stage_tags(engine_settings, file_id=file_id, managed_tags={"composer": ["Nope"]})
+        staging.stage_tags(engine_settings, file_id=file_id, tags={"composer": ["Nope"]})
 
 
 def test_stage_tags_rejects_unknown_file_id(engine_settings: Settings) -> None:
     with pytest.raises(ValueError, match="unknown file_id"):
-        staging.stage_tags(engine_settings, file_id=999, managed_tags={"genre": ["X"]})
+        staging.stage_tags(engine_settings, file_id=999, tags={"genre": ["X"]})
 
 
 def test_stage_tags_rejects_bad_origin(engine_settings: Settings, music_dir: Path) -> None:
@@ -661,9 +682,7 @@ def test_stage_tags_rejects_bad_origin(engine_settings: Settings, music_dir: Pat
     file_id = _file_id(engine_settings, music_dir, track.name)
 
     with pytest.raises(ValueError, match="invalid staged origin"):
-        staging.stage_tags(
-            engine_settings, file_id=file_id, managed_tags={"genre": ["X"]}, origin="bogus"
-        )
+        staging.stage_tags(engine_settings, file_id=file_id, tags={"genre": ["X"]}, origin="bogus")
 
 
 # The full wrong-release "stamp" the mismatch-fix flow repairs, rich in the widened fields.
@@ -702,8 +721,8 @@ def test_widened_fields_ride_through_commit_and_revert(
 
     current = versioning.managed_subset(read_tags(track).tags)
     target = {**current, "genre": ["Synthwave"]}
-    staging.stage_tags(engine_settings, file_id=file_id, managed_tags=target, origin="auto")
-    result = staging.commit_tags(engine_settings, origin="auto")
+    staging.stage_tags(engine_settings, file_id=file_id, tags=target, origin="auto")
+    result = staging.commit_tags(engine_settings)
     assert result.committed == 1
 
     # Every widened field survived the commit un-deleted; only genre changed on disk.
@@ -739,7 +758,7 @@ def test_partial_stage_preserves_other_managed_fields(
     scan_library(engine_settings)
     file_id = _file_id(engine_settings, music_dir, track.name)
 
-    staging.stage_tags(engine_settings, file_id=file_id, managed_tags={"genre": ["Synthwave"]})
+    staging.stage_tags(engine_settings, file_id=file_id, tags={"genre": ["Synthwave"]})
 
     # The merged target carries the whole subset; the diff still touches only genre.
     view = next(v for v in staging.diff_tags(engine_settings) if v.file_id == file_id)
@@ -764,7 +783,7 @@ def test_explicit_empty_list_still_deletes_a_managed_field(
     scan_library(engine_settings)
     file_id = _file_id(engine_settings, music_dir, track.name)
 
-    staging.stage_tags(engine_settings, file_id=file_id, managed_tags={"album": []})
+    staging.stage_tags(engine_settings, file_id=file_id, tags={"album": []})
     staging.commit_tags(engine_settings)
 
     on_disk = read_tags(track).tags
@@ -791,7 +810,7 @@ def test_explicit_empty_date_deletes_a_v23_iso_tyer(
     file_id = _file_id(engine_settings, music_dir, track.name)
     assert _stored_tags(engine_settings, file_id)["date"] == ["2013-10-04"]
 
-    staging.stage_tags(engine_settings, file_id=file_id, managed_tags={"date": []})
+    staging.stage_tags(engine_settings, file_id=file_id, tags={"date": []})
     result = staging.commit_tags(engine_settings)
 
     assert (result.committed, result.errors) == (1, 0)
@@ -820,7 +839,7 @@ def test_stage_tags_batch_stages_all_and_commits_as_one(
     assert _staged(engine_settings, a_id) is not None
     assert _staged(engine_settings, b_id) is not None
 
-    result = staging.commit_tags(engine_settings, root=music_dir)
+    result = staging.commit_tags(engine_settings, path=music_dir)
     assert result.committed == 2
     # Both files landed under ONE commit; the merge preserved each file's title.
     assert _revisions(engine_settings, a_id)[-1].commit_id == result.commit_id
@@ -896,10 +915,10 @@ def _auto_genre_year(
     staging.stage_tags(
         engine_settings,
         file_id=file_id,
-        managed_tags={"genre": [genre], "originaldate": [year]},
+        tags={"genre": [genre], "originaldate": [year]},
         origin="auto",
     )
-    staging.commit_tags(engine_settings, origin="auto")
+    staging.commit_tags(engine_settings)
 
 
 def _derived(engine_settings: Settings, file_id: int) -> tuple[str, str]:
@@ -925,7 +944,7 @@ def test_reopen_axes_flips_done_to_pending_and_stays_reopen_safe(
     assert _derived(engine_settings, file_id) == ("done", "done")
 
     # A manual identity fix, committed as its own commit.
-    staging.stage_tags(engine_settings, file_id=file_id, managed_tags={"albumartist": ["Ozzy"]})
+    staging.stage_tags(engine_settings, file_id=file_id, tags={"albumartist": ["Ozzy"]})
     fix = staging.commit_tags(engine_settings)
     assert fix.commit_id is not None
 
@@ -947,7 +966,7 @@ def test_reopen_axes_clears_artist_status(
     file_id = _file_id(engine_settings, music_dir, track.name)
 
     artists.set_artist_status(engine_settings, file_ids=[file_id], status="manual")
-    staging.stage_tags(engine_settings, file_id=file_id, managed_tags={"albumartist": ["Ozzy"]})
+    staging.stage_tags(engine_settings, file_id=file_id, tags={"albumartist": ["Ozzy"]})
     fix = staging.commit_tags(engine_settings)
     assert fix.commit_id is not None
 
@@ -971,35 +990,107 @@ def test_reopen_axes_rejects_auto_and_unknown_commit(
     staging.stage_tags(
         engine_settings,
         file_id=file_id,
-        managed_tags={"genre": ["Rock"]},
+        tags={"genre": ["Rock"]},
         origin="auto",
     )
-    auto = staging.commit_tags(engine_settings, origin="auto")
+    auto = staging.commit_tags(engine_settings)
     assert auto.commit_id is not None
 
-    with pytest.raises(ValueError, match="auto commit"):
+    with pytest.raises(ValueError, match="auto-resolved"):
         staging.reopen_axes(engine_settings, commit_id=auto.commit_id)
     with pytest.raises(ValueError, match="unknown commit_id"):
         staging.reopen_axes(engine_settings, commit_id=9999)
 
 
-def test_reopen_axes_ignores_noop_files(
+def _stage_mixed_sweep(engine_settings: Settings, music_dir: Path) -> None:
+    """Stage one auto change and one manual change on two fresh files."""
+    auto_track = make_track(music_dir / "auto.mp3", {"genre": ["Pop"]})
+    manual_track = make_track(music_dir / "manual.mp3", {"genre": ["Pop"]})
+    scan_library(engine_settings)
+    auto_id = _file_id(engine_settings, music_dir, auto_track.name)
+    manual_id = _file_id(engine_settings, music_dir, manual_track.name)
+    staging.stage_tags(
+        engine_settings,
+        file_id=auto_id,
+        tags={"genre": ["Rock"]},
+        origin="auto",
+    )
+    staging.stage_tags(engine_settings, file_id=manual_id, tags={"genre": ["Jazz"]})
+
+
+def _commit_origin(engine_settings: Settings, commit_id: int) -> str:
+    conn = connect(engine_settings.db_path)
+    try:
+        commit = commits.get_commit(conn, commit_id)
+        assert commit is not None
+        return commit.origin
+    finally:
+        conn.close()
+
+
+def test_commit_origin_is_auto_when_every_staged_row_is_auto(
     engine_settings: Settings,
     music_dir: Path,
 ) -> None:
-    # A no-op commit (target == current) leaves no revision row, so reopen touches nobody.
+    first = make_track(music_dir / "a.mp3", {"genre": ["Pop"]})
+    second = make_track(music_dir / "b.mp3", {"genre": ["Pop"]})
+    scan_library(engine_settings)
+    for track in (first, second):
+        staging.stage_tags(
+            engine_settings,
+            file_id=_file_id(engine_settings, music_dir, track.name),
+            tags={"genre": ["Rock"]},
+            origin="auto",
+        )
+
+    result = staging.commit_tags(engine_settings)
+
+    assert result.commit_id is not None
+    assert _commit_origin(engine_settings, result.commit_id) == "auto"
+
+
+def test_commit_origin_is_manual_for_a_mixed_sweep(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    _stage_mixed_sweep(engine_settings, music_dir)
+
+    result = staging.commit_tags(engine_settings)
+
+    assert result.commit_id is not None
+    assert result.committed == 2
+    assert _commit_origin(engine_settings, result.commit_id) == "manual"
+
+
+def test_reopen_axes_refuses_a_manual_commit_holding_an_auto_revision(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    _stage_mixed_sweep(engine_settings, music_dir)
+    mixed = staging.commit_tags(engine_settings)
+    assert mixed.commit_id is not None
+
+    with pytest.raises(ValueError, match="auto-resolved"):
+        staging.reopen_axes(engine_settings, commit_id=mixed.commit_id)
+
+
+def test_reopen_axes_refuses_a_commit_with_no_tag_revisions(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    # A no-op commit (target == current) leaves no revision row, so there is nothing to reopen.
     track = make_track(music_dir / "t.mp3", {"genre": ["Rock"]})
     scan_library(engine_settings)
     file_id = _file_id(engine_settings, music_dir, track.name)
     _auto_genre_year(engine_settings, file_id)  # genre done at Metal
 
-    staging.stage_tags(engine_settings, file_id=file_id, managed_tags={"genre": ["Metal"]})
+    staging.stage_tags(engine_settings, file_id=file_id, tags={"genre": ["Metal"]})
     noop = staging.commit_tags(engine_settings)
     assert noop.commit_id is not None
     assert noop.noop == 1
 
-    reopen = staging.reopen_axes(engine_settings, commit_id=noop.commit_id)
-    assert reopen.files == 0  # the noop file has no revision in this commit
+    with pytest.raises(ValueError, match="changed no tags"):
+        staging.reopen_axes(engine_settings, commit_id=noop.commit_id)
     # Genre stays done because nothing was voided.
     assert _derived(engine_settings, file_id) == ("done", "done")
 
@@ -1036,7 +1127,7 @@ def test_stale_snapshot_does_not_delete_a_managed_tag_from_disk(
     staging.stage_tags(
         engine_settings,
         file_id=file_id,
-        managed_tags={"genre": ["Industrial"]},
+        tags={"genre": ["Industrial"]},
         origin="manual",
     )
     staging.commit_tags(engine_settings, message="unrelated field")
@@ -1068,7 +1159,7 @@ def test_stage_rejects_a_file_that_vanished_from_disk(
         staging.stage_tags(
             engine_settings,
             file_id=file_id,
-            managed_tags={"genre": ["Rock"]},
+            tags={"genre": ["Rock"]},
             origin="manual",
         )
 
@@ -1101,7 +1192,7 @@ def test_diff_reads_current_from_disk_not_the_stale_snapshot(
     staging.stage_tags(
         engine_settings,
         file_id=file_id,
-        managed_tags={"genre": ["Industrial"]},
+        tags={"genre": ["Industrial"]},
         origin="manual",
     )
 
@@ -1128,7 +1219,7 @@ def test_diff_flags_a_name_changed_without_its_id(
     staging.stage_tags(
         engine_settings,
         file_id=file_id,
-        managed_tags={"artist": ["Alice in Chains"]},
+        tags={"artist": ["Alice in Chains"]},
         origin="manual",
     )
 
@@ -1136,6 +1227,62 @@ def test_diff_flags_a_name_changed_without_its_id(
     assert view.stale_identity == [
         {"changed": "artist", "stale_field": "musicbrainz_artistid", "stale_value": ["lp-id"]},
     ]
+
+
+def test_diff_flags_a_name_changed_without_its_sort_name(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    make_track(
+        music_dir / "t.mp3",
+        {"artist": ["The Doors"], "artistsort": ["Doors, The"]},
+    )
+    scan_library(engine_settings)
+    file_id = _file_id(engine_settings, music_dir, "t.mp3")
+
+    staging.stage_tags(engine_settings, file_id=file_id, tags={"artist": ["Skrillex"]})
+
+    view = staging.diff_tags(engine_settings)[0]
+    assert view.stale_identity == [
+        {"changed": "artist", "stale_field": "artistsort", "stale_value": ["Doors, The"]},
+    ]
+
+
+def test_diff_does_not_flag_a_sort_only_change(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    make_track(
+        music_dir / "t.mp3",
+        {"artist": ["The Doors"], "artistsort": ["The Doors"]},
+    )
+    scan_library(engine_settings)
+    file_id = _file_id(engine_settings, music_dir, "t.mp3")
+
+    staging.stage_tags(
+        engine_settings,
+        file_id=file_id,
+        tags={"artistsort": ["Doors, The"]},
+    )
+
+    assert staging.diff_tags(engine_settings)[0].stale_identity == []
+
+
+def test_diff_flags_the_release_stamp_an_album_change_leaves_behind(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    make_track(
+        music_dir / "t.mp3",
+        {"album": ["Greatest Hits"], "releasecountry": ["RU"], "media": ["CD"]},
+    )
+    scan_library(engine_settings)
+    file_id = _file_id(engine_settings, music_dir, "t.mp3")
+
+    staging.stage_tags(engine_settings, file_id=file_id, tags={"album": ["Dirt"]})
+
+    stale = staging.diff_tags(engine_settings)[0].stale_identity
+    assert {entry["stale_field"] for entry in stale} == {"releasecountry", "media"}
 
 
 def test_diff_does_not_flag_a_name_changed_with_its_id(
@@ -1152,7 +1299,7 @@ def test_diff_does_not_flag_a_name_changed_with_its_id(
     staging.stage_tags(
         engine_settings,
         file_id=file_id,
-        managed_tags={"artist": ["Alice in Chains"], "musicbrainz_artistid": ["aic-id"]},
+        tags={"artist": ["Alice in Chains"], "musicbrainz_artistid": ["aic-id"]},
         origin="manual",
     )
 
@@ -1171,7 +1318,7 @@ def test_diff_does_not_flag_when_the_coupled_field_is_empty(
     staging.stage_tags(
         engine_settings,
         file_id=file_id,
-        managed_tags={"artist": ["Alice in Chains"]},
+        tags={"artist": ["Alice in Chains"]},
         origin="manual",
     )
 
@@ -1195,9 +1342,7 @@ def test_albumartist_lookalike_survives_commit_and_revert(
     scan_library(engine_settings)
     file_id = _file_id(engine_settings, music_dir, track.name)
 
-    staging.stage_tags(
-        engine_settings, file_id=file_id, managed_tags={"artist": ["The Smashing Pumpkins"]}
-    )
+    staging.stage_tags(engine_settings, file_id=file_id, tags={"artist": ["The Smashing Pumpkins"]})
     assert staging.commit_tags(engine_settings).committed == 1
     committed = FLAC(track)
     assert committed["ARTIST"] == ["The Smashing Pumpkins"]

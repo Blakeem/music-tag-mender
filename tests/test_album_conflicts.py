@@ -660,6 +660,27 @@ def test_folder_wins_over_group() -> None:
     assert view.groups == []
 
 
+def test_grouped_view_respects_tier() -> None:
+    report = _classify(
+        [
+            _f(1, folder=r"C:\m\A\Album", release_id="r1"),
+            _f(2, folder=r"C:\m\A\Album", filename="b.mp3", release_id="r1"),
+            _f(3, folder=r"C:\m\A\Album", filename="c.mp3", release_id="r2"),
+            _f(11, folder=r"C:\m\B\Album"),
+            _f(12, folder=r"C:\m\B\Album", filename="b.mp3"),
+            _f(13, folder=r"C:\m\B\Album", filename="c.mp3", album="Album (disc 2: Extra)"),
+        ],
+    )
+
+    view = album_conflicts._narrow(report, tier="high", folder_key=None, limit=None, group=True)
+
+    assert [g.folder for g in view.groups] == [r"C:\m\A\Album"]
+    assert view.groups[0].flagged == 1
+    assert view.groups[0].file_ids == [3]
+    assert view.groups[0].tiers == {"high": 1}
+    assert (view.flagged, view.high, view.low) == (2, 1, 1)  # library counts unchanged
+
+
 def test_a_limit_caps_the_groups_in_the_grouped_view() -> None:
     view = album_conflicts._narrow(
         _three_folder_report(),

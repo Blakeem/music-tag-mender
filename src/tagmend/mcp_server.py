@@ -82,13 +82,14 @@ def check_health() -> dict[str, object]:
     """Verify TagMend is ready to use.
 
     Checks that settings load, the configured music folder is reachable and
-    readable, and the SQLite ledger opens. Returns an overall ``ok`` flag plus one
-    entry per check. Call this from the MCP Inspector to confirm the environment is
-    wired up correctly before building or running anything else.
+    readable, and the SQLite ledger opens. Returns ``{"ok": True, "ready", "checks"}`` with
+    one entry per check. ``ready`` is True only when every check passes. ``ok`` reports that
+    the request ran. Call this from the MCP Inspector to confirm the environment is wired up
+    correctly before building or running anything else.
     """
     settings = load_settings()
     report = health.check_health(settings)
-    return report.to_dict()
+    return {"ok": True, **report.to_dict()}
 
 
 @mcp.tool()
@@ -189,7 +190,7 @@ def stage_tags(
     staging.stage_tags(
         load_settings(),
         file_id=file_id,
-        managed_tags=tags,
+        tags=tags,
         note=note,
     )
     return {"ok": True}
@@ -239,6 +240,9 @@ def stage_tags_batch(
     deletes. Values are cleaned the same way. They are stripped and NFC-normalized, and a value
     holding a NUL, CR or LF rejects the whole batch. A subsequent
     ``commit_tags(path=<folder>)`` groups the batch into ONE revertible commit.
+    ``commit_tags(path=<folder>)`` and ``diff_tags(path=<folder>)`` cover that folder AND every
+    folder nested under it. Run ``diff_tags(path=<folder>)`` first and ``unstage_tags`` any
+    nested change you do not want in this commit.
 
     ``tracknumber``/``discnumber`` are staged verbatim. Supply the full ``"n/total"`` string
     (e.g. ``"3/12"``). This tool never parses or renumbers them.
@@ -261,8 +265,8 @@ def stage_tags_batch(
 def unstage_tags(file_id: int) -> dict[str, object]:
     """Remove a pending staged change for one file.
 
-    Returns ``{"ok": True, "removed": <bool>}`` — ``removed`` is ``False`` when the file
-    had nothing staged.
+    Returns ``{"ok": True, "removed": <bool>}``, where ``removed`` is ``False`` when the file
+    had nothing staged, or ``{"ok": False, "error": ...}`` if the file id is unknown.
     """
     removed = staging.unstage_tags(load_settings(), file_id=file_id)
     return {"ok": True, "removed": removed}
@@ -278,19 +282,22 @@ def diff_tags(path: str | None = None) -> dict[str, object]:
 
     ``stale_identity`` is the one thing to read before committing an identity fix. Staging
     merges onto the file's current tags, so a change that rewrites ``artist`` but omits
-    ``musicbrainz_artistid`` keeps the OLD artist's id — the file then names one artist and
+    ``musicbrainz_artistid`` keeps the OLD artist's id. The file then names one artist and
     points at another, and Picard or Navidrome will re-link it to the wrong one. Each entry is
     ``{changed, stale_field, stale_value}``: the coupled field this change leaves behind, and
-    the value it keeps. It is a REPORT, never a block — supply the matching id (or an empty
+    the value it keeps. It is a REPORT, never a block. Supply the matching id (or an empty
     list to clear it) and re-stage if the retained value is wrong. Coupled groups are
-    artist/albumartist and their MB ids, album with its album + release-group ids, and title
-    with its track + release-track ids.
+    artist/albumartist with their MB ids and sort names, album with its album + release-group
+    ids, title with its track + release-track ids, and album or its release id with the
+    release-stamp fields. A sort-name or release-stamp change alone flags nothing.
 
     Args:
         path: When given, only staged changes for files at this folder or nested under it
             are returned. Otherwise all staged changes are listed. Compared as a path: case
             and ``/`` versus backslash do not matter on Windows, and a relative folder resolves
-            under ``music_path``.
+            under ``music_path``. ``commit_tags(path=<folder>)`` and ``diff_tags(path=<folder>)``
+            cover that folder AND every folder nested under it. Run ``diff_tags(path=<folder>)``
+            first and ``unstage_tags`` any nested change you do not want in this commit.
 
     Returns:
         ``{"ok": True, "changes": [{file_id, folder, filename, is_missing, origin, note,
@@ -298,7 +305,7 @@ def diff_tags(path: str | None = None) -> dict[str, object]:
     """
     changes = staging.diff_tags(
         load_settings(),
-        root=Path(path) if path is not None else None,
+        path=Path(path) if path is not None else None,
     )
     return {"ok": True, "changes": [view.to_dict() for view in changes]}
 
@@ -309,8 +316,9 @@ def commit_tags(message: str | None = None, path: str | None = None) -> dict[str
     """Apply all staged tag changes to disk as one revertible commit.
 
     Writes each staged file's target tags to disk and appends an append-only revision
-    under a shared commit id, so the whole batch reverts as a unit. Files that vanished
-    from disk since staging are flagged missing, dropped, and reported under
+    under a shared commit id, so the whole batch reverts as a unit. The commit's ``origin`` is
+    ``auto`` only when every change it sweeps came from a resolver, and ``manual`` otherwise.
+    Files that vanished from disk since staging are flagged missing, dropped, and reported under
     ``missing_files``. Any commit left ``applying`` by a prior crash is marked interrupted
     first and its leftover staged rows are swept into this commit.
 
@@ -327,7 +335,10 @@ def commit_tags(message: str | None = None, path: str | None = None) -> dict[str
         path: When given, only staged changes for files at this folder or nested under it
             are committed. Otherwise all staged changes are committed. Compared as a path:
             case and ``/`` versus backslash do not matter on Windows, and a relative folder
-            resolves under ``music_path``.
+            resolves under ``music_path``. ``commit_tags(path=<folder>)`` and
+            ``diff_tags(path=<folder>)`` cover that folder AND every folder nested under it.
+            Run ``diff_tags(path=<folder>)`` first and ``unstage_tags`` any nested change you
+            do not want in this commit.
 
     Returns:
         ``{"ok": True, ...}`` with per-file ``outcomes`` (each ``{file_id, version, status,
@@ -337,7 +348,7 @@ def commit_tags(message: str | None = None, path: str | None = None) -> dict[str
     result = staging.commit_tags(
         load_settings(),
         message=message,
-        root=Path(path) if path is not None else None,
+        path=Path(path) if path is not None else None,
     )
     return {"ok": True, **result.to_dict()}
 
@@ -355,12 +366,14 @@ def reopen_axes(commit_id: int) -> dict[str, object]:
     re-pend them) and clears any ``file_artist_status`` row — without mutating history.
 
     Call it with a ``manual`` (or ``revert``) commit id from ``commit_tags`` / ``list_commits``.
-    An ``auto`` commit is refused (voiding fresh auto work is a foot-gun). A later fresh auto
-    commit reads ``done`` again.
+    A commit holding any auto-resolved revision is refused, whatever its own origin, because
+    voiding fresh auto work is a foot-gun. A commit that changed no tags is refused too. A later
+    fresh auto commit reads ``done`` again.
 
     Returns:
         ``{"ok": True, "commit_id": ..., "files": <count>, "artist_status_cleared": <count>}``,
-        or ``{"ok": False, "error": ...}`` if the commit id is unknown or is an ``auto`` commit.
+        or ``{"ok": False, "error": ...}`` if the commit id is unknown, holds an auto-resolved
+        revision, or changed no tags.
     """
     result = staging.reopen_axes(load_settings(), commit_id=commit_id)
     return {"ok": True, **result.to_dict()}
@@ -429,7 +442,7 @@ def list_files(  # noqa: PLR0913 - cohesive MCP discovery filters
     """
     views = library.list_files(
         load_settings(),
-        root=Path(path) if path is not None else None,
+        path=Path(path) if path is not None else None,
         limit=limit,
         genre_status=genre_status,
         artist_status=artist_status,
@@ -474,10 +487,13 @@ def detect_mismatches(
     Recommended workflow: start with ``group=true`` for a compact one-line-per-folder overview
     (cheap on a big library), then expand a single folder with ``folder="<exact folder path>"``
     to see its flagged rows, research the correct identity, and fix them with ``stage_tags_batch``
-    → ``commit_tags(path=<folder>)`` → ``reopen_axes``. Silence a false positive or defer a
-    misfiled file with ``set_mismatch_status`` — such files are dropped from the flagged rows and
-    reported under ``suppressed`` (a disposition-status → count map) so nothing is hidden
-    silently; the disposition goes stale (and the file re-surfaces) if its identity tag changes.
+    → ``commit_tags(path=<folder>)`` → ``reopen_axes``. ``commit_tags(path=<folder>)`` and
+    ``diff_tags(path=<folder>)`` cover that folder AND every folder nested under it. Run
+    ``diff_tags(path=<folder>)`` first and ``unstage_tags`` any nested change you do not want in
+    this commit. Silence a false positive or defer a misfiled file with ``set_mismatch_status``.
+    Such files are dropped from the flagged rows and reported under ``suppressed`` (a
+    disposition-status → count map), so nothing is hidden silently. The disposition goes stale
+    (and the file re-surfaces) if its identity tag changes.
 
     Each file is classified by ``albumartist``-vs-path bidirectional containment into a
     confidence tier: ``high`` (path disagreement in a folder with mixed albumartists),
@@ -504,6 +520,9 @@ def detect_mismatches(
 
     Args:
         tier: Return only rows/groups in this tier (``high`` | ``medium`` | ``low``). The
+            tier filters rows first, and the grouped view is built from the filtered rows, so a
+            group appears only when it holds a file of that tier and its ``flagged``,
+            ``file_ids`` and tier counts describe only those files. The
             ``high``/``medium``/``low``/``flagged``/``folder_context`` counts still describe
             the whole library, and context rows are never returned under a tier filter.
         limit: Cap the number of rows returned (or groups, with ``group=true``); counts
@@ -556,6 +575,9 @@ def detect_track_conflicts(
     single folder with ``folder="<exact folder path>"`` to see its rows, research the correct
     tracklist, and fix with ``stage_tags_batch`` -> ``diff_tags`` -> ``commit_tags(path=<folder>)``
     -> ``reopen_axes``. Read ``diff_tags``' ``stale_identity`` before committing.
+    ``commit_tags(path=<folder>)`` and ``diff_tags(path=<folder>)`` cover that folder AND every
+    folder nested under it. Run ``diff_tags(path=<folder>)`` first and ``unstage_tags`` any
+    nested change you do not want in this commit.
 
     Tiers, matching the shapes a real library contains:
 
@@ -655,9 +677,15 @@ def detect_disagreements(  # noqa: PLR0913 - one parameter per scope/view knob, 
     Recommended workflow: ``group=true`` for one line per folder, then ``path="<folder>"`` to
     expand one folder (nested disc folders included), then fix with ``stage_tags_batch`` ->
     ``diff_tags`` -> ``commit_tags(path=<folder>)`` -> ``reopen_axes``.
+    ``commit_tags(path=<folder>)`` and ``diff_tags(path=<folder>)`` cover that folder AND every
+    folder nested under it. Run ``diff_tags(path=<folder>)`` first and ``unstage_tags`` any
+    nested change you do not want in this commit.
 
     Args:
-        tier: Keep only rows in this tier (``high`` | ``medium`` | ``low``).
+        tier: Keep only rows in this tier (``high`` | ``medium`` | ``low``). The tier filters
+            rows first, and the grouped view is built from the filtered rows, so a group appears
+            only when it holds a file of that tier and its ``flagged``, ``file_ids`` and tier
+            counts describe only those files. The report-level counts still describe the run.
         path: Scope the run to this folder and every folder under it. Compared as a path: case
             and ``/`` versus backslash do not matter on Windows, and a relative path resolves
             under ``music_path``.
@@ -673,9 +701,10 @@ def detect_disagreements(  # noqa: PLR0913 - one parameter per scope/view knob, 
     Returns:
         ``{"ok": True, rows, fill_rows, total_files, flagged, flagged_fields, high, medium, low,
         fills, releases_attempted, releases_checked, releases_remaining, more,
-        skipped_no_release_id, unknown_releases, unmatched_tracks, errors, error_releases,
-        groups, summary}``. Each row is ``{file_id, folder, filename, release_id, release_title,
-        field, have, want, tier, reason}``. Each group is ``{folder, file_count, flagged,
+        skipped_no_release_id, unknown_releases, unmatched_tracks, errors, error_items, groups,
+        summary}``, where ``error_items`` is ``{key, message}`` keyed by the release id. Each
+        row is ``{file_id, folder, filename, release_id, release_title, field, have, want,
+        tier, reason}``. Each group is ``{folder, file_count, flagged,
         folder_context, tiers, file_ids, flagged_fields, fills, fields, releases}``, where
         ``file_ids`` names the flagged files only and ``releases`` lists ``{release_id,
         release_title, file_count}``. On failure, ``{"ok": False, "error": ...}``.
@@ -748,10 +777,17 @@ def detect_album_conflicts(
     Recommended workflow: start with ``group=true`` for one line per folder, then expand a
     single folder with ``folder="<exact folder path>"``, then fix with ``stage_tags_batch`` ->
     ``diff_tags`` -> ``commit_tags(path=<folder>)`` -> ``reopen_axes``. Read ``diff_tags``'
-    ``stale_identity`` before committing.
+    ``stale_identity`` before committing. ``commit_tags(path=<folder>)`` and
+    ``diff_tags(path=<folder>)`` cover that folder AND every folder nested under it. Run
+    ``diff_tags(path=<folder>)`` first and ``unstage_tags`` any nested change you do not want in
+    this commit.
 
     Args:
-        tier: Keep only rows in this tier (``high`` | ``medium`` | ``low``).
+        tier: Keep only rows in this tier (``high`` | ``medium`` | ``low``). The tier filters
+            rows first, and the grouped view is built from the filtered rows, so a group appears
+            only when it holds a file of that tier and its ``flagged``, ``file_ids`` and tier
+            counts describe only those files. The report-level counts still describe the whole
+            library.
         limit: Cap the rows returned, or the groups with ``group=true``.
         group: Return one compact line per folder instead of flat rows.
         folder: Expand exactly this folder's rows, never a subfolder. Takes precedence over
@@ -826,6 +862,9 @@ def detect_album_gaps(
     ``{file_id, proposed}`` + ``note`` to ``stage_tags_batch`` (one call per source keeps the
     ``note`` accurate) → review ``diff_tags(path=<folder>)`` → ``commit_tags(path=<folder>)`` →
     ``reopen_axes(commit_id)`` to re-open the filled files' derived genre/year axes.
+    ``commit_tags(path=<folder>)`` and ``diff_tags(path=<folder>)`` cover that folder AND every
+    folder nested under it. Run ``diff_tags(path=<folder>)`` first and ``unstage_tags`` any
+    nested change you do not want in this commit.
 
     Args:
         limit: Cap the number of folder groups returned. The ``total_files``/``green``/
@@ -864,44 +903,45 @@ def history_tags(file_id: int) -> dict[str, object]:
     the ``diff`` from the prior version. Use a ``version`` here with ``revert_tags``.
 
     Returns ``{"ok": True, "history": [{version, created_at, origin, reverted_from,
-    commit_id, managed_tags, diff, note}, ...]}`` (empty if the file has no history).
+    commit_id, managed_tags, diff, note}, ...]}`` (empty if the file has no history), or
+    ``{"ok": False, "error": ...}`` if the file id is unknown.
     """
     revisions = versioning.history_for(load_settings(), file_id)
-    return {
-        "ok": True,
-        "history": [
-            {
-                "version": r.version,
-                "created_at": r.created_at,
-                "origin": r.origin,
-                "reverted_from": r.reverted_from,
-                "commit_id": r.commit_id,
-                "managed_tags": r.managed_tags,
-                "diff": r.diff,
-                "note": r.note,
-            }
-            for r in revisions
-        ],
-    }
+    return {"ok": True, "history": [r.to_dict() for r in revisions]}
 
 
 @mcp.tool()
 @_error_envelope
-def revert_tags(file_id: int, version: int, note: str | None = None) -> dict[str, object]:
+def revert_tags(
+    file_id: int,
+    version: int,
+    note: str | None = None,
+    dry_run: bool = False,  # noqa: FBT001, FBT002 - MCP tool surface, not a Python API
+) -> dict[str, object]:
     """Restore a file's managed tags to a prior ``version`` (append-only, revertible).
 
     Writes the target revision's tags back to disk and appends a *new* ``revert`` revision
-    under its own single-file ``origin='revert'`` commit — nothing is destroyed, you can
+    under its own single-file ``origin='revert'`` commit. Nothing is destroyed, you can
     revert a revert, and the revert shows in ``list_commits`` (undoable via
     ``revert_commit``). Get valid versions from ``history_tags``. Refused while the file
-    has a staged change — commit or unstage it first.
+    has a staged change. Commit or unstage it first.
 
-    Returns ``{"ok": True, "new_version": int, "commit_id": int, "status": ...}``, where
-    ``status`` is ``"reverted"`` (tags moved on disk) or ``"noop"`` (the file already held
-    the target state). Returns ``{"ok": False, "error": ...}`` if the file or version is
-    unknown, the file is missing on disk, or the file has a pending staged change.
+    Args:
+        file_id: The file to restore.
+        version: The revision to restore it to (from ``history_tags``).
+        note: Optional message stored on the revert commit and its revision.
+        dry_run: When true, report the status the revert would have without touching the
+            file or the ledger. Every refusal of the real call still applies.
+
+    Returns:
+        ``{"ok": True, "file_id", "target_version", "new_version", "commit_id", "status",
+        "dry_run"}``, where ``status`` is ``"reverted"`` (tags moved on disk) or ``"noop"``
+        (the file already held the target state). A dry run returns ``null`` for
+        ``commit_id`` and ``new_version``. Returns ``{"ok": False, "error": ...}`` if the file
+        or version is unknown, the file is missing on disk, or the file has a pending staged
+        change.
     """
-    result = versioning.revert(load_settings(), file_id, version, note=note)
+    result = versioning.revert(load_settings(), file_id, version, note=note, dry_run=dry_run)
     return {"ok": True, **result.to_dict()}
 
 
@@ -954,12 +994,12 @@ def revert_commit(
 def list_commits(limit: int | None = None) -> dict[str, object]:
     """List commits newest first (the revertible units that group tag changes).
 
-    Returns ``{"ok": True, "commits": [{id, created_at, origin, message, reverted_from,
+    Returns ``{"ok": True, "commits": [{commit_id, created_at, origin, message, reverted_from,
     status}, ...]}``. ``status`` is ``applied`` (clean), ``applying`` (in flight), or
     ``interrupted`` (a crashed run whose leftovers were swept into a later commit).
     """
     rows = commits.list_commits_for(load_settings(), limit=limit)
-    return {"ok": True, "commits": [_commit_to_dict(c) for c in rows]}
+    return {"ok": True, "commits": [c.to_dict() for c in rows]}
 
 
 @mcp.tool()
@@ -967,25 +1007,13 @@ def list_commits(limit: int | None = None) -> dict[str, object]:
 def get_commit(commit_id: int) -> dict[str, object]:
     """Return one commit by id.
 
-    Returns ``{"ok": True, "commit": {id, created_at, origin, message, reverted_from,
+    Returns ``{"ok": True, "commit": {commit_id, created_at, origin, message, reverted_from,
     status}}``, or ``{"ok": False, "error": ...}`` if the id is unknown.
     """
     commit = commits.get_commit_for(load_settings(), commit_id)
     if commit is None:
         return {"ok": False, "error": f"unknown commit_id={commit_id}"}
-    return {"ok": True, "commit": _commit_to_dict(commit)}
-
-
-def _commit_to_dict(commit: commits.Commit) -> dict[str, object]:
-    """JSON-serializable form of a commit row."""
-    return {
-        "id": commit.id,
-        "created_at": commit.created_at,
-        "origin": commit.origin,
-        "message": commit.message,
-        "reverted_from": commit.reverted_from,
-        "status": commit.status,
-    }
+    return {"ok": True, "commit": commit.to_dict()}
 
 
 @mcp.tool()
@@ -995,6 +1023,7 @@ def resolve_genres(
     album: str | None = None,
     file_ids: list[int] | None = None,
     limit: int | None = None,
+    dry_run: bool = False,  # noqa: FBT001, FBT002 - MCP tool surface, not a Python API
 ) -> dict[str, object]:
     """Look up Last.fm genres for in-scope files and stage the result (writes nothing to disk).
 
@@ -1004,28 +1033,32 @@ def resolve_genres(
     (replacing ONLY ``genre`` — other managed tags are preserved). Review with
     ``diff_tags`` and apply with ``commit_tags``; ``revert_tags`` undoes it.
 
-    It is refused while anything is staged, since staging would replace that pending
+    A real run is refused while anything is staged, since staging would replace that pending
     change. Commit or unstage it first. It deliberately **skips** files that are already done
     (a committed ``auto`` genre revision), files marked ``no_match`` (unless the artist or
     album tag has changed since), files marked ``manual``, files with no artist tag at all,
     and files the last scan flagged missing. Files whose artist isn't on Last.fm (or yield no
     usable genre) are recorded ``no_match`` and not re-tried until their tags change. A
-    transient Last.fm error leaves that artist pending and is reported under ``errors`` so a
-    re-run retries it.
+    transient Last.fm error leaves that artist pending, is counted in ``errors`` and itemized
+    in ``error_items`` (``{key, message}``, keyed by the looked-up artist), so a re-run
+    retries it.
 
     Args:
         artist: Limit to files whose ``artist`` tag equals this value.
         album: Narrow an ``artist`` scope to one album.
         file_ids: Limit to these specific file ids (overrides ``artist``/``album``).
         limit: Max files to process this call (default ``genre_stage_limit``). Remaining
-            candidates are reported via ``pending_remaining`` / ``more`` — call again to
+            candidates are reported via ``pending_remaining`` / ``more``. Call again to
             continue.
+        dry_run: Preview the would-stage and would-no_match counts without staging or
+            recording anything. It reads the lookup cache and fetches on a cache miss.
 
     Returns:
-        ``{"ok": True, processed, staged, no_match,
-        skipped{done,no_match,manual,no_artist,missing}, pending_remaining, more, errors,
-        no_match_artists, summary}``, or ``{"ok": False, "error": ...}`` (e.g. pending
-        changes, a negative ``limit``, or no API key configured).
+        ``{"ok": True, processed, processed_unit, staged, no_match,
+        skipped{done,no_match,manual,no_identity,missing}, pending_remaining, more, errors,
+        error_items, no_match_artists, summary}``, or ``{"ok": False, "error": ...}`` (e.g.
+        pending changes, a negative ``limit``, or no API key configured). ``processed_unit``
+        is ``files``, and ``limit`` and ``pending_remaining`` count the same unit.
     """
     result = genres.resolve_genres(
         load_settings(),
@@ -1033,6 +1066,7 @@ def resolve_genres(
         album=album,
         file_ids=file_ids,
         limit=limit,
+        dry_run=dry_run,
     )
     return {"ok": True, **result.to_dict()}
 
@@ -1075,8 +1109,9 @@ def resolve_artists(
     exactly canonical stage nothing but are counted under ``already_canonical``; values with
     no Last.fm correction are reported under ``no_correction``. A correction to a MusicBrainz
     special-purpose placeholder (``[unknown]``, ``[no artist]``, …) is treated as no
-    correction. A transient lookup error leaves that value pending under ``error_values`` so
-    a re-run retries it.
+    correction. A transient lookup error leaves that value pending, counted in ``errors`` and
+    itemized in ``error_items`` (``{key, message}``, keyed by the value), so a re-run retries
+    it.
 
     Three classes are **held**: reported so you can act on them, never staged.
     ``shrinks_credit_values`` are names whose canonical form is contained in the current
@@ -1104,13 +1139,15 @@ def resolve_artists(
             staging anything (works from cache, no precondition).
 
     Returns:
-        ``{"ok": True, processed, staged_files, corrected_values, skipped_multi_artist,
-        skipped_sentinel, skipped_missing, no_correction, already_canonical, shrinks_credit,
-        needs_review, name_id_disagreement, errors, pending_remaining, more, mappings (each with
-        ``from``/``to``/``mbid``/``source``), multi_artist_files, no_correction_values,
-        already_canonical_values, shrinks_credit_values, needs_review_values,
-        name_id_disagreement_values, error_values, summary}``, or
-        ``{"ok": False, "error": ...}`` (e.g. pending changes, or no API key configured).
+        ``{"ok": True, processed, processed_unit, staged_files, corrected_values,
+        skipped_multi_artist, skipped_sentinel, skipped_missing, no_correction,
+        already_canonical, shrinks_credit, needs_review, name_id_disagreement, errors,
+        pending_remaining, more, mappings (each with ``from``/``to``/``mbid``/``source``),
+        multi_artist_files, no_correction_values, already_canonical_values,
+        shrinks_credit_values, needs_review_values, name_id_disagreement_values, error_items,
+        summary}``, or ``{"ok": False, "error": ...}`` (e.g. pending changes, or no API key
+        configured). ``processed_unit`` is ``values``, and ``limit`` and ``pending_remaining``
+        count the same unit.
     """
     result = artists.resolve_artists(
         load_settings(),
@@ -1189,7 +1226,8 @@ def reset_genre_status(
             ``file_ids`` is omitted).
 
     Returns:
-        ``{"ok": True, "affected": <count>}``.
+        ``{"ok": True, "affected": <count>}``, or ``{"ok": False, "error": ...}`` if a file id
+        is unknown.
     """
     affected = genres.reset_genre_status(
         load_settings(),
@@ -1250,7 +1288,8 @@ def reset_artist_status(
             when ``file_ids`` is omitted).
 
     Returns:
-        ``{"ok": True, "affected": <count>}``.
+        ``{"ok": True, "affected": <count>}``, or ``{"ok": False, "error": ...}`` if a file id
+        is unknown.
     """
     affected = artists.reset_artist_status(
         load_settings(),
@@ -1315,7 +1354,8 @@ def reset_mismatch_status(
             ``file_ids`` is omitted).
 
     Returns:
-        ``{"ok": True, "affected": <count>}``.
+        ``{"ok": True, "affected": <count>}``, or ``{"ok": False, "error": ...}`` if a file id
+        is unknown.
     """
     affected = mismatch.reset_mismatch_status(
         load_settings(),
@@ -1345,8 +1385,9 @@ def resolve_years(
 
     It deliberately **skips** files that already have an ``originaldate``
     (``skipped_present``), files with no ``album`` (``skipped_no_album``), files with no
-    artist (``skipped_no_artist``), ``manual`` exclusions (``skipped_manual``), and files the
-    last scan flagged missing (``skipped_missing``). A group
+    artist (``skipped_no_identity``), ``manual`` exclusions (``skipped_manual``), files a
+    still-current ``no_match`` holds back (``skipped_no_match``), and files the last scan
+    flagged missing (``skipped_missing``). A group
     MusicBrainz has no usable Album release group for is recorded ``no_match`` (re-opened if
     the artist or album changes). A transient MusicBrainz error leaves that group pending and
     is counted in ``errors`` and itemized in ``error_items`` (``{key, message}``).
@@ -1360,10 +1401,12 @@ def resolve_years(
             staging anything (works from cache, no precondition).
 
     Returns:
-        ``{"ok": True, processed, staged_files, no_match, skipped_present, skipped_no_album,
-        skipped_no_artist, skipped_manual, skipped_missing, pending_remaining, more, mappings,
-        errors, error_items, summary}``, or ``{"ok": False, "error": ...}`` (e.g. pending
-        changes).
+        ``{"ok": True, processed, processed_unit, staged_files, no_match, skipped_present,
+        skipped_no_album, skipped_no_identity, skipped_manual, skipped_no_match,
+        skipped_missing, pending_remaining, more, mappings, errors, error_items, summary}``, or
+        ``{"ok": False, "error": ...}`` (e.g. pending changes). ``processed_unit`` is
+        ``album_groups``, and ``limit`` and ``pending_remaining`` count the same unit. Every
+        ``skipped_*`` count is files.
     """
     result = years.resolve_years(
         load_settings(),
@@ -1464,7 +1507,8 @@ def reset_year_status(
             is omitted).
 
     Returns:
-        ``{"ok": True, "affected": <count>}``.
+        ``{"ok": True, "affected": <count>}``, or ``{"ok": False, "error": ...}`` if a file id
+        is unknown.
     """
     affected = years.reset_year_status(
         load_settings(),

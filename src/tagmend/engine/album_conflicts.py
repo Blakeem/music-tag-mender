@@ -54,6 +54,8 @@ from tagmend.engine.detector_core import (
     Tier,
     group_by_folder,
     is_non_album_folder,
+    regroup,
+    rows_in_tier,
     validate_tier,
 )
 from tagmend.engine.validation import check_limit
@@ -463,19 +465,18 @@ def _classify(files: list[_FileInput]) -> AlbumConflictsReport:
             context_rows.extend(folder_rows)
         else:
             rows.extend(folder_rows)
-        groups.append(
-            AlbumConflictGroup(
-                folder=folder,
-                file_count=folder_sizes[folder],
-                flagged=0 if context_reason else len(folder_rows),
-                folder_context=len(folder_rows) if context_reason else 0,
-                identities=len({f.identity for f in members}),
-                majority_identity=majority_label,
-                majority_files=majority_files,
-                tiers=dict(Counter(r.tier for r in folder_rows)) if not context_reason else {},
-                file_ids=[] if context_reason else sorted(r.file_id for r in folder_rows),
-            ),
+        base = AlbumConflictGroup(
+            folder=folder,
+            file_count=folder_sizes[folder],
+            flagged=0,
+            folder_context=len(folder_rows) if context_reason else 0,
+            identities=len({f.identity for f in members}),
+            majority_identity=majority_label,
+            majority_files=majority_files,
+            tiers={},
+            file_ids=[],
         )
+        groups.append(base if context_reason else _refold_group(base, folder_rows))
     groups.sort(key=lambda g: g.folder)
 
     # Output: the whole-library counts, which no later narrowing changes.
@@ -497,6 +498,19 @@ def _classify(files: list[_FileInput]) -> AlbumConflictsReport:
         folder_context=len(context_rows),
         folder_context_rows=context_rows,
         groups=groups,
+    )
+
+
+def _refold_group(
+    group: AlbumConflictGroup,
+    rows: list[AlbumConflictRow],
+) -> AlbumConflictGroup:
+    """Return *group* with its flagged counts describing exactly *rows*, its flagged rows."""
+    return replace(
+        group,
+        flagged=len(rows),
+        tiers=dict(Counter(r.tier for r in rows)),
+        file_ids=sorted(r.file_id for r in rows),
     )
 
 
@@ -539,13 +553,12 @@ def _narrow(
     caller expanding one folder also received every ``Singles``/``Remixes`` context row in the
     library. Groups ride only on the grouped view, which is what ``detect_track_conflicts``
     does, so a flat call does not also ship a line per folder. A *folder_key* wins over
-    *group*: that call returns the folder's flat rows and no groups, like every sibling.
+    *group*: that call returns the folder's flat rows and no groups, like every sibling. A
+    *tier* filters the rows first, and the grouped view is refolded over the filtered rows.
     """
-    rows = report.rows
-    context_rows = report.folder_context_rows
-    if tier is not None:
-        rows = [r for r in rows if r.tier == tier]
-        context_rows = []
+    rows = rows_in_tier(report.rows, tier)
+    context_rows = report.folder_context_rows if tier is None else []
+    tier_groups = report.groups if tier is None else regroup(report.groups, rows, _refold_group)
     if folder_key is not None:
         rows = [r for r in rows if path_keys.path_key(r.folder) == folder_key]
         context_rows = [r for r in context_rows if path_keys.path_key(r.folder) == folder_key]
@@ -554,7 +567,7 @@ def _narrow(
         context_rows = context_rows[:limit]
 
     flat = not group or folder_key is not None
-    groups = [] if flat else report.groups
+    groups = [] if flat else tier_groups
     if limit is not None:
         groups = groups[:limit]
 

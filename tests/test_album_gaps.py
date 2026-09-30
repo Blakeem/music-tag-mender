@@ -731,10 +731,10 @@ def test_detect_integration_read_only_then_fix_flow(
         entries=[(blank_id, {"album": ["Stand By Your Van"]})],
         note=proposal.note,
     )
-    diffs = staging.diff_tags(engine_settings, root=folder)
+    diffs = staging.diff_tags(engine_settings, path=folder)
     assert any(d.file_id == blank_id for d in diffs)
 
-    result = staging.commit_tags(engine_settings, root=folder)
+    result = staging.commit_tags(engine_settings, path=folder)
     assert result.committed == 1
     assert result.commit_id is not None
     assert _read_album(engine_settings, folder, "03.mp3") == ["Stand By Your Van"]

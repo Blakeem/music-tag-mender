@@ -238,9 +238,16 @@ def test_files_in_scope_by_file_ids_keeps_existing_in_order(
     db_conn: sqlite3.Connection,
 ) -> None:
     ids = _seed_library(db_conn)
-    # Pass out of order with a bogus id; result is the existing ones in ascending order.
-    requested = [ids["b1"], 9999, ids["a1"]]
+    # Passed out of order, returned in ascending order.
+    requested = [ids["b1"], ids["a1"]]
     assert store.files_in_scope(db_conn, file_ids=requested) == [ids["a1"], ids["b1"]]
+
+
+def test_files_in_scope_rejects_unknown_file_ids(db_conn: sqlite3.Connection) -> None:
+    ids = _seed_library(db_conn)
+
+    with pytest.raises(ValueError, match="9999"):
+        store.files_in_scope(db_conn, file_ids=[ids["a1"], 9999])
 
 
 def test_files_in_scope_empty_file_ids_returns_empty(db_conn: sqlite3.Connection) -> None:

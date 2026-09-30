@@ -69,6 +69,17 @@ class Commit:
     reverted_from: int | None
     status: str
 
+    def to_dict(self) -> dict[str, object]:
+        """JSON-serializable form for the MCP tools, keyed ``commit_id`` like every payload."""
+        return {
+            "commit_id": self.id,
+            "created_at": self.created_at,
+            "origin": self.origin,
+            "message": self.message,
+            "reverted_from": self.reverted_from,
+            "status": self.status,
+        }
+
 
 def _row_to_commit(row: tuple[object, ...]) -> Commit:
     """Build a typed :class:`Commit` from a raw sqlite tuple."""

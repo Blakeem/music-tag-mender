@@ -38,7 +38,13 @@ from typing import TYPE_CHECKING, Final, cast
 import mutagen
 
 from tagmend.engine import axis, commits, db, path_keys, schema, store, versioning
-from tagmend.engine.tags import MANAGED_TAGS, ensure_writable, read_tags, write_managed_tags
+from tagmend.engine.tags import (
+    MANAGED_TAGS,
+    RELEASE_STAMP_TAGS,
+    ensure_writable,
+    read_tags,
+    write_managed_tags,
+)
 from tagmend.log import get_logger
 
 if TYPE_CHECKING:
@@ -55,16 +61,23 @@ logger = get_logger(__name__)
 # revision the commit appends.
 _STAGED_ORIGINS = frozenset({"auto", "manual"})
 
-# A name and the ids that name the same thing. Rewriting one member of a group while leaving
-# another in place is how a file ends up reading "Alice in Chains" with Linkin Park's MBID
-# still attached — 118 files across 8 folders went that way in the 2026-08-25 run, because
-# staging merges onto the file's current tags and silently keeps whatever the caller omitted.
-# Reported on the diff for review; never blocked, never auto-changed.
-_IDENTITY_GROUPS: Final[tuple[tuple[str, ...], ...]] = (
-    ("artist", "musicbrainz_artistid"),
-    ("albumartist", "musicbrainz_albumartistid"),
-    ("album", "musicbrainz_albumid", "musicbrainz_releasegroupid"),
-    ("title", "musicbrainz_trackid", "musicbrainz_releasetrackid"),
+# (triggers, members): staging keeps every member a change omits, so a rewritten trigger leaves
+# the rest naming the old entity. Sort names and the release stamp only follow a name, never lead.
+_IDENTITY_GROUPS: Final[tuple[tuple[tuple[str, ...], tuple[str, ...]], ...]] = (
+    (("artist", "musicbrainz_artistid"), ("artist", "musicbrainz_artistid", "artistsort")),
+    (
+        ("albumartist", "musicbrainz_albumartistid"),
+        ("albumartist", "musicbrainz_albumartistid", "albumartistsort"),
+    ),
+    (
+        ("album", "musicbrainz_albumid", "musicbrainz_releasegroupid"),
+        ("album", "musicbrainz_albumid", "musicbrainz_releasegroupid"),
+    ),
+    (
+        ("title", "musicbrainz_trackid", "musicbrainz_releasetrackid"),
+        ("title", "musicbrainz_trackid", "musicbrainz_releasetrackid"),
+    ),
+    (("album", "musicbrainz_albumid"), tuple(sorted(RELEASE_STAMP_TAGS))),
 )
 
 
@@ -274,7 +287,7 @@ def _stage_one(  # noqa: PLR0913 - cohesive keyword-only per-file staging payloa
     conn: sqlite3.Connection,
     *,
     file_id: int,
-    managed_tags: dict[str, list[str]],
+    tags: dict[str, list[str]],
     origin: str,
     note: str | None,
     now: str,
@@ -285,18 +298,18 @@ def _stage_one(  # noqa: PLR0913 - cohesive keyword-only per-file staging payloa
     The shared per-file core of :func:`stage_tags` and :func:`stage_tags_batch`: rejects
     unmanaged keys, cleans every caller-supplied value (:func:`_clean_values`), rejects an
     unknown or missing *file_id*, lazily captures the version-0 baseline, merges
-    *managed_tags* onto the file's current managed subset (P0: omitted keys are preserved),
+    *tags* onto the file's current managed subset (P0: omitted keys are preserved),
     and upserts the staged row with the file's signature as its base, so the commit can refuse
     a file edited since. A *fill_only* key is dropped when the file on disk already holds a
     value for it, and when that leaves no caller-supplied key, nothing is staged and ``False``
     is returned. Raises :class:`ValueError` naming *file_id* on any invalid input. Leaves the
     transaction for the caller to commit or roll back.
     """
-    unmanaged = sorted(set(managed_tags) - MANAGED_TAGS)
+    unmanaged = sorted(set(tags) - MANAGED_TAGS)
     if unmanaged:
         message = f"cannot stage non-managed tag(s) for file_id={file_id}: {', '.join(unmanaged)}"
         raise ValueError(message)
-    requested = _clean_values(file_id, managed_tags)
+    requested = _clean_values(file_id, tags)
 
     file_row = store.get_file_by_id(conn, file_id)
     if file_row is None:
@@ -364,7 +377,7 @@ def stage_tags(  # noqa: PLR0913 - cohesive keyword-only staging payload
     settings: Settings,
     *,
     file_id: int,
-    managed_tags: dict[str, list[str]],
+    tags: dict[str, list[str]],
     origin: str = "manual",
     note: str | None = None,
     fill_only: frozenset[str] = frozenset(),
@@ -378,7 +391,7 @@ def stage_tags(  # noqa: PLR0913 - cohesive keyword-only staging payload
     changes and no further history is recorded until :func:`commit_tags`. Owns its
     transaction.
 
-    **No accidental deletion (P0).** *managed_tags* is merged *onto* the file's current
+    **No accidental deletion (P0).** *tags* is merged *onto* the file's current
     managed subset, so an omitted managed key means "leave it alone", not "delete it":
     staging ``{"genre": [...]}`` on a file rich in title/album/track/MB-id fields cannot
     wipe them at commit time (``commit_tags`` writes the staged target verbatim, and
@@ -404,7 +417,7 @@ def stage_tags(  # noqa: PLR0913 - cohesive keyword-only staging payload
         staged = _stage_one(
             connection,
             file_id=file_id,
-            managed_tags=managed_tags,
+            tags=tags,
             origin=origin,
             note=note,
             now=_utc_now(),
@@ -501,7 +514,7 @@ def stage_tags_batch(
             _stage_one(
                 connection,
                 file_id=file_id,
-                managed_tags=managed_tags,
+                tags=managed_tags,
                 origin="manual",
                 note=note,
                 now=now,
@@ -518,12 +531,17 @@ def stage_tags_batch(
 def unstage_tags(settings: Settings, *, file_id: int) -> bool:
     """Drop the pending change for *file_id*. Returns ``True`` if a row was removed.
 
-    A baseline captured at stage time stays (history is proportional to staged intent);
-    it is harmless and never re-applied.
+    A known file with nothing staged returns ``False``, and an unknown *file_id* raises
+    :class:`ValueError`, so a typo is never read as "nothing staged". A baseline captured at
+    stage time stays (history is proportional to staged intent). It is harmless and never
+    re-applied.
     """
     connection = db.connect(settings.db_path)
     try:
         schema.apply_schema(connection)
+        if store.get_file_by_id(connection, file_id) is None:
+            message = f"unknown file_id={file_id}"
+            raise ValueError(message)
         removed = store.get_staged_tag(connection, file_id) is not None
         if removed:
             store.delete_staged_tag(connection, file_id)
@@ -561,14 +579,15 @@ def _stale_identity(
     """Report coupled identity fields this change rewrites one half of.
 
     A group's name and its MusicBrainz ids describe the same thing, so changing the name while
-    keeping the old id leaves the file naming one entity and pointing at another.
+    keeping the old id leaves the file naming one entity and pointing at another. Only a
+    trigger field counts as the change, so a sort-only edit flags nothing.
     """
     stale: list[dict[str, object]] = []
-    for group in _IDENTITY_GROUPS:
-        changed = [field_name for field_name in group if field_name in diff]
+    for triggers, members in _IDENTITY_GROUPS:
+        changed = [field_name for field_name in triggers if field_name in diff]
         if not changed:
             continue
-        for field_name in group:
+        for field_name in members:
             retained = target.get(field_name)
             if field_name not in diff and retained:
                 stale.append(
@@ -581,18 +600,19 @@ def _stale_identity(
     return stale
 
 
-def diff_tags(settings: Settings, *, root: Path | None = None) -> list[TagDiffView]:
+def diff_tags(settings: Settings, *, path: Path | None = None) -> list[TagDiffView]:
     """Return staged-but-uncommitted tag changes enriched with the current→target diff.
 
     This is ``git diff --staged`` (staged-vs-snapshot), **not** working-tree: ``current``
     is the last committed/scanned managed-tag snapshot for the file and may lag the actual
     disk state after an interrupted commit. ``target`` is the staged managed tags and
     ``diff`` is :func:`tagmend.engine.versioning.compute_diff` between them (a no-op stage
-    yields ``diff == {}`` but the row still appears). Optionally limited to files under
-    *root*, resolved by :func:`tagmend.engine.path_keys.folder_arg_key` (which raises
-    :class:`ValueError` for a folder outside ``music_path``). Owns its transaction (read-only).
+    yields ``diff == {}`` but the row still appears). Optionally limited to files in the
+    folder *path* or nested under it, resolved by
+    :func:`tagmend.engine.path_keys.folder_arg_key` (which raises :class:`ValueError` for a
+    folder outside ``music_path``). Owns its transaction (read-only).
     """
-    root_key = None if root is None else path_keys.folder_arg_key(settings, root)
+    root_key = None if path is None else path_keys.folder_arg_key(settings, path)
 
     connection = db.connect(settings.db_path)
     try:
@@ -630,29 +650,32 @@ def diff_tags(settings: Settings, *, root: Path | None = None) -> list[TagDiffVi
         connection.close()
 
 
+def _commit_origin(origins: set[str]) -> str:
+    """Return ``auto`` only when every swept change came from a resolver, else ``manual``."""
+    return "auto" if origins == {"auto"} else "manual"
+
+
 def commit_tags(
     settings: Settings,
     *,
     message: str | None = None,
-    origin: str = "manual",
-    root: Path | None = None,
+    path: Path | None = None,
 ) -> CommitResult:
     """Apply every currently-staged tag change as one revertible commit; return a summary.
 
     First flips any lingering ``applying`` commit to ``interrupted`` (crash recovery in
-    the resume-free model), then sweeps every still-staged row (optionally limited to
-    *root*) under a fresh commit and applies them file by file via
-    :func:`tagmend.engine.commits.run_commit`. A file gone from disk is flagged missing,
-    its staged row dropped, and reported in ``missing_files``. A file edited on disk since it
-    was staged reports ``changed_since_stage``, and a file that fails to write reports
-    ``error`` with a ``detail``. Both keep their staged row, and the rest of the commit still
-    completes. ``commit_id`` is ``None`` when nothing was staged. *root* resolves through
+    the resume-free model), then sweeps every still-staged row (optionally limited to the
+    folder *path* and every folder nested under it) under a fresh commit and applies them
+    file by file via :func:`tagmend.engine.commits.run_commit`. The commit's origin is
+    ``auto`` only when every change it sweeps came from a resolver, and ``manual`` otherwise.
+    A file gone from disk is flagged missing, its staged row dropped, and reported in
+    ``missing_files``. A file edited on disk since it was staged reports
+    ``changed_since_stage``, and a file that fails to write reports ``error`` with a
+    ``detail``. Both keep their staged row, and the rest of the commit still completes.
+    ``commit_id`` is ``None`` when nothing was staged. *path* resolves through
     :func:`tagmend.engine.path_keys.folder_arg_key`. Owns its transaction.
     """
-    if origin not in _STAGED_ORIGINS:
-        message_text = f"invalid commit origin: {origin!r} (expected auto|manual)"
-        raise ValueError(message_text)
-    root_key = None if root is None else path_keys.folder_arg_key(settings, root)
+    root_key = None if path is None else path_keys.folder_arg_key(settings, path)
 
     domain = TagDomain()
     connection = db.connect(settings.db_path)
@@ -673,6 +696,7 @@ def commit_tags(
             return commits._summarize(commit_id=None, applied=[])  # noqa: SLF001
 
         now = _utc_now()
+        origin = _commit_origin(store.staged_origins(connection, file_ids))
         commit_id = commits.create_commit(connection, origin=origin, message=message, now=now)
         connection.commit()  # commit row durable before any per-file work
 
@@ -734,9 +758,10 @@ def reopen_axes(settings: Settings, *, commit_id: int) -> ReopenResult:
     * deletes any :func:`tagmend.engine.store.delete_artist_status` row.
 
     Noop/missing files have no revision row in the commit and are correctly untouched. Raises
-    :class:`ValueError` for an unknown *commit_id* or a commit with ``origin='auto'`` (voiding
-    fresh auto work is a foot-gun); ``manual``/``revert`` commits are allowed. Returns the
-    affected file count and how many artist rows were cleared. Owns its transaction; never
+    :class:`ValueError` for an unknown *commit_id*, for a commit that changed no tags, and for
+    a commit holding any ``auto`` revision, whatever the commit's own origin (voiding fresh
+    auto work is a foot-gun). ``manual`` and ``revert`` changes are allowed. Returns the
+    affected file count and how many artist rows were cleared. Owns its transaction. Never
     touches the ``commits`` table or the append-only ``tag_revisions`` history.
     """
     void_fields = axis.GENRE_AXIS.fields + axis.YEAR_AXIS.fields
@@ -745,18 +770,21 @@ def reopen_axes(settings: Settings, *, commit_id: int) -> ReopenResult:
     try:
         schema.apply_schema(connection)
 
-        commit = commits.get_commit(connection, commit_id)
-        if commit is None:
+        if commits.get_commit(connection, commit_id) is None:
             message = f"unknown commit_id={commit_id}"
             raise ValueError(message)
-        if commit.origin == "auto":
+        revisions = store.revisions_for_commit(connection, commit_id)
+        if not revisions:
+            message = f"commit_id={commit_id} changed no tags, so there is nothing to reopen"
+            raise ValueError(message)
+        if any(revision.origin == "auto" for revision in revisions):
             message = (
-                f"cannot reopen an auto commit (commit_id={commit_id}); "
-                "reopen targets manual identity-fix commits"
+                f"cannot reopen commit_id={commit_id}: it holds auto-resolved revisions "
+                "(reopen targets manual identity-fix commits)"
             )
             raise ValueError(message)
 
-        file_ids = sorted({r.file_id for r in store.revisions_for_commit(connection, commit_id)})
+        file_ids = sorted({r.file_id for r in revisions})
         artist_cleared = 0
         for fid in file_ids:
             store.void_auto_changes(connection, fid, void_fields)

@@ -96,7 +96,7 @@ def _stage_and_commit(
 ) -> int:
     """Stage each ``file_id -> managed_tags`` target and commit them into one commit."""
     for file_id, managed_tags in targets.items():
-        staging.stage_tags(settings, file_id=file_id, managed_tags=managed_tags)
+        staging.stage_tags(settings, file_id=file_id, tags=managed_tags)
     result = staging.commit_tags(settings, message=message)
     assert result.commit_id is not None
     return result.commit_id
@@ -391,7 +391,7 @@ def test_revert_commit_with_dirty_staging_raises(
     target = _stage_and_commit(engine_settings, {a_id: {"genre": ["Synthwave"]}})
 
     # Leave a pending staged change for a different file -> the staging area is dirty.
-    staging.stage_tags(engine_settings, file_id=b_id, managed_tags={"genre": ["Metal"]})
+    staging.stage_tags(engine_settings, file_id=b_id, tags={"genre": ["Metal"]})
 
     with pytest.raises(ValueError, match="staging area is not empty"):
         versioning.revert_commit(engine_settings, target)
@@ -575,7 +575,7 @@ def test_single_file_revert_blocked_by_staged_change(
     _stage_and_commit(engine_settings, {file_id: {"genre": ["Synthwave"]}})
 
     # Now stage a fresh change and try a single-file revert -> refused.
-    staging.stage_tags(engine_settings, file_id=file_id, managed_tags={"genre": ["Darksynth"]})
+    staging.stage_tags(engine_settings, file_id=file_id, tags={"genre": ["Darksynth"]})
 
     with pytest.raises(ValueError, match="staged change"):
         versioning.revert(engine_settings, file_id, 0)

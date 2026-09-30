@@ -342,6 +342,19 @@ class Revision:
     note: str | None
     managed_set: int
 
+    def to_dict(self) -> dict[str, object]:
+        """JSON-serializable form for ``history_tags``."""
+        return {
+            "version": self.version,
+            "created_at": self.created_at,
+            "origin": self.origin,
+            "reverted_from": self.reverted_from,
+            "commit_id": self.commit_id,
+            "managed_tags": self.managed_tags,
+            "diff": self.diff,
+            "note": self.note,
+        }
+
 
 def _row_to_revision(row: tuple[object, ...]) -> Revision:
     """Build a typed :class:`Revision` from a raw sqlite tuple."""
@@ -573,6 +586,18 @@ def list_staged_tags_under(conn: sqlite3.Connection, root_key: str) -> list[Stag
 def delete_staged_tag(conn: sqlite3.Connection, file_id: int) -> None:
     """Remove the pending change for *file_id* (no-op if none)."""
     conn.execute("DELETE FROM tag_revisions_staged WHERE file_id = ?", (file_id,))
+
+
+def staged_origins(conn: sqlite3.Connection, file_ids: list[int]) -> set[str]:
+    """Return the distinct origins of the pending changes for *file_ids*."""
+    if not file_ids:
+        return set()
+    placeholders = ",".join("?" for _ in file_ids)
+    cursor = conn.execute(
+        f"SELECT DISTINCT origin FROM tag_revisions_staged WHERE file_id IN ({placeholders})",  # noqa: S608
+        tuple(file_ids),
+    )
+    return {str(row[0]) for row in cursor.fetchall()}
 
 
 # --- lastfm_cache (persistent parsed-tag cache; PLAN — Last.fm genre tagging) --------
@@ -1559,17 +1584,35 @@ def files_in_scope(
 
     Precedence mirrors the ``resolve_genres`` scope rules:
 
-    * *file_ids* given → the subset of those that actually exist (others dropped);
+    * *file_ids* given → those ids, and an unknown id raises :class:`ValueError` so a typo is
+      never a silent no-op (an empty list returns ``[]``);
     * else *artist* given → files whose ``artist`` tag equals it, narrowed by *album*
       when given (both via ``file_tags`` joins on ``idx_file_tags_name_value``);
     * else → every tracked file.
     """
     if file_ids is not None:
+        require_known_file_ids(conn, file_ids)
         return _files_in_scope_by_ids(conn, file_ids)
     if artist is not None:
         return _files_in_scope_by_tags(conn, artist=artist, album=album)
     cursor = conn.execute("SELECT id FROM files ORDER BY id")
     return [_as_int(row[0]) for row in cursor.fetchall()]
+
+
+def require_known_file_ids(conn: sqlite3.Connection, file_ids: list[int]) -> None:
+    """Raise :class:`ValueError` naming every id in *file_ids* that ``files`` does not hold."""
+    if not file_ids:
+        return
+    placeholders = ",".join("?" for _ in file_ids)
+    cursor = conn.execute(
+        f"SELECT id FROM files WHERE id IN ({placeholders})",  # noqa: S608
+        tuple(file_ids),
+    )
+    known = {_as_int(row[0]) for row in cursor.fetchall()}
+    unknown = sorted(set(file_ids) - known)
+    if unknown:
+        message = f"unknown file_id(s): {unknown}"
+        raise ValueError(message)
 
 
 def _files_in_scope_by_ids(conn: sqlite3.Connection, file_ids: list[int]) -> list[int]:

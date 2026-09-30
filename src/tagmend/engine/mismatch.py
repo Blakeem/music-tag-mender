@@ -54,6 +54,7 @@ from tagmend.engine.detector_core import (
     fold,
     group_by_folder,
     is_non_album_folder,
+    rows_in_tier,
     validate_tier,
 )
 from tagmend.engine.validation import check_limit, require_choice
@@ -789,7 +790,7 @@ def _grouped_report(
 
     A *tier* query drops the context rows, exactly as the flat view does.
     """
-    rows = report.rows if tier is None else [r for r in report.rows if r.tier == tier]
+    rows = rows_in_tier(report.rows, tier)
     context_rows = report.folder_context_rows if tier is None else []
     groups = _build_groups(rows, context_rows, stats, report.suppressed_by_folder)
     if limit is not None:

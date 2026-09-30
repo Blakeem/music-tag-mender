@@ -124,7 +124,7 @@ def test_happy_path_stages_diffs_commits_multivalue_genre(
     assert views[0].diff == {"genre": {"from": ["Old"], "to": _EXPECTED_DAFT_PUNK}}
     assert views[0].origin == "auto"
 
-    commit_result = staging.commit_tags(engine_settings, origin="auto")
+    commit_result = staging.commit_tags(engine_settings)
     assert commit_result.committed == 1
 
     on_disk = read_tags(track).tags
@@ -166,7 +166,7 @@ def test_file_with_no_artist_is_skipped_and_untouched(
     fake = FakeTagSource({})
     result = genres.resolve_genres(engine_settings, client=fake)
 
-    assert result.skipped["no_artist"] == 1
+    assert result.skipped["no_identity"] == 1
     assert result.processed == 0
     assert fake.artist_lookups == []
     # Left pending (no status row) and untouched on disk.
@@ -175,12 +175,12 @@ def test_file_with_no_artist_is_skipped_and_untouched(
     assert read_tags(track).tags["genre"] == ["Old"]
 
 
-def test_whitespace_only_artist_is_skipped_no_artist(
+def test_whitespace_only_artist_is_skipped_no_identity(
     engine_settings: Settings,
     music_dir: Path,
 ) -> None:
     # A tab-only artist strips to blank → ``_identity`` yields None → the file is bucketed
-    # ``skipped_no_artist`` and NEVER looked up as ``"\t"`` junk (the live-testing artifact),
+    # ``skipped_no_identity`` and NEVER looked up as ``"\t"`` junk (the live-testing artifact),
     # so the Python identity rule agrees with the store-side ``no_identity``.
     track = make_track(music_dir / "ws.mp3", {"artist": ["\t"], "genre": ["Old"]})
     scan_library(engine_settings)
@@ -189,7 +189,7 @@ def test_whitespace_only_artist_is_skipped_no_artist(
     fake = FakeTagSource({})
     result = genres.resolve_genres(engine_settings, client=fake)
 
-    assert result.skipped["no_artist"] == 1
+    assert result.skipped["no_identity"] == 1
     assert result.processed == 0
     assert fake.artist_lookups == []  # no lookup for the whitespace junk
     assert _genre_status(engine_settings, file_id) is None
@@ -208,7 +208,7 @@ def test_commit_preserves_albumartist_and_replaces_only_genre(
 
     fake = FakeTagSource({"Daft Punk": _DAFT_PUNK_TAGS})
     genres.resolve_genres(engine_settings, client=fake)
-    staging.commit_tags(engine_settings, origin="auto")
+    staging.commit_tags(engine_settings)
 
     on_disk = read_tags(track).tags
     assert on_disk["genre"] == _EXPECTED_DAFT_PUNK
@@ -229,7 +229,7 @@ def test_committed_auto_revision_is_skipped_as_done_on_rerun(
 
     fake = FakeTagSource({"Daft Punk": _DAFT_PUNK_TAGS})
     genres.resolve_genres(engine_settings, client=fake)
-    staging.commit_tags(engine_settings, origin="auto")
+    staging.commit_tags(engine_settings)
 
     # Re-run: the committed auto revision derives "done" with no stored flag.
     second = genres.resolve_genres(engine_settings, client=fake)
@@ -552,8 +552,30 @@ def test_lastfm_transport_failure_is_reported_not_raised(
     result = genres.resolve_genres(engine_settings, client=fake)
 
     assert result.staged == 1
-    assert [error["artist"] for error in result.errors] == ["Justice"]
-    assert "transport error" in result.errors[0]["message"]
+    assert [error["key"] for error in result.error_items] == ["Justice"]
+    assert "transport error" in result.error_items[0]["message"]
+
+
+def test_lastfm_error_is_counted_and_itemized(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    make_track(music_dir / "b.mp3", {"artist": ["Justice"], "genre": ["Old"]})
+    scan_library(engine_settings)
+    file_id = _file_id(engine_settings, music_dir, "b.mp3")
+
+    fake = _FailingTagSource({}, failing={"Justice"})
+    result = genres.resolve_genres(engine_settings, client=fake)
+
+    assert result.errors == 1
+    assert result.error_items == [
+        {
+            "key": "Justice",
+            "message": "Last.fm artist.gettoptags failed after 3 attempt(s): transport error",
+        },
+    ]
+    assert _genre_status(engine_settings, file_id) is None  # still pending
+    assert staging.diff_tags(engine_settings) == []
 
 
 # --- limit / more loop ---------------------------------------------------------------
@@ -587,6 +609,55 @@ def test_limit_caps_and_reports_pending_then_continues(
     assert second.more is False
 
 
+def test_result_names_its_processed_unit(engine_settings: Settings) -> None:
+    result = genres.resolve_genres(engine_settings, client=FakeTagSource({}))
+
+    assert result.to_dict()["processed_unit"] == "files"
+
+
+# --- dry run -------------------------------------------------------------------------
+
+
+def test_dry_run_stages_nothing_and_records_no_status(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    make_track(music_dir / "a.mp3", {"artist": ["Daft Punk"], "genre": ["Old"]})
+    make_track(music_dir / "b.mp3", {"artist": ["Obscure Band"], "genre": ["Old"]})
+    scan_library(engine_settings)
+    missed_id = _file_id(engine_settings, music_dir, "b.mp3")
+
+    fake = FakeTagSource({"Daft Punk": _DAFT_PUNK_TAGS, "Obscure Band": None})
+    result = genres.resolve_genres(engine_settings, client=fake, dry_run=True)
+
+    assert result.staged == 1
+    assert result.no_match == 1
+    assert result.no_match_artists == ["Obscure Band"]
+    assert staging.diff_tags(engine_settings) == []
+    assert _genre_status(engine_settings, missed_id) is None
+
+
+def test_dry_run_ignores_the_staging_precondition(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    make_track(music_dir / "a.mp3", {"artist": ["Daft Punk"], "album": ["Discovery"]})
+    make_track(music_dir / "b.mp3", {"artist": ["Daft Punk"], "genre": ["Old"]})
+    scan_library(engine_settings)
+    fixed_id = _file_id(engine_settings, music_dir, "a.mp3")
+    staging.stage_tags(engine_settings, file_id=fixed_id, tags={"album": ["Discovery (Live)"]})
+    fake = FakeTagSource({"Daft Punk": _DAFT_PUNK_TAGS})
+
+    preview = genres.resolve_genres(engine_settings, client=fake, dry_run=True)
+
+    assert preview.staged == 2
+    assert [view.target["album"] for view in staging.diff_tags(engine_settings)] == [
+        ["Discovery (Live)"],
+    ]
+    with pytest.raises(ValueError, match="commit or unstage"):
+        genres.resolve_genres(engine_settings, client=fake)
+
+
 # --- revert --------------------------------------------------------------------------
 
 
@@ -600,7 +671,7 @@ def test_revert_restores_original_genre(
 
     fake = FakeTagSource({"Daft Punk": _DAFT_PUNK_TAGS})
     genres.resolve_genres(engine_settings, client=fake)
-    staging.commit_tags(engine_settings, origin="auto")
+    staging.commit_tags(engine_settings)
     assert read_tags(track).tags["genre"] == _EXPECTED_DAFT_PUNK
 
     # Revert to the version-0 baseline restores the original genre.
@@ -668,7 +739,7 @@ def test_listing_status_tracks_stage_then_commit_and_no_match_source(
     assert no_match_view.genre_source_artist == "Obscure Band"
 
     # After committing the staged change, the matched file derives 'done'.
-    staging.commit_tags(engine_settings, origin="auto")
+    staging.commit_tags(engine_settings)
     assert _status_of(engine_settings, matched_id) == "done"
     # The no-match file is unaffected by the commit.
     assert _status_of(engine_settings, unknown_id) == "no_match"

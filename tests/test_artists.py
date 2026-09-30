@@ -24,7 +24,7 @@ import pytest
 from conftest import make_track
 from tagmend.engine import artists, staging, store, versioning
 from tagmend.engine.db import connect
-from tagmend.engine.lastfm import ArtistCorrection
+from tagmend.engine.lastfm import ArtistCorrection, LastfmError
 from tagmend.engine.library import list_files as library_list
 from tagmend.engine.library import scan_library
 from tagmend.engine.musicbrainz import MBArtist
@@ -173,7 +173,7 @@ def test_mbid_written_on_changed_files_only(
         },
     )
     artists.resolve_artists(engine_settings, client=fake)
-    staging.commit_tags(engine_settings, origin="auto")
+    staging.commit_tags(engine_settings)
 
     assert read_tags(changed).tags["musicbrainz_artistid"] == ["mbid-1"]
     # The already-canonical file is not touched just to backfill an MBID.
@@ -275,7 +275,7 @@ def test_rerun_after_commit_is_idempotent(
     # The commit stamps mbid-1 onto the file, so the re-run reaches the MusicBrainz tier.
     mb = FakeArtistSource({"mbid-1": _mb("Miami Nights 1984", mbid="mbid-1")})
     artists.resolve_artists(engine_settings, client=fake, mb_client=mb)
-    staging.commit_tags(engine_settings, origin="auto")
+    staging.commit_tags(engine_settings)
     scan_library(engine_settings)
 
     # The canonical value now equals the correction → no further change.
@@ -301,6 +301,42 @@ def test_no_correction_is_reported_not_an_error(
     assert result.no_correction_values == ["Obscure Band"]
     assert result.staged_files == 0
     assert result.errors == 0
+
+
+class _FailingCorrectionSource(FakeCorrectionSource):
+    """A :class:`FakeCorrectionSource` whose lookup for the given values always fails."""
+
+    def __init__(self, table: dict[str, ArtistCorrection | None], failing: set[str]) -> None:
+        super().__init__(table)
+        self._failing = failing
+
+    def artist_correction(self, name: str) -> ArtistCorrection | None:
+        if name in self._failing:
+            message = "transport error"
+            raise LastfmError(message)
+        return super().artist_correction(name)
+
+
+def test_lookup_error_is_counted_and_itemized(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    make_track(music_dir / "t.mp3", {"artist": ["Obscure Band"]})
+    scan_library(engine_settings)
+
+    fake = _FailingCorrectionSource({}, failing={"Obscure Band"})
+    result = artists.resolve_artists(engine_settings, client=fake)
+
+    assert result.errors == 1
+    assert result.error_items == [{"key": "Obscure Band", "message": "transport error"}]
+    assert result.to_dict()["error_items"] == result.error_items
+    assert result.staged_files == 0
+
+
+def test_result_names_its_processed_unit(engine_settings: Settings) -> None:
+    result = artists.resolve_artists(engine_settings, client=FakeCorrectionSource({}))
+
+    assert result.to_dict()["processed_unit"] == "values"
 
 
 # --- (7b) MusicBrainz placeholder guard ----------------------------------------------
@@ -367,7 +403,7 @@ def test_normal_correction_still_stages_with_mbid_alongside_placeholder(
         },
     )
     result = artists.resolve_artists(engine_settings, client=fake)
-    staging.commit_tags(engine_settings, origin="auto")
+    staging.commit_tags(engine_settings)
 
     assert result.corrected_values == 1
     assert result.staged_files == 1
@@ -566,7 +602,7 @@ def test_dry_run_ignores_empty_staging_precondition(
     staging.stage_tags(
         engine_settings,
         file_id=other_id,
-        managed_tags={"artist": ["Someone Else"]},
+        tags={"artist": ["Someone Else"]},
         origin="manual",
     )
 
@@ -592,7 +628,7 @@ def test_non_dry_run_requires_empty_staging(
     staging.stage_tags(
         engine_settings,
         file_id=file_id,
-        managed_tags={"artist": ["Anything"]},
+        tags={"artist": ["Anything"]},
         origin="manual",
     )
 
@@ -675,7 +711,7 @@ def test_two_non_dry_runs_with_a_commit_between_do_not_advance_the_frontier(
         {"from": "Alpha '84", "to": "Alpha 1984", "mbid": "mbid-a", "source": "lastfm"},
     ]
     assert first.pending_remaining == 1
-    staging.commit_tags(engine_settings, origin="auto")
+    staging.commit_tags(engine_settings)
 
     second = artists.resolve_artists(engine_settings, client=fake, mb_client=mb, limit=1)
 
@@ -825,7 +861,7 @@ def test_commit_then_revert_commit_restores_original_name(
         {"Miami Nights '84": ArtistCorrection("Miami Nights 1984", "mbid-1")},
     )
     artists.resolve_artists(engine_settings, client=fake)
-    commit_result = staging.commit_tags(engine_settings, origin="auto")
+    commit_result = staging.commit_tags(engine_settings)
     assert commit_result.commit_id is not None
 
     on_disk = read_tags(track).tags

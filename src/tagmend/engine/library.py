@@ -175,7 +175,7 @@ def _row_matches_status(  # noqa: PLR0913 - cohesive keyword-only status filters
 def list_files(  # noqa: PLR0913 - cohesive keyword-only discovery filters
     settings: Settings,
     *,
-    root: Path | None = None,
+    path: Path | None = None,
     limit: int | None = None,
     genre_status: str | None = None,
     artist_status: str | None = None,
@@ -184,9 +184,9 @@ def list_files(  # noqa: PLR0913 - cohesive keyword-only discovery filters
 ) -> list[FileView]:
     """Return tracked files (id order) with their managed tags, for discovery.
 
-    Optionally limited to files under *root* (resolved by
+    Optionally limited to files in the folder *path* or under it (resolved by
     :func:`tagmend.engine.path_keys.folder_arg_key`, so case and separators do not matter on
-    Windows and a relative *root* resolves under ``music_path``), filtered to one genre
+    Windows and a relative *path* resolves under ``music_path``), filtered to one genre
     workflow status
     (``pending`` | ``no_identity`` | ``no_match`` | ``manual`` | ``staged`` | ``done``), one
     artist workflow status (``pending`` | ``no_identity`` | ``manual`` | ``staged`` |
@@ -198,14 +198,14 @@ def list_files(  # noqa: PLR0913 - cohesive keyword-only discovery filters
     status filter the cap is applied before reading tags, so a large library stays cheap to
     browse; with any filter, all candidate rows are examined, ALL filters are applied, and the
     cap counts the *matching* files. Raises :class:`ValueError` for an unknown status, a
-    negative *limit* or a *root* outside ``music_path``. Read-only.
+    negative *limit* or a *path* outside ``music_path``. Read-only.
     """
     check_limit(limit)
     require_choice("genre_status", genre_status, store.GENRE_WORKFLOW_STATUSES)
     require_choice("artist_status", artist_status, store.ARTIST_WORKFLOW_STATUSES)
     require_choice("year_status", year_status, store.YEAR_WORKFLOW_STATUSES)
     require_choice("mismatch_status", mismatch_status, store.MISMATCH_WORKFLOW_STATUSES)
-    root_key = None if root is None else path_keys.folder_arg_key(settings, root)
+    root_key = None if path is None else path_keys.folder_arg_key(settings, path)
 
     filtered = (
         genre_status is not None

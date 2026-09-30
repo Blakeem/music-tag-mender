@@ -112,7 +112,7 @@ def test_commit_then_read_fills_originaldate_and_keeps_date(
 
     fake = FakeMBAlbumSource({("Black Sabbath", "Paranoid"): _mb("1970")})
     years.resolve_years(engine_settings, client=fake)
-    staging.commit_tags(engine_settings, origin="auto")
+    staging.commit_tags(engine_settings)
 
     on_disk = read_tags(track).tags
     assert on_disk["originaldate"] == ["1970"]
@@ -186,7 +186,7 @@ def test_file_without_artist_is_skipped(
 
     fake = FakeMBAlbumSource({})
     result = years.resolve_years(engine_settings, client=fake)
-    assert result.skipped_no_artist == 1
+    assert result.skipped_no_identity == 1
     assert result.staged_files == 0
 
 
@@ -310,6 +310,30 @@ def test_a_musicbrainz_error_is_counted_and_itemized(
     # No status row: the group stays pending so the next run retries it.
     view = next(v for v in library_list(engine_settings) if v.file_id == file_id)
     assert view.year_status == "pending"
+
+
+def test_held_no_match_is_counted_in_skipped_no_match(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    make_track(music_dir / "a.mp3", {"artist": ["Obscure"], "album": ["Demos"]})
+    make_track(music_dir / "b.mp3", {"artist": ["Obscure"], "album": ["Demos"]})
+    scan_library(engine_settings)
+    fake = FakeMBAlbumSource({("Obscure", "Demos"): None})
+    first = years.resolve_years(engine_settings, client=fake)
+    assert first.no_match == 2
+
+    second = years.resolve_years(engine_settings, client=fake)
+
+    assert second.processed == 0
+    assert second.skipped_no_match == 2
+    assert "2 file(s) no_match held" in second.summary
+
+
+def test_result_names_its_processed_unit(engine_settings: Settings) -> None:
+    result = years.resolve_years(engine_settings, client=FakeMBAlbumSource({}))
+
+    assert result.to_dict()["processed_unit"] == "album_groups"
 
 
 def test_no_match_skipped_on_rerun_until_identity_changes(
@@ -464,7 +488,7 @@ def test_dry_run_ignores_empty_staging_precondition(
     staging.stage_tags(
         engine_settings,
         file_id=other_id,
-        managed_tags={"genre": ["Rock"]},
+        tags={"genre": ["Rock"]},
         origin="manual",
     )
 
@@ -483,7 +507,7 @@ def test_non_dry_run_requires_empty_staging(
     staging.stage_tags(
         engine_settings,
         file_id=file_id,
-        managed_tags={"genre": ["Rock"]},
+        tags={"genre": ["Rock"]},
         origin="manual",
     )
 
@@ -564,7 +588,7 @@ def test_summary_labels_group_and_file_counts(
     assert "no_match 1 file(s)" in result.summary
     assert "Skipped 1 file(s) present" in result.summary
     assert "0 file(s) no_album" in result.summary
-    assert "0 file(s) no_artist" in result.summary
+    assert "0 file(s) no_identity" in result.summary
     assert "0 file(s) manual" in result.summary
 
 
@@ -580,7 +604,7 @@ def test_rerun_after_commit_is_idempotent(
 
     fake = FakeMBAlbumSource({("Black Sabbath", "Paranoid"): _mb("1970")})
     years.resolve_years(engine_settings, client=fake)
-    staging.commit_tags(engine_settings, origin="auto")
+    staging.commit_tags(engine_settings)
     scan_library(engine_settings)
 
     second = years.resolve_years(engine_settings, client=fake)
@@ -606,7 +630,7 @@ def test_commit_then_revert_commit_restores_blank_originaldate(
 
     fake = FakeMBAlbumSource({("Black Sabbath", "Paranoid"): _mb("1970")})
     years.resolve_years(engine_settings, client=fake)
-    commit_result = staging.commit_tags(engine_settings, origin="auto")
+    commit_result = staging.commit_tags(engine_settings)
     assert commit_result.commit_id is not None
 
     on_disk = read_tags(track).tags

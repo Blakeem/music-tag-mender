@@ -406,6 +406,23 @@ def test_groups_ship_only_in_the_grouped_view() -> None:
     assert grouped.rows == []
 
 
+def test_grouped_view_respects_tier() -> None:
+    report = _run(
+        [
+            _f(1, folder=r"C:\m\Band\High", release_track_id="rt-99", recording_id="rec-99"),
+            _f(2, folder=r"C:\m\Band\Low", releasecountry="GB"),
+        ],
+    )
+
+    view = disagreements._narrow(report, tier="high", folder_key=None, limit=None, group=True)
+
+    assert [g.folder for g in view.groups] == [r"C:\m\Band\High"]
+    assert view.groups[0].flagged == 1
+    assert view.groups[0].file_ids == [1]
+    assert view.groups[0].tiers == {"high": 1}
+    assert (view.flagged, view.high, view.low) == (2, 1, 1)  # run counts unchanged
+
+
 def test_the_recording_id_still_matches_when_the_release_track_id_is_wrong() -> None:
     # A file carrying a stale release-track id but the right recording id is still placed,
     # so its track-level fields are checked rather than skipped.
@@ -746,6 +763,7 @@ def test_releases_checked_counts_what_was_actually_fetched() -> None:
     )
 
     assert report.errors == 1
+    assert report.error_items == [{"key": "rel-a", "message": "boom"}]
     assert report.releases_checked == 1
     assert report.releases_attempted == 2
 

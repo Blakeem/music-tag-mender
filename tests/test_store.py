@@ -317,6 +317,25 @@ def test_insert_and_get_revision_round_trip(db_conn: sqlite3.Connection) -> None
     assert rev.managed_set == MANAGED_SET_VERSION
 
 
+def test_revision_to_dict_keys(db_conn: sqlite3.Connection) -> None:
+    file_id = _insert(db_conn, folder="/lib", filename="a.mp3")
+    _insert_revision(db_conn, file_id, version=0, origin="scan")
+
+    revision = store.get_revision(db_conn, file_id, 0)
+
+    assert revision is not None
+    assert set(revision.to_dict()) == {
+        "version",
+        "created_at",
+        "origin",
+        "reverted_from",
+        "commit_id",
+        "managed_tags",
+        "diff",
+        "note",
+    }
+
+
 def test_get_revisions_orders_by_version(db_conn: sqlite3.Connection) -> None:
     file_id = _insert(db_conn, folder="/lib", filename="a.mp3")
     # Insert out of order to prove ORDER BY version (not insertion order).

@@ -11,7 +11,7 @@ proposal carries a confidence label and a provenance note pre-formatted for
 ``stage_tags_batch``. Nothing stages, nothing auto-commits. The first two sources are
 network-free. The recording source is opt-out (``use_musicbrainz=False``) and its result is
 ``confidence: "review"`` (never green). The report feeds the existing ``stage_tags_batch →
-diff_tags(root) → commit_tags(root) → reopen_axes`` spine, where the human is the
+diff_tags(path) → commit_tags(path) → reopen_axes`` spine, where the human is the
 diff-gate.
 
 The recording source's ONLY side effect is its persistent lookup cache

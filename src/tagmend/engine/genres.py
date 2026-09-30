@@ -69,9 +69,9 @@ class _Identity:
 def _first_nonblank(values: list[str] | None) -> str | None:
     """Return the first value that is non-blank after ``str.strip()``, else ``None``.
 
-    Whitespace-only tag values (spaces, tabs, newlines) count as absent — the Python twin
-    of :func:`tagmend.engine.store.has_identity`'s blankness rule, so ``_select``'s
-    ``identity.artist is None`` gate buckets such files as ``skipped_no_artist`` (rather
+    Whitespace-only tag values (spaces, tabs, newlines) count as absent. This is the Python
+    twin of :func:`tagmend.engine.store.has_identity`'s blankness rule, so ``_select``'s
+    ``identity.artist is None`` gate buckets such files as ``skipped_no_identity`` (rather
     than looking up ``" "`` junk) and the derived ``no_identity`` status agrees. The value
     is returned verbatim (unstripped), preserving the exact lookup string for non-blank tags.
     """
@@ -106,12 +106,14 @@ class StageGenresResult:
     """Immutable summary of one :func:`resolve_genres` call, JSON-ready for the MCP tool."""
 
     processed: int
+    processed_unit: str
     staged: int
     no_match: int
     skipped: dict[str, int]
     pending_remaining: int
     more: bool
-    errors: list[dict[str, str]]
+    errors: int
+    error_items: list[dict[str, str]]
     no_match_artists: list[str]
     summary: str
 
@@ -119,12 +121,14 @@ class StageGenresResult:
         """JSON-serializable form for the MCP tool."""
         return {
             "processed": self.processed,
+            "processed_unit": self.processed_unit,
             "staged": self.staged,
             "no_match": self.no_match,
             "skipped": dict(self.skipped),
             "pending_remaining": self.pending_remaining,
             "more": self.more,
-            "errors": list(self.errors),
+            "errors": self.errors,
+            "error_items": [dict(item) for item in self.error_items],
             "no_match_artists": list(self.no_match_artists),
             "summary": self.summary,
         }
@@ -139,9 +143,9 @@ class _Tally:
     skipped_done: int = 0
     skipped_no_match: int = 0
     skipped_manual: int = 0
-    skipped_no_artist: int = 0
+    skipped_no_identity: int = 0
     skipped_missing: int = 0
-    errors: list[dict[str, str]] = field(default_factory=list)
+    error_items: list[dict[str, str]] = field(default_factory=list)
     no_match_artists: set[str] = field(default_factory=set)
 
 
@@ -177,7 +181,7 @@ def _select(
         identity = _identity(store.get_tags(conn, fid))
 
         if identity.artist is None:
-            tally.skipped_no_artist += 1
+            tally.skipped_no_identity += 1
             continue
 
         if store.has_staged_change_for(conn, fid, genre_fields) or store.has_auto_change_for(
@@ -228,6 +232,7 @@ def resolve_genres(  # noqa: PLR0913 - cohesive keyword-only scope + injection p
     album: str | None = None,
     file_ids: list[int] | None = None,
     limit: int | None = None,
+    dry_run: bool = False,
     client: TagSource | None = None,
 ) -> StageGenresResult:
     """Look up Last.fm genres for the in-scope, not-yet-done files and stage the result.
@@ -240,12 +245,15 @@ def resolve_genres(  # noqa: PLR0913 - cohesive keyword-only scope + injection p
     last scan flagged missing is counted under ``skipped["missing"]``. A transient Last.fm
     error leaves the group pending and is reported, never aborting the call.
 
+    *dry_run* counts what would be staged or recorded ``no_match`` without staging or writing
+    any status row. It still reads the lookup cache and fetches on a cache miss.
+
     *client* lets callers inject a :class:`tagmend.engine.lastfm.TagSource` (a fake in
     tests). When ``None`` a real :class:`LastfmClient` is built and requires
-    ``settings.lastfm_api_key``. Raises :class:`ValueError` if anything is already staged
-    ("commit or unstage pending changes first"), for a negative *limit*, or when a real
-    client is needed but no API key is configured. Owns its connection, and ``stage_tags``
-    opens its own.
+    ``settings.lastfm_api_key``. A non-dry run raises :class:`ValueError` if anything is
+    already staged ("commit or unstage pending changes first"). Any run raises it for a
+    negative *limit*, or when a real client is needed but no API key is configured. Owns its
+    connection, and ``stage_tags`` opens its own.
     """
     check_limit(limit)
     effective_limit = limit if limit is not None else settings.genre_stage_limit
@@ -257,7 +265,7 @@ def resolve_genres(  # noqa: PLR0913 - cohesive keyword-only scope + injection p
 
         # Staging replaces a file's pending row, so a genre run would silently discard a
         # manual fix to another field that is still waiting for its commit.
-        if store.any_staged(connection):
+        if not dry_run and store.any_staged(connection):
             message = "commit or unstage pending changes first"
             raise ValueError(message)
 
@@ -278,7 +286,15 @@ def resolve_genres(  # noqa: PLR0913 - cohesive keyword-only scope + injection p
         pending_remaining = len(processable) - len(to_process)
 
         if to_process:
-            _process_groups(settings, connection, to_process, vocab, client, tally)
+            _process_groups(
+                settings,
+                connection,
+                to_process,
+                vocab,
+                client,
+                tally,
+                dry_run=dry_run,
+            )
     finally:
         connection.close()
 
@@ -286,6 +302,7 @@ def resolve_genres(  # noqa: PLR0913 - cohesive keyword-only scope + injection p
         tally,
         processed=len(to_process),
         pending_remaining=pending_remaining,
+        dry_run=dry_run,
     )
 
 
@@ -296,13 +313,24 @@ def _process_groups(  # noqa: PLR0913 - cohesive orchestration inputs
     vocab: Vocabulary,
     client: TagSource | None,
     tally: _Tally,
+    *,
+    dry_run: bool,
 ) -> None:
     """Group *candidates* by identity and resolve each group via *client* (built if None)."""
     groups = _group_by_identity(candidates)
 
     if client is not None:
         for identity, fids in groups.items():
-            _process_one_group(settings, conn, identity, fids, vocab, client, tally)
+            _process_one_group(
+                settings,
+                conn,
+                identity,
+                fids,
+                vocab,
+                client,
+                tally,
+                dry_run=dry_run,
+            )
         return
 
     if not settings.lastfm_api_key:
@@ -314,7 +342,16 @@ def _process_groups(  # noqa: PLR0913 - cohesive orchestration inputs
         rate_per_sec=settings.lastfm_rate_per_sec,
     ) as owned_client:
         for identity, fids in groups.items():
-            _process_one_group(settings, conn, identity, fids, vocab, owned_client, tally)
+            _process_one_group(
+                settings,
+                conn,
+                identity,
+                fids,
+                vocab,
+                owned_client,
+                tally,
+                dry_run=dry_run,
+            )
 
 
 def _group_by_identity(candidates: list[_Candidate]) -> dict[_Identity, list[int]]:
@@ -333,12 +370,14 @@ def _process_one_group(  # noqa: PLR0913 - cohesive per-group inputs
     vocab: Vocabulary,
     client: TagSource,
     tally: _Tally,
+    *,
+    dry_run: bool,
 ) -> None:
     """Resolve one ``(artist, album)`` group and stage / mark its files accordingly.
 
     A transient :class:`LastfmError` leaves the group's files pending (no status row),
     records the error, and returns without aborting the wider call. The group's status
-    writes are committed together at the end.
+    writes are committed together at the end. A dry run counts the outcome and writes nothing.
     """
     # ``_select`` guarantees a non-None artist for every processable candidate.
     lookup_artist = identity.artist
@@ -348,15 +387,22 @@ def _process_one_group(  # noqa: PLR0913 - cohesive per-group inputs
         resolved = _resolve_group(settings, identity, vocab, client)
     except LastfmError as exc:
         logger.warning("last.fm error for artist=%r: %s", lookup_artist, exc)
-        tally.errors.append({"artist": lookup_artist, "message": str(exc)})
+        tally.error_items.append({"key": lookup_artist, "message": str(exc)})
         return
 
     if resolved:
         for fid in file_ids:
-            _stage_resolved(settings, fid, resolved)
+            if not dry_run:
+                _stage_resolved(settings, fid, resolved)
             tally.staged += 1
         return
 
+    # The lookup already happened, so a preview reports the miss. Only the sticky status row
+    # is withheld until the real run.
+    if dry_run:
+        tally.no_match += len(file_ids)
+        tally.no_match_artists.add(lookup_artist)
+        return
     now = _utc_now()
     for fid in file_ids:
         store.set_genre_status(
@@ -407,7 +453,7 @@ def _stage_resolved(settings: Settings, file_id: int, resolved: list[str]) -> No
     staging.stage_tags(
         settings,
         file_id=file_id,
-        managed_tags={"genre": resolved},
+        tags={"genre": resolved},
         origin="auto",
         note=f"lastfm: {', '.join(resolved)}",
     )
@@ -418,13 +464,14 @@ def _build_result(
     *,
     processed: int,
     pending_remaining: int,
+    dry_run: bool,
 ) -> StageGenresResult:
     """Freeze the run's tally + counts into the public :class:`StageGenresResult`."""
     skipped = {
         "done": tally.skipped_done,
         "no_match": tally.skipped_no_match,
         "manual": tally.skipped_manual,
-        "no_artist": tally.skipped_no_artist,
+        "no_identity": tally.skipped_no_identity,
         "missing": tally.skipped_missing,
     }
     more = pending_remaining > 0
@@ -433,15 +480,18 @@ def _build_result(
         processed=processed,
         pending_remaining=pending_remaining,
         skipped=skipped,
+        dry_run=dry_run,
     )
     return StageGenresResult(
         processed=processed,
+        processed_unit="files",
         staged=tally.staged,
         no_match=tally.no_match,
         skipped=skipped,
         pending_remaining=pending_remaining,
         more=more,
-        errors=list(tally.errors),
+        errors=len(tally.error_items),
+        error_items=list(tally.error_items),
         no_match_artists=sorted(tally.no_match_artists),
         summary=summary,
     )
@@ -453,20 +503,33 @@ def _summarize(
     processed: int,
     pending_remaining: int,
     skipped: dict[str, int],
+    dry_run: bool,
 ) -> str:
-    """Build a short, plain human summary of what was and was not processed."""
+    """Build a short, plain human summary of what was and was not processed.
+
+    A dry run records neither a stage nor a ``no_match``, so its remainder is not resumable
+    and is worded accordingly.
+    """
     skipped_total = sum(skipped.values())
+    errors = len(tally.error_items)
     parts = [
         f"Processed {processed} file(s): staged {tally.staged}, no_match {tally.no_match}.",
         f"Skipped {skipped_total} "
         f"(done {skipped['done']}, no_match {skipped['no_match']}, "
-        f"manual {skipped['manual']}, no_artist {skipped['no_artist']}, "
+        f"manual {skipped['manual']}, no_identity {skipped['no_identity']}, "
         f"missing {skipped['missing']}).",
     ]
-    if pending_remaining > 0:
+    if pending_remaining > 0 and dry_run:
+        parts.append(
+            f"Processed the first {processed} of {processed + pending_remaining} file(s) in "
+            f"scope. A dry run records nothing, so an identical call re-processes the same "
+            f"files. Raise limit above {processed}, or scope with artist= / file_ids=, to "
+            f"reach the remaining {pending_remaining} file(s).",
+        )
+    elif pending_remaining > 0:
         parts.append(f"{pending_remaining} still pending — call again to continue.")
-    if tally.errors:
-        parts.append(f"{len(tally.errors)} artist(s) errored and stay pending — re-run to retry.")
+    if errors > 0:
+        parts.append(f"{errors} artist(s) errored and stay pending. Re-run to retry.")
     return " ".join(parts)
 
 

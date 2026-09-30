@@ -67,12 +67,14 @@ class ResolveYearsResult:
     """Immutable summary of one :func:`resolve_years` call, JSON-ready for the MCP tool."""
 
     processed: int
+    processed_unit: str
     staged_files: int
     no_match: int
     skipped_present: int
     skipped_no_album: int
-    skipped_no_artist: int
+    skipped_no_identity: int
     skipped_manual: int
+    skipped_no_match: int
     skipped_missing: int
     pending_remaining: int
     more: bool
@@ -85,12 +87,14 @@ class ResolveYearsResult:
         """JSON-serializable form for the MCP tool."""
         return {
             "processed": self.processed,
+            "processed_unit": self.processed_unit,
             "staged_files": self.staged_files,
             "no_match": self.no_match,
             "skipped_present": self.skipped_present,
             "skipped_no_album": self.skipped_no_album,
-            "skipped_no_artist": self.skipped_no_artist,
+            "skipped_no_identity": self.skipped_no_identity,
             "skipped_manual": self.skipped_manual,
+            "skipped_no_match": self.skipped_no_match,
             "skipped_missing": self.skipped_missing,
             "pending_remaining": self.pending_remaining,
             "more": self.more,
@@ -109,8 +113,9 @@ class _Tally:
     no_match: int = 0
     skipped_present: int = 0
     skipped_no_album: int = 0
-    skipped_no_artist: int = 0
+    skipped_no_identity: int = 0
     skipped_manual: int = 0
+    skipped_no_match: int = 0
     skipped_missing: int = 0
     # identity -> original_date (one mapping per resolved album group).
     mappings: dict[tuple[str | None, str | None], str] = field(default_factory=dict)
@@ -234,7 +239,7 @@ def _select(
         identity = genres._identity(tags)  # noqa: SLF001 - shared identity shape
 
         if identity.artist is None:
-            tally.skipped_no_artist += 1
+            tally.skipped_no_identity += 1
             continue
         if identity.album is None:
             tally.skipped_no_album += 1
@@ -254,10 +259,11 @@ def _select(
 
         decision = store.get_year_status(conn, fid)
         if decision is not None and _decision_blocks(decision, identity):
-            # A sticky 'manual' is reported; a non-stale 'no_match' is silently held back
-            # (a stale no_match does not block and falls through to be reprocessed).
+            # A stale no_match does not block and falls through to be reprocessed.
             if decision.status == "manual":
                 tally.skipped_manual += 1
+            else:  # a non-stale 'no_match'
+                tally.skipped_no_match += 1
             continue
 
         processable.append(_Candidate(file_id=fid, identity=identity))
@@ -398,7 +404,7 @@ def _stage_resolved(settings: Settings, file_id: int, original_date: str) -> boo
     return staging.stage_tags(
         settings,
         file_id=file_id,
-        managed_tags={_YEAR_FIELD: [original_date]},
+        tags={_YEAR_FIELD: [original_date]},
         origin="auto",
         note=f"musicbrainz: {original_date}",
         fill_only=frozenset({_YEAR_FIELD}),
@@ -429,12 +435,14 @@ def _build_result(
     )
     return ResolveYearsResult(
         processed=processed,
+        processed_unit="album_groups",
         staged_files=tally.staged_files,
         no_match=tally.no_match,
         skipped_present=tally.skipped_present,
         skipped_no_album=tally.skipped_no_album,
-        skipped_no_artist=tally.skipped_no_artist,
+        skipped_no_identity=tally.skipped_no_identity,
         skipped_manual=tally.skipped_manual,
+        skipped_no_match=tally.skipped_no_match,
         skipped_missing=tally.skipped_missing,
         pending_remaining=pending_remaining,
         more=more,
@@ -463,8 +471,9 @@ def _summarize(
         f"no_match {tally.no_match} file(s).",
         f"Skipped {tally.skipped_present} file(s) present, "
         f"{tally.skipped_no_album} file(s) no_album, "
-        f"{tally.skipped_no_artist} file(s) no_artist, "
+        f"{tally.skipped_no_identity} file(s) no_identity, "
         f"{tally.skipped_manual} file(s) manual, "
+        f"{tally.skipped_no_match} file(s) no_match held, "
         f"{tally.skipped_missing} file(s) missing.",
     ]
     if pending_remaining > 0 and dry_run:

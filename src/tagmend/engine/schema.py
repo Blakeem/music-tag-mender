@@ -138,6 +138,14 @@ upgrades in place with every row preserved):
   one file on disk become two rows. The column is nullable in both shapes, and every engine
   insert sets it. :func:`_migrate_files_path_key` backfills it and refuses a ledger in which two
   rows already share a key.
+
+The commit-origin pass changes no shape (schema v19. A v18 ledger upgrades in place with every
+row preserved):
+
+* ``commits.origin`` is derived from the staged rows a commit sweeps, so a commit is ``auto``
+  only when every change in it came from a resolver. Earlier builds stamped every MCP commit
+  ``manual``. :func:`_migrate_commit_origin` restamps each ``manual`` commit whose revisions
+  are all ``auto``.
 """
 
 from __future__ import annotations
@@ -152,7 +160,7 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
-SCHEMA_VERSION: Final = 18
+SCHEMA_VERSION: Final = 19
 
 _FILES_DDL: Final = """
 CREATE TABLE IF NOT EXISTS files (
@@ -639,6 +647,33 @@ def _migrate_files_path_key(connection: sqlite3.Connection) -> None:
     logger.info("schema v18: backfilled files.path_key on %d row(s)", len(rows))
 
 
+def _migrate_commit_origin(connection: sqlite3.Connection) -> None:
+    """v19: restamp ``auto`` on every ``manual`` commit whose revisions are all ``auto``.
+
+    Runs BEFORE the DDL, so the guard leads with ``_table_exists``: a fresh ledger has no
+    commits to restamp. Idempotent: a second run finds no ``manual`` commit left to match. It
+    updates ``commits`` only, which carries no append-only trigger. Commits itself like v13,
+    since a read-only caller would otherwise roll the restamp back.
+    """
+    if not _table_exists(connection, "commits"):
+        return
+    if not _table_exists(connection, "tag_revisions"):
+        return
+    cursor = connection.execute(
+        """
+        UPDATE commits SET origin = 'auto'
+        WHERE origin = 'manual'
+          AND EXISTS (SELECT 1 FROM tag_revisions r WHERE r.commit_id = commits.id)
+          AND NOT EXISTS (
+            SELECT 1 FROM tag_revisions r WHERE r.commit_id = commits.id AND r.origin != 'auto'
+          )
+        """,
+    )
+    restamped = cursor.rowcount
+    connection.commit()
+    logger.info("schema v19: restamped %d all-auto commit(s) as auto", restamped)
+
+
 def apply_schema(connection: sqlite3.Connection) -> None:
     """Upgrade the ledger to :data:`SCHEMA_VERSION` when its stamp is older, else do nothing.
 
@@ -652,8 +687,9 @@ def apply_schema(connection: sqlite3.Connection) -> None:
     (:func:`_migrate_v12_year_status`), v13 adds and stamps ``tag_revisions.managed_set``
     (:func:`_migrate_v13_managed_set`), v14 adds ``files.reader_version``
     (:func:`_migrate_v14_reader_version`), v17 adds the staged base signature
-    (:func:`_migrate_staged_base_signature`) and v18 adds and backfills ``files.path_key``
-    (:func:`_migrate_files_path_key`). The triggers come after every migration, so a
+    (:func:`_migrate_staged_base_signature`), v18 adds and backfills ``files.path_key``
+    (:func:`_migrate_files_path_key`) and v19 restamps all-auto commits
+    (:func:`_migrate_commit_origin`). The triggers come after every migration, so a
     migration that updates a log runs before they exist.
 
     ``commits`` is created before the revision/staging tables that reference it.
@@ -674,6 +710,7 @@ def apply_schema(connection: sqlite3.Connection) -> None:
     _migrate_v14_reader_version(connection)
     _migrate_staged_base_signature(connection)
     _migrate_files_path_key(connection)
+    _migrate_commit_origin(connection)
     connection.execute(_FILES_DDL)
     connection.execute(_FILES_PATH_KEY_INDEX_DDL)
     connection.execute(_FILE_TAGS_DDL)

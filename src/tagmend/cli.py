@@ -66,7 +66,7 @@ def check_health(
         mark = "OK  " if check.ok else "FAIL"
         typer.echo(f"[{mark}] {check.name}: {check.detail}")
 
-    if not report.ok:
+    if not report.ready:
         typer.echo("Not ready — fix the failures above.")
         raise typer.Exit(code=1)
     typer.echo("All checks passed — ready to go.")

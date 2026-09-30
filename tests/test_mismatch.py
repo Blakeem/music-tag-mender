@@ -379,6 +379,25 @@ def test_grouped_view_splits_flagged_and_context_per_folder() -> None:
     assert singles.to_dict()["folder_context"] == 2
 
 
+def test_grouped_view_respects_tier() -> None:
+    files = _all_classes_library()
+    report = mismatch._classify(files, _MUSIC)
+
+    grouped = mismatch._grouped_report(
+        report,
+        mismatch._folder_stats(files),
+        tier="high",
+        limit=None,
+    )
+
+    ozzy = str(_MUSIC / "Ozzy Osbourne" / "(2001) Ozzy Osbourne - Down To Earth")
+    assert [g.folder for g in grouped.groups] == [ozzy]
+    assert grouped.groups[0].flagged == 1
+    assert grouped.groups[0].file_ids == [100]
+    assert grouped.groups[0].tiers == {"high": 1}
+    assert grouped.medium == 2  # library counts unchanged
+
+
 # --- library-root file must not crash -----------------------------------------------
 
 
@@ -843,10 +862,10 @@ def test_mismatch_fix_flow_end_to_end(
         staging.stage_tags(
             engine_settings,
             file_id=fid,
-            managed_tags={"genre": ["Metal"], "originaldate": ["2001"]},
+            tags={"genre": ["Metal"], "originaldate": ["2001"]},
             origin="auto",
         )
-    staging.commit_tags(engine_settings, origin="auto")
+    staging.commit_tags(engine_settings)
     artists.set_artist_status(engine_settings, file_ids=[jem1, jem2], status="manual")
     assert _derived(engine_settings, jem1) == ("done", "done", "manual")
 
@@ -874,7 +893,7 @@ def test_mismatch_fix_flow_end_to_end(
     assert staged == [jem1, jem2]
 
     # 4. commit the folder as ONE revertible commit.
-    result = staging.commit_tags(engine_settings, root=poisoned)
+    result = staging.commit_tags(engine_settings, path=poisoned)
     assert result.committed == 2
     commit_id = result.commit_id
     assert commit_id is not None
@@ -1049,15 +1068,17 @@ def test_mcp_reopen_axes_rejects_auto_commit(music_dir: Path) -> None:
     staging.stage_tags(
         config.load_settings(),
         file_id=file_id,
-        managed_tags={"genre": ["Rock"]},
+        tags={"genre": ["Rock"]},
         origin="auto",
     )
-    auto_commit = staging.commit_tags(config.load_settings(), origin="auto").commit_id
-    assert auto_commit is not None
+    committed = mcp_server.commit_tags()
+    auto_commit = committed["commit_id"]
+    assert isinstance(auto_commit, int)
+    assert mcp_server.get_commit(auto_commit)["commit"]["origin"] == "auto"
 
     payload = mcp_server.reopen_axes(auto_commit)
     assert payload["ok"] is False
-    assert "auto" in str(payload["error"])
+    assert "auto-resolved" in str(payload["error"])
 
     assert mcp_server.reopen_axes(9999)["ok"] is False  # unknown commit id
 

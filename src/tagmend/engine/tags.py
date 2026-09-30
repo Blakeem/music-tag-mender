@@ -171,7 +171,7 @@ _WIDENED_MANAGED_TAGS: Final[frozenset[str]] = frozenset(
 # "Alice in Chains - Greatest Hits" while its albumstatus still says "bootleg" and its country
 # "RU" — from the Russian bootleg it was wrongly matched to. Managed so the fix flow can clear
 # or replace it in the same commit, and so revert governs it like everything else.
-_RELEASE_STAMP_TAGS: Final[frozenset[str]] = frozenset(
+RELEASE_STAMP_TAGS: Final[frozenset[str]] = frozenset(
     {
         "musicbrainz_albumstatus",
         "media",
@@ -192,7 +192,7 @@ _RELEASE_STAMP_TAGS: Final[frozenset[str]] = frozenset(
 # ``date`` (reissue year, MP4 ``©day``) and ``originaldate`` (original year, MP4 freeform) are
 # BOTH managed and kept distinct.
 MANAGED_TAGS: Final[frozenset[str]] = (
-    ORIGINAL_MANAGED_TAGS | _WIDENED_MANAGED_TAGS | _RELEASE_STAMP_TAGS
+    ORIGINAL_MANAGED_TAGS | _WIDENED_MANAGED_TAGS | RELEASE_STAMP_TAGS
 )
 
 # Which managed set governed a given revision, so revert can tell "this tag was empty then"

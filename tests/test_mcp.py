@@ -21,7 +21,7 @@ from mcp.types import TextContent
 from conftest import make_track
 from tagmend import mcp_server
 from tagmend.config import load_settings
-from tagmend.engine import staging, store
+from tagmend.engine import health, staging, store
 from tagmend.engine.db import connect
 from tagmend.engine.lastfm import LastfmError
 from tagmend.engine.musicbrainz import MusicBrainzError
@@ -447,10 +447,11 @@ def test_list_commits_and_get_commit(music_dir: Path) -> None:
     assert listed["ok"] is True
     commits_list = listed["commits"]
     assert isinstance(commits_list, list)
-    assert any(c["id"] == commit_id for c in commits_list)
+    assert any(c["commit_id"] == commit_id for c in commits_list)
 
     got = mcp_server.get_commit(commit_id)
     assert got["ok"] is True
+    assert got["commit"]["commit_id"] == commit_id
     assert got["commit"]["status"] == "applied"
     assert got["commit"]["message"] == "reclassify"
 
@@ -505,6 +506,54 @@ def test_revert_commit_unknown_id_returns_error() -> None:
     payload = mcp_server.revert_commit(9999)
     assert payload["ok"] is False
     assert "error" in payload
+
+
+def test_revert_tags_dry_run_envelope(music_dir: Path) -> None:
+    file_id = _scanned_track_id(music_dir)
+    mcp_server.stage_tags(file_id, {"genre": ["Synthwave"]})
+    mcp_server.commit_tags()
+
+    payload = mcp_server.revert_tags(file_id, 0, dry_run=True)
+
+    assert payload == {
+        "ok": True,
+        "file_id": file_id,
+        "target_version": 0,
+        "new_version": None,
+        "commit_id": None,
+        "status": "reverted",
+        "dry_run": True,
+    }
+    assert read_tags_via_disk(music_dir) == ["Synthwave"]
+
+
+def test_check_health_envelope_separates_ok_from_ready(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The live pings would hit the network guard, so the engine report is stubbed.
+    failing = health.HealthReport(
+        checks=[health.Check(name="lastfm", ok=False, detail="no API key")],
+    )
+    monkeypatch.setattr("tagmend.engine.health.check_health", lambda _settings: failing)
+
+    payload = mcp_server.check_health()
+
+    assert payload["ok"] is True
+    assert payload["ready"] is False
+
+
+def test_unknown_ids_return_the_error_envelope() -> None:
+    for payload in (
+        mcp_server.unstage_tags(9999),
+        mcp_server.history_tags(9999),
+        mcp_server.revert_tags(9999, 0),
+    ):
+        assert payload["ok"] is False
+        assert "unknown file_id" in str(payload["error"])
+    for payload in (
+        mcp_server.set_artist_status("manual", file_ids=[9999]),
+        mcp_server.reset_genre_status(file_ids=[9999]),
+    ):
+        assert payload["ok"] is False
+        assert "9999" in str(payload["error"])
 
 
 # --- the error envelope ----------------------------------------------------------------

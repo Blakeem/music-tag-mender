@@ -25,7 +25,7 @@ def test_apply_schema_stamps_current_version(db_conn: sqlite3.Connection) -> Non
     # db_conn already applied the schema; the stamp must match the constant the code ships.
     version = db_conn.execute("PRAGMA user_version").fetchone()[0]
     assert version == SCHEMA_VERSION
-    assert SCHEMA_VERSION == 18
+    assert SCHEMA_VERSION == 19
 
 
 def test_apply_schema_creates_genre_tables(db_conn: sqlite3.Connection) -> None:
@@ -570,6 +570,68 @@ def test_duplicate_path_keys_abort_the_upgrade_untouched() -> None:
         assert "path_key" not in _files_columns(conn)
         assert conn.execute("PRAGMA user_version").fetchone()[0] == 17
         assert conn.execute("SELECT COUNT(*) FROM files").fetchone()[0] == 2
+    finally:
+        conn.close()
+
+
+def _insert_commit_row(conn: sqlite3.Connection, origin: str) -> int:
+    cursor = conn.execute(
+        """
+        INSERT INTO commits (created_at, origin, status)
+        VALUES ('2026-08-01T00:00:00+00:00', ?, 'applied')
+        """,
+        (origin,),
+    )
+    assert cursor.lastrowid is not None
+    return int(cursor.lastrowid)
+
+
+def _insert_commit_revision(
+    conn: sqlite3.Connection, file_id: int, version: int, commit_id: int, origin: str
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO tag_revisions (
+            file_id, version, created_at, origin, commit_id, managed_tags, diff
+        )
+        VALUES (?, ?, '2026-08-01T00:00:00+00:00', ?, ?, '{}', '{}')
+        """,
+        (file_id, version, origin, commit_id),
+    )
+
+
+def test_migrate_commit_origin_restamps_all_auto_commits() -> None:
+    # Earlier builds stamped every MCP commit manual, so a resolver commit read as manual and
+    # reopen_axes could void the work it had just written.
+    conn = sqlite3.connect(":memory:")
+    try:
+        apply_schema(conn)
+        first_file = _insert_file_at(conn, "/lib/Album", "a.mp3")
+        second_file = _insert_file_at(conn, "/lib/Album", "b.mp3")
+        all_auto = _insert_commit_row(conn, "manual")
+        mixed = _insert_commit_row(conn, "manual")
+        all_manual = _insert_commit_row(conn, "manual")
+        revert = _insert_commit_row(conn, "revert")
+        _insert_commit_revision(conn, first_file, 1, all_auto, "auto")
+        _insert_commit_revision(conn, second_file, 1, all_auto, "auto")
+        _insert_commit_revision(conn, first_file, 2, mixed, "auto")
+        _insert_commit_revision(conn, second_file, 2, mixed, "manual")
+        _insert_commit_revision(conn, first_file, 3, all_manual, "manual")
+        _insert_commit_revision(conn, first_file, 4, revert, "revert")
+        conn.execute("PRAGMA user_version = 18")
+        conn.commit()
+
+        apply_schema(conn)  # the in-place upgrade
+
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        origins = dict(conn.execute("SELECT id, origin FROM commits").fetchall())
+        assert origins == {
+            all_auto: "auto",
+            mixed: "manual",
+            all_manual: "manual",
+            revert: "revert",
+        }
+        assert conn.execute("SELECT COUNT(*) FROM tag_revisions").fetchone()[0] == 6
     finally:
         conn.close()
 

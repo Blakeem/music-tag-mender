@@ -49,14 +49,14 @@ class HealthReport:
     checks: list[Check]
 
     @property
-    def ok(self) -> bool:
+    def ready(self) -> bool:
         """``True`` only if every check passed."""
         return all(check.ok for check in self.checks)
 
     def to_dict(self) -> dict[str, object]:
         """JSON-serializable form, suitable for returning from an MCP tool."""
         return {
-            "ok": self.ok,
+            "ready": self.ready,
             "checks": [{"name": c.name, "ok": c.ok, "detail": c.detail} for c in self.checks],
         }
 
@@ -81,7 +81,7 @@ def check_health(
         _check_musicbrainz(settings, transport=musicbrainz_transport),
     ]
     report = HealthReport(checks=checks)
-    logger.info("health check complete: ok=%s", report.ok)
+    logger.info("health check complete: ready=%s", report.ready)
     return report
 
 

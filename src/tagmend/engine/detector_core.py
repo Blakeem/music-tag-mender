@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Final, Protocol
 from tagmend.engine.validation import require_choice
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Callable, Iterable
 
 
 class Tier(StrEnum):
@@ -57,6 +57,13 @@ class _HasFolder(Protocol):
     def folder(self) -> str: ...
 
 
+class _HasTier(Protocol):
+    """A detector row that carries a tier."""
+
+    @property
+    def tier(self) -> str: ...
+
+
 def validate_tier(tier: str | None) -> None:
     """Raise :class:`ValueError` for a *tier* outside :data:`TIERS`. ``None`` passes."""
     require_choice("tier", tier, TIERS)
@@ -93,6 +100,31 @@ def group_by_folder[T: _HasFolder](items: Iterable[T]) -> dict[str, list[T]]:
     for item in items:
         grouped.setdefault(item.folder, []).append(item)
     return grouped
+
+
+def rows_in_tier[T: _HasTier](rows: list[T], tier: str | None) -> list[T]:
+    """Return the *rows* in *tier*, or every row when *tier* is ``None``.
+
+    Every tiered detector filters by tier first and builds its grouped view from the result, so
+    a group appears only when it holds a file of that tier.
+    """
+    if tier is None:
+        return rows
+    return [row for row in rows if row.tier == tier]
+
+
+def regroup[G: _HasFolder, R: _HasFolder](
+    groups: list[G],
+    rows: list[R],
+    refold: Callable[[G, list[R]], G],
+) -> list[G]:
+    """Refold each of *groups* over its own folder's *rows*, dropping a group with none."""
+    rows_by_folder = group_by_folder(rows)
+    return [
+        refold(group, rows_by_folder[group.folder])
+        for group in groups
+        if group.folder in rows_by_folder
+    ]
 
 
 def parse_position(value: str | None) -> int | None:

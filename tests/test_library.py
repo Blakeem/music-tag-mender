@@ -158,7 +158,7 @@ def test_list_files_respects_limit_and_root(
     scan_library(engine_settings, path=other)
 
     assert len(list_files(engine_settings, limit=2)) == 2
-    under_main = list_files(engine_settings, root=main)
+    under_main = list_files(engine_settings, path=main)
     assert {v.filename for v in under_main} == {"track00.mp3", "track01.mp3", "track02.mp3"}
 
 
@@ -173,7 +173,7 @@ def test_list_files_path_ignores_case_and_slashes(
     scan_library(engine_settings)
 
     spellings = (album, Path(str(album).upper()), Path(str(album).replace(os.sep, "/")))
-    found = [{v.file_id for v in list_files(engine_settings, root=s)} for s in spellings]
+    found = [{v.file_id for v in list_files(engine_settings, path=s)} for s in spellings]
 
     assert len(found[0]) == 1
     assert found[0] == found[1] == found[2]
@@ -187,7 +187,7 @@ def test_list_files_relative_path_resolves_under_music_path(
     make_track(music_dir / "Other" / "b.mp3", {"genre": ["Jazz"]})
     scan_library(engine_settings)
 
-    views = list_files(engine_settings, root=Path("Artist"))
+    views = list_files(engine_settings, path=Path("Artist"))
 
     assert [v.filename for v in views] == ["a.mp3"]
 
@@ -494,7 +494,7 @@ def test_case_only_folder_rename_keeps_the_id_and_history(
     track = make_track(album / "a.mp3", {"artist": ["A"], "genre": ["Rock"]})
     scan_library(engine_settings)
     file_id = _file_row(engine_settings, album, track.name).id
-    staging.stage_tags(engine_settings, file_id=file_id, managed_tags={"genre": ["Jazz"]})
+    staging.stage_tags(engine_settings, file_id=file_id, tags={"genre": ["Jazz"]})
     staging.commit_tags(engine_settings)
     album.rename(music_dir / "ALBUM")
 

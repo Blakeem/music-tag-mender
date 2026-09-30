@@ -141,6 +141,24 @@ def test_commit_lifecycle(db_conn: sqlite3.Connection) -> None:
     assert commits.get_applying_commits(db_conn) == []  # no longer interrupted
 
 
+def test_commit_to_dict_keys(db_conn: sqlite3.Connection) -> None:
+    commit_id = commits.create_commit(db_conn, origin="manual", message="msg", now=_NOW)
+
+    commit = commits.get_commit(db_conn, commit_id)
+
+    assert commit is not None
+    payload = commit.to_dict()
+    assert set(payload) == {
+        "commit_id",
+        "created_at",
+        "origin",
+        "message",
+        "reverted_from",
+        "status",
+    }
+    assert payload["commit_id"] == commit_id
+
+
 def test_set_commit_status_rejects_unknown(db_conn: sqlite3.Connection) -> None:
     commit_id = commits.create_commit(db_conn, origin="manual", message=None, now=_NOW)
 

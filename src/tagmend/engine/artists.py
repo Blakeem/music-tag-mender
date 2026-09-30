@@ -193,6 +193,7 @@ class ResolveArtistsResult:
     """Immutable summary of one :func:`resolve_artists` call, JSON-ready for the MCP tool."""
 
     processed: int
+    processed_unit: str
     staged_files: int
     corrected_values: int
     skipped_multi_artist: int
@@ -215,13 +216,14 @@ class ResolveArtistsResult:
     shrinks_credit_values: list[dict[str, str]]
     needs_review_values: list[dict[str, str]]
     name_id_disagreement_values: list[dict[str, str]]
-    error_values: list[dict[str, str]]
+    error_items: list[dict[str, str]]
     summary: str
 
     def to_dict(self) -> dict[str, object]:
         """JSON-serializable form for the MCP tool."""
         return {
             "processed": self.processed,
+            "processed_unit": self.processed_unit,
             "staged_files": self.staged_files,
             "corrected_values": self.corrected_values,
             "skipped_multi_artist": self.skipped_multi_artist,
@@ -244,7 +246,7 @@ class ResolveArtistsResult:
             "shrinks_credit_values": [dict(h) for h in self.shrinks_credit_values],
             "needs_review_values": [dict(h) for h in self.needs_review_values],
             "name_id_disagreement_values": [dict(d) for d in self.name_id_disagreement_values],
-            "error_values": [dict(e) for e in self.error_values],
+            "error_items": [dict(e) for e in self.error_items],
             "summary": self.summary,
         }
 
@@ -277,7 +279,7 @@ class _Tally:
     shrinks_credit_values: list[dict[str, str]] = field(default_factory=list)
     needs_review_values: list[dict[str, str]] = field(default_factory=list)
     name_id_disagreement_values: list[dict[str, str]] = field(default_factory=list)
-    error_values: list[dict[str, str]] = field(default_factory=list)
+    error_items: list[dict[str, str]] = field(default_factory=list)
     # value -> resolution: only the substantive ones a tier's gate accepts.
     corrections: dict[str, _Resolution] = field(default_factory=dict)
 
@@ -530,7 +532,7 @@ def _lookup_each(
             artist = client.artist_by_mbid(mbid)
         except MusicBrainzError as exc:
             logger.warning("musicbrainz artist error for mbid=%r: %s", mbid, exc)
-            tally.error_values.append({"value": value, "message": str(exc)})
+            tally.error_items.append({"key": value, "message": str(exc)})
             settled.add(value)
             continue
         if artist is None:
@@ -634,7 +636,7 @@ def _resolve_one_value(
         correction = client.artist_correction(value)
     except LastfmError as exc:
         logger.warning("last.fm correction error for value=%r: %s", value, exc)
-        tally.error_values.append({"value": value, "message": str(exc)})
+        tally.error_items.append({"key": value, "message": str(exc)})
         return
 
     if correction is None or _is_placeholder(correction.name):
@@ -747,7 +749,7 @@ def _stage_target(
     staging.stage_tags(
         settings,
         file_id=file_id,
-        managed_tags=target.tags,
+        tags=target.tags,
         origin="auto",
         note=target.note,
     )
@@ -780,6 +782,7 @@ def _build_result(
     )
     return ResolveArtistsResult(
         processed=processed,
+        processed_unit="values",
         staged_files=tally.staged_files,
         corrected_values=len(tally.corrections),
         skipped_multi_artist=tally.skipped_multi_artist,
@@ -791,7 +794,7 @@ def _build_result(
         shrinks_credit=len(tally.shrinks_credit_values),
         needs_review=len(tally.needs_review_values),
         name_id_disagreement=len(tally.name_id_disagreement_values),
-        errors=len(tally.error_values),
+        errors=len(tally.error_items),
         pending_remaining=pending_remaining,
         more=more,
         mappings=mappings,
@@ -802,7 +805,7 @@ def _build_result(
         shrinks_credit_values=[dict(h) for h in tally.shrinks_credit_values],
         needs_review_values=[dict(h) for h in tally.needs_review_values],
         name_id_disagreement_values=[dict(d) for d in tally.name_id_disagreement_values],
-        error_values=list(tally.error_values),
+        error_items=list(tally.error_items),
         summary=summary,
     )
 
@@ -840,9 +843,9 @@ def _summarize(
             f"Raise limit above {processed}, or scope with artist= / file_ids=, to reach "
             f"the remaining {pending_remaining} value(s).",
         )
-    if tally.error_values:
+    if tally.error_items:
         parts.append(
-            f"{len(tally.error_values)} value(s) errored and stay pending — re-run to retry.",
+            f"{len(tally.error_items)} value(s) errored and stay pending. Re-run to retry.",
         )
     return " ".join(parts)
 

@@ -95,7 +95,7 @@ def _run_ok(settings: Settings) -> HealthReport:
 
 def test_passes_for_valid_library(temp_library: Path, tmp_path: Path) -> None:
     report = _run_ok(_settings(temp_library, tmp_path, lastfm_api_key=_LASTFM_KEY))
-    assert report.ok
+    assert report.ready
     assert {c.name for c in report.checks} == {
         "music_path",
         "database",
@@ -121,7 +121,7 @@ def test_interrupted_commit_is_reported_but_not_a_failure(
 
     report = _run_ok(settings)
 
-    assert report.ok  # informational only — never flips overall readiness
+    assert report.ready  # informational only, it never flips overall readiness
     commits_check = next(c for c in report.checks if c.name == "commits")
     assert "interrupted" in commits_check.detail
     assert commits_check.ok
@@ -129,25 +129,26 @@ def test_interrupted_commit_is_reported_but_not_a_failure(
 
 def test_to_dict_shape(temp_library: Path, tmp_path: Path) -> None:
     data = _run_ok(_settings(temp_library, tmp_path, lastfm_api_key=_LASTFM_KEY)).to_dict()
-    assert data["ok"] is True
+    assert data["ready"] is True
+    assert "ok" not in data
     assert isinstance(data["checks"], list)
 
 
 def test_fails_when_music_path_unset(tmp_path: Path) -> None:
     report = _run_ok(_settings(None, tmp_path))
-    assert not report.ok
+    assert not report.ready
 
 
 def test_fails_when_music_path_missing(tmp_path: Path) -> None:
     report = _run_ok(_settings(tmp_path / "does-not-exist", tmp_path))
-    assert not report.ok
+    assert not report.ready
 
 
 def test_database_check_creates_ledger(temp_library: Path, tmp_path: Path) -> None:
     db_path = tmp_path / "nested" / "ledger.sqlite3"
     settings = Settings(music_path=temp_library, lastfm_api_key=_LASTFM_KEY, db_path=db_path)
     report = _run_ok(settings)
-    assert report.ok
+    assert report.ready
     assert db_path.exists()
 
 
@@ -165,7 +166,7 @@ def test_lastfm_no_key_fails_without_http(temp_library: Path, tmp_path: Path) ->
     assert not lastfm_check.ok
     assert "not configured" in lastfm_check.detail
     assert calls == []  # a missing key attempts no HTTP at all
-    assert not report.ok  # a failed lastfm check flips overall readiness
+    assert not report.ready  # a failed lastfm check flips overall readiness
 
 
 def test_network_checks_pass_on_success(temp_library: Path, tmp_path: Path) -> None:
@@ -191,7 +192,7 @@ def test_lastfm_http_error_fails_gracefully(temp_library: Path, tmp_path: Path) 
     assert len(calls) == 1  # the round-trip was attempted
     # A failed network check still yields a full five-check report (no exception escapes).
     assert len(report.checks) == 5
-    assert not report.ok
+    assert not report.ready
 
 
 def test_musicbrainz_http_error_fails_gracefully(temp_library: Path, tmp_path: Path) -> None:
@@ -205,7 +206,7 @@ def test_musicbrainz_http_error_fails_gracefully(temp_library: Path, tmp_path: P
     assert not mb_check.ok
     assert "unreachable" in mb_check.detail
     assert len(calls) == 1
-    assert not report.ok
+    assert not report.ready
 
 
 def test_musicbrainz_network_down_fails_gracefully(temp_library: Path, tmp_path: Path) -> None:
@@ -219,4 +220,4 @@ def test_musicbrainz_network_down_fails_gracefully(temp_library: Path, tmp_path:
     assert not mb_check.ok
     assert "unreachable" in mb_check.detail
     assert len(calls) == 1
-    assert not report.ok
+    assert not report.ready

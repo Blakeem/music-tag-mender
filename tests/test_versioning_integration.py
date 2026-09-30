@@ -188,6 +188,7 @@ def test_revert_restores_file_and_live_snapshot(
     assert revisions[-1].managed_tags == {"genre": ["Electronic"]}
 
     # The revert is recorded under its own origin='revert' commit (not NULL).
+    assert result.commit_id is not None
     assert revisions[-1].commit_id == result.commit_id
     commit = _commit(engine_settings, result.commit_id)
     assert commit is not None
@@ -366,10 +367,56 @@ def test_revert_with_staged_change_raises(engine_settings: Settings, music_dir: 
     file_id = _file_id(engine_settings, music_dir, track.name)
     _baseline(engine_settings, file_id, {"genre": ["Electronic"]})
 
-    staging.stage_tags(engine_settings, file_id=file_id, managed_tags={"genre": ["Synthwave"]})
+    staging.stage_tags(engine_settings, file_id=file_id, tags={"genre": ["Synthwave"]})
 
     with pytest.raises(ValueError, match="staged change"):
         versioning.revert(engine_settings, file_id, 0)
+
+
+def _committed_track(settings: Settings, music_dir: Path) -> tuple[Path, int]:
+    """Return a track and its id after one commit moved its genre from Electronic to Synthwave."""
+    from tagmend.engine import staging  # noqa: PLC0415 - local import keeps module imports lean
+
+    track = make_track(music_dir / "t.mp3", {"genre": ["Electronic"]})
+    scan_library(settings)
+    file_id = _file_id(settings, music_dir, track.name)
+    staging.stage_tags(settings, file_id=file_id, tags={"genre": ["Synthwave"]})
+    staging.commit_tags(settings)
+    return track, file_id
+
+
+def test_revert_dry_run_touches_nothing(engine_settings: Settings, music_dir: Path) -> None:
+    track, file_id = _committed_track(engine_settings, music_dir)
+    history_before = len(_revisions(engine_settings, file_id))
+    commits_before = len(commits.list_commits_for(engine_settings))
+
+    result = versioning.revert(engine_settings, file_id, 0, dry_run=True)
+
+    assert result.status == "reverted"
+    assert result.commit_id is None
+    assert result.new_version is None
+    assert result.to_dict()["dry_run"] is True
+    assert read_tags(track).tags["genre"] == ["Synthwave"]
+    assert len(_revisions(engine_settings, file_id)) == history_before
+    assert len(commits.list_commits_for(engine_settings)) == commits_before
+
+
+def test_revert_dry_run_reports_noop(engine_settings: Settings, music_dir: Path) -> None:
+    _, file_id = _committed_track(engine_settings, music_dir)
+
+    result = versioning.revert(engine_settings, file_id, 1, dry_run=True)
+
+    assert result.status == "noop"
+
+
+def test_revert_dry_run_refuses_a_staged_file(engine_settings: Settings, music_dir: Path) -> None:
+    from tagmend.engine import staging  # noqa: PLC0415 - local import keeps module imports lean
+
+    _, file_id = _committed_track(engine_settings, music_dir)
+    staging.stage_tags(engine_settings, file_id=file_id, tags={"genre": ["Ambient"]})
+
+    with pytest.raises(ValueError, match="staged change"):
+        versioning.revert(engine_settings, file_id, 0, dry_run=True)
 
 
 def test_write_managed_tags_preserves_unmanaged_and_deletes_omitted(tmp_path: Path) -> None:

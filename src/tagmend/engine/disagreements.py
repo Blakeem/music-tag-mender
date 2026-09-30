@@ -44,6 +44,8 @@ from tagmend.engine.detector_core import (
     Tier,
     group_by_folder,
     parse_position,
+    regroup,
+    rows_in_tier,
     validate_tier,
 )
 from tagmend.engine.musicbrainz import MusicBrainzClient, MusicBrainzError
@@ -217,7 +219,7 @@ class DisagreementsReport:
     errors: int
     summary: str
     fill_rows: list[DisagreementRow] = field(default_factory=list)
-    error_releases: list[dict[str, str]] = field(default_factory=list)
+    error_items: list[dict[str, str]] = field(default_factory=list)
     groups: list[DisagreementGroup] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, object]:
@@ -240,7 +242,7 @@ class DisagreementsReport:
             "unknown_releases": self.unknown_releases,
             "unmatched_tracks": self.unmatched_tracks,
             "errors": self.errors,
-            "error_releases": [dict(e) for e in self.error_releases],
+            "error_items": [dict(e) for e in self.error_items],
             "groups": [g.to_dict() for g in self.groups],
             "summary": self.summary,
         }
@@ -504,7 +506,7 @@ def _classify(
             release = client.release_by_mbid(release_id)
         except MusicBrainzError as exc:
             logger.warning("musicbrainz release error for mbid=%r: %s", release_id, exc)
-            errors.append({"release_id": release_id, "message": str(exc)})
+            errors.append({"key": release_id, "message": str(exc)})
             continue
         fetched += 1
         if release is None:
@@ -549,7 +551,7 @@ def _classify(
             errors=len(errors),
         ),
         fill_rows=_ordered(fills),
-        error_releases=errors,
+        error_items=errors,
         groups=_build_groups(rows, files, titles),
     )
 
@@ -591,23 +593,35 @@ def _build_groups(
     files_by_folder = group_by_folder(files)
     groups: list[DisagreementGroup] = []
     for folder in sorted(rows_by_folder):
-        contradictions = [r for r in rows_by_folder[folder] if not r.is_fill]
-        tiers = _tiers_by_file(contradictions)
-        groups.append(
-            DisagreementGroup(
-                folder=folder,
-                file_count=len(files_by_folder.get(folder, [])),
-                flagged=sum(tiers.values()),
-                folder_context=0,
-                tiers=dict(tiers),
-                file_ids=sorted({r.file_id for r in contradictions}),
-                flagged_fields=len(contradictions),
-                fills=len(rows_by_folder[folder]) - len(contradictions),
-                fields=dict(Counter(r.field for r in contradictions)),
-                releases=_releases_in(files_by_folder.get(folder, []), titles),
-            ),
+        base = DisagreementGroup(
+            folder=folder,
+            file_count=len(files_by_folder.get(folder, [])),
+            flagged=0,
+            folder_context=0,
+            tiers={},
+            file_ids=[],
+            flagged_fields=0,
+            fills=0,
+            fields={},
+            releases=_releases_in(files_by_folder.get(folder, []), titles),
         )
+        groups.append(_refold_group(base, rows_by_folder[folder]))
     return groups
+
+
+def _refold_group(group: DisagreementGroup, rows: list[DisagreementRow]) -> DisagreementGroup:
+    """Return *group* with its counts describing exactly *rows*, contradictions and fills."""
+    contradictions = [r for r in rows if not r.is_fill]
+    tiers = _tiers_by_file(contradictions)
+    return replace(
+        group,
+        flagged=sum(tiers.values()),
+        tiers=dict(tiers),
+        file_ids=sorted({r.file_id for r in contradictions}),
+        flagged_fields=len(contradictions),
+        fills=len(rows) - len(contradictions),
+        fields=dict(Counter(r.field for r in contradictions)),
+    )
 
 
 def _summarize(  # noqa: PLR0913 - one keyword per reported count, cohesive by design
@@ -658,13 +672,14 @@ def _narrow(
     """Return *report* with its rows filtered for display. The run counts never change.
 
     Groups ride only on the grouped view. A *folder_key* wins over *group*: that call returns
-    the folder's flat rows and no groups, like every sibling detector.
+    the folder's flat rows and no groups, like every sibling detector. A *tier* filters the rows
+    first, and the grouped view is refolded over the filtered rows.
     """
-    rows = report.rows
-    fill_rows = report.fill_rows
-    if tier is not None:
-        rows = [r for r in rows if r.tier == tier]
-        fill_rows = [r for r in fill_rows if r.tier == tier]
+    rows = rows_in_tier(report.rows, tier)
+    fill_rows = rows_in_tier(report.fill_rows, tier)
+    tier_groups = (
+        report.groups if tier is None else regroup(report.groups, rows + fill_rows, _refold_group)
+    )
     if folder_key is not None:
         rows = [r for r in rows if path_keys.path_key(r.folder) == folder_key]
         fill_rows = [r for r in fill_rows if path_keys.path_key(r.folder) == folder_key]
@@ -673,7 +688,7 @@ def _narrow(
         fill_rows = fill_rows[:limit]
 
     flat = not group or folder_key is not None
-    groups = [] if flat else report.groups
+    groups = [] if flat else tier_groups
     if limit is not None:
         groups = groups[:limit]
     return replace(

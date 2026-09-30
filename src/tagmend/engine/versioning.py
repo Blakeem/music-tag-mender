@@ -192,6 +192,30 @@ def _revert_target_tags(
     return target
 
 
+def _revert_plan(
+    conn: sqlite3.Connection,
+    file_id: int,
+    target_version: int,
+) -> tuple[Revision, Path]:
+    """Return the revision to restore and the file's path, or raise :class:`ValueError`.
+
+    The file is checked before the revision, so a mistyped file id reports "unknown file_id"
+    rather than a missing revision.
+    """
+    file_row = store.get_file_by_id(conn, file_id)
+    if file_row is None:
+        message = f"unknown file_id={file_id}"
+        raise ValueError(message)
+    if file_row.is_missing:
+        message = f"cannot revert a missing file (file_id={file_id})"
+        raise ValueError(message)
+    target = store.get_revision(conn, file_id, target_version)
+    if target is None:
+        message = f"no revision {target_version} for file_id={file_id}"
+        raise ValueError(message)
+    return target, Path(file_row.folder) / file_row.filename
+
+
 def _revert_file(
     conn: sqlite3.Connection,
     file_id: int,
@@ -212,27 +236,16 @@ def _revert_file(
     ``False`` for a revert that moved nothing on disk (an empty diff); callers report that
     as ``noop`` rather than as a successful revert.
 
-    Raises :class:`ValueError` if the target revision is unknown, the file is unknown,
-    or the file is flagged missing. Leaves all DB writes in the open transaction —
-    the caller owns the ``conn.commit()``.
+    Raises :class:`ValueError` if the file is unknown, the file is flagged missing, or the
+    target revision is unknown (:func:`_revert_plan`). Leaves all DB writes in the open
+    transaction. The caller owns the ``conn.commit()``.
     """
-    target = store.get_revision(conn, file_id, target_version)
-    if target is None:
-        message = f"no revision {target_version} for file_id={file_id}"
-        raise ValueError(message)
-    file_row = store.get_file_by_id(conn, file_id)
-    if file_row is None:
-        message = f"unknown file_id={file_id}"
-        raise ValueError(message)
-    if file_row.is_missing:
-        message = f"cannot revert a missing file (file_id={file_id})"
-        raise ValueError(message)
+    target, path = _revert_plan(conn, file_id, target_version)
 
     # Disk write first, before any DB append: a write failure aborts with no row. The
     # snapshot is merged onto the file's current values for every field OUTSIDE the target
     # revision's own managed set, which it never governed (see _revert_target_tags). A revert
     # that moves nothing skips the write, so it never rewrites the file.
-    path = Path(file_row.folder) / file_row.filename
     planned = _revert_target_tags(path, target.managed_tags, target.managed_set)
     if compute_diff(managed_subset(read_tags(path).tags), planned):
         write_managed_tags(path, planned)
@@ -282,13 +295,17 @@ def _revert_file(
 
 @dataclass(frozen=True, slots=True)
 class RevertResult:
-    """Summary of a single-file revert: the new revision and the commit recording it."""
+    """Summary of a single-file revert: the new revision and the commit recording it.
+
+    A dry run records nothing, so its ``new_version`` and ``commit_id`` are ``None``.
+    """
 
     file_id: int
     target_version: int
-    new_version: int
-    commit_id: int
+    new_version: int | None
+    commit_id: int | None
     status: str  # 'reverted' (tags moved) | 'noop' (already at the target state)
+    dry_run: bool
 
     def to_dict(self) -> dict[str, object]:
         """JSON-serializable form for the MCP tool."""
@@ -298,17 +315,19 @@ class RevertResult:
             "new_version": self.new_version,
             "commit_id": self.commit_id,
             "status": self.status,
+            "dry_run": self.dry_run,
         }
 
 
 def revert(
     settings: Settings,
     file_id: int,
-    target_version: int,
+    version: int,
     *,
     note: str | None = None,
+    dry_run: bool = False,
 ) -> RevertResult:
-    """Restore *file_id* to *target_version*, recorded as its own ``origin='revert'`` commit.
+    """Restore *file_id* to *version*, recorded as its own ``origin='revert'`` commit.
 
     Every disk mutation is a commit (PLAN.md §7): the revert revision lands under a
     fresh single-file commit row, so it shows in ``list_commits`` and can itself be
@@ -320,11 +339,18 @@ def revert(
     ``'reverted'`` when the managed tags moved, ``'noop'`` when the file already held the
     target state and nothing on disk changed.
 
-    Raises :class:`ValueError` if the target revision is unknown, the file is unknown,
-    flagged missing, or staged. Owns its transaction: the commit row, the disk write,
+    *dry_run* reports that same status without writing the file or the ledger, and keeps
+    every refusal of the real call, so the preview predicts it.
+
+    Raises :class:`ValueError` if the file is unknown, flagged missing, or staged, or the
+    target revision is unknown. Owns its transaction: the commit row, the disk write,
     and the revision land in ONE transaction, so a crash leaves no partial DB state
     (re-running the revert is idempotent).
     """
+    new_version: int | None = None
+    commit_id: int | None = None
+    changed = False
+
     connection = db.connect(settings.db_path)
     try:
         schema.apply_schema(connection)
@@ -335,39 +361,45 @@ def revert(
             )
             raise ValueError(message)
 
-        commit_id = commits.create_commit(
-            connection,
-            origin="revert",
-            message=note,
-            now=_utc_now(),
-        )
-        version, changed = _revert_file(
-            connection,
-            file_id,
-            target_version,
-            note=note,
-            commit_id=commit_id,
-        )
-        commits.set_commit_status(connection, commit_id, "applied")
-        connection.commit()
+        if dry_run:
+            _, path = _revert_plan(connection, file_id, version)
+            changed = _would_change(connection, file_id, version, path)
+        else:
+            commit_id = commits.create_commit(
+                connection,
+                origin="revert",
+                message=note,
+                now=_utc_now(),
+            )
+            new_version, changed = _revert_file(
+                connection,
+                file_id,
+                version,
+                note=note,
+                commit_id=commit_id,
+            )
+            commits.set_commit_status(connection, commit_id, "applied")
+            connection.commit()
     finally:
         connection.close()
 
     status = "reverted" if changed else "noop"
     logger.info(
-        "%s file_id=%d to version %d (new version %d, commit %d)",
+        "%s file_id=%d to version %d (new version %s, commit %s, dry_run=%s)",
         status,
         file_id,
-        target_version,
         version,
+        new_version,
         commit_id,
+        dry_run,
     )
     return RevertResult(
         file_id=file_id,
-        target_version=target_version,
-        new_version=version,
+        target_version=version,
+        new_version=new_version,
         commit_id=commit_id,
         status=status,
+        dry_run=dry_run,
     )
 
 
@@ -428,23 +460,31 @@ class RevertCommitResult:
 _PROCESSABLE_KINDS: Final = frozenset({"revertable", "noop"})
 
 
-def _would_change(conn: sqlite3.Connection, revision: Revision, path: Path) -> bool:
-    """Whether reverting *revision* would actually move any managed tag on disk.
+def _would_change(
+    conn: sqlite3.Connection,
+    file_id: int,
+    target_version: int,
+    path: Path,
+) -> bool:
+    """Whether reverting *file_id* to *target_version* would move any managed tag on disk.
 
-    Mirrors the comparison :func:`_revert_file` makes after its write, so the dry run
-    cannot promise a revert that delivers nothing. Costs one mutagen read per planned file,
-    accepted deliberately: an honest preview is the point. An unreadable file is reported as
-    changing, leaving the real run's per-file error handling to deal with it.
+    Compares the file's latest revision with the tags the revert would write, which is the
+    comparison :func:`_revert_file` makes after its write, so a dry run cannot promise a revert
+    that delivers nothing. Costs one mutagen read per planned file, accepted deliberately: an
+    honest preview is the point. An unreadable file is reported as changing, leaving the real
+    run's error handling to deal with it.
     """
-    target = store.get_revision(conn, revision.file_id, revision.version - 1)
-    if target is None:  # pragma: no cover - defensive; version-1 precedes a commit revision
+    target = store.get_revision(conn, file_id, target_version)
+    latest_version = store.max_version(conn, file_id)
+    latest = None if latest_version is None else store.get_revision(conn, file_id, latest_version)
+    if target is None or latest is None:  # pragma: no cover - defensive, the caller checked both
         return True
     try:
         planned = _revert_target_tags(path, target.managed_tags, target.managed_set)
     except (OSError, mutagen.MutagenError) as exc:  # type: ignore[attr-defined]
-        logger.warning("revert preview: file_id=%d unreadable: %s", revision.file_id, exc)
+        logger.warning("revert preview: file_id=%d unreadable: %s", file_id, exc)
         return True
-    return bool(compute_diff(revision.managed_tags, planned))
+    return bool(compute_diff(latest.managed_tags, planned))
 
 
 def _classify_for_revert(conn: sqlite3.Connection, revision: Revision) -> str:
@@ -466,7 +506,7 @@ def _classify_for_revert(conn: sqlite3.Connection, revision: Revision) -> str:
     latest = store.max_version(conn, revision.file_id)
     if latest != revision.version:
         return "skipped_later_changes"
-    if not _would_change(conn, revision, path):
+    if not _would_change(conn, revision.file_id, revision.version - 1, path):
         return "noop"
     return "revertable"
 
@@ -665,10 +705,17 @@ def history(conn: sqlite3.Connection, file_id: int) -> list[Revision]:
 
 
 def history_for(settings: Settings, file_id: int) -> list[Revision]:
-    """Conn-owning :func:`history`: open the ledger and return *file_id*'s log. Read-only."""
+    """Conn-owning :func:`history`: open the ledger and return *file_id*'s log. Read-only.
+
+    Raises :class:`ValueError` for an unknown *file_id*, so a typo does not read as a file
+    with no history.
+    """
     connection = db.connect(settings.db_path)
     try:
         schema.apply_schema(connection)
+        if store.get_file_by_id(connection, file_id) is None:
+            message = f"unknown file_id={file_id}"
+            raise ValueError(message)
         return history(connection, file_id)
     finally:
         connection.close()

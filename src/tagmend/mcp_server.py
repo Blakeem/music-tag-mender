@@ -104,14 +104,19 @@ def scan_library(
     to the music files themselves.
 
     Args:
-        path: Folder to scan. Defaults to the configured ``music_path`` when omitted.
+        path: Folder to scan. Defaults to the configured ``music_path`` when omitted. A
+            relative path resolves under ``music_path``, and a folder outside ``music_path`` is
+            refused. The walk stores the configured ``music_path`` spelling plus each folder's
+            on-disk name, so a path typed in another case finds the same files.
         mode: ``incremental`` re-reads tags only when a file changed or was never read;
             ``full`` re-reads every file's tags; ``presence`` only reconciles which
             files exist (added/missing/restored) without reading any tags.
 
     Returns:
         Per-run counts (``added``, ``updated``, ``tags_read``, ``missing_flagged``,
-        ``restored``, ``errors``, ...) plus ``ok``. ``updated`` counts files whose
+        ``restored``, ``errors``, ``respelled``, ...) plus ``ok``. ``respelled`` counts known
+        files found under a new spelling of the same path (a case-only rename on Windows),
+        which keep their id and history. ``updated`` counts files whose
         on-disk size/mtime signature changed since the last scan. ``tags_read`` counts
         files whose tags were re-read and actually differed from the stored snapshot (an
         identical re-read is an honest no-op and is not tallied). On a configuration/path
@@ -167,6 +172,10 @@ def stage_tags(
     alone, so staging ``{"genre": ["Synthwave"]}`` changes only the genre and preserves
     title/album/track/MusicBrainz ids. To intentionally clear a managed field, pass it
     explicitly with an empty list (e.g. ``{"genre": []}``).
+
+    Every value is stripped of leading and trailing whitespace and NFC-normalized, and a value
+    left empty is dropped (a list left empty clears the field). A value containing a NUL, CR or
+    LF is rejected and nothing is staged.
 
     Args:
         file_id: Stable id of the file (from ``scan_library`` / the snapshot).
@@ -226,11 +235,13 @@ def stage_tags_batch(
     and every change is staged in a single transaction. If ANY entry is invalid (an unmanaged
     tag key, an unknown/missing file, or a duplicate ``file_id`` in the batch) the whole batch
     is rejected and NOTHING is staged. Each entry's ``tags`` is merged onto that file's current
-    managed tags exactly like ``stage_tags`` (omitted keys preserved; ``{"key": []}`` deletes).
-    A subsequent ``commit_tags(path=<folder>)`` groups the batch into ONE revertible commit.
+    managed tags exactly like ``stage_tags``: omitted keys are preserved, and ``{"key": []}``
+    deletes. Values are cleaned the same way. They are stripped and NFC-normalized, and a value
+    holding a NUL, CR or LF rejects the whole batch. A subsequent
+    ``commit_tags(path=<folder>)`` groups the batch into ONE revertible commit.
 
-    ``tracknumber``/``discnumber`` are staged verbatim — supply the full ``"n/total"`` string
-    (e.g. ``"3/12"``); this tool never parses or renumbers them.
+    ``tracknumber``/``discnumber`` are staged verbatim. Supply the full ``"n/total"`` string
+    (e.g. ``"3/12"``). This tool never parses or renumbers them.
 
     Args:
         entries: A list of ``{"file_id": <int>, "tags": {name: [values], ...}}`` objects.
@@ -277,7 +288,9 @@ def diff_tags(path: str | None = None) -> dict[str, object]:
 
     Args:
         path: When given, only staged changes for files at this folder or nested under it
-            are returned; otherwise all staged changes are listed.
+            are returned. Otherwise all staged changes are listed. Compared as a path: case
+            and ``/`` versus backslash do not matter on Windows, and a relative folder resolves
+            under ``music_path``.
 
     Returns:
         ``{"ok": True, "changes": [{file_id, folder, filename, is_missing, origin, note,
@@ -312,7 +325,9 @@ def commit_tags(message: str | None = None, path: str | None = None) -> dict[str
     Args:
         message: Optional commit message stored on the commit.
         path: When given, only staged changes for files at this folder or nested under it
-            are committed; otherwise all staged changes are committed.
+            are committed. Otherwise all staged changes are committed. Compared as a path:
+            case and ``/`` versus backslash do not matter on Windows, and a relative folder
+            resolves under ``music_path``.
 
     Returns:
         ``{"ok": True, ...}`` with per-file ``outcomes`` (each ``{file_id, version, status,
@@ -383,6 +398,8 @@ def list_files(  # noqa: PLR0913 - cohesive MCP discovery filters
 
     Args:
         path: When given, only files at this folder or nested under it are returned.
+            Compared as a path: case and ``/`` versus backslash do not matter on Windows, and a
+            relative folder resolves under ``music_path``.
         limit: Cap the number of files returned. With ``genre_status`` the cap counts
             *matching* files; without it, it is applied before reading tags.
         genre_status: Return only files in this genre workflow state
@@ -495,8 +512,9 @@ def detect_mismatches(
             empty; each group carries ``folder``, ``path_artist``, ``file_count``, ``flagged``,
             ``folder_context``, ``tag_values``, ``tiers``, ``fields``, ``file_ids``,
             ``suppressed`` — the per-folder ``file_ids`` list holds flagged files only).
-        folder: Return the flat rows of exactly this folder (exact path equality, never a
-            prefix match). Takes precedence over ``group``.
+        folder: Return the flat rows of exactly this folder, never a subfolder. Takes
+            precedence over ``group``. Compared as a path: case and ``/`` versus backslash do
+            not matter on Windows, and a relative folder resolves under ``music_path``.
 
     Returns:
         ``{"ok": True, rows, folder_context_rows, groups, total_files, flagged, high, medium,
@@ -561,7 +579,9 @@ def detect_track_conflicts(
         tier: Keep only rows in this tier (``high`` | ``medium`` | ``low``).
         limit: Cap the rows returned, or the groups with ``group=true``.
         group: Return one compact line per folder instead of flat rows.
-        folder: Expand exactly this folder's rows (exact path, never a prefix).
+        folder: Expand exactly this folder's rows, never a subfolder. Compared as a path:
+            case and ``/`` versus backslash do not matter on Windows, and a relative folder
+            resolves under ``music_path``.
 
     Returns:
         ``{"ok": True, rows, total_files, flagged, high, medium, low, folder_context,
@@ -630,7 +650,9 @@ def detect_disagreements(  # noqa: PLR0913 - one parameter per scope/view knob, 
 
     Args:
         tier: Keep only rows in this tier (``high`` | ``medium`` | ``low``).
-        folder: Limit to exactly this folder (exact path, never a prefix).
+        folder: Limit to exactly this folder, never a subfolder. Compared as a path: case and
+            ``/`` versus backslash do not matter on Windows, and a relative folder resolves
+            under ``music_path``.
         file_ids: Limit to these specific file ids.
         limit: Max distinct releases to FETCH this call. ``folder`` and ``file_ids`` scope
             the run, so the counts then describe only that scope and no release outside it is
@@ -717,7 +739,9 @@ def detect_album_conflicts(
         tier: Keep only rows in this tier (``high`` | ``medium`` | ``low``).
         limit: Cap the rows returned.
         group: Return one compact line per folder instead of flat rows.
-        folder: Expand exactly this folder's rows (exact path, never a prefix).
+        folder: Expand exactly this folder's rows, never a subfolder. Compared as a path:
+            case and ``/`` versus backslash do not matter on Windows, and a relative folder
+            resolves under ``music_path``.
 
     Returns:
         ``{"ok": True, rows, total_files, flagged, high, medium, low, folder_context,
@@ -784,8 +808,9 @@ def detect_album_gaps(
     Args:
         limit: Cap the number of folder groups returned; the ``green``/``confirm``/``review``/
             ``stays_blank`` counts still describe the whole library.
-        folder: Return only the group for exactly this folder (exact path equality, never a
-            prefix match).
+        folder: Return only the group for exactly this folder, never a subfolder. Compared as
+            a path: case and ``/`` versus backslash do not matter on Windows, and a relative
+            folder resolves under ``music_path``.
         use_musicbrainz: When False, skip the ``mb_recording`` review tier entirely (tiers 1-2
             only, no network). Default True.
 

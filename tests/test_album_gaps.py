@@ -17,10 +17,10 @@ from pathlib import Path
 
 import pytest
 
-from conftest import make_track
+from conftest import FOLDER_SPELLINGS, make_track, spell_folder
 from tagmend import config, mcp_server
 from tagmend.config import Settings
-from tagmend.engine import album_gaps, classify, schema, staging, store
+from tagmend.engine import album_gaps, classify, path_keys, schema, staging, store
 from tagmend.engine.album_gaps import AlbumGapsReport, GapGroup, GapProposal, detect_album_gaps
 from tagmend.engine.db import connect
 from tagmend.engine.library import scan_library
@@ -542,12 +542,12 @@ def test_folder_filter_is_exact_equality() -> None:
     report = _two_group_report()
     folder_a = _MUSIC / "A" / "Album"
 
-    expanded = album_gaps._expand_folder(report, str(folder_a))
+    expanded = album_gaps._expand_folder(report, path_keys.path_key(folder_a))
     assert len(expanded.groups) == 1
     assert expanded.groups[0].folder == str(folder_a)
     # Counts preserved; a parent prefix must NOT match (equality, not substring).
     assert expanded.total_blank == 2
-    assert album_gaps._expand_folder(report, str(_MUSIC / "A")).groups == []
+    assert album_gaps._expand_folder(report, path_keys.path_key(_MUSIC / "A")).groups == []
 
 
 # --- to_dict shape -------------------------------------------------------------------
@@ -609,6 +609,31 @@ def _read_album(settings: Settings, folder: Path, filename: str) -> list[str]:
         return store.get_tags(conn, row.id).get("album", [])
     finally:
         conn.close()
+
+
+@pytest.mark.parametrize("spelling", FOLDER_SPELLINGS)
+def test_folder_argument_variants_match_the_same_rows(
+    engine_settings: Settings,
+    music_dir: Path,
+    spelling: str,
+) -> None:
+    folder = music_dir / "Green Artist" / "Album"
+    other = music_dir / "Green Artist" / "Other"
+    for target in (folder, other):
+        make_track(target / "01.mp3", {"album": ["Stand By Your Van"], "artist": ["Green Artist"]})
+        make_track(target / "02.mp3", {"album": ["Stand By Your Van"], "artist": ["Green Artist"]})
+        make_track(target / "03.mp3", {"artist": ["Green Artist"]})
+    scan_library(engine_settings)
+
+    exact = detect_album_gaps(engine_settings, folder=str(folder), use_musicbrainz=False)
+    variant = detect_album_gaps(
+        engine_settings,
+        folder=spell_folder(folder, spelling),
+        use_musicbrainz=False,
+    )
+
+    assert [g.folder for g in exact.groups] == [str(folder)]
+    assert [g.folder for g in variant.groups] == [g.folder for g in exact.groups]
 
 
 def test_detect_integration_read_only_then_fix_flow(

@@ -15,11 +15,11 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
-from conftest import make_track
+from conftest import FOLDER_SPELLINGS, make_track, spell_folder
 from tagmend import config, mcp_server
 from tagmend.cli import app
 from tagmend.config import Settings
-from tagmend.engine import artists, mismatch, staging, store, versioning
+from tagmend.engine import artists, mismatch, path_keys, staging, store, versioning
 from tagmend.engine.db import connect
 from tagmend.engine.library import scan_library
 from tagmend.engine.mismatch import detect_mismatches
@@ -424,6 +424,33 @@ def test_detect_integration_flags_high_and_is_read_only(
     assert _read_albumartist(engine_settings, ozzy, "01 Gets Me Through.mp3") == ["Jem"]
 
 
+@pytest.mark.parametrize("spelling", FOLDER_SPELLINGS)
+def test_folder_argument_variants_match_the_same_rows(
+    engine_settings: Settings,
+    music_dir: Path,
+    spelling: str,
+) -> None:
+    ozzy = _make_mislabeled_library(music_dir)
+    scan_library(engine_settings)
+
+    exact = detect_mismatches(engine_settings, folder=str(ozzy))
+    variant = detect_mismatches(engine_settings, folder=spell_folder(ozzy, spelling))
+
+    assert exact.rows
+    assert [r.file_id for r in variant.rows] == [r.file_id for r in exact.rows]
+    assert [r.file_id for r in variant.folder_context_rows] == [
+        r.file_id for r in exact.folder_context_rows
+    ]
+
+
+def test_folder_outside_music_path_is_refused(
+    engine_settings: Settings,
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ValueError, match="outside music_path"):
+        detect_mismatches(engine_settings, folder=str(tmp_path / "elsewhere"))
+
+
 def test_detect_tier_filter_and_unknown_tier(
     engine_settings: Settings,
     music_dir: Path,
@@ -662,13 +689,15 @@ def test_folder_expansion_is_exact_equality() -> None:
     files = _all_classes_library()
     report = mismatch._classify(files, _MUSIC)
 
-    expanded = mismatch._expand_folder(report, _OZZY_FOLDER, tier=None, limit=None)
+    expanded = mismatch._expand_folder(
+        report, path_keys.path_key(_OZZY_FOLDER), tier=None, limit=None
+    )
     assert {r.file_id for r in expanded.rows} == {100}
     assert {r.file_id for r in expanded.folder_context_rows} == {101}
     assert expanded.groups == []
 
     # A parent prefix must NOT match (equality, not substring/LIKE).
-    prefix = str(_MUSIC / "Ozzy Osbourne")
+    prefix = path_keys.path_key(_MUSIC / "Ozzy Osbourne")
     assert mismatch._expand_folder(report, prefix, tier=None, limit=None).rows == []
 
 

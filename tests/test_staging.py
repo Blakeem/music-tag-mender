@@ -8,13 +8,12 @@ and crash recovery are covered in ``test_staging_integration``.
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
 
 from conftest import make_track
-from tagmend.engine import commits, db, schema, staging, store, versioning
+from tagmend.engine import commits, db, path_keys, schema, staging, store, versioning
 
 if TYPE_CHECKING:
     import sqlite3
@@ -119,7 +118,7 @@ def test_list_staged_tags_under_filters_by_folder(db_conn: sqlite3.Connection) -
             db_conn, file_id=file_id, managed_tags={"genre": ["X"]}, origin="auto", now=_NOW
         )
 
-    under_rock = store.list_staged_tags_under(db_conn, Path("/music/rock"))
+    under_rock = store.list_staged_tags_under(db_conn, path_keys.path_key("/music/rock"))
 
     assert {s.file_id for s in under_rock} == {rock, rock_sub}  # nested included, jazz out
 

@@ -49,7 +49,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
-from tagmend.engine import axis, db, schema, store
+from tagmend.engine import axis, db, path_keys, schema, store
 from tagmend.engine.validation import check_limit
 from tagmend.log import get_logger
 
@@ -760,14 +760,16 @@ def _limit_report(report: MismatchReport, *, tier: str | None, limit: int | None
 
 def _expand_folder(
     report: MismatchReport,
-    folder: str,
+    folder_key: str,
     *,
     tier: str | None,
     limit: int | None,
 ) -> MismatchReport:
-    """Return the flat rows of EXACTLY *folder* (path equality, never LIKE), tier/limit applied."""
-    rows = [r for r in report.rows if r.folder == folder]
-    context_rows = [r for r in report.folder_context_rows if r.folder == folder]
+    """Return the flat rows of exactly the folder keyed *folder_key*, tier/limit applied."""
+    rows = [r for r in report.rows if path_keys.path_key(r.folder) == folder_key]
+    context_rows = [
+        r for r in report.folder_context_rows if path_keys.path_key(r.folder) == folder_key
+    ]
     narrowed = replace(report, rows=rows, folder_context_rows=context_rows)
     return _limit_report(narrowed, tier=tier, limit=limit)
 
@@ -863,22 +865,23 @@ def detect_mismatches(
     :func:`set_mismatch_status`) are dropped from the flagged rows and reported in the report's
     ``suppressed`` map.
 
-    *tier* narrows the returned ``rows`` to one tier (``high`` | ``medium`` | ``low``); *limit*
-    caps rows (or groups, in the grouped view); the counts always describe the whole library
+    *tier* narrows the returned ``rows`` to one tier (``high`` | ``medium`` | ``low``). *limit*
+    caps rows (or groups, in the grouped view). The counts always describe the whole library
     minus fresh dispositions. *group* returns one compact :class:`MismatchGroup` per folder
-    (``rows`` then empty); *folder* returns the flat rows of exactly that folder (exact path
-    equality, never a prefix/LIKE match) and takes precedence over *group*. Raises
-    :class:`ValueError` when no music path is configured (mirrors
-    :func:`tagmend.engine.library.scan_library`), for an unknown *tier* or for a negative
-    *limit*.
+    (``rows`` then empty). *folder* returns the flat rows of exactly that folder, never a
+    subfolder, and takes precedence over *group*. *folder* is compared as a path
+    (:func:`tagmend.engine.path_keys.folder_arg_key`). Raises :class:`ValueError` when no music
+    path is configured (mirrors :func:`tagmend.engine.library.scan_library`), for an unknown
+    *tier*, for a negative *limit* or for a *folder* outside ``music_path``.
     """
     check_limit(limit)
     if settings.music_path is None:
-        message = "music_path not configured — run `tagmend config-set music_path <dir>`"
+        message = "music_path not configured. Run `tagmend config-set music_path <dir>`"
         raise ValueError(message)
     if tier is not None and tier not in _TIERS:
         message = f"unknown tier: {tier!r} (expected one of {sorted(_TIERS)})"
         raise ValueError(message)
+    folder_key = None if folder is None else path_keys.folder_arg_key(settings, folder)
 
     music_path = settings.music_path
     container_folders = frozenset(fold(name) for name in settings.container_folders)
@@ -922,8 +925,8 @@ def detect_mismatches(
         sum(report.suppressed.values()),
     )
 
-    if folder is not None:
-        return _expand_folder(report, folder, tier=tier, limit=limit)
+    if folder_key is not None:
+        return _expand_folder(report, folder_key, tier=tier, limit=limit)
     if group:
         return _grouped_report(report, _folder_stats(files), tier=tier, limit=limit)
     return _limit_report(report, tier=tier, limit=limit)

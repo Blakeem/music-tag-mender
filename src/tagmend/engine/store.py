@@ -16,10 +16,9 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from pathlib import Path
 from typing import TYPE_CHECKING, Final, SupportsInt, cast
 
-from tagmend.engine import axis
+from tagmend.engine import axis, path_keys
 from tagmend.engine.tags import MANAGED_SET_VERSION, TAG_READER_VERSION
 from tagmend.log import get_logger
 
@@ -85,10 +84,14 @@ def _row_to_file(row: tuple[object, ...]) -> FileRow:
 
 
 def get_file(conn: sqlite3.Connection, folder: str, filename: str) -> FileRow | None:
-    """Return the file row anchored at ``(folder, filename)``, or ``None``."""
+    """Return the file row at ``(folder, filename)``, or ``None``.
+
+    The lookup is by the platform path key (:func:`tagmend.engine.path_keys.file_path_key`), so
+    on Windows a spelling that differs only by case or separator finds the same row.
+    """
     cursor = conn.execute(
-        f"SELECT {_FILE_COLUMNS} FROM files WHERE folder = ? AND filename = ?",  # noqa: S608
-        (folder, filename),
+        f"SELECT {_FILE_COLUMNS} FROM files WHERE path_key = ?",  # noqa: S608
+        (path_keys.file_path_key(folder, filename),),
     )
     row = cursor.fetchone()
     return None if row is None else _row_to_file(tuple(row))
@@ -128,11 +131,21 @@ def insert_file(  # noqa: PLR0913 - keyword-only insert payload, all columns req
         """
         INSERT INTO files (
             folder, filename, ext, size_bytes, mtime_ns,
-            is_missing, first_seen_at, updated_at, tags_updated_at, reader_version
+            is_missing, first_seen_at, updated_at, tags_updated_at, reader_version, path_key
         )
-        VALUES (?, ?, ?, ?, ?, 0, ?, ?, NULL, ?)
+        VALUES (?, ?, ?, ?, ?, 0, ?, ?, NULL, ?, ?)
         """,
-        (folder, filename, ext, size_bytes, mtime_ns, now, now, TAG_READER_VERSION),
+        (
+            folder,
+            filename,
+            ext,
+            size_bytes,
+            mtime_ns,
+            now,
+            now,
+            TAG_READER_VERSION,
+            path_keys.file_path_key(folder, filename),
+        ),
     )
     new_id = cursor.lastrowid
     if new_id is None:  # pragma: no cover - defensive; INTEGER PK always assigns one
@@ -153,6 +166,25 @@ def update_signature(
     conn.execute(
         "UPDATE files SET size_bytes = ?, mtime_ns = ?, updated_at = ? WHERE id = ?",
         (size_bytes, mtime_ns, now, file_id),
+    )
+
+
+def update_location(
+    conn: sqlite3.Connection,
+    file_id: int,
+    *,
+    folder: str,
+    filename: str,
+    now: str,
+) -> None:
+    """Record a new display spelling of the same path and bump ``updated_at``.
+
+    ``path_key`` is left alone: the caller found this row by that key, so the new spelling
+    names the same file.
+    """
+    conn.execute(
+        "UPDATE files SET folder = ?, filename = ?, updated_at = ? WHERE id = ?",
+        (folder, filename, now, file_id),
     )
 
 
@@ -223,20 +255,18 @@ def stamp_reader_version(conn: sqlite3.Connection, file_id: int) -> None:
     )
 
 
-def tracked_files_under(conn: sqlite3.Connection, root: Path) -> list[FileRow]:
-    """Return every tracked file whose folder is *root* or nested under it.
+def tracked_files_under(conn: sqlite3.Connection, root_key: str) -> list[FileRow]:
+    """Return every tracked file whose folder is the folder keyed *root_key* or nested under it.
 
-    Filtering happens in Python via :meth:`Path.is_relative_to` to avoid ``LIKE``
-    wildcard pitfalls when paths contain ``_`` or ``%``.
+    One key-range query on ``idx_files_path_key`` (:func:`tagmend.engine.path_keys.subtree_bounds`),
+    so ``_`` and ``%`` in a path are ordinary characters. Rows come back in id order.
     """
-    cursor = conn.execute(f"SELECT {_FILE_COLUMNS} FROM files")  # noqa: S608
-    result: list[FileRow] = []
-    for raw in cursor.fetchall():
-        row = _row_to_file(tuple(raw))
-        from_path = Path(row.folder)
-        if from_path == root or from_path.is_relative_to(root):
-            result.append(row)
-    return result
+    low, high = path_keys.subtree_bounds(root_key)
+    cursor = conn.execute(
+        f"SELECT {_FILE_COLUMNS} FROM files WHERE path_key >= ? AND path_key < ? ORDER BY id",  # noqa: S608
+        (low, high),
+    )
+    return [_row_to_file(tuple(row)) for row in cursor.fetchall()]
 
 
 def list_files(conn: sqlite3.Connection, *, limit: int | None = None) -> list[FileRow]:
@@ -433,7 +463,6 @@ def max_version(conn: sqlite3.Connection, file_id: int) -> int | None:
 _STAGED_TAG_COLUMNS = (
     "file_id, managed_tags, origin, note, staged_at, base_size_bytes, base_mtime_ns"
 )
-_STAGED_TAG_WIDTH: Final = 7
 
 
 @dataclass(frozen=True, slots=True)
@@ -521,28 +550,24 @@ def list_staged_tags(conn: sqlite3.Connection) -> list[StagedTag]:
     return [_row_to_staged_tag(tuple(row)) for row in cursor.fetchall()]
 
 
-def list_staged_tags_under(conn: sqlite3.Connection, root: Path) -> list[StagedTag]:
-    """Return pending changes whose file lives at *root* or nested under it.
+def list_staged_tags_under(conn: sqlite3.Connection, root_key: str) -> list[StagedTag]:
+    """Return pending changes whose file lives in the folder keyed *root_key* or under it.
 
-    Joins ``files`` for each staged row's folder and filters in Python via
-    :meth:`Path.is_relative_to` (same approach as :func:`tracked_files_under`).
+    Joins ``files`` on the same key range as :func:`tracked_files_under`, in file_id order.
     """
+    low, high = path_keys.subtree_bounds(root_key)
     cursor = conn.execute(
         """
         SELECT s.file_id, s.managed_tags, s.origin, s.note, s.staged_at,
-               s.base_size_bytes, s.base_mtime_ns, f.folder
+               s.base_size_bytes, s.base_mtime_ns
         FROM tag_revisions_staged s
         JOIN files f ON f.id = s.file_id
+        WHERE f.path_key >= ? AND f.path_key < ?
         ORDER BY s.file_id
         """,
+        (low, high),
     )
-    result: list[StagedTag] = []
-    for raw in cursor.fetchall():
-        row = tuple(raw)
-        folder = Path(str(row[_STAGED_TAG_WIDTH]))
-        if folder == root or folder.is_relative_to(root):
-            result.append(_row_to_staged_tag(row[:_STAGED_TAG_WIDTH]))
-    return result
+    return [_row_to_staged_tag(tuple(row)) for row in cursor.fetchall()]
 
 
 def delete_staged_tag(conn: sqlite3.Connection, file_id: int) -> None:

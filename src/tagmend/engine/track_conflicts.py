@@ -39,7 +39,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
-from tagmend.engine import db, schema, store
+from tagmend.engine import db, path_keys, schema, store
 from tagmend.engine.mismatch import NON_ALBUM_FOLDERS, fold
 from tagmend.engine.validation import check_limit
 from tagmend.log import get_logger
@@ -390,15 +390,15 @@ def _narrow(  # noqa: PLR0913 - the view knobs the public entry forwards, one ea
     tier: str | None,
     limit: int | None,
     group: bool,
-    folder: str | None,
+    folder_key: str | None,
 ) -> TrackConflictsReport:
     """Apply the tier/folder/limit view without touching the library-wide counts."""
     rows = report.rows if tier is None else [r for r in report.rows if r.tier == tier]
     context_rows = report.folder_context_rows if tier is None else []
-    if folder is not None:
-        # Exact path equality, never a prefix: a sibling folder must not be swept in.
-        rows = [r for r in rows if r.folder == folder]
-        context_rows = [r for r in context_rows if r.folder == folder]
+    if folder_key is not None:
+        # Key equality, never a prefix: a sibling or a subfolder must not be swept in.
+        rows = [r for r in rows if path_keys.path_key(r.folder) == folder_key]
+        context_rows = [r for r in context_rows if path_keys.path_key(r.folder) == folder_key]
         return replace(
             report,
             rows=rows[:limit] if limit is not None else rows,
@@ -457,13 +457,15 @@ def detect_track_conflicts(
 ) -> TrackConflictsReport:
     """Report files that share a ``(disc, track)`` slot with a sibling in the same folder.
 
-    Read-only over the snapshot: run ``scan_library`` first. Raises :class:`ValueError` for an
-    unknown *tier* or a negative *limit*.
+    Read-only over the snapshot: run ``scan_library`` first. *folder* is compared as a path
+    (:func:`tagmend.engine.path_keys.folder_arg_key`). Raises :class:`ValueError` for an unknown
+    *tier*, a negative *limit* or a *folder* outside ``music_path``.
     """
     check_limit(limit)
     if tier is not None and tier not in _TIERS:
         message = f"unknown tier {tier!r}; expected one of {sorted(_TIERS)}"
         raise ValueError(message)
+    folder_key = None if folder is None else path_keys.folder_arg_key(settings, folder)
 
     connection = db.connect(settings.db_path)
     try:
@@ -482,4 +484,11 @@ def detect_track_conflicts(
         report.folder_context,
         report.total_files,
     )
-    return _narrow(report, dict(file_counts), tier=tier, limit=limit, group=group, folder=folder)
+    return _narrow(
+        report,
+        dict(file_counts),
+        tier=tier,
+        limit=limit,
+        group=group,
+        folder_key=folder_key,
+    )

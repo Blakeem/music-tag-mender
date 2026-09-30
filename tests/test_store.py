@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import sqlite3
+import sys
 from typing import TYPE_CHECKING
 
 import pytest
 
-from tagmend.engine import store
+from tagmend.engine import path_keys, store
 from tagmend.engine.tags import MANAGED_SET_VERSION, TAG_READER_VERSION
 
 if TYPE_CHECKING:
@@ -52,6 +53,28 @@ def test_insert_get_round_trip(db_conn: sqlite3.Connection) -> None:
     assert row.tags_updated_at is None
     # A newly discovered file is not a leftover of an older reader, so it starts current.
     assert row.reader_version == TAG_READER_VERSION
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="NTFS is case-insensitive")
+def test_get_file_matches_a_case_variant(db_conn: sqlite3.Connection) -> None:
+    file_id = _insert(db_conn, folder=r"C:\Lib\Album", filename="Track.mp3")
+
+    for folder, filename in ((r"c:\lib\ALBUM", "track.MP3"), ("C:/Lib/Album", "Track.mp3")):
+        row = store.get_file(db_conn, folder, filename)
+        assert row is not None
+        assert row.id == file_id
+        assert (row.folder, row.filename) == (r"C:\Lib\Album", "Track.mp3")
+
+
+def test_update_location_keeps_the_row_findable(db_conn: sqlite3.Connection) -> None:
+    file_id = _insert(db_conn, folder="/lib/Album", filename="a.mp3")
+
+    store.update_location(db_conn, file_id, folder="/lib/./Album", filename="a.mp3", now=_LATER)
+
+    row = store.get_file(db_conn, "/lib/Album", "a.mp3")
+    assert row is not None
+    assert row.id == file_id
+    assert row.folder == "/lib/./Album"
 
 
 def test_stamp_reader_version_marks_a_stale_row_current(db_conn: sqlite3.Connection) -> None:
@@ -143,11 +166,49 @@ def test_tracked_files_under_excludes_prefix_sibling(
     _insert(db_conn, folder=str(sibling), filename="sibling.mp3")
     _insert(db_conn, folder=str(unrelated), filename="other.mp3")
 
-    found = {row.id for row in store.tracked_files_under(db_conn, root)}
+    found = {row.id for row in store.tracked_files_under(db_conn, path_keys.path_key(root))}
 
     # Only the real descendants of root are returned; the prefix sibling is excluded
     # (guards is_relative_to vs a naive LIKE 'root%' prefix match).
     assert found == {root_id, sub_id}
+
+
+def test_tracked_files_under_excludes_a_prefix_sibling(db_conn: sqlite3.Connection) -> None:
+    album = _insert(db_conn, folder="/lib/Album", filename="a.mp3")
+    disc = _insert(db_conn, folder="/lib/Album/Disc 1", filename="b.mp3")
+    _insert(db_conn, folder="/lib/Album 2", filename="c.mp3")
+
+    found = [row.id for row in store.tracked_files_under(db_conn, path_keys.path_key("/lib/Album"))]
+
+    assert found == [album, disc]
+
+
+def test_tracked_files_under_treats_percent_and_underscore_literally(
+    db_conn: sqlite3.Connection,
+) -> None:
+    underscore = _insert(db_conn, folder="/lib/a_b", filename="a.mp3")
+    percent = _insert(db_conn, folder="/lib/a%b", filename="b.mp3")
+    _insert(db_conn, folder="/lib/axb", filename="c.mp3")
+
+    under_underscore = store.tracked_files_under(db_conn, path_keys.path_key("/lib/a_b"))
+    under_percent = store.tracked_files_under(db_conn, path_keys.path_key("/lib/a%b"))
+
+    assert [row.id for row in under_underscore] == [underscore]
+    assert [row.id for row in under_percent] == [percent]
+
+
+def test_list_staged_tags_under_uses_the_same_range(db_conn: sqlite3.Connection) -> None:
+    album = _insert(db_conn, folder="/lib/Album", filename="a.mp3")
+    disc = _insert(db_conn, folder="/lib/Album/Disc 1", filename="b.mp3")
+    sibling = _insert(db_conn, folder="/lib/Album 2", filename="c.mp3")
+    for file_id in (album, disc, sibling):
+        store.upsert_staged_tag(
+            db_conn, file_id=file_id, managed_tags={"genre": ["X"]}, origin="auto", now=_NOW
+        )
+
+    staged = store.list_staged_tags_under(db_conn, path_keys.path_key("/lib/Album"))
+
+    assert [s.file_id for s in staged] == [album, disc]
 
 
 def test_compute_stats_full_shape(db_conn: sqlite3.Connection, tmp_path: Path) -> None:

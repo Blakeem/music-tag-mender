@@ -91,14 +91,19 @@ checked even for a file carrying no track id. Track-level fields (`title`, `trac
 `discnumber`) need a matched track and are skipped without one. A blank field is a **fill**,
 not a disagreement: `flagged` counts only fields where the file says one thing and the release
 says another, while `fill_rows` collects what the release can supply for free.
-34 MCP tools total. Schema is **v16** (additive: v11 adds
+34 MCP tools total. Schema is **v18** (additive: v11 adds
 `musicbrainz_recording_cache`, v12 renames `file_album_status` → `file_year_status` in place —
 dispositions preserved; v13 adds `tag_revisions.managed_set`, stamping which managed-tag set
 governed each revision so a revert can restore emptiness on the widened fields; v14 adds
 `files.reader_version` so an incremental scan re-reads a row an older tag reader wrote. v15 adds
 `musicbrainz_artist_cache`, the by-MBID artist lookup's cache. v16 adds
 `musicbrainz_release_cache`, the by-MBID release lookup's cache, holding the parsed release as
-one JSON payload. An older ledger upgrades in place). M6 organize/paths (`paths.py`)
+one JSON payload. v17 adds the stage-time base signature on `tag_revisions_staged`, append-only
+triggers on both revision logs and their `commit_id` indexes. v18 adds `files.path_key` with a
+UNIQUE index. `path_keys.py` is the one place that decides when two paths name the same file, and
+every folder argument resolves through `path_keys.resolve_folder_arg` (`folder_arg_key` for its
+key). An older ledger upgrades in place, except that the v18 upgrade refuses one where two file
+rows share a path key and names them. A newer ledger is refused). M6 organize/paths (`paths.py`)
 is a paper sketch (its DDL ships in v6; logic deferred).
 
 **The canonical tag namespace is TagMend's, not mutagen's.** mutagen's "easy" layer is an
@@ -113,7 +118,10 @@ because 245 real FLACs hold a different label in each. **`MANAGED_TAGS` is 25** 
 identity + 7 release-stamp = managed-set version 3; `MANAGED_SETS` keeps every older set frozen
 because stored revisions point at them). Any change to what `read_tags` produces bumps
 `TAG_READER_VERSION` in the same commit, which is what makes the next incremental scan re-read a
-stale row exactly once.
+stale row exactly once. Every write verifies its temp copy before the atomic swap (audio payload
+hash except on Ogg, unmanaged entries, ID3v1/APEv2 presence, managed read-back) and raises
+`TagWriteError` on any difference. A container the verifier has no layout for, or a non-Ogg file
+whose audio payload cannot be located, is refused, and staging refuses such a file up front.
 
 ## Python
 
@@ -271,7 +279,8 @@ src/tagmend/
   mcp_server.py     FastMCP server (thin) — 34 tools
   engine/
     db.py           SQLite connection (WAL)
-    schema.py       all DDL + PRAGMA user_version (v16)
+    schema.py       all DDL + PRAGMA user_version (v18)
+    path_keys.py    path identity keys, subtree key ranges, the folder-argument normalizer
     scan.py         filesystem discovery + signatures
     health.py       check_health / readiness + interrupted-commit report
     store.py        pure data access: files/file_tags + tag_revisions[_staged] + genre/artist status

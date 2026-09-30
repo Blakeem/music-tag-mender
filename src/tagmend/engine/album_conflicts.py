@@ -49,7 +49,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
-from tagmend.engine import db, schema, store
+from tagmend.engine import db, path_keys, schema, store
 from tagmend.engine.mismatch import NON_ALBUM_FOLDERS, fold
 from tagmend.engine.validation import check_limit
 from tagmend.log import get_logger
@@ -533,7 +533,7 @@ def _narrow(
     report: AlbumConflictsReport,
     *,
     tier: str | None,
-    folder: str | None,
+    folder_key: str | None,
     limit: int | None,
     group: bool = False,
 ) -> AlbumConflictsReport:
@@ -549,16 +549,16 @@ def _narrow(
     if tier is not None:
         rows = [r for r in rows if r.tier == tier]
         context_rows = []
-    if folder is not None:
-        rows = [r for r in rows if r.folder == folder]
-        context_rows = [r for r in context_rows if r.folder == folder]
+    if folder_key is not None:
+        rows = [r for r in rows if path_keys.path_key(r.folder) == folder_key]
+        context_rows = [r for r in context_rows if path_keys.path_key(r.folder) == folder_key]
     if limit is not None:
         rows = rows[:limit]
         context_rows = context_rows[:limit]
 
     groups = report.groups
-    if folder is not None:
-        groups = [g for g in groups if g.folder == folder]
+    if folder_key is not None:
+        groups = [g for g in groups if path_keys.path_key(g.folder) == folder_key]
     if limit is not None:
         groups = groups[:limit]
 
@@ -613,13 +613,15 @@ def detect_album_conflicts(
 ) -> AlbumConflictsReport:
     """Report files whose album identity differs from their folder siblings'.
 
-    Read-only over the snapshot: run ``scan_library`` first. Raises :class:`ValueError` for an
-    unknown *tier* or a negative *limit*.
+    Read-only over the snapshot: run ``scan_library`` first. *folder* is compared as a path
+    (:func:`tagmend.engine.path_keys.folder_arg_key`). Raises :class:`ValueError` for an unknown
+    *tier*, a negative *limit* or a *folder* outside ``music_path``.
     """
     check_limit(limit)
     if tier is not None and tier not in _TIERS:
         message = f"unknown tier {tier!r}; expected one of {sorted(_TIERS)}"
         raise ValueError(message)
+    folder_key = None if folder is None else path_keys.folder_arg_key(settings, folder)
 
     connection = db.connect(settings.db_path)
     try:
@@ -635,4 +637,4 @@ def detect_album_conflicts(
         report.folder_context,
         report.total_files,
     )
-    return _narrow(report, tier=tier, folder=folder, limit=limit, group=group)
+    return _narrow(report, tier=tier, folder_key=folder_key, limit=limit, group=group)

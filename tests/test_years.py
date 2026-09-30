@@ -142,6 +142,25 @@ def test_existing_originaldate_is_skipped_present(
     assert len(staging.diff_tags(engine_settings)) == 0
 
 
+def test_resolve_years_never_overwrites_a_disk_value_the_mirror_lacks(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    track = make_track(music_dir / "a.mp3", {"artist": ["Black Sabbath"], "album": ["Paranoid"]})
+    scan_library(engine_settings)
+    audio = mutagen.File(track, easy=True)  # type: ignore[attr-defined]
+    audio["originaldate"] = ["1969"]
+    audio.save()  # on disk only: no rescan, so the mirror still reads it as blank
+
+    fake = FakeMBAlbumSource({("Black Sabbath", "Paranoid"): _mb("1970")})
+    result = years.resolve_years(engine_settings, client=fake)
+
+    assert result.staged_files == 0
+    assert result.skipped_present == 1
+    assert staging.diff_tags(engine_settings) == []
+    assert read_tags(track).tags["originaldate"] == ["1969"]
+
+
 # --- skip: no album / no artist ------------------------------------------------------
 
 

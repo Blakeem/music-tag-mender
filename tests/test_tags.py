@@ -2,16 +2,37 @@
 
 from __future__ import annotations
 
+import io
 from typing import TYPE_CHECKING
 
 import mutagen
 import pytest
+from mutagen.apev2 import APEv2
 from mutagen.flac import FLAC
-from mutagen.id3 import ID3, TRCK, TSO2  # type: ignore[attr-defined]
+from mutagen.id3 import (  # type: ignore[attr-defined]
+    ID3,
+    IPLS,
+    TCON,
+    TDAT,
+    TDOR,
+    TIME,
+    TIPL,
+    TIT2,
+    TORY,
+    TRCK,
+    TRDA,
+    TSO2,
+    TXXX,
+    TYER,
+    Frame,
+    MakeID3v1,
+    ParseID3v1,
+)
 from mutagen.mp4 import MP4
 from mutagen.oggvorbis import OggVorbis
 
 from conftest import make_track
+from tagmend.engine import tags
 
 # Import tags so its module-load RegisterFreeformKey runs before make_track writes any
 # ``originaldate`` via raw mutagen easy mode (the M4A freeform atom must be registered).
@@ -21,6 +42,7 @@ from tagmend.engine.tags import (
     MANAGED_TAGS,
     ORIGINAL_MANAGED_TAGS,
     TAG_READER_VERSION,
+    TagWriteError,
     read_tags,
     write_managed_tags,
 )
@@ -513,7 +535,7 @@ def test_managed_set_version_3_registered() -> None:
     # Older stamps must stay frozen: stored revisions point at them.
     assert MANAGED_SETS[1] == ORIGINAL_MANAGED_TAGS
     assert len(MANAGED_SETS[2]) == 18
-    assert TAG_READER_VERSION == 5
+    assert TAG_READER_VERSION == 6
 
 
 def test_write_leaves_unchanged_frames_untouched(tmp_path: Path) -> None:
@@ -547,3 +569,248 @@ def test_write_with_no_change_does_not_touch_the_file(tmp_path: Path, suffix: st
     assert track.read_bytes() == before_bytes
     assert track.stat().st_mtime_ns == before_mtime
     assert not list(tmp_path.glob("*.tagmend.tmp"))
+
+
+def _managed(track: Path) -> dict[str, list[str]]:
+    return {key: values for key, values in read_tags(track).tags.items() if key in MANAGED_TAGS}
+
+
+def test_write_refuses_to_drop_a_frame(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    track = make_track(tmp_path / "keep.mp3", {"genre": ["Rock"]})
+    raw = ID3(track)  # type: ignore[no-untyped-call]
+    raw.add(TXXX(encoding=3, desc="Foo", text=["bar"]))  # type: ignore[no-untyped-call]
+    raw.save()
+    before = track.read_bytes()
+    real_apply = tags._apply_changes
+
+    def lossy(
+        path: Path, container: tags._Container, changes: list[tuple[str, list[str] | None]]
+    ) -> None:
+        real_apply(path, container, changes)
+        frames = ID3(path)  # type: ignore[no-untyped-call]
+        frames.delall("TXXX:Foo")  # type: ignore[no-untyped-call]
+        frames.save()
+
+    monkeypatch.setattr(tags, "_apply_changes", lossy)
+
+    with pytest.raises(TagWriteError, match="dropped TXXX:Foo"):
+        write_managed_tags(track, {**_managed(track), "genre": ["Jazz"]})
+
+    assert track.read_bytes() == before
+    assert not list(tmp_path.glob("*.tagmend.tmp"))
+
+
+def test_write_refuses_a_container_the_verifier_cannot_check(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    track = make_track(tmp_path / "other.mp3", {"genre": ["Rock"]})
+    before = track.read_bytes()
+    monkeypatch.setattr(tags, "_container_of", lambda _audio: tags._Container.OTHER)
+
+    with pytest.raises(TagWriteError, match=r"no layout for the \w+ container"):
+        write_managed_tags(track, {**_managed(track), "genre": ["Jazz"]})
+
+    assert track.read_bytes() == before
+    assert not list(tmp_path.glob("*.tagmend.tmp"))
+
+
+def test_write_refuses_when_the_audio_payload_cannot_be_located(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    track = make_track(tmp_path / "lost.flac", {"genre": ["Rock"]})
+    before = track.read_bytes()
+    monkeypatch.setattr(tags, "_audio_ranges", lambda *_args: None)
+
+    with pytest.raises(TagWriteError, match="audio payload could not be located"):
+        write_managed_tags(track, {**_managed(track), "genre": ["Jazz"]})
+
+    assert track.read_bytes() == before
+    assert not list(tmp_path.glob("*.tagmend.tmp"))
+
+
+def test_mp4_without_an_mdat_atom_has_no_locatable_payload() -> None:
+    ftyp = (16).to_bytes(4, "big") + b"ftypM4A " + bytes(4)
+    trailer = tags._Trailer(has_id3v1=False, has_apev2=False, audio_end=len(ftyp))
+
+    assert tags._audio_ranges(io.BytesIO(ftyp), tags._Container.MP4, trailer) is None
+
+
+def test_write_refuses_when_audio_payload_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    track = make_track(tmp_path / "audio.mp3", {"genre": ["Rock"]})
+    before = track.read_bytes()
+    real_apply = tags._apply_changes
+
+    def corrupting(
+        path: Path,
+        container: tags._Container,
+        changes: list[tuple[str, list[str] | None]],
+    ) -> None:
+        real_apply(path, container, changes)
+        data = bytearray(path.read_bytes())
+        with path.open("rb") as handle:
+            start = tags._id3v2_end(handle)
+            end = tags._read_trailer(handle, len(data)).audio_end
+        data[(start + end) // 2] ^= 0xFF
+        path.write_bytes(bytes(data))
+
+    monkeypatch.setattr(tags, "_apply_changes", corrupting)
+
+    with pytest.raises(TagWriteError, match="audio payload changed"):
+        write_managed_tags(track, {**_managed(track), "genre": ["Jazz"]})
+
+    assert track.read_bytes() == before
+    assert not list(tmp_path.glob("*.tagmend.tmp"))
+
+
+def test_v23_iso_tyer_survives_a_write(tmp_path: Path) -> None:
+    track = make_track(tmp_path / "iso.mp3")
+    frames = ID3()  # type: ignore[no-untyped-call]
+    frames.add(TYER(encoding=0, text=["2013-10-04T07:00:00Z"]))  # type: ignore[no-untyped-call]
+    frames.add(TCON(encoding=0, text=["Rock"]))  # type: ignore[no-untyped-call]
+    frames.save(track, v2_version=3)
+
+    assert read_tags(track).tags["date"] == ["2013-10-04"]
+
+    write_managed_tags(track, {**_managed(track), "genre": ["Jazz"]})
+
+    after = read_tags(track).tags
+    assert after["date"] == ["2013-10-04"]
+    assert after["genre"] == ["Jazz"]
+
+
+def _v23_track(path: Path, frames: list[Frame]) -> Path:
+    track = make_track(path)
+    tag = ID3()  # type: ignore[no-untyped-call]
+    tag.add(TCON(encoding=0, text=["Rock"]))  # type: ignore[no-untyped-call]
+    for frame in frames:
+        tag.add(frame)  # type: ignore[no-untyped-call]
+    tag.save(track, v2_version=3)
+    return track
+
+
+@pytest.mark.parametrize(
+    ("frames", "dropped"),
+    [
+        pytest.param(
+            [
+                TYER(encoding=0, text=["2013"]),  # type: ignore[no-untyped-call]
+                TRDA(encoding=0, text=["4th-7th June 2013"]),  # type: ignore[no-untyped-call]
+            ],
+            "TRDA",
+            id="trda-has-no-successor",
+        ),
+        pytest.param(
+            [TDAT(encoding=0, text=["0410"])],  # type: ignore[no-untyped-call]
+            "TDAT",
+            id="tdat-without-a-year",
+        ),
+        pytest.param(
+            [
+                TORY(encoding=0, text=["1998"]),  # type: ignore[no-untyped-call]
+                TDOR(encoding=0, text=["1999"]),  # type: ignore[no-untyped-call]
+            ],
+            "TORY",
+            id="tory-beside-a-different-tdor",
+        ),
+        pytest.param(
+            [
+                IPLS(encoding=0, people=[["producer", "X"]]),  # type: ignore[no-untyped-call]
+                TIPL(encoding=0, people=[["mix", "Y"]]),  # type: ignore[no-untyped-call]
+            ],
+            "IPLS",
+            id="ipls-beside-a-tipl",
+        ),
+    ],
+)
+def test_write_refuses_a_v23_frame_the_upgrade_drops(
+    tmp_path: Path, frames: list[Frame], dropped: str
+) -> None:
+    track = _v23_track(tmp_path / "v23.mp3", frames)
+    before = track.read_bytes()
+
+    with pytest.raises(TagWriteError, match=f"dropped {dropped}"):
+        write_managed_tags(track, {**_managed(track), "genre": ["Jazz"]})
+
+    assert track.read_bytes() == before
+    assert not list(tmp_path.glob("*.tagmend.tmp"))
+
+
+def test_write_carries_v23_frames_the_upgrade_folds(tmp_path: Path) -> None:
+    track = _v23_track(
+        tmp_path / "v23.mp3",
+        [
+            TYER(encoding=0, text=["2013"]),  # type: ignore[no-untyped-call]
+            TDAT(encoding=0, text=["0410"]),  # type: ignore[no-untyped-call]
+            TIME(encoding=0, text=["0730"]),  # type: ignore[no-untyped-call]
+            TORY(encoding=0, text=["1999"]),  # type: ignore[no-untyped-call]
+            IPLS(encoding=0, people=[["producer", "X"]]),  # type: ignore[no-untyped-call]
+        ],
+    )
+
+    assert write_managed_tags(track, {**_managed(track), "genre": ["Jazz"]}) is True
+
+    after = read_tags(track).tags
+    assert after["date"] == ["2013-10-04 07:30:00"]
+    assert after["originaldate"] == ["1999"]
+    assert ID3(track)["TIPL"].people == [["producer", "X"]]  # type: ignore[no-untyped-call]
+
+
+@pytest.mark.parametrize("with_id3v1", [False, True])
+def test_write_deletes_a_v23_iso_tyer_date(tmp_path: Path, *, with_id3v1: bool) -> None:
+    track = make_track(tmp_path / "iso.mp3")
+    frames = ID3()  # type: ignore[no-untyped-call]
+    frames.add(TYER(encoding=0, text=["2013-10-04T07:00:00Z"]))  # type: ignore[no-untyped-call]
+    frames.save(track, v2_version=3, v1=0)
+    if with_id3v1:
+        year = TYER(encoding=0, text=["2013"])  # type: ignore[no-untyped-call]
+        with track.open("ab") as handle:
+            handle.write(MakeID3v1({"TYER": year}))  # type: ignore[no-untyped-call]
+    target = _managed(track)
+    assert target.pop("date") == ["2013-10-04"]
+
+    assert write_managed_tags(track, target) is True
+
+    assert "date" not in read_tags(track).tags
+    assert (track.read_bytes()[-128:-125] == b"TAG") is with_id3v1
+
+
+def test_write_keeps_id3v1_and_apev2_presence(tmp_path: Path) -> None:
+    with_v1 = make_track(tmp_path / "v1.mp3", {"genre": ["Rock"], "title": ["Song"]})
+    ID3(with_v1).save(v1=2)  # type: ignore[no-untyped-call]
+    with_ape = make_track(tmp_path / "ape.mp3", {"genre": ["Rock"]})
+    ape = APEv2()  # type: ignore[no-untyped-call]
+    ape["Foo"] = "bar"
+    ape.save(with_ape)
+
+    for track in (with_v1, with_ape):
+        write_managed_tags(track, {**_managed(track), "genre": ["Jazz"]})
+
+    assert with_v1.read_bytes()[-128:-125] == b"TAG"
+    assert str(APEv2(with_ape)["Foo"]) == "bar"  # type: ignore[no-untyped-call]
+    assert read_tags(with_v1).tags["genre"] == ["Jazz"]
+    assert read_tags(with_ape).tags["genre"] == ["Jazz"]
+
+
+def test_write_does_not_promote_id3v1_only_fields(tmp_path: Path) -> None:
+    track = make_track(tmp_path / "v1only.mp3")
+    frames = ID3()  # type: ignore[no-untyped-call]
+    frames.add(TCON(encoding=3, text=["Rock"]))  # type: ignore[no-untyped-call]
+    frames.save(track, v1=0)
+    title = TIT2(encoding=0, text=["Short Title"])  # type: ignore[no-untyped-call]
+    with track.open("ab") as handle:
+        handle.write(MakeID3v1({"TIT2": title}))  # type: ignore[no-untyped-call]
+    assert read_tags(track).tags["title"] == ["Short Title"]
+
+    write_managed_tags(track, {**_managed(track), "genre": ["Jazz"]})
+
+    v2 = ID3(track, load_v1=False)  # type: ignore[no-untyped-call]
+    assert "TIT2" not in v2
+    assert v2["TCON"].text == ["Jazz"]
+    v1 = ParseID3v1(track.read_bytes()[-128:])  # type: ignore[no-untyped-call]
+    assert v1 is not None
+    assert v1["TIT2"].text == ["Short Title"]

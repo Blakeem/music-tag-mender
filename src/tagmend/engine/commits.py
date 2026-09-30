@@ -291,8 +291,11 @@ class RevisionDomain(Protocol):
         """Return every staged file id, in a stable order."""
         ...
 
-    def list_staged_file_ids_under(self, conn: sqlite3.Connection, root: Path) -> list[int]:
-        """Return staged file ids whose file lives at *root* or nested under it."""
+    def list_staged_file_ids_under(self, conn: sqlite3.Connection, root_key: str) -> list[int]:
+        """Return staged file ids whose file lives in the folder keyed *root_key* or under it.
+
+        *root_key* is a :func:`tagmend.engine.path_keys.path_key`.
+        """
         ...
 
     def plan_order(self, conn: sqlite3.Connection, file_ids: list[int]) -> list[int]:

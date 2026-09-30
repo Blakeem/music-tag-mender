@@ -38,7 +38,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
-from tagmend.engine import classify, db, genres, parsing, schema, store
+from tagmend.engine import classify, db, genres, parsing, path_keys, schema, store
 from tagmend.engine.musicbrainz import MusicBrainzClient, MusicBrainzError
 from tagmend.engine.validation import check_limit
 from tagmend.log import get_logger
@@ -468,9 +468,9 @@ def _summarize(  # noqa: PLR0913 - cohesive keyword-only summary counts
 # --- narrowing (library-wide counts preserved) ---------------------------------------
 
 
-def _expand_folder(report: AlbumGapsReport, folder: str) -> AlbumGapsReport:
-    """Return the report narrowed to EXACTLY *folder* (path equality, never a prefix/LIKE)."""
-    groups = [g for g in report.groups if g.folder == folder]
+def _expand_folder(report: AlbumGapsReport, folder_key: str) -> AlbumGapsReport:
+    """Return the report narrowed to exactly the folder keyed *folder_key*, never a subfolder."""
+    groups = [g for g in report.groups if path_keys.path_key(g.folder) == folder_key]
     return replace(report, groups=groups)
 
 
@@ -573,20 +573,22 @@ def detect_album_gaps(
     upholding the additive-fill guarantee the staging merge does not enforce.
 
     Tiers 1-2 are pure and network-free. The recording tier runs only for files that tiers 1-2
-    leave blank AND that carry a non-blank artist and title; *use_musicbrainz* (default True)
-    skips it entirely for a local-only, network-free run. The client is built LAZILY — only
-    when such candidates actually exist — so a run without any never opens an HTTP client. MB
-    results are cached, so a re-run after the first pass is network-free; those cache writes are
-    the tool's ONLY ledger writes (tags/status/staging untouched). *client* lets callers inject
+    leave blank AND that carry a non-blank artist and title. *use_musicbrainz* (default True)
+    skips it entirely for a local-only, network-free run. The client is built LAZILY, only when
+    such candidates exist, so a run without any never opens an HTTP client. MB results are
+    cached, so a re-run after the first pass is network-free. Those cache writes are the tool's
+    ONLY ledger writes (tags, status and staging are untouched). *client* lets callers inject
     an :class:`tagmend.engine.musicbrainz.MBRecordingSource` (a fake in tests).
 
-    *folder* returns exactly that folder's group (exact path equality); *limit* caps the
-    number of groups. The ``green``/``confirm``/``review``/``stays_blank`` counts always
-    describe the whole library. Loads the genre vocabulary once per run (:class:`ValueError` on
-    a corrupt vocabulary propagates to the MCP envelope). Raises :class:`ValueError` for a
-    negative *limit*. Owns its connection.
+    *folder* returns exactly that folder's group, never a subfolder, compared as a path
+    (:func:`tagmend.engine.path_keys.folder_arg_key`). *limit* caps the number of groups. The
+    ``green``/``confirm``/``review``/``stays_blank`` counts always describe the whole library.
+    Loads the genre vocabulary once per run (:class:`ValueError` on a corrupt vocabulary
+    propagates to the MCP envelope). Raises :class:`ValueError` for a negative *limit* or a
+    *folder* outside ``music_path``. Owns its connection.
     """
     check_limit(limit)
+    folder_key = None if folder is None else path_keys.folder_arg_key(settings, folder)
     vocab = classify.load_vocabulary()
 
     connection = db.connect(settings.db_path)
@@ -610,8 +612,8 @@ def detect_album_gaps(
         report.stays_blank,
     )
 
-    if folder is not None:
-        return _expand_folder(report, folder)
+    if folder_key is not None:
+        return _expand_folder(report, folder_key)
     if limit is not None:
         return _limit_report(report, limit)
     return report

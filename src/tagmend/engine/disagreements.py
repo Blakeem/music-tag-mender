@@ -38,7 +38,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING, Final
 
-from tagmend.engine import db, schema, store
+from tagmend.engine import db, path_keys, schema, store
 from tagmend.engine.album_conflicts import group_key
 from tagmend.engine.musicbrainz import MusicBrainzClient, MusicBrainzError
 from tagmend.engine.validation import check_limit
@@ -622,7 +622,7 @@ def _narrow(
     report: DisagreementsReport,
     *,
     tier: str | None,
-    folder: str | None,
+    folder_key: str | None,
     limit: int | None,
     group: bool,
 ) -> DisagreementsReport:
@@ -632,16 +632,16 @@ def _narrow(
     if tier is not None:
         rows = [r for r in rows if r.tier == tier]
         fill_rows = [r for r in fill_rows if r.tier == tier]
-    if folder is not None:
-        rows = [r for r in rows if r.folder == folder]
-        fill_rows = [r for r in fill_rows if r.folder == folder]
+    if folder_key is not None:
+        rows = [r for r in rows if path_keys.path_key(r.folder) == folder_key]
+        fill_rows = [r for r in fill_rows if path_keys.path_key(r.folder) == folder_key]
     if limit is not None:
         rows = rows[:limit]
         fill_rows = fill_rows[:limit]
 
     groups = report.groups
-    if folder is not None:
-        groups = [g for g in groups if g.folder == folder]
+    if folder_key is not None:
+        groups = [g for g in groups if path_keys.path_key(g.folder) == folder_key]
     if limit is not None:
         groups = groups[:limit]
 
@@ -726,22 +726,25 @@ def detect_disagreements(  # noqa: PLR0913 - cohesive keyword-only scope + injec
     call (default 200, about three minutes at MusicBrainz's requested one request per second)
     and the remainder is reported via ``releases_remaining``/``more``. *row_limit* caps the
     rows returned without changing any count.
+    *folder* is compared as a path (:func:`tagmend.engine.path_keys.folder_arg_key`).
     *client* injects an :class:`tagmend.engine.musicbrainz.MBReleaseSource` for tests. Raises
-    :class:`ValueError` for an unknown *tier* or a negative *limit* or *row_limit*.
+    :class:`ValueError` for an unknown *tier*, a negative *limit* or *row_limit*, or a *folder*
+    outside ``music_path``.
     """
     check_limit(limit)
     check_limit(row_limit, name="row_limit")
     if tier is not None and tier not in _TIERS:
         message = f"unknown tier {tier!r}; expected one of {sorted(_TIERS)}"
         raise ValueError(message)
+    folder_key = None if folder is None else path_keys.folder_arg_key(settings, folder)
 
     connection = db.connect(settings.db_path)
     try:
         schema.apply_schema(connection)
         scoped = None if file_ids is None else store.files_in_scope(connection, file_ids=file_ids)
         files = _load_inputs(connection, scoped)
-        if folder is not None:
-            files = [f for f in files if f.folder == folder]
+        if folder_key is not None:
+            files = [f for f in files if path_keys.path_key(f.folder) == folder_key]
 
         effective_limit = _DEFAULT_LIMIT if limit is None else limit
         if client is not None:
@@ -762,4 +765,4 @@ def detect_disagreements(  # noqa: PLR0913 - cohesive keyword-only scope + injec
         report.releases_checked,
         report.total_files,
     )
-    return _narrow(report, tier=tier, folder=folder, limit=row_limit, group=group)
+    return _narrow(report, tier=tier, folder_key=folder_key, limit=row_limit, group=group)

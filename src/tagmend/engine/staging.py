@@ -29,6 +29,7 @@ connection and commit; the building blocks in :mod:`tagmend.engine.store` never 
 
 from __future__ import annotations
 
+import unicodedata
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -36,8 +37,8 @@ from typing import TYPE_CHECKING, Final, cast
 
 import mutagen
 
-from tagmend.engine import axis, commits, db, schema, store, versioning
-from tagmend.engine.tags import MANAGED_TAGS, read_tags, write_managed_tags
+from tagmend.engine import axis, commits, db, path_keys, schema, store, versioning
+from tagmend.engine.tags import MANAGED_TAGS, ensure_writable, read_tags, write_managed_tags
 from tagmend.log import get_logger
 
 if TYPE_CHECKING:
@@ -67,9 +68,48 @@ _IDENTITY_GROUPS: Final[tuple[tuple[str, ...], ...]] = (
 )
 
 
+# A NUL splits a value inside TagLib, and ID3v2.4 forbids line breaks in a text frame.
+_FORBIDDEN_CHARACTERS: Final = ("\x00", "\r", "\n")
+
+
 def _utc_now() -> str:
     """Return the current time as an ISO-8601 UTC string."""
     return datetime.now(UTC).isoformat()
+
+
+def _clean_values(file_id: int, managed_tags: dict[str, list[str]]) -> dict[str, list[str]]:
+    """Return caller-supplied values stripped and NFC-normalized, dropping the ones left empty.
+
+    Navidrome trims only genre and single-valued artist fields and never Unicode-normalizes, so
+    a trailing space or a decomposed accent splits one album or artist into two. A list left
+    empty still means "delete the field". Raises :class:`ValueError` naming *file_id*, the key
+    and the value for a NUL, CR or LF.
+    """
+    cleaned: dict[str, list[str]] = {}
+    for key, values in managed_tags.items():
+        for value in values:
+            if any(character in value for character in _FORBIDDEN_CHARACTERS):
+                message = (
+                    f"cannot stage file_id={file_id}: {key} value {value!r} contains a NUL, "
+                    "CR or LF"
+                )
+                raise ValueError(message)
+        stripped = (unicodedata.normalize("NFC", value.strip()) for value in values)
+        cleaned[key] = [value for value in stripped if value]
+    return cleaned
+
+
+def _drop_filled(
+    requested: dict[str, list[str]],
+    current: dict[str, list[str]],
+    fill_only: frozenset[str],
+) -> dict[str, list[str]]:
+    """Return *requested* without the *fill_only* keys *current* already holds a value for."""
+    return {
+        key: values
+        for key, values in requested.items()
+        if key not in fill_only or not any(value.strip() for value in current.get(key, []))
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,7 +151,7 @@ class TagDomain:
 
     Frozen and stateless: it reads each staged file's payload from
     :mod:`tagmend.engine.store` by ``file_id``. ``plan_order`` and ``post_commit_file``
-    are identity/no-op — tag commits have no ordering or filesystem-cleanup concerns.
+    are identity and no-op, because tag commits have no ordering or filesystem-cleanup concerns.
     """
 
     name: str = "tags"
@@ -125,9 +165,9 @@ class TagDomain:
         """Return every staged file id, in file_id order."""
         return [s.file_id for s in store.list_staged_tags(conn)]
 
-    def list_staged_file_ids_under(self, conn: sqlite3.Connection, root: Path) -> list[int]:
-        """Return staged file ids whose file lives at *root* or nested under it."""
-        return [s.file_id for s in store.list_staged_tags_under(conn, root)]
+    def list_staged_file_ids_under(self, conn: sqlite3.Connection, root_key: str) -> list[int]:
+        """Return staged file ids whose file lives in the folder keyed *root_key* or under it."""
+        return [s.file_id for s in store.list_staged_tags_under(conn, root_key)]
 
     def plan_order(self, conn: sqlite3.Connection, file_ids: list[int]) -> list[int]:  # noqa: ARG002
         """Tags have no move ordering: iterate in the given order."""
@@ -238,20 +278,25 @@ def _stage_one(  # noqa: PLR0913 - cohesive keyword-only per-file staging payloa
     origin: str,
     note: str | None,
     now: str,
-) -> None:
+    fill_only: frozenset[str] = frozenset(),
+) -> bool:
     """Validate + stage one file's change on an OPEN connection (no commit). Never drifts.
 
     The shared per-file core of :func:`stage_tags` and :func:`stage_tags_batch`: rejects
-    unmanaged keys, rejects an unknown or missing *file_id*, lazily captures the version-0
-    baseline, merges *managed_tags* onto the file's current managed subset (P0 — omitted keys
-    are preserved), and upserts the staged row with the file's signature as its base, so the
-    commit can refuse a file edited since. Raises :class:`ValueError` naming *file_id* on
-    any invalid input; leaves the transaction for the caller to commit or roll back.
+    unmanaged keys, cleans every caller-supplied value (:func:`_clean_values`), rejects an
+    unknown or missing *file_id*, lazily captures the version-0 baseline, merges
+    *managed_tags* onto the file's current managed subset (P0: omitted keys are preserved),
+    and upserts the staged row with the file's signature as its base, so the commit can refuse
+    a file edited since. A *fill_only* key is dropped when the file on disk already holds a
+    value for it, and when that leaves no caller-supplied key, nothing is staged and ``False``
+    is returned. Raises :class:`ValueError` naming *file_id* on any invalid input. Leaves the
+    transaction for the caller to commit or roll back.
     """
     unmanaged = sorted(set(managed_tags) - MANAGED_TAGS)
     if unmanaged:
         message = f"cannot stage non-managed tag(s) for file_id={file_id}: {', '.join(unmanaged)}"
         raise ValueError(message)
+    requested = _clean_values(file_id, managed_tags)
 
     file_row = store.get_file_by_id(conn, file_id)
     if file_row is None:
@@ -278,6 +323,20 @@ def _stage_one(  # noqa: PLR0913 - cohesive keyword-only per-file staging payloa
         message = f"cannot read tags from disk for file_id={file_id} ({path}): {exc}"
         raise ValueError(message) from exc
 
+    # A blank-fill decided from the snapshot mirror must still never overwrite a value the
+    # file gained on disk since the last scan.
+    remaining = _drop_filled(requested, current, fill_only)
+    if requested and not remaining:
+        return False
+
+    # A staged row the writer must refuse would fail every commit and block revert_commit's
+    # empty-staging guard until someone unstaged it by hand.
+    try:
+        ensure_writable(path)
+    except (mutagen.MutagenError, OSError, ValueError) as exc:  # type: ignore[attr-defined]
+        message = f"cannot stage file_id={file_id}: {exc}"
+        raise ValueError(message) from exc
+
     # Capture v0 now (resume-free model): freeze the true original before any commit.
     if store.max_version(conn, file_id) is None:
         versioning.ensure_baseline(conn, file_id, managed_tags=current, now=now)
@@ -286,7 +345,7 @@ def _stage_one(  # noqa: PLR0913 - cohesive keyword-only per-file staging payloa
     # keys are preserved through the commit's delete-on-absent write. The caller's values
     # win; an explicit empty list still deletes a field.
     target = versioning.managed_subset(current)
-    target.update(managed_tags)
+    target.update(remaining)
 
     store.upsert_staged_tag(
         conn,
@@ -298,16 +357,18 @@ def _stage_one(  # noqa: PLR0913 - cohesive keyword-only per-file staging payloa
         base_size_bytes=base.st_size,
         base_mtime_ns=base.st_mtime_ns,
     )
+    return True
 
 
-def stage_tags(
+def stage_tags(  # noqa: PLR0913 - cohesive keyword-only staging payload
     settings: Settings,
     *,
     file_id: int,
     managed_tags: dict[str, list[str]],
     origin: str = "manual",
     note: str | None = None,
-) -> None:
+    fill_only: frozenset[str] = frozenset(),
+) -> bool:
     """Record the desired target managed tags for *file_id* (replacing any pending one).
 
     Validates *origin* (``auto``/``manual``) then, via the shared :func:`_stage_one` core,
@@ -324,6 +385,14 @@ def stage_tags(
     :func:`tagmend.engine.tags.write_managed_tags` deletes every managed key *absent* from
     that target). An explicit empty list still deletes a field. Each resolver stages only
     the fields it decides, and :func:`_stage_one` merges them onto the tags read from disk.
+
+    **Value hygiene.** Every supplied value is stripped of leading and trailing whitespace and
+    NFC-normalized, and a value left empty is dropped (a list left empty deletes the field). A
+    value containing a NUL, CR or LF raises :class:`ValueError` and stages nothing.
+
+    **Blank-fill guard.** A key in *fill_only* is dropped when the file on disk already holds a
+    value for it, so a fill aimed by a stale snapshot never overwrites one. Returns ``False``
+    when that leaves nothing to stage (no row is written), else ``True``.
     """
     if origin not in _STAGED_ORIGINS:
         message = f"invalid staged origin: {origin!r} (expected auto|manual)"
@@ -332,19 +401,24 @@ def stage_tags(
     connection = db.connect(settings.db_path)
     try:
         schema.apply_schema(connection)
-        _stage_one(
+        staged = _stage_one(
             connection,
             file_id=file_id,
             managed_tags=managed_tags,
             origin=origin,
             note=note,
             now=_utc_now(),
+            fill_only=fill_only,
         )
         connection.commit()
     finally:
         connection.close()
 
-    logger.info("staged tags for file_id=%d (origin=%s)", file_id, origin)
+    if staged:
+        logger.info("staged tags for file_id=%d (origin=%s)", file_id, origin)
+    else:
+        logger.info("file_id=%d already holds every fill-only value: nothing staged", file_id)
+    return staged
 
 
 _BATCH_ENTRY_WIDTH = 2
@@ -399,12 +473,13 @@ def stage_tags_batch(
     checked first by :func:`_validate_batch_entries` (a :class:`ValueError` naming the index
     and what was wrong), then each is validated and staged through the SAME :func:`_stage_one`
     core as :func:`stage_tags` (unmanaged-key rejection, unknown/missing-file rejection, lazy
-    v0 baseline, merge-onto-current-subset), so single and batch can never drift. The
-    ``origin`` is hardcoded ``"manual"`` (this flow never auto-stages — no origin parameter is
-    exposed). A malformed entry, a duplicate ``file_id`` in one batch, or any invalid entry
-    raises :class:`ValueError` and NOTHING is staged (the shared transaction is rolled back on
-    close). A later :func:`commit_tags` groups the whole batch into ONE revertible commit.
-    Returns the staged file ids in input order.
+    v0 baseline, merge-onto-current-subset, and the value hygiene :func:`stage_tags` describes:
+    values stripped and NFC-normalized, a NUL, CR or LF rejected), so single and batch can never
+    drift. The ``origin`` is hardcoded ``"manual"`` (this flow never auto-stages, so no origin
+    parameter is exposed). A malformed entry, a duplicate ``file_id`` in one batch, or any
+    invalid entry raises :class:`ValueError` and NOTHING is staged (the shared transaction is
+    rolled back on close). A later :func:`commit_tags` groups the whole batch into ONE
+    revertible commit. Returns the staged file ids in input order.
 
     ``tracknumber``/``discnumber`` values are staged VERBATIM (callers supply the full
     ``"n/total"`` strings); this helper never parses or computes them.
@@ -514,15 +589,18 @@ def diff_tags(settings: Settings, *, root: Path | None = None) -> list[TagDiffVi
     disk state after an interrupted commit. ``target`` is the staged managed tags and
     ``diff`` is :func:`tagmend.engine.versioning.compute_diff` between them (a no-op stage
     yields ``diff == {}`` but the row still appears). Optionally limited to files under
-    *root*. Owns its transaction (read-only).
+    *root*, resolved by :func:`tagmend.engine.path_keys.folder_arg_key` (which raises
+    :class:`ValueError` for a folder outside ``music_path``). Owns its transaction (read-only).
     """
+    root_key = None if root is None else path_keys.folder_arg_key(settings, root)
+
     connection = db.connect(settings.db_path)
     try:
         schema.apply_schema(connection)
         staged_rows = (
             store.list_staged_tags(connection)
-            if root is None
-            else store.list_staged_tags_under(connection, root)
+            if root_key is None
+            else store.list_staged_tags_under(connection, root_key)
         )
         views: list[TagDiffView] = []
         for staged in staged_rows:
@@ -568,11 +646,13 @@ def commit_tags(
     its staged row dropped, and reported in ``missing_files``. A file edited on disk since it
     was staged reports ``changed_since_stage``, and a file that fails to write reports
     ``error`` with a ``detail``. Both keep their staged row, and the rest of the commit still
-    completes. ``commit_id`` is ``None`` when nothing was staged. Owns its transaction.
+    completes. ``commit_id`` is ``None`` when nothing was staged. *root* resolves through
+    :func:`tagmend.engine.path_keys.folder_arg_key`. Owns its transaction.
     """
     if origin not in _STAGED_ORIGINS:
         message_text = f"invalid commit origin: {origin!r} (expected auto|manual)"
         raise ValueError(message_text)
+    root_key = None if root is None else path_keys.folder_arg_key(settings, root)
 
     domain = TagDomain()
     connection = db.connect(settings.db_path)
@@ -584,8 +664,8 @@ def commit_tags(
         connection.commit()
 
         file_ids = (
-            domain.list_staged_file_ids_under(connection, root)
-            if root is not None
+            domain.list_staged_file_ids_under(connection, root_key)
+            if root_key is not None
             else domain.list_staged_file_ids(connection)
         )
         if not file_ids:

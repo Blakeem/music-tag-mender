@@ -9,24 +9,26 @@ resume-free model — there is no ``resume`` call).
 
 from __future__ import annotations
 
+import sys
+import wave
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import mutagen
 import pytest
 from mutagen.flac import FLAC
+from mutagen.id3 import ID3, TYER, MakeID3v1  # type: ignore[attr-defined]
 
 from conftest import make_track
 from tagmend import mcp_server
 from tagmend.config import load_settings
-from tagmend.engine import artists, commits, staging, store, versioning
+from tagmend.engine import artists, commits, staging, store, tags, versioning
 from tagmend.engine.db import connect
 from tagmend.engine.library import ScanMode, scan_library
 from tagmend.engine.schema import apply_schema
 from tagmend.engine.tags import read_tags, write_managed_tags
 
 if TYPE_CHECKING:
-    from pathlib import Path
-
     from tagmend.config import Settings
 
 _FORMATS = [".mp3", ".flac", ".m4a", ".ogg"]
@@ -524,6 +526,95 @@ def test_commit_root_scope_limits_to_subtree(
     assert read_tags(jazz).tags["genre"] == ["Rock"]  # untouched on disk
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="NTFS is case-insensitive")
+def test_commit_path_scope_ignores_case(engine_settings: Settings, music_dir: Path) -> None:
+    rock = make_track(music_dir / "Rock" / "a.mp3", {"genre": ["Electronic"]})
+    jazz = make_track(music_dir / "Jazz" / "b.mp3", {"genre": ["Rock"]})
+    scan_library(engine_settings)
+    rock_id = _file_id(engine_settings, music_dir / "Rock", rock.name)
+    jazz_id = _file_id(engine_settings, music_dir / "Jazz", jazz.name)
+    staging.stage_tags(engine_settings, file_id=rock_id, managed_tags={"genre": ["Synthwave"]})
+    staging.stage_tags(engine_settings, file_id=jazz_id, managed_tags={"genre": ["Metal"]})
+    shouted = Path(str(music_dir / "Rock").upper())
+
+    diffs = staging.diff_tags(engine_settings, root=shouted)
+    result = staging.commit_tags(engine_settings, root=shouted)
+
+    assert [d.file_id for d in diffs] == [rock_id]
+    assert result.committed == 1
+    assert read_tags(rock).tags["genre"] == ["Synthwave"]
+    assert _staged(engine_settings, jazz_id) is not None
+
+
+def test_stage_strips_and_nfc_normalises_values(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    track = make_track(music_dir / "a.flac", {"album": ["Old"]})
+    scan_library(engine_settings)
+    file_id = _file_id(engine_settings, music_dir, track.name)
+
+    staging.stage_tags(
+        engine_settings,
+        file_id=file_id,
+        managed_tags={"album": ["  ", "Cafe\u0301 "]},
+    )
+    staging.commit_tags(engine_settings)
+
+    assert read_tags(track).tags["album"] == ["Caf\u00e9"]
+
+
+def test_stage_rejects_control_characters(engine_settings: Settings, music_dir: Path) -> None:
+    good = make_track(music_dir / "a.mp3", {"title": ["Fine"]})
+    bad = make_track(music_dir / "b.mp3", {"title": ["Fine"]})
+    scan_library(engine_settings)
+    good_id = _file_id(engine_settings, music_dir, good.name)
+    bad_id = _file_id(engine_settings, music_dir, bad.name)
+
+    with pytest.raises(ValueError, match="contains a NUL, CR or LF"):
+        staging.stage_tags(engine_settings, file_id=bad_id, managed_tags={"title": ["a\nb"]})
+    with pytest.raises(ValueError, match="contains a NUL, CR or LF"):
+        staging.stage_tags_batch(
+            engine_settings,
+            entries=[(good_id, {"title": ["New"]}), (bad_id, {"title": ["a\x00b"]})],
+        )
+
+    assert _staged(engine_settings, good_id) is None
+    assert _staged(engine_settings, bad_id) is None
+
+
+def test_stage_refuses_a_container_the_writer_cannot_verify(
+    engine_settings: Settings, music_dir: Path
+) -> None:
+    wav = music_dir / "clip.wav"
+    with wave.open(str(wav), "wb") as stream:
+        stream.setnchannels(1)
+        stream.setsampwidth(2)
+        stream.setframerate(8000)
+        stream.writeframes(bytes(1600))
+    scan_library(engine_settings)
+    wav_id = _file_id(engine_settings, music_dir, wav.name)
+
+    with pytest.raises(ValueError, match="no layout for the WAVE container"):
+        staging.stage_tags(engine_settings, file_id=wav_id, managed_tags={"title": ["Clip"]})
+
+    assert _staged(engine_settings, wav_id) is None
+
+
+def test_stage_refuses_a_file_whose_audio_payload_cannot_be_located(
+    engine_settings: Settings, music_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    track = make_track(music_dir / "lost.flac", {"title": ["Lost"]})
+    scan_library(engine_settings)
+    file_id = _file_id(engine_settings, music_dir, track.name)
+    monkeypatch.setattr(tags, "_audio_ranges", lambda *_args: None)
+
+    with pytest.raises(ValueError, match="audio payload could not be located"):
+        staging.stage_tags(engine_settings, file_id=file_id, managed_tags={"title": ["Found"]})
+
+    assert _staged(engine_settings, file_id) is None
+
+
 def test_diff_tags_enrichment(engine_settings: Settings, music_dir: Path) -> None:
     changed = make_track(music_dir / "c.mp3", {"genre": ["Electronic"]})
     noop = make_track(music_dir / "n.flac", {"genre": ["Rock"]})
@@ -679,6 +770,33 @@ def test_explicit_empty_list_still_deletes_a_managed_field(
     on_disk = read_tags(track).tags
     assert on_disk.get("album") is None  # explicitly cleared
     assert on_disk.get("genre") == ["Rock"]  # untouched managed field preserved
+
+
+@pytest.mark.parametrize("with_id3v1", [False, True])
+def test_explicit_empty_date_deletes_a_v23_iso_tyer(
+    engine_settings: Settings,
+    music_dir: Path,
+    *,
+    with_id3v1: bool,
+) -> None:
+    track = make_track(music_dir / "iso.mp3")
+    frames = ID3()  # type: ignore[no-untyped-call]
+    frames.add(TYER(encoding=0, text=["2013-10-04T07:00:00Z"]))  # type: ignore[no-untyped-call]
+    frames.save(track, v2_version=3, v1=0)
+    if with_id3v1:
+        year = TYER(encoding=0, text=["2013"])  # type: ignore[no-untyped-call]
+        with track.open("ab") as handle:
+            handle.write(MakeID3v1({"TYER": year}))  # type: ignore[no-untyped-call]
+    scan_library(engine_settings)
+    file_id = _file_id(engine_settings, music_dir, track.name)
+    assert _stored_tags(engine_settings, file_id)["date"] == ["2013-10-04"]
+
+    staging.stage_tags(engine_settings, file_id=file_id, managed_tags={"date": []})
+    result = staging.commit_tags(engine_settings)
+
+    assert (result.committed, result.errors) == (1, 0)
+    assert "date" not in read_tags(track).tags
+    assert "date" not in _stored_tags(engine_settings, file_id)
 
 
 # --- stage_tags_batch (atomic multi-file staging) -----------------------------------

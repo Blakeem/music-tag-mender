@@ -6,13 +6,15 @@ via the ``engine_settings`` fixture, so they exercise the full scan/reconcile pa
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+import os
+import sys
+from pathlib import Path
 
 import pytest
 
 from conftest import make_track
 from tagmend.config import Settings
-from tagmend.engine import artists, mismatch, store
+from tagmend.engine import artists, mismatch, staging, store, versioning
 from tagmend.engine.db import connect
 from tagmend.engine.library import (
     ScanMode,
@@ -24,10 +26,9 @@ from tagmend.engine.library import (
 from tagmend.engine.schema import apply_schema
 from tagmend.engine.tags import TAG_READER_VERSION
 
-if TYPE_CHECKING:
-    from pathlib import Path
-
 _N = 3
+
+_NTFS_ONLY = pytest.mark.skipif(sys.platform != "win32", reason="NTFS is case-insensitive")
 
 
 def _populate(music_dir: Path, count: int) -> list[Path]:
@@ -148,17 +149,47 @@ def test_list_files_returns_views_with_managed_tags(
 def test_list_files_respects_limit_and_root(
     engine_settings: Settings,
     music_dir: Path,
-    tmp_path: Path,
 ) -> None:
-    _populate(music_dir, _N)
-    other = tmp_path / "elsewhere"
+    main = music_dir / "main"
+    _populate(main, _N)
+    other = music_dir / "elsewhere"
     make_track(other / "x.mp3", {"genre": ["Jazz"]})
-    scan_library(engine_settings, path=music_dir)
+    scan_library(engine_settings, path=main)
     scan_library(engine_settings, path=other)
 
     assert len(list_files(engine_settings, limit=2)) == 2
-    under_music = list_files(engine_settings, root=music_dir)
-    assert {v.filename for v in under_music} == {"track00.mp3", "track01.mp3", "track02.mp3"}
+    under_main = list_files(engine_settings, root=main)
+    assert {v.filename for v in under_main} == {"track00.mp3", "track01.mp3", "track02.mp3"}
+
+
+@_NTFS_ONLY
+def test_list_files_path_ignores_case_and_slashes(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    album = music_dir / "Artist" / "Album"
+    make_track(album / "a.mp3", {"genre": ["Jazz"]})
+    make_track(music_dir / "Other" / "b.mp3", {"genre": ["Jazz"]})
+    scan_library(engine_settings)
+
+    spellings = (album, Path(str(album).upper()), Path(str(album).replace(os.sep, "/")))
+    found = [{v.file_id for v in list_files(engine_settings, root=s)} for s in spellings]
+
+    assert len(found[0]) == 1
+    assert found[0] == found[1] == found[2]
+
+
+def test_list_files_relative_path_resolves_under_music_path(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    make_track(music_dir / "Artist" / "Album" / "a.mp3", {"genre": ["Jazz"]})
+    make_track(music_dir / "Other" / "b.mp3", {"genre": ["Jazz"]})
+    scan_library(engine_settings)
+
+    views = list_files(engine_settings, root=Path("Artist"))
+
+    assert [v.filename for v in views] == ["a.mp3"]
 
 
 def test_get_file_view(engine_settings: Settings, music_dir: Path) -> None:
@@ -377,9 +408,106 @@ def test_scan_requires_music_path(tmp_path: Path) -> None:
         scan_library(settings)
 
 
-def test_scan_rejects_nonexistent_path(engine_settings: Settings, tmp_path: Path) -> None:
+def test_scan_rejects_a_relative_path_without_music_path(tmp_path: Path) -> None:
+    settings = Settings(
+        music_path=None,
+        lastfm_api_key=None,
+        db_path=tmp_path / "ledger.sqlite3",
+    )
+    with pytest.raises(ValueError, match="relative folder needs music_path"):
+        scan_library(settings, path=Path("Artist"))
+
+
+def test_scan_rejects_nonexistent_path(engine_settings: Settings) -> None:
+    assert engine_settings.music_path is not None
     with pytest.raises(ValueError, match="does not exist"):
-        scan_library(engine_settings, path=tmp_path / "does-not-exist")
+        scan_library(engine_settings, path=engine_settings.music_path / "does-not-exist")
+
+
+def test_scan_refuses_a_path_outside_music_path(
+    engine_settings: Settings,
+    tmp_path: Path,
+) -> None:
+    outside = tmp_path / "elsewhere"
+    make_track(outside / "x.mp3", {"genre": ["Jazz"]})
+
+    with pytest.raises(ValueError, match="outside music_path"):
+        scan_library(engine_settings, path=outside)
+
+
+def test_relative_scan_path_resolves_under_music_path(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    make_track(music_dir / "A" / "a.mp3", {"genre": ["Jazz"]})
+    make_track(music_dir / "B" / "b.mp3", {"genre": ["Jazz"]})
+
+    result = scan_library(engine_settings, path=Path("A"))
+
+    assert result.added == 1
+    assert [v.folder for v in list_files(engine_settings)] == [str(music_dir / "A")]
+
+
+def test_relative_music_path_scans_from_the_working_directory(
+    tmp_path: Path,
+    music_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    make_track(music_dir / "A" / "a.mp3", {"genre": ["Jazz"]})
+    monkeypatch.chdir(tmp_path)
+    settings = Settings(
+        music_path=Path(music_dir.name),
+        lastfm_api_key=None,
+        db_path=tmp_path / "ledger.sqlite3",
+    )
+
+    result = scan_library(settings)
+
+    assert result.added == 1
+    assert [v.folder for v in list_files(settings)] == [str(Path(music_dir.name) / "A")]
+
+
+@_NTFS_ONLY
+def test_rescan_with_a_case_variant_root_keeps_every_id(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    _populate(music_dir, _N)
+    scan_library(engine_settings)
+    before = {v.file_id: (v.folder, v.filename) for v in list_files(engine_settings)}
+
+    result = scan_library(engine_settings, path=Path(str(music_dir).upper()))
+
+    assert result.added == 0
+    assert result.missing_flagged == 0
+    assert result.respelled == 0
+    after = {v.file_id: (v.folder, v.filename) for v in list_files(engine_settings)}
+    assert after == before
+
+
+@_NTFS_ONLY
+def test_case_only_folder_rename_keeps_the_id_and_history(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    album = music_dir / "Album"
+    track = make_track(album / "a.mp3", {"artist": ["A"], "genre": ["Rock"]})
+    scan_library(engine_settings)
+    file_id = _file_row(engine_settings, album, track.name).id
+    staging.stage_tags(engine_settings, file_id=file_id, managed_tags={"genre": ["Jazz"]})
+    staging.commit_tags(engine_settings)
+    album.rename(music_dir / "ALBUM")
+
+    result = scan_library(engine_settings)
+
+    assert result.respelled == 1
+    assert result.missing_flagged == 0
+    assert result.added == 0
+    view = get_file_view(engine_settings, file_id)
+    assert view is not None
+    assert Path(view.folder).name == "ALBUM"
+    assert view.is_missing is False
+    assert [r.version for r in versioning.history_for(engine_settings, file_id)] == [0, 1]
 
 
 # --- genre_status filter + new FileView fields --------------------------------------

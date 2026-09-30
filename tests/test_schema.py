@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import sqlite3
+import sys
 from typing import TYPE_CHECKING
 
 import pytest
 
+from tagmend.engine import path_keys
 from tagmend.engine.schema import SCHEMA_VERSION, apply_append_only_triggers, apply_schema
 from tagmend.engine.tags import TAG_READER_VERSION
 
@@ -23,7 +25,7 @@ def test_apply_schema_stamps_current_version(db_conn: sqlite3.Connection) -> Non
     # db_conn already applied the schema; the stamp must match the constant the code ships.
     version = db_conn.execute("PRAGMA user_version").fetchone()[0]
     assert version == SCHEMA_VERSION
-    assert SCHEMA_VERSION == 17
+    assert SCHEMA_VERSION == 18
 
 
 def test_apply_schema_creates_genre_tables(db_conn: sqlite3.Connection) -> None:
@@ -493,6 +495,81 @@ def test_v16_ledger_gains_the_staged_base_signature_in_place() -> None:
             (file_id,),
         ).fetchone()
         assert row == ('{"genre":["Rock"]}', "kept", None, None)
+    finally:
+        conn.close()
+
+
+def _downgrade_to_v17(conn: sqlite3.Connection) -> None:
+    """Turn a freshly-applied ledger back into a v17 one (no ``path_key`` or its index)."""
+    conn.execute("DROP INDEX idx_files_path_key")
+    conn.execute("ALTER TABLE files DROP COLUMN path_key")
+    conn.execute("PRAGMA user_version = 17")
+
+
+def _insert_file_at(conn: sqlite3.Connection, folder: str, filename: str) -> int:
+    cursor = conn.execute(
+        """
+        INSERT INTO files (folder, filename, ext, first_seen_at, updated_at)
+        VALUES (?, ?, '.mp3', '2026-06-08T00:00:00+00:00', '2026-06-08T00:00:00+00:00')
+        """,
+        (folder, filename),
+    )
+    assert cursor.lastrowid is not None
+    return int(cursor.lastrowid)
+
+
+def _files_columns(conn: sqlite3.Connection) -> list[str]:
+    return [str(row[1]) for row in conn.execute("PRAGMA table_info(files)")]
+
+
+def test_previous_ledger_gains_path_key_backfilled() -> None:
+    fresh = sqlite3.connect(":memory:")
+    try:
+        apply_schema(fresh)
+        fresh_columns = _files_columns(fresh)
+    finally:
+        fresh.close()
+
+    conn = sqlite3.connect(":memory:")
+    try:
+        apply_schema(conn)
+        _downgrade_to_v17(conn)
+        first = _insert_file_at(conn, "/lib/Album", "a.mp3")
+        second = _insert_file_at(conn, "/lib/Other", "b.mp3")
+        conn.commit()
+
+        apply_schema(conn)  # the in-place upgrade
+
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        assert _files_columns(conn) == fresh_columns
+        keys = dict(conn.execute("SELECT id, path_key FROM files").fetchall())
+        assert keys == {
+            first: path_keys.file_path_key("/lib/Album", "a.mp3"),
+            second: path_keys.file_path_key("/lib/Other", "b.mp3"),
+        }
+        assert "idx_files_path_key" in _schema_objects(conn, "index")
+    finally:
+        conn.close()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="NTFS is case-insensitive")
+def test_duplicate_path_keys_abort_the_upgrade_untouched() -> None:
+    conn = sqlite3.connect(":memory:")
+    try:
+        apply_schema(conn)
+        _downgrade_to_v17(conn)
+        first = _insert_file_at(conn, r"C:\lib\Album", "a.mp3")
+        second = _insert_file_at(conn, r"C:\lib\ALBUM", "a.mp3")
+        conn.commit()
+
+        with pytest.raises(RuntimeError) as excinfo:
+            apply_schema(conn)
+
+        assert f"id={first}" in str(excinfo.value)
+        assert f"id={second}" in str(excinfo.value)
+        assert "path_key" not in _files_columns(conn)
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 17
+        assert conn.execute("SELECT COUNT(*) FROM files").fetchone()[0] == 2
     finally:
         conn.close()
 

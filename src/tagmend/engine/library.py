@@ -16,21 +16,22 @@ Scan modes:
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import mutagen
 
-from tagmend.engine import db, scan, schema, store, versioning
+from tagmend.engine import db, path_keys, scan, schema, store, versioning
 from tagmend.engine.tags import TAG_READER_VERSION, read_tags
 from tagmend.engine.validation import check_limit
 from tagmend.log import get_logger
 
 if TYPE_CHECKING:
     import sqlite3
-    from pathlib import Path
 
     from tagmend.config import Settings
 
@@ -183,7 +184,10 @@ def list_files(  # noqa: PLR0913 - cohesive keyword-only discovery filters
 ) -> list[FileView]:
     """Return tracked files (id order) with their managed tags, for discovery.
 
-    Optionally limited to files under *root*, filtered to one genre workflow status
+    Optionally limited to files under *root* (resolved by
+    :func:`tagmend.engine.path_keys.folder_arg_key`, so case and separators do not matter on
+    Windows and a relative *root* resolves under ``music_path``), filtered to one genre
+    workflow status
     (``pending`` | ``no_identity`` | ``no_match`` | ``manual`` | ``staged`` | ``done``), one
     artist workflow status (``pending`` | ``no_identity`` | ``manual`` | ``staged`` |
     ``done``), one year workflow status (``pending`` | ``no_identity`` | ``no_match`` |
@@ -193,8 +197,8 @@ def list_files(  # noqa: PLR0913 - cohesive keyword-only discovery filters
     that carry neither ``artist`` nor ``albumartist`` (every resolver skips them). With NO
     status filter the cap is applied before reading tags, so a large library stays cheap to
     browse; with any filter, all candidate rows are examined, ALL filters are applied, and the
-    cap counts the *matching* files. Raises :class:`ValueError` for an unknown status or a
-    negative *limit*. Read-only.
+    cap counts the *matching* files. Raises :class:`ValueError` for an unknown status, a
+    negative *limit* or a *root* outside ``music_path``. Read-only.
     """
     check_limit(limit)
     if genre_status is not None and genre_status not in store.GENRE_WORKFLOW_STATUSES:
@@ -221,6 +225,7 @@ def list_files(  # noqa: PLR0913 - cohesive keyword-only discovery filters
             f"(expected one of {sorted(store.MISMATCH_WORKFLOW_STATUSES)})"
         )
         raise ValueError(message)
+    root_key = None if root is None else path_keys.folder_arg_key(settings, root)
 
     filtered = (
         genre_status is not None
@@ -233,13 +238,13 @@ def list_files(  # noqa: PLR0913 - cohesive keyword-only discovery filters
     try:
         schema.apply_schema(connection)
         rows = (
-            store.tracked_files_under(connection, root)
-            if root is not None
+            store.tracked_files_under(connection, root_key)
+            if root_key is not None
             else store.list_files(connection, limit=None if filtered else limit)
         )
 
         if not filtered:
-            if root is not None and limit is not None:
+            if root_key is not None and limit is not None:
                 rows = rows[:limit]
             return [_to_view(connection, row) for row in rows]
 
@@ -295,6 +300,7 @@ class ScanResult:
     missing_flagged: int
     restored: int
     errors: int
+    respelled: int
 
     def to_dict(self) -> dict[str, object]:
         """JSON-serializable form for the MCP tool."""
@@ -307,6 +313,7 @@ class ScanResult:
             "missing_flagged": self.missing_flagged,
             "restored": self.restored,
             "errors": self.errors,
+            "respelled": self.respelled,
         }
 
 
@@ -322,6 +329,7 @@ class _Counters:
     missing_flagged: int = 0
     restored: int = 0
     errors: int = 0
+    respelled: int = 0
     seen_ids: set[int] = field(default_factory=set)
 
     def to_result(self) -> ScanResult:
@@ -335,6 +343,7 @@ class _Counters:
             missing_flagged=self.missing_flagged,
             restored=self.restored,
             errors=self.errors,
+            respelled=self.respelled,
         )
 
 
@@ -351,13 +360,25 @@ def scan_library(
 ) -> ScanResult:
     """Scan *path* (or the configured ``music_path``) into the snapshot.
 
-    Raises :class:`ValueError` when no music path is configured or the path is not an
-    existing directory.
+    A relative *path* resolves under ``music_path``. A *path* under ``music_path`` is walked as
+    the configured ``music_path`` spelling plus each deeper folder's on-disk name, so every scan
+    stores one spelling per file. A file found under a new spelling of a known path (a
+    case-only rename) keeps its id and history and is counted ``respelled``.
+
+    Raises :class:`ValueError` when no music path is configured, the path is not an existing
+    directory, the path lies outside ``music_path``, or a relative path has no ``music_path``
+    to resolve under.
     """
     # Input / validation
-    root = path or settings.music_path
-    if root is None:
-        message = "music_path not configured — run `tagmend config-set music_path <dir>`"
+    music_path = settings.music_path
+    # Only an explicit path resolves against music_path. A relative music_path is itself
+    # relative to the working directory, so joining it onto itself would name a missing folder.
+    if path is not None:
+        root = path_keys.resolve_folder_arg(settings, path)
+    elif music_path is not None:
+        root = music_path
+    else:
+        message = "music_path not configured. Run `tagmend config-set music_path <dir>`"
         raise ValueError(message)
     if not root.exists():
         message = f"music path does not exist: {root}"
@@ -365,6 +386,8 @@ def scan_library(
     if not root.is_dir():
         message = f"music path is not a directory: {root}"
         raise ValueError(message)
+    if music_path is not None:
+        root = _spell_under_music_path(root, music_path)
 
     # Process
     connection = db.connect(settings.db_path)
@@ -382,7 +405,7 @@ def scan_library(
     result = counters.to_result()
     logger.info(
         "scan complete: mode=%s seen=%d added=%d updated=%d unchanged=%d "
-        "tags_read=%d restored=%d missing=%d errors=%d",
+        "tags_read=%d restored=%d missing=%d errors=%d respelled=%d",
         mode.value,
         result.total_seen,
         result.added,
@@ -392,8 +415,30 @@ def scan_library(
         result.restored,
         result.missing_flagged,
         result.errors,
+        result.respelled,
     )
     return result
+
+
+def _spell_under_music_path(root: Path, music_path: Path) -> Path:
+    """Return *root* spelled as *music_path* plus each deeper folder's on-disk name.
+
+    NTFS answers to any casing and the walk keeps the root's casing in every stored path, so a
+    root typed another way would otherwise re-add each file under a second spelling. *root* is
+    already known to lie within *music_path* (:func:`tagmend.engine.path_keys.resolve_folder_arg`).
+    """
+    music_depth = len(Path(os.path.normpath(music_path)).parts)
+    spelled = music_path
+    for part in Path(os.path.normpath(root)).parts[music_depth:]:
+        spelled = spelled / _on_disk_name(spelled, part)
+    return spelled
+
+
+def _on_disk_name(parent: Path, name: str) -> str:
+    """Return the entry of *parent* whose name has the same path key as *name*, else *name*."""
+    wanted = path_keys.path_key(name)
+    with os.scandir(parent) as entries:
+        return next((e.name for e in entries if path_keys.path_key(e.name) == wanted), name)
 
 
 def _process_file(
@@ -421,8 +466,11 @@ def _process_file(
 
     if existing is None:
         _process_new_file(conn, path, mode, counters, folder, filename, ext, size_bytes, mtime_ns)
-    else:
-        _process_existing_file(conn, path, mode, counters, existing, size_bytes, mtime_ns)
+        return
+    if (existing.folder, existing.filename) != (folder, filename):
+        store.update_location(conn, existing.id, folder=folder, filename=filename, now=_utc_now())
+        counters.respelled += 1
+    _process_existing_file(conn, path, mode, counters, existing, size_bytes, mtime_ns)
 
 
 def _process_new_file(  # noqa: PLR0913 - cohesive insert payload, all required
@@ -550,7 +598,7 @@ def _try_read_and_store(
 def _reconcile_missing(conn: sqlite3.Connection, root: Path, counters: _Counters) -> None:
     """Flag tracked files under *root* that were not seen on this pass."""
     now = _utc_now()
-    for row in store.tracked_files_under(conn, root):
+    for row in store.tracked_files_under(conn, path_keys.path_key(root)):
         if row.id in counters.seen_ids or row.is_missing:
             continue
         store.flag_missing(conn, row.id, now)

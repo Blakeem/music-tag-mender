@@ -14,8 +14,8 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from conftest import make_track
-from tagmend.engine import store, track_conflicts
+from conftest import FOLDER_SPELLINGS, make_track, spell_folder
+from tagmend.engine import path_keys, store, track_conflicts
 from tagmend.engine.db import connect
 from tagmend.engine.library import scan_library
 from tagmend.engine.schema import apply_schema
@@ -284,7 +284,7 @@ def test_narrowing_preserves_library_wide_counts() -> None:
     ]
     report = track_conflicts._classify(files)
 
-    narrowed = track_conflicts._narrow(report, {}, tier=None, limit=1, group=False, folder=None)
+    narrowed = track_conflicts._narrow(report, {}, tier=None, limit=1, group=False, folder_key=None)
 
     assert len(narrowed.rows) == 1
     assert narrowed.flagged == 2  # unchanged by the view
@@ -299,7 +299,9 @@ def test_tier_filter_returns_no_context_rows() -> None:
     ]
     report = track_conflicts._classify(files)
 
-    narrowed = track_conflicts._narrow(report, {}, tier="low", limit=None, group=False, folder=None)
+    narrowed = track_conflicts._narrow(
+        report, {}, tier="low", limit=None, group=False, folder_key=None
+    )
 
     assert narrowed.folder_context_rows == []
 
@@ -317,7 +319,7 @@ def test_group_view_counts_flagged_and_context_separately() -> None:
     counts = {str(album): 2, str(singles): 2}
 
     grouped = track_conflicts._narrow(
-        report, counts, tier=None, limit=None, group=True, folder=None
+        report, counts, tier=None, limit=None, group=True, folder_key=None
     )
 
     by_folder = {g.folder: g for g in grouped.groups}
@@ -341,7 +343,7 @@ def test_folder_expansion_is_exact_not_a_prefix() -> None:
     report = track_conflicts._classify(files)
 
     narrowed = track_conflicts._narrow(
-        report, {}, tier=None, limit=None, group=False, folder=str(outer)
+        report, {}, tier=None, limit=None, group=False, folder_key=path_keys.path_key(outer)
     )
 
     assert {r.file_id for r in narrowed.rows} == {1, 2}
@@ -385,6 +387,27 @@ def test_detect_integration_flags_and_is_read_only(
         assert store.any_staged(conn) is False
     finally:
         conn.close()
+
+
+@pytest.mark.parametrize("spelling", FOLDER_SPELLINGS)
+def test_folder_argument_variants_match_the_same_rows(
+    engine_settings: Settings,
+    music_dir: Path,
+    spelling: str,
+) -> None:
+    album = music_dir / "Artist" / "Album"
+    make_track(album / "a.mp3", {"tracknumber": ["1"], "title": ["X"], "album": ["Album"]})
+    make_track(album / "b.mp3", {"tracknumber": ["1"], "title": ["Y"], "album": ["Album"]})
+    other = music_dir / "Artist" / "Other"
+    make_track(other / "c.mp3", {"tracknumber": ["1"], "title": ["P"], "album": ["Other"]})
+    make_track(other / "d.mp3", {"tracknumber": ["1"], "title": ["Q"], "album": ["Other"]})
+    scan_library(engine_settings)
+
+    exact = detect_track_conflicts(engine_settings, folder=str(album))
+    variant = detect_track_conflicts(engine_settings, folder=spell_folder(album, spelling))
+
+    assert len(exact.rows) == 2
+    assert [r.file_id for r in variant.rows] == [r.file_id for r in exact.rows]
 
 
 def test_detect_rejects_an_unknown_tier(engine_settings: Settings, music_dir: Path) -> None:

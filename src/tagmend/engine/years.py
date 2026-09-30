@@ -353,9 +353,10 @@ def _process_one_group(  # noqa: PLR0913 - cohesive per-group inputs
     if resolved is not None:
         tally.mappings[(identity.artist, identity.album)] = resolved.original_date
         for fid in file_ids:
-            if not dry_run:
-                _stage_resolved(settings, fid, resolved.original_date)
-            tally.staged_files += 1
+            if dry_run or _stage_resolved(settings, fid, resolved.original_date):
+                tally.staged_files += 1
+            else:
+                tally.skipped_present += 1
         return
 
     # The lookup already happened, so a preview can and must report the miss; only the
@@ -376,19 +377,22 @@ def _process_one_group(  # noqa: PLR0913 - cohesive per-group inputs
     conn.commit()
 
 
-def _stage_resolved(settings: Settings, file_id: int, original_date: str) -> None:
+def _stage_resolved(settings: Settings, file_id: int, original_date: str) -> bool:
     """Stage *original_date* for *file_id*, passing ONLY ``originaldate`` (P0, no deletion).
 
     :func:`tagmend.engine.staging._stage_one` merges it onto the tags read from disk, so
     every other managed tag keeps its on-disk value through the commit's delete-on-absent
-    write. ``stage_tags`` owns its conn.
+    write. ``originaldate`` is fill-only: selection read the snapshot mirror, which can lag the
+    file, so a value already on disk wins and ``False`` is returned. ``stage_tags`` owns its
+    conn.
     """
-    staging.stage_tags(
+    return staging.stage_tags(
         settings,
         file_id=file_id,
         managed_tags={_YEAR_FIELD: [original_date]},
         origin="auto",
         note=f"musicbrainz: {original_date}",
+        fill_only=frozenset({_YEAR_FIELD}),
     )
 
 

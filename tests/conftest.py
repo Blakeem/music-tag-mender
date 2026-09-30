@@ -13,8 +13,10 @@ rather than the dummy byte file ``temp_library`` produces.
 
 from __future__ import annotations
 
+import os
 import shutil
 import sqlite3
+import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -68,6 +70,28 @@ def make_track(
         audio.save()
 
     return dest
+
+
+# The ways a user can type one folder. Upper case names the same folder only where the
+# filesystem ignores case, so that spelling runs on Windows alone.
+FOLDER_SPELLINGS = (
+    "exact",
+    pytest.param(
+        "upper",
+        marks=pytest.mark.skipif(sys.platform != "win32", reason="NTFS is case-insensitive"),
+    ),
+    "slash",
+)
+
+
+def spell_folder(folder: Path, spelling: str) -> str:
+    """Return *folder* as typed in one of the :data:`FOLDER_SPELLINGS`."""
+    text = str(folder)
+    if spelling == "upper":
+        return text.upper()
+    if spelling == "slash":
+        return text.replace(os.sep, "/")
+    return text
 
 
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})

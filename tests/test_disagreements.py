@@ -10,7 +10,9 @@ from __future__ import annotations
 import unicodedata
 from typing import TYPE_CHECKING
 
-from conftest import make_track
+import pytest
+
+from conftest import FOLDER_SPELLINGS, make_track, spell_folder
 from tagmend.engine import disagreements
 from tagmend.engine.disagreements import Tier, _classify, _FileInput
 from tagmend.engine.library import scan_library
@@ -388,6 +390,41 @@ def test_detect_disagreements_end_to_end(
     assert all(r.have == "" for r in report.fill_rows)
 
 
+@pytest.mark.parametrize("spelling", FOLDER_SPELLINGS)
+def test_folder_argument_variants_match_the_same_rows(
+    engine_settings: Settings,
+    music_dir: Path,
+    spelling: str,
+) -> None:
+    album = music_dir / "Band" / "Album"
+    for folder in (album, music_dir / "Band" / "Other"):
+        make_track(
+            folder / "a.mp3",
+            {
+                "album": ["Wrong Album"],
+                "albumartist": ["Band"],
+                "title": ["Song One"],
+                "tracknumber": ["1"],
+                "musicbrainz_albumid": [_RELEASE_ID],
+                "musicbrainz_releasetrackid": ["rt-1"],
+            },
+        )
+    scan_library(engine_settings)
+    source = FakeReleaseSource({_RELEASE_ID: _release(_track("1", "Song One"))})
+
+    exact = disagreements.detect_disagreements(engine_settings, folder=str(album), client=source)
+    variant = disagreements.detect_disagreements(
+        engine_settings,
+        folder=spell_folder(album, spelling),
+        client=source,
+    )
+
+    assert exact.total_files == 1
+    assert [r.file_id for r in exact.rows] == [r.file_id for r in variant.rows]
+    assert [r.file_id for r in exact.fill_rows] == [r.file_id for r in variant.fill_rows]
+    assert variant.total_files == exact.total_files
+
+
 # --- the track's own artist credit ---------------------------------------------------
 
 
@@ -583,7 +620,7 @@ def test_a_row_limit_caps_both_row_lists() -> None:
             _f(2, album="Wrong Too", releasecountry="XX", date=None),
         ]
     )
-    view = disagreements._narrow(report, tier=None, folder=None, limit=1, group=False)
+    view = disagreements._narrow(report, tier=None, folder_key=None, limit=1, group=False)
 
     assert len(view.rows) == 1
     assert len(view.fill_rows) == 1

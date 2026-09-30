@@ -10,8 +10,10 @@ from __future__ import annotations
 import unicodedata
 from typing import TYPE_CHECKING
 
-from conftest import make_track
-from tagmend.engine import album_conflicts
+import pytest
+
+from conftest import FOLDER_SPELLINGS, make_track, spell_folder
+from tagmend.engine import album_conflicts, path_keys
 from tagmend.engine.album_conflicts import _REASON_NO_ALBUMARTIST, _classify, _FileInput
 from tagmend.engine.library import scan_library
 
@@ -310,7 +312,7 @@ def test_a_context_folder_never_appears_under_a_tier_filter() -> None:
         _f(1, folder=r"C:\m\B\Singles", album="One"),
         _f(2, folder=r"C:\m\B\Singles", filename="b.mp3", album="Two"),
     ]
-    report = album_conflicts._narrow(_classify(files), tier="medium", folder=None, limit=None)
+    report = album_conflicts._narrow(_classify(files), tier="medium", folder_key=None, limit=None)
 
     assert report.rows == []
 
@@ -335,6 +337,32 @@ def test_detect_album_conflicts_end_to_end(
     assert report.flagged == 1
     assert report.rows[0].filename == "c.mp3"
     assert report.medium == 1
+
+
+@pytest.mark.parametrize("spelling", FOLDER_SPELLINGS)
+def test_folder_argument_variants_match_the_same_rows(
+    engine_settings: Settings,
+    music_dir: Path,
+    spelling: str,
+) -> None:
+    album = music_dir / "Band" / "Album"
+    make_track(album / "a.mp3", {"album": ["Real Album"], "albumartist": ["Band"]})
+    make_track(album / "b.mp3", {"album": ["Real Album"], "albumartist": ["Band"]})
+    make_track(album / "c.mp3", {"album": ["Different Album"], "albumartist": ["Band"]})
+    other = music_dir / "Band" / "Other"
+    make_track(other / "d.mp3", {"album": ["Other"], "albumartist": ["Band"]})
+    make_track(other / "e.mp3", {"album": ["Other"], "albumartist": ["Band"]})
+    make_track(other / "f.mp3", {"album": ["Else"], "albumartist": ["Band"]})
+    scan_library(engine_settings)
+
+    exact = album_conflicts.detect_album_conflicts(engine_settings, folder=str(album))
+    variant = album_conflicts.detect_album_conflicts(
+        engine_settings,
+        folder=spell_folder(album, spelling),
+    )
+
+    assert [r.filename for r in exact.rows] == ["c.mp3"]
+    assert [r.file_id for r in variant.rows] == [r.file_id for r in exact.rows]
 
 
 # --- blank album belongs to detect_album_gaps ----------------------------------------
@@ -505,7 +533,7 @@ def test_a_folder_narrowing_also_narrows_the_context_rows() -> None:
     view = album_conflicts._narrow(
         _three_folder_report(),
         tier=None,
-        folder=r"C:\m\A\Album",
+        folder_key=path_keys.path_key(r"C:\m\A\Album"),
         limit=None,
     )
 
@@ -514,7 +542,7 @@ def test_a_folder_narrowing_also_narrows_the_context_rows() -> None:
 
 
 def test_a_limit_caps_the_context_rows_too() -> None:
-    view = album_conflicts._narrow(_three_folder_report(), tier=None, folder=None, limit=1)
+    view = album_conflicts._narrow(_three_folder_report(), tier=None, folder_key=None, limit=1)
 
     assert len(view.rows) == 1
     assert len(view.folder_context_rows) == 1
@@ -522,8 +550,8 @@ def test_a_limit_caps_the_context_rows_too() -> None:
 
 def test_groups_are_returned_only_for_the_grouped_view() -> None:
     report = _three_folder_report()
-    flat = album_conflicts._narrow(report, tier=None, folder=None, limit=None)
-    grouped = album_conflicts._narrow(report, tier=None, folder=None, limit=None, group=True)
+    flat = album_conflicts._narrow(report, tier=None, folder_key=None, limit=None)
+    grouped = album_conflicts._narrow(report, tier=None, folder_key=None, limit=None, group=True)
 
     assert flat.groups == []
     assert len(grouped.groups) == 3
@@ -533,7 +561,7 @@ def test_a_limit_caps_the_groups_in_the_grouped_view() -> None:
     view = album_conflicts._narrow(
         _three_folder_report(),
         tier=None,
-        folder=None,
+        folder_key=None,
         limit=2,
         group=True,
     )

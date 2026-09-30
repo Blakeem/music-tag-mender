@@ -129,12 +129,22 @@ tables. A v16 ledger upgrades in place with every row preserved):
 * The four append-only triggers from :func:`apply_append_only_triggers`. A migration that
   rebuilds or updates a log drops its triggers first and relies on the DDL phase, which runs
   after every migration, to recreate them.
+
+The path-identity pass adds one column and one index (schema v18, no new tables. A v17 ledger
+upgrades in place with every row preserved):
+
+* ``files.path_key`` + ``idx_files_path_key`` (UNIQUE): the platform identity key of the file's
+  path (:mod:`tagmend.engine.path_keys`). NTFS ignores case, so ``(folder, filename)`` alone let
+  one file on disk become two rows. The column is nullable in both shapes, and every engine
+  insert sets it. :func:`_migrate_files_path_key` backfills it and refuses a ledger in which two
+  rows already share a key.
 """
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Final
 
+from tagmend.engine import path_keys
 from tagmend.log import get_logger
 
 if TYPE_CHECKING:
@@ -142,7 +152,7 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
-SCHEMA_VERSION: Final = 17
+SCHEMA_VERSION: Final = 18
 
 _FILES_DDL: Final = """
 CREATE TABLE IF NOT EXISTS files (
@@ -158,9 +168,14 @@ CREATE TABLE IF NOT EXISTS files (
   tags_updated_at TEXT,
   status          TEXT NOT NULL DEFAULT 'scanned',
   reader_version  INTEGER NOT NULL DEFAULT 0,
+  path_key        TEXT,
   UNIQUE (folder, filename)
 )
 """
+
+_FILES_PATH_KEY_INDEX_DDL: Final = (
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_files_path_key ON files(path_key)"
+)
 
 _FILE_TAGS_DDL: Final = """
 CREATE TABLE IF NOT EXISTS file_tags (
@@ -566,6 +581,64 @@ def _migrate_staged_base_signature(connection: sqlite3.Connection) -> None:
     logger.info("schema v17: added tag_revisions_staged base signature columns")
 
 
+def _keyed_file_rows(connection: sqlite3.Connection) -> list[tuple[int, str, str, str]]:
+    """Return every ``files`` row as ``(id, folder, filename, path key)``, in id order."""
+    cursor = connection.execute("SELECT id, folder, filename FROM files ORDER BY id")
+    rows: list[tuple[int, str, str, str]] = []
+    for raw in cursor.fetchall():
+        folder = str(raw[1])
+        filename = str(raw[2])
+        rows.append((int(raw[0]), folder, filename, path_keys.file_path_key(folder, filename)))
+    return rows
+
+
+def _refuse_path_key_collisions(rows: list[tuple[int, str, str, str]]) -> None:
+    """Raise :class:`RuntimeError` naming every path key two or more *rows* share."""
+    by_key: dict[str, list[str]] = {}
+    for file_id, folder, filename, key in rows:
+        by_key.setdefault(key, []).append(f"id={file_id} ({folder!r}, {filename!r})")
+    collisions = {key: members for key, members in by_key.items() if len(members) > 1}
+    if not collisions:
+        return
+    details = "; ".join(f"{key}: {', '.join(ids)}" for key, ids in sorted(collisions.items()))
+    message = (
+        f"schema v18: {len(collisions)} path key(s) are held by more than one file row, so one "
+        f"file is tracked twice. Keep one row per key, then restart: {details}"
+    )
+    raise RuntimeError(message)
+
+
+def _migrate_files_path_key(connection: sqlite3.Connection) -> None:
+    """v18: add ``files.path_key``, backfill it and create its UNIQUE index, all or nothing.
+
+    Runs BEFORE the DDL, so the guard leads with ``_table_exists``: a fresh ledger takes the
+    column from :data:`_FILES_DDL`. Idempotent: the ``_column_exists`` half stops a second
+    application. Two rows sharing a key are one file recorded twice, and only the owner can say
+    which row keeps the history, so the upgrade rolls back (the ADD COLUMN included, SQLite DDL
+    being transactional) and raises :class:`RuntimeError` naming each collision.
+    """
+    if not _table_exists(connection, "files"):
+        return
+    if _column_exists(connection, "files", "path_key"):
+        return
+
+    connection.execute("BEGIN")
+    try:
+        connection.execute("ALTER TABLE files ADD COLUMN path_key TEXT")
+        rows = _keyed_file_rows(connection)
+        _refuse_path_key_collisions(rows)
+        connection.executemany(
+            "UPDATE files SET path_key = ? WHERE id = ?",
+            [(key, file_id) for file_id, _, _, key in rows],
+        )
+        connection.execute(_FILES_PATH_KEY_INDEX_DDL)
+    except BaseException:
+        connection.rollback()
+        raise
+    connection.commit()
+    logger.info("schema v18: backfilled files.path_key on %d row(s)", len(rows))
+
+
 def apply_schema(connection: sqlite3.Connection) -> None:
     """Upgrade the ledger to :data:`SCHEMA_VERSION` when its stamp is older, else do nothing.
 
@@ -578,8 +651,9 @@ def apply_schema(connection: sqlite3.Connection) -> None:
     preserve real data: v12 renames ``file_album_status`` to ``file_year_status``
     (:func:`_migrate_v12_year_status`), v13 adds and stamps ``tag_revisions.managed_set``
     (:func:`_migrate_v13_managed_set`), v14 adds ``files.reader_version``
-    (:func:`_migrate_v14_reader_version`) and v17 adds the staged base signature
-    (:func:`_migrate_staged_base_signature`). The triggers come after every migration, so a
+    (:func:`_migrate_v14_reader_version`), v17 adds the staged base signature
+    (:func:`_migrate_staged_base_signature`) and v18 adds and backfills ``files.path_key``
+    (:func:`_migrate_files_path_key`). The triggers come after every migration, so a
     migration that updates a log runs before they exist.
 
     ``commits`` is created before the revision/staging tables that reference it.
@@ -599,7 +673,9 @@ def apply_schema(connection: sqlite3.Connection) -> None:
     _migrate_v13_managed_set(connection)
     _migrate_v14_reader_version(connection)
     _migrate_staged_base_signature(connection)
+    _migrate_files_path_key(connection)
     connection.execute(_FILES_DDL)
+    connection.execute(_FILES_PATH_KEY_INDEX_DDL)
     connection.execute(_FILE_TAGS_DDL)
     connection.execute(_FILE_TAGS_INDEX_DDL)
     connection.execute(_COMMITS_DDL)

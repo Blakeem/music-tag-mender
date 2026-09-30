@@ -1,19 +1,20 @@
-"""Blank-``album`` gap detection: group gapped files by folder, tier them, propose fills.
+"""Blank-``album`` gap detection: group gapped files by folder, source a fill, propose it.
 
 A grouped detect/report tool (decision-r2 C6). It groups files whose ``album`` tag is blank
-across ALL ordinals by their folder, computes three grounding tiers — a **sibling** tier
-(blank files fill from a unanimous non-blank album value shared by their folder mates), a
-**folder-parse** tier (a folder with no sibling values at all fills from its parsed folder
-name, but only when the folder's own filenames self-corroborate it), and a review-only
-**mb_recording** tier (a folder tiers 1-2 leave blank fills each blank file from a cached,
-paced MusicBrainz ``(artist, title)`` → release-group-title recording search) — and emits
-per-file proposals with a confidence label + provenance note pre-formatted for
-``stage_tags_batch``. Nothing stages, nothing auto-commits. Tiers 1-2 are network-free; the
-recording tier is opt-out (``use_musicbrainz=False``) and its result is ``confidence:
-"review"`` (never green). The report feeds the existing ``stage_tags_batch → diff_tags(root)
-→ commit_tags(root) → reopen_axes`` spine, where the human is the diff-gate.
+across ALL ordinals by their folder and tries three grounding sources in order. The
+**sibling** source fills blank files from a unanimous non-blank album value shared by their
+folder mates. The **folder-parse** source fills a folder with no sibling values at all from its
+parsed folder name, but only when the folder's own filenames self-corroborate it. The
+review-only **mb_recording** source fills each blank file of a folder the first two sources
+leave blank from a cached, paced MusicBrainz ``(artist, title)`` recording search. Each
+proposal carries a confidence label and a provenance note pre-formatted for
+``stage_tags_batch``. Nothing stages, nothing auto-commits. The first two sources are
+network-free. The recording source is opt-out (``use_musicbrainz=False``) and its result is
+``confidence: "review"`` (never green). The report feeds the existing ``stage_tags_batch →
+diff_tags(root) → commit_tags(root) → reopen_axes`` spine, where the human is the
+diff-gate.
 
-The recording tier's ONLY side effect is its persistent lookup cache
+The recording source's ONLY side effect is its persistent lookup cache
 (``musicbrainz_recording_cache``): tags, status, and staging are untouched, so a re-run after
 the first pass is network-free.
 
@@ -34,11 +35,12 @@ are the recording client's cache writes.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
 from tagmend.engine import classify, db, genres, parsing, path_keys, schema, store
+from tagmend.engine.detector_core import group_by_folder
 from tagmend.engine.musicbrainz import MusicBrainzClient, MusicBrainzError
 from tagmend.engine.validation import check_limit
 from tagmend.log import get_logger
@@ -67,11 +69,13 @@ _PLACEHOLDER_DENYLIST: Final = frozenset(
     {"unreleased", "misc", "singles", "unknown", "various", "youtube", "mp3"},
 )
 
-# Per-folder tier labels (the group's ``tier`` field).
-_TIER_SIBLING: Final = "sibling"
-_TIER_FOLDER_PARSE: Final = "folder_parse"
-_TIER_MB_RECORDING: Final = "mb_recording"
-_TIER_STAYS_BLANK: Final = "stays_blank"
+# Per-folder source labels (the group's ``source`` field).
+_SOURCE_SIBLING: Final = "sibling"
+_SOURCE_FOLDER_PARSE: Final = "folder_parse"
+_SOURCE_MB_RECORDING: Final = "mb_recording"
+_SOURCE_STAYS_BLANK: Final = "stays_blank"
+# A folder whose recording lookups failed and proposed nothing, kept apart from a real miss.
+_SOURCE_LOOKUP_ERROR: Final = "lookup_error"
 
 # Per-proposal confidence labels + the confirm-reason vocabulary.
 _CONF_GREEN: Final = "green"
@@ -83,7 +87,7 @@ _REASON_N1_WEAK: Final = "n1_weak"
 _REASON_FOLDER_PARSE: Final = "folder_parse"
 _REASON_MB_RECORDING: Final = "mb_recording"
 
-# The fixed provenance note for a review-tier proposal (decision-r2 C6).
+# The fixed provenance note for a review-confidence proposal (decision-r2 C6).
 _NOTE_MB_RECORDING: Final = "musicbrainz: recording search"
 
 
@@ -96,9 +100,9 @@ class _FileInput:
 
     ``album`` is the first non-blank ``album`` value across ALL ordinals (the exact
     ``resolve_years`` identity rule), or ``None`` when the file's album is blank
-    everywhere — the only files that may ever be proposed. ``artist`` (the
+    everywhere, the only files that may ever be proposed. ``artist`` (the
     ``albumartist``-else-``artist`` identity) and ``title`` are the ``(artist, title)`` the
-    MusicBrainz recording tier looks a blank file up against; each is ``None`` when blank
+    MusicBrainz recording source looks a blank file up against. Each is ``None`` when blank
     (the Python-strip rule), in which case the file is never sent to MusicBrainz.
     """
 
@@ -114,7 +118,7 @@ class _FileInput:
 
 
 @dataclass(frozen=True, slots=True)
-class GapProposal:
+class AlbumGapProposal:
     """One blank file's proposed ``album`` fill with its confidence + provenance note."""
 
     file_id: int
@@ -137,25 +141,29 @@ class GapProposal:
 
 
 @dataclass(frozen=True, slots=True)
-class GapGroup:
-    """One folder's blank-album files collapsed into a tiered group with its proposals."""
+class AlbumGapGroup:
+    """One folder's blank-album files collapsed into a sourced group with its proposals."""
 
     folder: str
     blank_count: int  # files in the folder whose album is blank across all ordinals
-    total_files: int  # tracked files in the folder (blank or not)
+    file_count: int  # present tracked files in the folder (blank or not)
+    file_ids: list[int]  # the folder's blank-album file ids, sorted
     sibling_histogram: dict[str, int]  # distinct non-blank album value -> sibling count
-    tier: str  # _TIER_SIBLING | _TIER_FOLDER_PARSE | _TIER_STAYS_BLANK
-    proposals: list[GapProposal]  # one per blank file (empty for stays_blank)
+    source: str  # one of the _SOURCE_* labels
+    proposals: list[AlbumGapProposal]  # at most one per blank file (empty for stays_blank)
+    errors: int = 0  # recording lookups in this folder that failed
 
     def to_dict(self) -> dict[str, object]:
         """JSON-serializable form for the MCP tool."""
         return {
             "folder": self.folder,
             "blank_count": self.blank_count,
-            "total_files": self.total_files,
+            "file_count": self.file_count,
+            "file_ids": self.file_ids,
             "sibling_histogram": self.sibling_histogram,
-            "tier": self.tier,
+            "source": self.source,
             "proposals": [p.to_dict() for p in self.proposals],
+            "errors": self.errors,
         }
 
 
@@ -163,44 +171,43 @@ class GapGroup:
 class AlbumGapsReport:
     """Immutable summary of one :func:`detect_album_gaps` run, JSON-ready for the MCP tool.
 
-    ``groups`` is the (folder-sorted, optionally narrowed) worklist; the ``green`` /
-    ``confirm`` / ``review`` / ``stays_blank`` counts describe the WHOLE library and are
-    unaffected by a ``limit``/``folder`` narrowing (mirroring the mismatch report). Every
-    blank file lands in exactly one of those four, so
-    ``green + confirm + review + stays_blank == total_blank``. ``review`` is the MusicBrainz
-    recording tier (never green).
+    ``groups`` is the (folder-sorted, optionally narrowed) worklist. ``total_files`` and the
+    ``green`` / ``confirm`` / ``review`` / ``stays_blank`` / ``errors`` counts describe the
+    WHOLE library and are unaffected by a ``limit``/``folder`` narrowing (mirroring the
+    mismatch report). Every blank file lands in exactly one of those five, so
+    ``green + confirm + review + stays_blank + errors == total_blank``. ``review`` is the
+    MusicBrainz recording source (never green), and ``errors`` counts its failed lookups,
+    itemized in ``error_items``.
     """
 
-    groups: list[GapGroup]
+    groups: list[AlbumGapGroup]
+    total_files: int
     total_blank: int
     green: int
     confirm: int
     review: int
     stays_blank: int
     summary: str
+    errors: int = 0
+    error_items: list[dict[str, str]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, object]:
         """JSON-serializable form for the MCP tool."""
         return {
             "groups": [g.to_dict() for g in self.groups],
+            "total_files": self.total_files,
             "total_blank": self.total_blank,
             "green": self.green,
             "confirm": self.confirm,
             "review": self.review,
             "stays_blank": self.stays_blank,
+            "errors": self.errors,
+            "error_items": [dict(e) for e in self.error_items],
             "summary": self.summary,
         }
 
 
 # --- pure classifier -----------------------------------------------------------------
-
-
-def _group_by_folder(files: list[_FileInput]) -> dict[str, list[_FileInput]]:
-    """Bucket files by their folder path, preserving first-seen order within a folder."""
-    groups: dict[str, list[_FileInput]] = {}
-    for f in files:
-        groups.setdefault(f.folder, []).append(f)
-    return groups
 
 
 def _sibling_histogram(folder_files: list[_FileInput]) -> dict[str, int]:
@@ -244,26 +251,26 @@ def _sibling_reason(value: str, witnesses: int, vocab: Vocabulary) -> str | None
     return None
 
 
-def _sibling_tier(
+def _sibling_source(
     blank_files: list[_FileInput],
     histogram: dict[str, int],
     vocab: Vocabulary,
-) -> tuple[str, list[GapProposal]]:
-    """Build the sibling-tier proposals, or leave the folder blank when siblings are mixed.
+) -> tuple[str, list[AlbumGapProposal]]:
+    """Build the sibling-source proposals, or leave the folder blank when siblings are mixed.
 
     A single distinct sibling value (unanimous, any n>=1) always proposes for every blank
-    file; a green-light value stages bulk, otherwise it is a ``confirm`` with the reason.
-    Two or more distinct sibling values (mixed) yield no proposal — the folder stays blank
+    file. A green-light value stages bulk, otherwise it is a ``confirm`` with the reason.
+    Two or more distinct sibling values (mixed) yield no proposal, so the folder stays blank
     (folder-parse never runs when any sibling value exists).
     """
     if len(histogram) != 1:
-        return _TIER_STAYS_BLANK, []
+        return _SOURCE_STAYS_BLANK, []
     value, witnesses = next(iter(histogram.items()))
     reason = _sibling_reason(value, witnesses, vocab)
     confidence = _CONF_GREEN if reason is None else _CONF_CONFIRM
     note = f"sibling: unanimous n={witnesses}"
     proposals = [
-        GapProposal(
+        AlbumGapProposal(
             file_id=f.file_id,
             filename=f.filename,
             proposed=value,
@@ -273,14 +280,14 @@ def _sibling_tier(
         )
         for f in blank_files
     ]
-    return _TIER_SIBLING, proposals
+    return _SOURCE_SIBLING, proposals
 
 
-def _folder_parse_tier(
+def _folder_parse_source(
     folder: str,
     folder_files: list[_FileInput],
     blank_files: list[_FileInput],
-) -> tuple[str, list[GapProposal]]:
+) -> tuple[str, list[AlbumGapProposal]]:
     """Build the folder-parse proposals for an all-blank folder, gated by self-corroboration.
 
     Parses the folder's leaf name; a parsed album is proposed (always ``confirm``, never
@@ -290,18 +297,18 @@ def _folder_parse_tier(
     """
     parsed = parsing.parse_folder(Path(folder).name)
     if parsed is None:
-        return _TIER_STAYS_BLANK, []
+        return _SOURCE_STAYS_BLANK, []
 
     total = len(folder_files)
     if total == 0:  # pragma: no cover - a gap group always has at least the blank file(s)
-        return _TIER_STAYS_BLANK, []
+        return _SOURCE_STAYS_BLANK, []
     hits = sum(1 for f in folder_files if parsing.fold_contains(f.filename, parsed.album))
     if hits / total < _CORROBORATION_THRESHOLD:
-        return _TIER_STAYS_BLANK, []
+        return _SOURCE_STAYS_BLANK, []
 
     note = f"folder-parse: self-corroborated {hits}/{total}"
     proposals = [
-        GapProposal(
+        AlbumGapProposal(
             file_id=f.file_id,
             filename=f.filename,
             proposed=parsed.album,
@@ -311,23 +318,25 @@ def _folder_parse_tier(
         )
         for f in blank_files
     ]
-    return _TIER_FOLDER_PARSE, proposals
+    return _SOURCE_FOLDER_PARSE, proposals
 
 
-def _recording_tier(
+def _recording_source(
     blank_files: list[_FileInput],
     client: MBRecordingSource,
-) -> tuple[str, list[GapProposal]]:
-    """Build the review-only MusicBrainz recording-tier proposals for an all-blank folder.
+) -> tuple[str, list[AlbumGapProposal], list[dict[str, str]]]:
+    """Build the review-only MusicBrainz recording-source proposals for an all-blank folder.
 
-    Runs ONLY when tiers 1-2 produced nothing (a ``stays_blank`` folder). Each blank file
-    carrying a non-blank ``artist`` AND ``title`` is looked up ``(artist, title)`` → the
-    recording's release-group title; a hit becomes a ``review`` proposal (never green). Files
-    lacking artist or title are never sent to MusicBrainz. A transient
-    :class:`MusicBrainzError` leaves that file unproposed without aborting the folder. With no
-    hits the folder stays blank.
+    Runs ONLY when the sibling and folder-parse sources produced nothing (a ``stays_blank``
+    folder). Each blank file carrying a non-blank ``artist`` AND ``title`` is looked up
+    ``(artist, title)`` against the recording's release-group title, and a hit becomes a
+    ``review`` proposal (never green). Files lacking artist or title are never sent to
+    MusicBrainz. A transient :class:`MusicBrainzError` leaves that file unproposed without
+    aborting the folder and is returned as one error item. With no hits the folder is
+    ``lookup_error`` when any lookup failed, else ``stays_blank``.
     """
-    proposals: list[GapProposal] = []
+    proposals: list[AlbumGapProposal] = []
+    error_items: list[dict[str, str]] = []
     for f in blank_files:
         if f.artist is None or f.title is None:
             continue
@@ -340,11 +349,12 @@ def _recording_tier(
                 f.title,
                 exc,
             )
+            error_items.append({"key": f"{f.artist} - {f.title}", "message": str(exc)})
             continue
         if resolved is None:
             continue
         proposals.append(
-            GapProposal(
+            AlbumGapProposal(
                 file_id=f.file_id,
                 filename=f.filename,
                 proposed=resolved.album_title,
@@ -353,9 +363,11 @@ def _recording_tier(
                 note=_NOTE_MB_RECORDING,
             ),
         )
-    if not proposals:
-        return _TIER_STAYS_BLANK, []
-    return _TIER_MB_RECORDING, proposals
+    if proposals:
+        return _SOURCE_MB_RECORDING, proposals, error_items
+    if error_items:
+        return _SOURCE_LOOKUP_ERROR, [], error_items
+    return _SOURCE_STAYS_BLANK, [], []
 
 
 def _classify_folder(
@@ -364,27 +376,32 @@ def _classify_folder(
     blank_files: list[_FileInput],
     vocab: Vocabulary,
     client: MBRecordingSource | None,
-) -> GapGroup:
-    """Classify one folder (known to hold >=1 blank file) into a tiered :class:`GapGroup`.
+) -> tuple[AlbumGapGroup, list[dict[str, str]]]:
+    """Classify one folder (known to hold >=1 blank file) into a sourced :class:`AlbumGapGroup`.
 
-    Tiers 1-2 (sibling, folder-parse) run purely; when they yield nothing and a *client* is
-    supplied, the review-only MusicBrainz recording tier gets a last pass at the blank files.
+    The sibling and folder-parse sources run purely. When they yield nothing and a *client* is
+    supplied, the review-only MusicBrainz recording source gets a last pass at the blank files.
+    Returns the group plus the recording lookups that failed.
     """
+    error_items: list[dict[str, str]] = []
     histogram = _sibling_histogram(folder_files)
     if histogram:
-        tier, proposals = _sibling_tier(blank_files, histogram, vocab)
+        source, proposals = _sibling_source(blank_files, histogram, vocab)
     else:
-        tier, proposals = _folder_parse_tier(folder, folder_files, blank_files)
-    if tier == _TIER_STAYS_BLANK and client is not None:
-        tier, proposals = _recording_tier(blank_files, client)
-    return GapGroup(
+        source, proposals = _folder_parse_source(folder, folder_files, blank_files)
+    if source == _SOURCE_STAYS_BLANK and client is not None:
+        source, proposals, error_items = _recording_source(blank_files, client)
+    group = AlbumGapGroup(
         folder=folder,
         blank_count=len(blank_files),
-        total_files=len(folder_files),
+        file_count=len(folder_files),
+        file_ids=sorted(f.file_id for f in blank_files),
         sibling_histogram=histogram,
-        tier=tier,
+        source=source,
         proposals=proposals,
+        errors=len(error_items),
     )
+    return group, error_items
 
 
 def _classify(
@@ -394,23 +411,31 @@ def _classify(
 ) -> AlbumGapsReport:
     """Classify constructed file inputs into a full :class:`AlbumGapsReport` (pure core).
 
-    Groups by folder, keeps only folders holding at least one blank-album file, and tiers
+    Groups by folder, keeps only folders holding at least one blank-album file, and sources
     each. The report's counts describe every blank file across all groups. When *client* is
-    given, folders that tiers 1-2 leave blank get the review-only recording tier (the only
-    part that is not pure/network-free).
+    given, folders the sibling and folder-parse sources leave blank get the review-only
+    recording source (the only part that is not pure/network-free).
     """
-    gap_groups: list[GapGroup] = []
-    grouped = _group_by_folder(files)
+    gap_groups: list[AlbumGapGroup] = []
+    error_items: list[dict[str, str]] = []
+    grouped = group_by_folder(files)
     for folder in sorted(grouped):
         folder_files = grouped[folder]
         blank_files = [f for f in folder_files if f.album is None]
         if not blank_files:
             continue
-        gap_groups.append(_classify_folder(folder, folder_files, blank_files, vocab, client))
-    return _assemble_report(gap_groups)
+        group, folder_errors = _classify_folder(folder, folder_files, blank_files, vocab, client)
+        gap_groups.append(group)
+        error_items.extend(folder_errors)
+    return _assemble_report(gap_groups, error_items, total_files=len(files))
 
 
-def _assemble_report(groups: list[GapGroup]) -> AlbumGapsReport:
+def _assemble_report(
+    groups: list[AlbumGapGroup],
+    error_items: list[dict[str, str]],
+    *,
+    total_files: int,
+) -> AlbumGapsReport:
     """Freeze the classified groups + library-wide disposition counts into a report."""
     green = 0
     confirm = 0
@@ -424,10 +449,10 @@ def _assemble_report(groups: list[GapGroup]) -> AlbumGapsReport:
                 review += 1
             else:
                 confirm += 1
-        # A blank file with no proposal stays blank (mixed siblings, an uncorroborated
-        # folder-parse, or an MB recording miss). Sibling/folder-parse tiers propose exactly
-        # one per blank file, so those groups contribute nothing here.
-        stays_blank += group.blank_count - len(group.proposals)
+        # A blank file with no proposal and no failed lookup stays blank (mixed siblings, an
+        # uncorroborated folder-parse, or an MB recording miss). A failed lookup is an error,
+        # never a miss, so a caller can tell an unreachable MusicBrainz from no ground.
+        stays_blank += group.blank_count - len(group.proposals) - group.errors
     total_blank = sum(group.blank_count for group in groups)
     summary = _summarize(
         groups=len(groups),
@@ -436,15 +461,19 @@ def _assemble_report(groups: list[GapGroup]) -> AlbumGapsReport:
         confirm=confirm,
         review=review,
         stays_blank=stays_blank,
+        errors=len(error_items),
     )
     return AlbumGapsReport(
         groups=groups,
+        total_files=total_files,
         total_blank=total_blank,
         green=green,
         confirm=confirm,
         review=review,
         stays_blank=stays_blank,
         summary=summary,
+        errors=len(error_items),
+        error_items=error_items,
     )
 
 
@@ -456,13 +485,17 @@ def _summarize(  # noqa: PLR0913 - cohesive keyword-only summary counts
     confirm: int,
     review: int,
     stays_blank: int,
+    errors: int,
 ) -> str:
     """Build a short, plain human summary of the run."""
-    return (
+    head = (
         f"{groups} folder group(s), {total_blank} blank-album file(s): "
         f"{green} green + {confirm} confirm + {review} review proposal(s), "
         f"{stays_blank} stay(s) blank."
     )
+    if errors:
+        head += f" {errors} lookup(s) failed and stay unresolved. Re-run to retry."
+    return head
 
 
 # --- narrowing (library-wide counts preserved) ---------------------------------------
@@ -488,9 +521,9 @@ def _gather_inputs(conn: sqlite3.Connection) -> list[_FileInput]:
     """Read every non-missing tracked file into a :class:`_FileInput` (album/artist/title).
 
     ``album``/``artist`` come from the shared ``resolve_years`` identity
-    (:func:`tagmend.engine.genres._identity` — ``albumartist``-else-``artist``, first non-blank
-    album at ANY ordinal), so the binding blank-only guarantee cannot drift; ``title`` is the
-    file's first non-blank ``title``. The two carry the ``(artist, title)`` the review tier
+    (:func:`tagmend.engine.genres._identity`: ``albumartist``-else-``artist``, first non-blank
+    album at ANY ordinal), so the binding blank-only guarantee cannot drift. ``title`` is the
+    file's first non-blank ``title``. The two carry the ``(artist, title)`` the review source
     looks a blank file up against.
     """
     files: list[_FileInput] = []
@@ -514,12 +547,12 @@ def _gather_inputs(conn: sqlite3.Connection) -> list[_FileInput]:
 
 
 def _has_recording_candidates(report: AlbumGapsReport, files: list[_FileInput]) -> bool:
-    """Whether any blank file with an artist AND title sits in a tiers-1-2 ``stays_blank`` folder.
+    """Whether any blank file with an artist AND title sits in a ``stays_blank`` folder.
 
     Gates the lazy MusicBrainz client construction: a run with no such candidate never opens an
     HTTP client (nor touches the network).
     """
-    blank_folders = {g.folder for g in report.groups if g.tier == _TIER_STAYS_BLANK}
+    blank_folders = {g.folder for g in report.groups if g.source == _SOURCE_STAYS_BLANK}
     if not blank_folders:
         return False
     return any(
@@ -531,18 +564,18 @@ def _has_recording_candidates(report: AlbumGapsReport, files: list[_FileInput]) 
     )
 
 
-def _resolve_recording_tier(
+def _resolve_recording_source(
     settings: Settings,
     conn: sqlite3.Connection,
     files: list[_FileInput],
     vocab: Vocabulary,
     client: MBRecordingSource | None,
 ) -> AlbumGapsReport:
-    """Re-classify with the recording tier active, using *client* or a lazily-built real one.
+    """Re-classify with the recording source active, using *client* or a lazily-built real one.
 
     The real :class:`MusicBrainzClient` caches into *conn* (its ONLY ledger writes) and paces
-    itself; a fake injected via *client* bypasses both. Re-running the pure tiers 1-2 is cheap
-    and keeps the tier ordering in one place.
+    itself. A fake injected via *client* bypasses both. Re-running the two pure sources is cheap
+    and keeps the source ordering in one place.
     """
     if client is not None:
         return _classify(files, vocab, client=client)
@@ -566,23 +599,27 @@ def detect_album_gaps(
 
     A scan over the ``files``/``file_tags`` snapshot: no tag writes, nothing staged. Every
     non-missing tracked file whose ``album`` is blank across all ordinals is grouped by folder
-    and tiered — ``sibling`` (a unanimous non-blank album value from folder mates),
+    and given one source: ``sibling`` (a unanimous non-blank album value from folder mates),
     ``folder_parse`` (the parsed folder name, self-corroborated by the folder's filenames),
-    ``mb_recording`` (a review-only MusicBrainz ``(artist, title)`` → album lookup, never
-    green), or ``stays_blank`` (no defensible ground). Only blank files are ever proposed,
-    upholding the additive-fill guarantee the staging merge does not enforce.
+    ``mb_recording`` (a review-only MusicBrainz ``(artist, title)`` album lookup, never
+    green), ``lookup_error`` (every recording lookup that ran failed), or ``stays_blank`` (no
+    defensible ground). Only blank files are ever proposed, upholding the additive-fill
+    guarantee the staging merge does not enforce.
 
-    Tiers 1-2 are pure and network-free. The recording tier runs only for files that tiers 1-2
-    leave blank AND that carry a non-blank artist and title. *use_musicbrainz* (default True)
-    skips it entirely for a local-only, network-free run. The client is built LAZILY, only when
-    such candidates exist, so a run without any never opens an HTTP client. MB results are
-    cached, so a re-run after the first pass is network-free. Those cache writes are the tool's
-    ONLY ledger writes (tags, status and staging are untouched). *client* lets callers inject
-    an :class:`tagmend.engine.musicbrainz.MBRecordingSource` (a fake in tests).
+    The sibling and folder-parse sources are pure and network-free. The recording source runs
+    only for files those two leave blank AND that carry a non-blank artist and title.
+    *use_musicbrainz* (default True) skips it entirely for a local-only, network-free run.
+    The client is built LAZILY, only when such candidates exist, so a run without any never
+    opens an HTTP client. MB results are cached, so a re-run after the first pass is
+    network-free. Those cache writes are the tool's ONLY ledger writes (tags, status and
+    staging are untouched). A failed lookup is counted in ``errors`` and itemized in
+    ``error_items``, never folded into ``stays_blank``. *client* lets callers inject an
+    :class:`tagmend.engine.musicbrainz.MBRecordingSource` (a fake in tests).
 
     *folder* returns exactly that folder's group, never a subfolder, compared as a path
     (:func:`tagmend.engine.path_keys.folder_arg_key`). *limit* caps the number of groups. The
-    ``green``/``confirm``/``review``/``stays_blank`` counts always describe the whole library.
+    ``total_files``/``green``/``confirm``/``review``/``stays_blank``/``errors`` counts always
+    describe the whole library.
     Loads the genre vocabulary once per run (:class:`ValueError` on a corrupt vocabulary
     propagates to the MCP envelope). Raises :class:`ValueError` for a negative *limit* or a
     *folder* outside ``music_path``. Owns its connection.
@@ -597,19 +634,20 @@ def detect_album_gaps(
         files = _gather_inputs(connection)
         report = _classify(files, vocab)
         if use_musicbrainz and _has_recording_candidates(report, files):
-            report = _resolve_recording_tier(settings, connection, files, vocab, client)
+            report = _resolve_recording_source(settings, connection, files, vocab, client)
     finally:
         connection.close()
 
     logger.info(
         "album-gaps complete: groups=%d total_blank=%d green=%d confirm=%d review=%d "
-        "stays_blank=%d",
+        "stays_blank=%d errors=%d",
         len(report.groups),
         report.total_blank,
         report.green,
         report.confirm,
         report.review,
         report.stays_blank,
+        report.errors,
     )
 
     if folder_key is not None:

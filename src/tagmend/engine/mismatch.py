@@ -42,15 +42,21 @@ mirroring :mod:`tagmend.engine.library`.
 from __future__ import annotations
 
 import re
-import unicodedata
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
-from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
 from tagmend.engine import axis, db, path_keys, schema, store
-from tagmend.engine.validation import check_limit
+from tagmend.engine.detector_core import (
+    TIER_RANK,
+    Tier,
+    fold,
+    group_by_folder,
+    is_non_album_folder,
+    validate_tier,
+)
+from tagmend.engine.validation import check_limit, require_choice
 from tagmend.log import get_logger
 
 if TYPE_CHECKING:
@@ -85,41 +91,11 @@ VA_ALBUMARTISTS: Final = frozenset(
     {"various artists", "various", "va", "soundtrack", "original soundtrack", "ost"},
 )
 
-# Leaf folder names (case-insensitive, anchored) that are not normal albums: a guest/other
-# artist here is legitimate, so such a folder can never reach HIGH/MEDIUM (demoted to LOW).
-NON_ALBUM_FOLDERS: Final = frozenset(
-    {"singles", "featured", "remixes", "bonus", "live", "ep"},
-)
-
-# Ligature/eszett map applied after casefold (which already folds ``ß`` → ``ss`` and
-# ``Æ`` → ``æ`` etc.), covering the compatibility cases NFKD does not decompose.
-_LIGATURES: Final = {
-    "æ": "ae",
-    "ø": "o",
-    "œ": "oe",
-    "ł": "l",
-    "þ": "th",
-    "ð": "d",
-}
-_LIGATURE_TABLE: Final = str.maketrans(_LIGATURES)
-
-_NON_ALNUM: Final = re.compile(r"[^a-z0-9]+")
 _DISCOGRAPHY_SUFFIX: Final = re.compile(r"\s*\[discography\]\s*$", re.IGNORECASE)
 # Split a possibly-multi-artist ``artist`` value on the feat./ft./featuring family and the
 # ``&``/``,`` separators to recover the primary (first) artist for the fallback check.
 _PRIMARY_ARTIST_SPLIT: Final = re.compile(r"\b(?:feat|ft|featuring)\b\.?|[&,]", re.IGNORECASE)
 
-
-class Tier(StrEnum):
-    """Confidence tier for a flagged file (most to least confident)."""
-
-    HIGH = "high"
-    MEDIUM = "medium"
-    LOW = "low"
-
-
-_TIER_RANK: Final = {Tier.HIGH: 0, Tier.MEDIUM: 1, Tier.LOW: 2}
-_TIERS: Final = frozenset(t.value for t in Tier)
 
 # Per-tier reason strings (named so they stay stable across the row + tests).
 _REASON_HIGH: Final = "albumartist disagrees with the folder path; folder has mixed albumartists"
@@ -135,22 +111,6 @@ _REASON_SUPPRESSED: Final = (
 )
 _REASON_NO_SIGNAL: Final = "folder has mixed albumartists and this file has no path signal"
 _REASON_ARTIST: Final = "artist disagrees with the folder path (no albumartist tag)"
-
-
-def fold(s: str) -> str:
-    """Return the detector's fold-key for *s*: casefold + Unicode/ligature fold + strip.
-
-    Casefold, translate the residual ligatures NFKD leaves intact (``æ`` → ``ae`` …),
-    NFKD-decompose and drop combining marks (diacritics), then strip everything outside
-    ``[a-z0-9]``. Deliberately a **superset** of :func:`tagmend.engine.classify.fold` (the
-    genre fold-key, which is casefold + strip only): the detector additionally needs the
-    Unicode/ligature folding so ``Leæther Strip`` == ``Leaether Strip`` and ``Dååth`` ==
-    ``Daath``. A match/compare key only — never written to disk.
-    """
-    translated = s.casefold().translate(_LIGATURE_TABLE)
-    decomposed = unicodedata.normalize("NFKD", translated)
-    without_marks = "".join(ch for ch in decomposed if not unicodedata.combining(ch))
-    return _NON_ALNUM.sub("", without_marks)
 
 
 def _top_artist(folder: str, music_path: Path) -> str | None:
@@ -254,10 +214,10 @@ class _FolderStats:
         return self.distinct_albumartists.get(folder, 0) > 1
 
     def is_non_album(self, folder: str) -> bool:
-        """Whether *folder* is a 1-file leaf or an anchored non-album name (Singles, …)."""
+        """Whether *folder* is a 1-file leaf or a non-album name (Singles, …)."""
         if self.file_count.get(folder, 0) <= 1:
             return True
-        return Path(folder).name.casefold() in NON_ALBUM_FOLDERS
+        return is_non_album_folder(folder)
 
 
 # --- public result types -------------------------------------------------------------
@@ -322,7 +282,7 @@ class MismatchGroup:
 
 
 @dataclass(frozen=True, slots=True)
-class MismatchReport:
+class MismatchesReport:
     """Immutable summary of one :func:`detect_mismatches` run, JSON-ready for the MCP tool.
 
     ``rows`` is the (tier-filtered, capped) worklist; the ``high``/``medium``/``low``/
@@ -601,8 +561,8 @@ def _classify(
     *,
     dispositions: dict[int, store.MismatchStatusRow] | None = None,
     container_folders: frozenset[str] = frozenset(),
-) -> MismatchReport:
-    """Classify constructed file inputs into a full :class:`MismatchReport` (pure core).
+) -> MismatchesReport:
+    """Classify constructed file inputs into a full :class:`MismatchesReport` (pure core).
 
     Assumes each input's ``albumartist``/``artist`` is already cleaned (``None`` or a
     non-empty string). Produces every flagged row over ALL files (the folder stats +
@@ -628,7 +588,7 @@ def _classify(
         result = _classify_file(a, stats, suppressed=suppressed)
         if result is not None:
             classified.append(result)
-    classified.sort(key=lambda c: (_TIER_RANK[Tier(c.row.tier)], c.row.file_id))
+    classified.sort(key=lambda c: (TIER_RANK[Tier(c.row.tier)], c.row.file_id))
 
     files_by_id = {f.file_id: f for f in files}
     kept, suppressed_dispositions, suppressed_by_folder = _apply_skip_filter(
@@ -658,7 +618,7 @@ def _assemble_report(  # noqa: PLR0913 - cohesive keyword-only report payload
     suppressed_dispositions: dict[str, int],
     suppressed_by_folder: dict[str, dict[str, int]],
     container_suppressed: dict[str, int],
-) -> MismatchReport:
+) -> MismatchesReport:
     """Freeze the kept rows + post-filter counts + guard diagnostics into a report.
 
     Only *rows* feed the tier tallies and ``flagged``; *context_rows* are counted apart.
@@ -676,7 +636,7 @@ def _assemble_report(  # noqa: PLR0913 - cohesive keyword-only report payload
         suppressed_count=sum(suppressed_dispositions.values()),
         container_suppressed=container_suppressed,
     )
-    return MismatchReport(
+    return MismatchesReport(
         rows=rows,
         total_files=total_files,
         flagged=len(rows),
@@ -739,7 +699,9 @@ def _clean(value: str | None) -> str | None:
     return stripped or None
 
 
-def _limit_report(report: MismatchReport, *, tier: str | None, limit: int | None) -> MismatchReport:
+def _limit_report(
+    report: MismatchesReport, *, tier: str | None, limit: int | None
+) -> MismatchesReport:
     """Narrow a report's ``rows`` to one *tier* and/or the first *limit*, counts unchanged.
 
     A *tier* query asks for defects of that tier, so it drops the context rows entirely (they
@@ -759,12 +721,12 @@ def _limit_report(report: MismatchReport, *, tier: str | None, limit: int | None
 
 
 def _expand_folder(
-    report: MismatchReport,
+    report: MismatchesReport,
     folder_key: str,
     *,
     tier: str | None,
     limit: int | None,
-) -> MismatchReport:
+) -> MismatchesReport:
     """Return the flat rows of exactly the folder keyed *folder_key*, tier/limit applied."""
     rows = [r for r in report.rows if path_keys.path_key(r.folder) == folder_key]
     context_rows = [
@@ -772,14 +734,6 @@ def _expand_folder(
     ]
     narrowed = replace(report, rows=rows, folder_context_rows=context_rows)
     return _limit_report(narrowed, tier=tier, limit=limit)
-
-
-def _group_by_folder(rows: list[MismatchRow]) -> dict[str, list[MismatchRow]]:
-    """Bucket *rows* by their folder, preserving each folder's row order."""
-    buckets: dict[str, list[MismatchRow]] = {}
-    for row in rows:
-        buckets.setdefault(row.folder, []).append(row)
-    return buckets
 
 
 def _build_groups(
@@ -794,8 +748,8 @@ def _build_groups(
     ``tag_values``/``tiers``/``fields``/``file_ids``, so the ``stage_tags_batch`` fix flow can
     never pick up a context file (one that already agrees with its path).
     """
-    by_folder = _group_by_folder(rows)
-    context_by_folder = _group_by_folder(context_rows)
+    by_folder = group_by_folder(rows)
+    context_by_folder = group_by_folder(context_rows)
     groups: list[MismatchGroup] = []
     for folder in sorted(by_folder.keys() | context_by_folder.keys()):
         folder_rows = by_folder.get(folder, [])
@@ -825,12 +779,12 @@ def _build_groups(
 
 
 def _grouped_report(
-    report: MismatchReport,
+    report: MismatchesReport,
     stats: _FolderStats,
     *,
     tier: str | None,
     limit: int | None,
-) -> MismatchReport:
+) -> MismatchesReport:
     """Build the grouped view: tier filters rows, group by folder, then *limit* caps groups.
 
     A *tier* query drops the context rows, exactly as the flat view does.
@@ -850,7 +804,7 @@ def detect_mismatches(
     limit: int | None = None,
     group: bool = False,
     folder: str | None = None,
-) -> MismatchReport:
+) -> MismatchesReport:
     """Detect files whose ``albumartist``/``artist`` tag disagrees with their folder path.
 
     A read-only scan over the ``files``/``file_tags`` snapshot: no tag writes, nothing staged,
@@ -878,9 +832,7 @@ def detect_mismatches(
     if settings.music_path is None:
         message = "music_path not configured. Run `tagmend config-set music_path <dir>`"
         raise ValueError(message)
-    if tier is not None and tier not in _TIERS:
-        message = f"unknown tier: {tier!r} (expected one of {sorted(_TIERS)})"
-        raise ValueError(message)
+    validate_tier(tier)
     folder_key = None if folder is None else path_keys.folder_arg_key(settings, folder)
 
     music_path = settings.music_path
@@ -995,9 +947,7 @@ def set_mismatch_status(
     Returns the number of files affected. Raises :class:`ValueError` for an unknown *status*.
     Owns its transaction; writes only ``file_mismatch_status`` rows.
     """
-    if status not in _USER_MISMATCH_STATUSES:
-        message = f"invalid status: {status!r} (expected legit_ignore|misfiled_deferred|pending)"
-        raise ValueError(message)
+    require_choice("status", status, _USER_MISMATCH_STATUSES)
 
     connection = db.connect(settings.db_path)
     try:

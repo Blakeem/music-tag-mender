@@ -27,7 +27,7 @@ import mutagen
 
 from tagmend.engine import db, path_keys, scan, schema, store, versioning
 from tagmend.engine.tags import TAG_READER_VERSION, read_tags
-from tagmend.engine.validation import check_limit
+from tagmend.engine.validation import check_limit, require_choice
 from tagmend.log import get_logger
 
 if TYPE_CHECKING:
@@ -201,30 +201,10 @@ def list_files(  # noqa: PLR0913 - cohesive keyword-only discovery filters
     negative *limit* or a *root* outside ``music_path``. Read-only.
     """
     check_limit(limit)
-    if genre_status is not None and genre_status not in store.GENRE_WORKFLOW_STATUSES:
-        message = (
-            f"unknown genre_status: {genre_status!r} "
-            f"(expected one of {sorted(store.GENRE_WORKFLOW_STATUSES)})"
-        )
-        raise ValueError(message)
-    if artist_status is not None and artist_status not in store.ARTIST_WORKFLOW_STATUSES:
-        message = (
-            f"unknown artist_status: {artist_status!r} "
-            f"(expected one of {sorted(store.ARTIST_WORKFLOW_STATUSES)})"
-        )
-        raise ValueError(message)
-    if year_status is not None and year_status not in store.YEAR_WORKFLOW_STATUSES:
-        message = (
-            f"unknown year_status: {year_status!r} "
-            f"(expected one of {sorted(store.YEAR_WORKFLOW_STATUSES)})"
-        )
-        raise ValueError(message)
-    if mismatch_status is not None and mismatch_status not in store.MISMATCH_WORKFLOW_STATUSES:
-        message = (
-            f"unknown mismatch_status: {mismatch_status!r} "
-            f"(expected one of {sorted(store.MISMATCH_WORKFLOW_STATUSES)})"
-        )
-        raise ValueError(message)
+    require_choice("genre_status", genre_status, store.GENRE_WORKFLOW_STATUSES)
+    require_choice("artist_status", artist_status, store.ARTIST_WORKFLOW_STATUSES)
+    require_choice("year_status", year_status, store.YEAR_WORKFLOW_STATUSES)
+    require_choice("mismatch_status", mismatch_status, store.MISMATCH_WORKFLOW_STATUSES)
     root_key = None if root is None else path_keys.folder_arg_key(settings, root)
 
     filtered = (

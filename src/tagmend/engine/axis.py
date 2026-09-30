@@ -106,11 +106,12 @@ class Axis:
 # --- genre / artist staleness rules --------------------------------------------------
 
 
-def _genre_decision_blocks(decision: StatusRow, identity: Identity) -> bool:
-    """Genre rule: ``manual`` always blocks; ``no_match`` blocks unless its identity changed.
+def _identity_decision_blocks(decision: StatusRow, identity: Identity) -> bool:
+    """Rule for every axis whose ``no_match`` is keyed on the lookup identity (genre, year).
 
-    A ``no_match`` whose ``source`` identity no longer matches the file's current identity is
-    *stale* and falls through to be reprocessed (``resolve_genres`` retries it).
+    ``manual`` always blocks. A ``no_match`` blocks only while its recorded ``source`` identity
+    still equals the file's current identity. Once either part changes it is *stale* and falls
+    through to be reprocessed, so the resolver retries it.
     """
     if decision.status == "manual":
         return True
@@ -125,24 +126,6 @@ def _genre_decision_blocks(decision: StatusRow, identity: Identity) -> bool:
 def _artist_decision_blocks(decision: StatusRow, _identity: Identity) -> bool:
     """Artist rule: a stored ``manual`` is sticky — it always blocks (no staleness re-check)."""
     return decision.status == "manual"
-
-
-def _year_decision_blocks(decision: StatusRow, identity: Identity) -> bool:
-    """Year rule (same as genre): ``manual`` always blocks; ``no_match`` blocks unless stale.
-
-    Identity is ``(albumartist-else-artist, album)``; a stored ``no_match`` whose recorded
-    identity no longer matches the file's current one is *stale* and falls through to be
-    reprocessed. Because the primary is the resolved lookup artist, a change to either the
-    artist (or album-artist fallback) OR the album re-opens the decision.
-    """
-    if decision.status == "manual":
-        return True
-    if decision.status == "no_match":
-        return (
-            decision.source_primary == identity.primary
-            and decision.source_secondary == identity.secondary
-        )
-    return False
 
 
 def _mismatch_decision_blocks(decision: StatusRow, identity: Identity) -> bool:
@@ -181,7 +164,7 @@ GENRE_AXIS: Final = Axis(
     workflow_statuses=frozenset(
         {"pending", "no_identity", "no_match", "manual", "staged", "done"},
     ),
-    decision_blocks=_genre_decision_blocks,
+    decision_blocks=_identity_decision_blocks,
 )
 
 ARTIST_AXIS: Final = Axis(
@@ -209,7 +192,7 @@ YEAR_AXIS: Final = Axis(
     workflow_statuses=frozenset(
         {"pending", "no_identity", "no_match", "manual", "staged", "done"},
     ),
-    decision_blocks=_year_decision_blocks,
+    decision_blocks=_identity_decision_blocks,
 )
 
 MISMATCH_AXIS: Final = Axis(

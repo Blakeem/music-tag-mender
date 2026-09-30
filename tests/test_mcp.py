@@ -576,7 +576,7 @@ _NEGATIVE_LIMIT_CALLS = [
     ("detect_album_conflicts", {"limit": -1}),
     ("detect_album_gaps", {"limit": -1}),
     ("detect_disagreements", {"limit": -1}),
-    ("detect_disagreements", {"row_limit": -1}),
+    ("detect_disagreements", {"release_limit": -1}),
 ]
 
 

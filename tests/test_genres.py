@@ -435,7 +435,7 @@ def test_manual_status_skips_then_reset_requeues(
 
 
 def test_set_genre_status_rejects_unknown_status(engine_settings: Settings) -> None:
-    with pytest.raises(ValueError, match="invalid status"):
+    with pytest.raises(ValueError, match="unknown status"):
         genres.set_genre_status(engine_settings, file_ids=[1], status="no_match")
 
 

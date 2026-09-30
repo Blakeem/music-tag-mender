@@ -14,7 +14,8 @@ import pytest
 
 from conftest import FOLDER_SPELLINGS, make_track, spell_folder
 from tagmend.engine import disagreements
-from tagmend.engine.disagreements import Tier, _classify, _FileInput
+from tagmend.engine.detector_core import Tier
+from tagmend.engine.disagreements import _classify, _FileInput
 from tagmend.engine.library import scan_library
 from tagmend.engine.musicbrainz import MBMedium, MBRelease, MBTrack, MusicBrainzError
 
@@ -115,7 +116,7 @@ def _run(
     release: MBRelease | None = None,
 ) -> disagreements.DisagreementsReport:
     source = FakeReleaseSource({_RELEASE_ID: release or _release(_track("1", "Song One"))})
-    return _classify(files, source, limit=None)
+    return _classify(files, source, release_limit=None)
 
 
 # --- an agreeing file is silent ------------------------------------------------------
@@ -131,7 +132,7 @@ def test_a_file_matching_its_release_flags_nothing() -> None:
 
 def test_a_file_with_no_release_id_is_never_looked_up() -> None:
     source = FakeReleaseSource({})
-    report = _classify([_f(release_id=None)], source, limit=None)
+    report = _classify([_f(release_id=None)], source, release_limit=None)
 
     assert report.flagged == 0
     assert report.skipped_no_release_id == 1
@@ -146,7 +147,7 @@ def test_each_release_is_fetched_once_for_all_its_files() -> None:
         _f(1),
         _f(2, release_track_id="rt-2", recording_id="rec-2", title="Song Two", tracknumber="2"),
     ]
-    report = _classify(files, source, limit=None)
+    report = _classify(files, source, release_limit=None)
 
     assert source.lookups == [_RELEASE_ID]
     assert report.flagged == 0
@@ -165,7 +166,7 @@ def test_a_file_whose_track_id_is_not_on_the_release_is_high() -> None:
 
 def test_a_release_musicbrainz_does_not_know_is_reported_not_an_error() -> None:
     source = FakeReleaseSource({_RELEASE_ID: None})
-    report = _classify([_f()], source, limit=None)
+    report = _classify([_f()], source, release_limit=None)
 
     assert report.flagged == 0
     assert report.unknown_releases == 1
@@ -311,6 +312,23 @@ def test_tier_counts_sum_to_flagged() -> None:
     assert report.high + report.medium + report.low == report.flagged
 
 
+def test_flagged_counts_files_and_flagged_fields_counts_rows() -> None:
+    report = _run([_f(album="Wrong Album", title="Wrong Title")])
+
+    assert report.flagged == 1
+    assert report.flagged_fields == 2
+    assert report.medium == 1
+
+
+def test_a_negative_release_limit_is_refused(engine_settings: Settings) -> None:
+    with pytest.raises(ValueError, match="release_limit must be >= 0"):
+        disagreements.detect_disagreements(
+            engine_settings,
+            release_limit=-1,
+            client=FakeReleaseSource({}),
+        )
+
+
 def test_limit_caps_the_releases_fetched_and_reports_the_remainder() -> None:
     source = FakeReleaseSource(
         {
@@ -322,7 +340,7 @@ def test_limit_caps_the_releases_fetched_and_reports_the_remainder() -> None:
         _f(1, release_id="rel-a", album="Wrong A"),
         _f(2, release_id="rel-b", album="Wrong B"),
     ]
-    report = _classify(files, source, limit=1)
+    report = _classify(files, source, release_limit=1)
 
     assert len(source.lookups) == 1
     assert report.releases_checked == 1
@@ -338,8 +356,54 @@ def test_groups_summarize_one_folder_each() -> None:
     assert group.folder == r"C:\m\Band\Album"
     assert group.file_count == 2
     assert group.flagged == 2
+    assert group.flagged_fields == 2
+    assert group.folder_context == 0
+    assert group.tiers == {"medium": 2}
+    assert group.file_ids == [1, 2]
     assert group.fields == {"album": 1, "title": 1}
-    assert group.release_title == "Real Album"
+    assert group.releases == [
+        {"release_id": _RELEASE_ID, "release_title": "Real Album", "file_count": 2},
+    ]
+
+
+def test_one_group_per_folder_even_with_two_releases() -> None:
+    source = FakeReleaseSource(
+        {
+            "rel-a": _release(_track("1", "Song One"), mbid="rel-a", title="A Album"),
+            "rel-b": _release(_track("1", "Song One"), mbid="rel-b", title="B Album"),
+        },
+    )
+    files = [
+        _f(1, release_id="rel-a", album="Wrong A"),
+        _f(2, release_id="rel-b", album="Wrong B"),
+    ]
+
+    report = _classify(files, source, release_limit=None)
+
+    assert len(report.groups) == 1
+    group = report.groups[0]
+    assert group.flagged == 2
+    assert [r["release_id"] for r in group.releases] == ["rel-a", "rel-b"]
+
+
+def test_group_file_ids_exclude_fill_only_files() -> None:
+    report = _run([_f(1, album="Wrong Album"), _f(2, releasecountry=None)])
+
+    group = report.groups[0]
+    assert group.file_ids == [1]
+    assert group.fills == 1
+    assert group.file_count == 2
+
+
+def test_groups_ship_only_in_the_grouped_view() -> None:
+    report = _run([_f(1, album="Wrong Album")])
+
+    flat = disagreements._narrow(report, tier=None, folder_key=None, limit=None, group=False)
+    grouped = disagreements._narrow(report, tier=None, folder_key=None, limit=None, group=True)
+
+    assert flat.groups == []
+    assert len(grouped.groups) == 1
+    assert grouped.rows == []
 
 
 def test_the_recording_id_still_matches_when_the_release_track_id_is_wrong() -> None:
@@ -412,17 +476,116 @@ def test_folder_argument_variants_match_the_same_rows(
     scan_library(engine_settings)
     source = FakeReleaseSource({_RELEASE_ID: _release(_track("1", "Song One"))})
 
-    exact = disagreements.detect_disagreements(engine_settings, folder=str(album), client=source)
+    exact = disagreements.detect_disagreements(
+        engine_settings,
+        path=music_dir / "Band",
+        folder=str(album),
+        client=source,
+    )
     variant = disagreements.detect_disagreements(
         engine_settings,
+        path=music_dir / "Band",
         folder=spell_folder(album, spelling),
         client=source,
     )
 
-    assert exact.total_files == 1
+    assert exact.total_files == 2
+    assert [r.folder for r in exact.rows] == [str(album)]
     assert [r.file_id for r in exact.rows] == [r.file_id for r in variant.rows]
     assert [r.file_id for r in exact.fill_rows] == [r.file_id for r in variant.fill_rows]
     assert variant.total_files == exact.total_files
+
+
+def _scan_two_releases(music_dir: Path, settings: Settings) -> tuple[Path, Path]:
+    """Scan one wrong-album file on ``rel-a`` under ``A/X`` and one on ``rel-b`` under ``B/Y``."""
+    folder_a = music_dir / "A" / "X"
+    folder_b = music_dir / "B" / "Y"
+    for folder, release_id in ((folder_a, "rel-a"), (folder_b, "rel-b")):
+        make_track(
+            folder / "a.mp3",
+            {
+                "album": ["Wrong Album"],
+                "title": ["Song One"],
+                "musicbrainz_albumid": [release_id],
+                "musicbrainz_releasetrackid": ["rt-1"],
+            },
+        )
+    scan_library(settings)
+    return folder_a, folder_b
+
+
+def _two_release_source() -> FakeReleaseSource:
+    return FakeReleaseSource(
+        {
+            "rel-a": _release(_track("1", "Song One"), mbid="rel-a"),
+            "rel-b": _release(_track("1", "Song One"), mbid="rel-b"),
+        },
+    )
+
+
+def test_a_bare_folder_without_a_run_scope_is_refused(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    folder_a, _ = _scan_two_releases(music_dir, engine_settings)
+    source = _two_release_source()
+
+    with pytest.raises(ValueError, match="path="):
+        disagreements.detect_disagreements(engine_settings, folder=str(folder_a), client=source)
+
+    assert source.lookups == []
+
+
+def test_path_scopes_the_run_and_fetches_nothing_outside_it(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    _scan_two_releases(music_dir, engine_settings)
+    source = _two_release_source()
+
+    report = disagreements.detect_disagreements(
+        engine_settings,
+        path=music_dir / "A",
+        client=source,
+    )
+
+    assert source.lookups == ["rel-a"]
+    assert report.total_files == 1
+
+
+def test_folder_narrows_a_scoped_run_and_wins_over_group(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    folder_a, _ = _scan_two_releases(music_dir, engine_settings)
+    make_track(
+        folder_a / "Disc 2" / "b.mp3",
+        {
+            "album": ["Wrong Album"],
+            "title": ["Song One"],
+            "musicbrainz_albumid": ["rel-a"],
+            "musicbrainz_releasetrackid": ["rt-1"],
+        },
+    )
+    scan_library(engine_settings)
+
+    whole = disagreements.detect_disagreements(
+        engine_settings,
+        path=music_dir / "A",
+        client=_two_release_source(),
+    )
+    view = disagreements.detect_disagreements(
+        engine_settings,
+        path=music_dir / "A",
+        folder=str(folder_a),
+        group=True,
+        client=_two_release_source(),
+    )
+
+    assert whole.flagged == 2
+    assert {r.folder for r in view.rows} == {str(folder_a)}
+    assert view.groups == []
+    assert view.flagged == whole.flagged
 
 
 # --- the track's own artist credit ---------------------------------------------------
@@ -554,14 +717,14 @@ def test_a_date_is_only_lenient_when_the_tag_is_the_more_precise_one() -> None:
     assert wrong_month.flagged == 1
 
 
-def test_group_flagged_counts_rows_like_the_headline_does() -> None:
-    # One file with two wrong fields is two rows. The report and the group must not disagree
-    # about what the word counts.
+def test_group_flagged_counts_files_like_the_headline_does() -> None:
+    # One file with two wrong fields is one file and two fields. The report and the group
+    # must not disagree about what the word counts.
     report = _run([_f(album="Wrong Album", releasecountry="RU")])
 
-    assert report.flagged == 2
+    assert report.flagged == 1
     assert sum(g.flagged for g in report.groups) == report.flagged
-    assert report.groups[0].flagged_files == 1
+    assert report.groups[0].flagged_fields == 2
 
 
 def test_releases_checked_counts_what_was_actually_fetched() -> None:
@@ -579,7 +742,7 @@ def test_releases_checked_counts_what_was_actually_fetched() -> None:
     report = _classify(
         [_f(1, release_id="rel-a"), _f(2, release_id="rel-b", album="Wrong")],
         Raiser(),
-        limit=None,
+        release_limit=None,
     )
 
     assert report.errors == 1
@@ -613,7 +776,7 @@ def test_a_multi_disc_release_still_proposes_the_disc_number() -> None:
     assert ("discnumber", "", "2") in {(r.field, r.have, r.want) for r in report.fill_rows}
 
 
-def test_a_row_limit_caps_both_row_lists() -> None:
+def test_a_limit_caps_both_row_lists() -> None:
     report = _run(
         [
             _f(1, album="Wrong", releasecountry="RU", date=None),

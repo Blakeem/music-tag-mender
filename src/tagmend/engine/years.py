@@ -34,7 +34,7 @@ from typing import TYPE_CHECKING
 
 from tagmend.engine import axis, db, genres, schema, staging, store
 from tagmend.engine.musicbrainz import MusicBrainzClient, MusicBrainzError
-from tagmend.engine.validation import check_limit
+from tagmend.engine.validation import check_limit, require_choice
 from tagmend.log import get_logger
 
 if TYPE_CHECKING:
@@ -78,6 +78,8 @@ class ResolveYearsResult:
     more: bool
     mappings: list[dict[str, str | None]]
     summary: str
+    errors: int = 0
+    error_items: list[dict[str, str]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, object]:
         """JSON-serializable form for the MCP tool."""
@@ -93,6 +95,8 @@ class ResolveYearsResult:
             "pending_remaining": self.pending_remaining,
             "more": self.more,
             "mappings": [dict(m) for m in self.mappings],
+            "errors": self.errors,
+            "error_items": [dict(e) for e in self.error_items],
             "summary": self.summary,
         }
 
@@ -110,6 +114,8 @@ class _Tally:
     skipped_missing: int = 0
     # identity -> original_date (one mapping per resolved album group).
     mappings: dict[tuple[str | None, str | None], str] = field(default_factory=dict)
+    # One item per album group whose MusicBrainz lookup failed, so an outage is visible.
+    error_items: list[dict[str, str]] = field(default_factory=list)
 
 
 @dataclass(frozen=True, slots=True)
@@ -330,8 +336,8 @@ def _process_one_group(  # noqa: PLR0913 - cohesive per-group inputs
 ) -> None:
     """Resolve one ``(artist, album)`` group and blank-fill / mark its files accordingly.
 
-    A transient :class:`MusicBrainzError` leaves the group's files pending (no status row)
-    and returns without aborting the wider call.
+    A transient :class:`MusicBrainzError` leaves the group's files pending (no status row),
+    records one error item, and returns without aborting the wider call.
     """
     # ``_select`` guarantees non-None artist and album for every processable candidate.
     lookup_artist = identity.artist
@@ -347,6 +353,9 @@ def _process_one_group(  # noqa: PLR0913 - cohesive per-group inputs
             lookup_artist,
             lookup_album,
             exc,
+        )
+        tally.error_items.append(
+            {"key": f"{lookup_artist} - {lookup_album}", "message": str(exc)},
         )
         return
 
@@ -431,6 +440,8 @@ def _build_result(
         more=more,
         mappings=mappings,
         summary=summary,
+        errors=len(tally.error_items),
+        error_items=list(tally.error_items),
     )
 
 
@@ -465,6 +476,9 @@ def _summarize(
         )
     elif pending_remaining > 0:
         parts.append(f"{pending_remaining} group(s) still pending — call again to continue.")
+    errors = len(tally.error_items)
+    if errors > 0:
+        parts.append(f"{errors} album group(s) errored and stay pending. Re-run to retry.")
     return " ".join(parts)
 
 
@@ -504,9 +518,7 @@ def set_year_status(
     file. Returns the number of files affected. Raises :class:`ValueError` for an unknown
     *status*. Owns its transaction.
     """
-    if status not in _USER_STATUSES:
-        message = f"invalid status: {status!r} (expected manual|pending)"
-        raise ValueError(message)
+    require_choice("status", status, _USER_STATUSES)
 
     connection = db.connect(settings.db_path)
     try:

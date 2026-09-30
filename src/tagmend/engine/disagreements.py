@@ -34,18 +34,25 @@ ledger writes are the release lookup's own cache rows.
 from __future__ import annotations
 
 from collections import Counter, defaultdict
-from dataclasses import dataclass, field
-from enum import StrEnum
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Final
 
 from tagmend.engine import db, path_keys, schema, store
 from tagmend.engine.album_conflicts import group_key
+from tagmend.engine.detector_core import (
+    TIER_RANK,
+    Tier,
+    group_by_folder,
+    parse_position,
+    validate_tier,
+)
 from tagmend.engine.musicbrainz import MusicBrainzClient, MusicBrainzError
 from tagmend.engine.validation import check_limit
 from tagmend.log import get_logger
 
 if TYPE_CHECKING:
     import sqlite3
+    from pathlib import Path
 
     from tagmend.config import Settings
     from tagmend.engine.musicbrainz import MBRelease, MBReleaseSource, MBTrack
@@ -69,24 +76,13 @@ _DETECT_FIELDS: Final = (
 
 # How many distinct releases one call fetches when the caller names no limit. At the one
 # request per second MusicBrainz asks for, this is about three minutes of wall clock.
-_DEFAULT_LIMIT: Final = 200
+_DEFAULT_RELEASE_LIMIT: Final = 200
 
 _SLASH: Final = "/"
 
 # MusicBrainz dates are ``YYYY`` / ``YYYY-MM`` / ``YYYY-MM-DD``.
 _DATE_SEPARATOR: Final = "-"
 
-
-class Tier(StrEnum):
-    """How much the disagreement costs a listener."""
-
-    HIGH = "high"
-    MEDIUM = "medium"
-    LOW = "low"
-
-
-_TIER_RANK: Final = {Tier.HIGH: 0, Tier.MEDIUM: 1, Tier.LOW: 2}
-_TIERS: Final = frozenset(t.value for t in Tier)
 
 # Fields that decide how a library groups, names and orders this file. A disagreement here is
 # visible to anyone browsing.
@@ -161,44 +157,52 @@ class DisagreementRow:
 class DisagreementGroup:
     """One folder's disagreements, compact enough to scan a whole library at a glance.
 
-    ``flagged`` counts ROWS, matching the headline count, so the groups sum to it. One file
-    with two wrong fields is two. ``flagged_files`` is the distinct-file count beside it.
+    ``flagged`` counts files, matching the headline count, so the groups sum to it. One file
+    with two wrong fields is one, and ``flagged_fields`` counts the fields beside it.
+    ``file_ids`` names the flagged files only, never a file that merely has a blank to fill.
+    ``releases`` lists every release the folder's in-scope files name.
     """
 
     folder: str
-    release_id: str
-    release_title: str
     file_count: int
     flagged: int
-    flagged_files: int
-    fills: int
-    fields: dict[str, int]
+    folder_context: int
     tiers: dict[str, int]
     file_ids: list[int]
+    flagged_fields: int
+    fills: int
+    fields: dict[str, int]
+    releases: list[dict[str, object]]
 
     def to_dict(self) -> dict[str, object]:
         """JSON-serializable form for the MCP tool."""
         return {
             "folder": self.folder,
-            "release_id": self.release_id,
-            "release_title": self.release_title,
             "file_count": self.file_count,
             "flagged": self.flagged,
-            "flagged_files": self.flagged_files,
-            "fills": self.fills,
-            "fields": self.fields,
+            "folder_context": self.folder_context,
             "tiers": self.tiers,
             "file_ids": self.file_ids,
+            "flagged_fields": self.flagged_fields,
+            "fills": self.fills,
+            "fields": self.fields,
+            "releases": [dict(r) for r in self.releases],
         }
 
 
 @dataclass(frozen=True, slots=True)
 class DisagreementsReport:
-    """Immutable summary of one :func:`detect_disagreements` run, JSON-ready for the tool."""
+    """Immutable summary of one :func:`detect_disagreements` run, JSON-ready for the tool.
+
+    ``flagged`` counts files with at least one contradiction and ``flagged_fields`` counts the
+    contradicting fields. Each file sits in the tier of its most severe contradiction, so the
+    tier counts sum to ``flagged``.
+    """
 
     rows: list[DisagreementRow]
     total_files: int
     flagged: int
+    flagged_fields: int
     high: int
     medium: int
     low: int
@@ -222,6 +226,7 @@ class DisagreementsReport:
             "rows": [r.to_dict() for r in self.rows],
             "total_files": self.total_files,
             "flagged": self.flagged,
+            "flagged_fields": self.flagged_fields,
             "high": self.high,
             "medium": self.medium,
             "low": self.low,
@@ -257,13 +262,17 @@ def _text_key(value: str) -> str:
 
 
 def _position(value: str | None) -> str:
-    """Return the position part of an ``n`` / ``n/total`` tag value, without leading zeros."""
+    """Return the position part of an ``n`` / ``n/total`` tag value, without leading zeros.
+
+    A non-decimal head such as the vinyl ``A1`` comes back verbatim, so a side designation
+    still compares.
+    """
+    number = parse_position(value)
+    if number is not None:
+        return str(number)
     if not value:
         return ""
-    head = value.split(_SLASH, 1)[0].strip()
-    # isdecimal, not isdigit: isdigit accepts superscripts and enclosed digits that int()
-    # rejects, and one such tag would abort the whole run.
-    return str(int(head)) if head.isdecimal() else head
+    return value.split(_SLASH, 1)[0].strip()
 
 
 def _track_number_agrees(have: str, track: MBTrack) -> bool:
@@ -466,7 +475,7 @@ def _classify(
     files: list[_FileInput],
     client: MBReleaseSource,
     *,
-    limit: int | None,
+    release_limit: int | None,
 ) -> DisagreementsReport:
     """Compare every in-scope file against the release it names, one lookup per release."""
     # Input: group by release so each is fetched at most once, in first-seen order.
@@ -480,7 +489,7 @@ def _classify(
         by_release[release_id].append(f)
 
     order = list(by_release)
-    cap = limit if limit is not None else len(order)
+    cap = release_limit if release_limit is not None else len(order)
     to_check = order[:cap]
 
     # Process: one lookup per release, then every field of every file on it.
@@ -511,11 +520,12 @@ def _classify(
     # Output: the contradictions and the blank fills are separate populations.
     contradictions = [r for r in rows if not r.is_fill]
     fills = [r for r in rows if r.is_fill]
-    tiers = Counter(r.tier for r in contradictions)
+    tiers = _tiers_by_file(contradictions)
     return DisagreementsReport(
         rows=_ordered(contradictions),
         total_files=len(files),
-        flagged=len(contradictions),
+        flagged=sum(tiers.values()),
+        flagged_fields=len(contradictions),
         high=tiers.get(Tier.HIGH.value, 0),
         medium=tiers.get(Tier.MEDIUM.value, 0),
         low=tiers.get(Tier.LOW.value, 0),
@@ -540,45 +550,64 @@ def _classify(
         ),
         fill_rows=_ordered(fills),
         error_releases=errors,
-        groups=_build_groups(rows, by_release, titles),
+        groups=_build_groups(rows, files, titles),
     )
 
 
 def _ordered(rows: list[DisagreementRow]) -> list[DisagreementRow]:
     """Return *rows* most-severe first, then stably by location and field."""
-    return sorted(rows, key=lambda r: (_TIER_RANK[Tier(r.tier)], r.folder, r.filename, r.field))
+    return sorted(rows, key=lambda r: (TIER_RANK[Tier(r.tier)], r.folder, r.filename, r.field))
+
+
+def _tiers_by_file(contradictions: list[DisagreementRow]) -> Counter[str]:
+    """Count files by their most severe contradiction, so the counts sum to the file count."""
+    worst: dict[int, Tier] = {}
+    for row in contradictions:
+        tier = Tier(row.tier)
+        current = worst.get(row.file_id)
+        if current is None or TIER_RANK[tier] < TIER_RANK[current]:
+            worst[row.file_id] = tier
+    return Counter(tier.value for tier in worst.values())
+
+
+def _releases_in(folder_files: list[_FileInput], titles: dict[str, str]) -> list[dict[str, object]]:
+    """Return every release one folder's files name, with its title and file count."""
+    counts = Counter(
+        release_id for f in folder_files if (release_id := (f.release_id or "").strip())
+    )
+    return [
+        {"release_id": release_id, "release_title": titles.get(release_id, ""), "file_count": n}
+        for release_id, n in sorted(counts.items())
+    ]
 
 
 def _build_groups(
     rows: list[DisagreementRow],
-    by_release: dict[str, list[_FileInput]],
+    files: list[_FileInput],
     titles: dict[str, str],
 ) -> list[DisagreementGroup]:
-    """Fold the rows into one line per (folder, release) pair."""
-    keyed: dict[tuple[str, str], list[DisagreementRow]] = defaultdict(list)
-    for row in rows:
-        keyed[(row.folder, row.release_id)].append(row)
-
-    counts: dict[tuple[str, str], int] = defaultdict(int)
-    for release_id, members in by_release.items():
-        for f in members:
-            counts[(f.folder, release_id)] += 1
-
-    return [
-        DisagreementGroup(
-            folder=folder,
-            release_id=release_id,
-            release_title=titles.get(release_id, ""),
-            file_count=counts[(folder, release_id)],
-            flagged=len([r for r in group_rows if not r.is_fill]),
-            flagged_files=len({r.file_id for r in group_rows if not r.is_fill}),
-            fills=len([r for r in group_rows if r.is_fill]),
-            fields=dict(Counter(r.field for r in group_rows if not r.is_fill)),
-            tiers=dict(Counter(r.tier for r in group_rows if not r.is_fill)),
-            file_ids=sorted({r.file_id for r in group_rows}),
+    """Fold the rows into one line per folder, sorted by folder."""
+    rows_by_folder = group_by_folder(rows)
+    files_by_folder = group_by_folder(files)
+    groups: list[DisagreementGroup] = []
+    for folder in sorted(rows_by_folder):
+        contradictions = [r for r in rows_by_folder[folder] if not r.is_fill]
+        tiers = _tiers_by_file(contradictions)
+        groups.append(
+            DisagreementGroup(
+                folder=folder,
+                file_count=len(files_by_folder.get(folder, [])),
+                flagged=sum(tiers.values()),
+                folder_context=0,
+                tiers=dict(tiers),
+                file_ids=sorted({r.file_id for r in contradictions}),
+                flagged_fields=len(contradictions),
+                fills=len(rows_by_folder[folder]) - len(contradictions),
+                fields=dict(Counter(r.field for r in contradictions)),
+                releases=_releases_in(files_by_folder.get(folder, []), titles),
+            ),
         )
-        for (folder, release_id), group_rows in keyed.items()
-    ]
+    return groups
 
 
 def _summarize(  # noqa: PLR0913 - one keyword per reported count, cohesive by design
@@ -597,7 +626,7 @@ def _summarize(  # noqa: PLR0913 - one keyword per reported count, cohesive by d
         head = f"Every file agrees with the release it names ({checked} release(s) checked)."
     else:
         head = (
-            f"{len({r.file_id for r in rows})} file(s) disagree with the release they name "
+            f"{sum(tiers.values())} file(s) disagree with the release they name "
             f"across {len(rows)} field(s), over {checked} release(s): "
             f"{tiers.get(Tier.HIGH.value, 0)} high, {tiers.get(Tier.MEDIUM.value, 0)} medium, "
             f"{tiers.get(Tier.LOW.value, 0)} low."
@@ -609,9 +638,9 @@ def _summarize(  # noqa: PLR0913 - one keyword per reported count, cohesive by d
     if unknown:
         head += f" {unknown} release id(s) are unknown to MusicBrainz."
     if remaining:
-        head += f" {remaining} release(s) not yet checked — raise limit to reach them."
+        head += f" {remaining} release(s) not yet checked. Raise release_limit to reach them."
     if errors:
-        head += f" {errors} release lookup(s) errored and stay pending — re-run to retry."
+        head += f" {errors} release lookup(s) errored and stay pending. Re-run to retry."
     return head
 
 
@@ -626,7 +655,11 @@ def _narrow(
     limit: int | None,
     group: bool,
 ) -> DisagreementsReport:
-    """Return *report* with its rows filtered for display; the run counts never change."""
+    """Return *report* with its rows filtered for display. The run counts never change.
+
+    Groups ride only on the grouped view. A *folder_key* wins over *group*: that call returns
+    the folder's flat rows and no groups, like every sibling detector.
+    """
     rows = report.rows
     fill_rows = report.fill_rows
     if tier is not None:
@@ -639,31 +672,14 @@ def _narrow(
         rows = rows[:limit]
         fill_rows = fill_rows[:limit]
 
-    groups = report.groups
-    if folder_key is not None:
-        groups = [g for g in groups if path_keys.path_key(g.folder) == folder_key]
+    flat = not group or folder_key is not None
+    groups = [] if flat else report.groups
     if limit is not None:
         groups = groups[:limit]
-
-    return DisagreementsReport(
-        rows=[] if group else rows,
-        total_files=report.total_files,
-        flagged=report.flagged,
-        high=report.high,
-        medium=report.medium,
-        low=report.low,
-        fills=report.fills,
-        releases_attempted=report.releases_attempted,
-        releases_checked=report.releases_checked,
-        releases_remaining=report.releases_remaining,
-        more=report.more,
-        skipped_no_release_id=report.skipped_no_release_id,
-        unknown_releases=report.unknown_releases,
-        unmatched_tracks=report.unmatched_tracks,
-        errors=report.errors,
-        summary=report.summary,
-        fill_rows=[] if group else fill_rows,
-        error_releases=report.error_releases,
+    return replace(
+        report,
+        rows=rows if flat else [],
+        fill_rows=fill_rows if flat else [],
         groups=groups,
     )
 
@@ -709,10 +725,11 @@ def detect_disagreements(  # noqa: PLR0913 - cohesive keyword-only scope + injec
     settings: Settings,
     *,
     tier: str | None = None,
+    path: Path | None = None,
     folder: str | None = None,
     file_ids: list[int] | None = None,
+    release_limit: int | None = None,
     limit: int | None = None,
-    row_limit: int | None = None,
     group: bool = False,
     client: MBReleaseSource | None = None,
 ) -> DisagreementsReport:
@@ -720,22 +737,29 @@ def detect_disagreements(  # noqa: PLR0913 - cohesive keyword-only scope + injec
 
     Reads the snapshot, so run ``scan_library`` first.
 
-    *folder* and *file_ids* scope the RUN, not the view: the counts then describe only that
-    scope, and no release outside it is fetched. *tier* narrows the view alone, so the counts
-    still describe the whole run. *limit* caps the number of distinct releases fetched this
-    call (default 200, about three minutes at MusicBrainz's requested one request per second)
-    and the remainder is reported via ``releases_remaining``/``more``. *row_limit* caps the
-    rows returned without changing any count.
-    *folder* is compared as a path (:func:`tagmend.engine.path_keys.folder_arg_key`).
-    *client* injects an :class:`tagmend.engine.musicbrainz.MBReleaseSource` for tests. Raises
-    :class:`ValueError` for an unknown *tier*, a negative *limit* or *row_limit*, or a *folder*
-    outside ``music_path``.
+    *path* and *file_ids* scope the RUN: the counts then describe only that scope, and no
+    release outside it is fetched. *path* takes the folder itself and every folder under it.
+    *folder* and *tier* narrow the VIEW alone, so the counts still describe the whole run.
+    *folder* names exactly one folder and wins over *group*. *release_limit* caps the number of
+    distinct releases fetched this call (default 200, about three minutes at MusicBrainz's
+    requested one request per second) and the remainder is reported via
+    ``releases_remaining``/``more``. *limit* caps the rows (or groups) returned without changing
+    any count. *path* and *folder* are compared as paths
+    (:func:`tagmend.engine.path_keys.folder_arg_key`). *client* injects an
+    :class:`tagmend.engine.musicbrainz.MBReleaseSource` for tests. Raises :class:`ValueError`
+    for a *folder* with neither *path* nor *file_ids*, an unknown *tier*, a negative
+    *release_limit* or *limit*, or a *path* or *folder* outside ``music_path``.
     """
-    check_limit(limit)
-    check_limit(row_limit, name="row_limit")
-    if tier is not None and tier not in _TIERS:
-        message = f"unknown tier {tier!r}; expected one of {sorted(_TIERS)}"
+    if folder is not None and path is None and file_ids is None:
+        message = (
+            "detect_disagreements fetches from MusicBrainz, so scope the run with path=<folder> "
+            "or file_ids. folder= only narrows a scoped run's view"
+        )
         raise ValueError(message)
+    check_limit(release_limit, name="release_limit")
+    check_limit(limit)
+    validate_tier(tier)
+    root_key = None if path is None else path_keys.folder_arg_key(settings, path)
     folder_key = None if folder is None else path_keys.folder_arg_key(settings, folder)
 
     connection = db.connect(settings.db_path)
@@ -743,19 +767,21 @@ def detect_disagreements(  # noqa: PLR0913 - cohesive keyword-only scope + injec
         schema.apply_schema(connection)
         scoped = None if file_ids is None else store.files_in_scope(connection, file_ids=file_ids)
         files = _load_inputs(connection, scoped)
-        if folder_key is not None:
-            files = [f for f in files if path_keys.path_key(f.folder) == folder_key]
+        if root_key is not None:
+            files = [
+                f for f in files if path_keys.is_within(path_keys.path_key(f.folder), root_key)
+            ]
 
-        effective_limit = _DEFAULT_LIMIT if limit is None else limit
+        effective_limit = _DEFAULT_RELEASE_LIMIT if release_limit is None else release_limit
         if client is not None:
-            report = _classify(files, client, limit=effective_limit)
+            report = _classify(files, client, release_limit=effective_limit)
         else:
             with MusicBrainzClient(
                 settings.musicbrainz_user_agent,
                 connection,
                 rate_per_sec=settings.musicbrainz_rate_per_sec,
             ) as owned:
-                report = _classify(files, owned, limit=effective_limit)
+                report = _classify(files, owned, release_limit=effective_limit)
     finally:
         connection.close()
 
@@ -765,4 +791,4 @@ def detect_disagreements(  # noqa: PLR0913 - cohesive keyword-only scope + injec
         report.releases_checked,
         report.total_files,
     )
-    return _narrow(report, tier=tier, folder_key=folder_key, limit=row_limit, group=group)
+    return _narrow(report, tier=tier, folder_key=folder_key, limit=limit, group=group)

@@ -31,7 +31,7 @@ def _f(  # noqa: PLR0913 - one keyword per detected field, cohesive by design
     albumartist: str | None = "Band",
     artist: str | None = "Band",
     release_id: str | None = None,
-    year: str | None = None,
+    date: str | None = None,
     compilation: str | None = None,
 ) -> _FileInput:
     """Build one file input; defaults describe a clean single-album folder member."""
@@ -43,7 +43,7 @@ def _f(  # noqa: PLR0913 - one keyword per detected field, cohesive by design
         albumartist=albumartist,
         artist=artist,
         release_id=release_id,
-        year=year,
+        date=date,
         compilation=compilation,
     )
 
@@ -202,12 +202,12 @@ def test_a_compilation_flag_stands_in_for_a_missing_album_artist() -> None:
     assert report.flagged == 0
 
 
-def test_year_disagreement_without_release_ids_is_medium() -> None:
+def test_date_disagreement_without_release_ids_is_medium() -> None:
     report = _classify(
         [
-            _f(1, year="2005"),
-            _f(2, filename="b.mp3", year="2005"),
-            _f(3, filename="c.mp3", year="2005-06-01"),
+            _f(1, date="2005"),
+            _f(2, filename="b.mp3", date="2005"),
+            _f(3, filename="c.mp3", date="2005-06-01"),
         ],
     )
 
@@ -271,6 +271,19 @@ def test_a_singles_folder_is_context_not_a_defect() -> None:
     assert len(report.folder_context_rows) == 1
 
 
+def test_a_context_folder_group_names_no_file_ids() -> None:
+    report = _classify(
+        [
+            _f(1, folder=r"C:\m\Band\Singles", album="One"),
+            _f(2, folder=r"C:\m\Band\Singles", filename="b.mp3", album="Two"),
+        ],
+    )
+
+    group = report.groups[0]
+    assert group.flagged == 0
+    assert group.file_ids == []
+
+
 def test_tier_counts_always_sum_to_flagged() -> None:
     report = _classify(
         [
@@ -307,6 +320,44 @@ def test_groups_report_the_identity_breakdown_per_folder() -> None:
     assert group.majority_files == 2
 
 
+def test_group_file_ids_name_only_the_flagged_minority() -> None:
+    report = _classify(
+        [
+            _f(1, release_id="rel-1"),
+            _f(2, filename="b.mp3", release_id="rel-1"),
+            _f(3, filename="c.mp3", release_id="rel-2"),
+        ],
+    )
+
+    assert report.groups[0].file_ids == [3]
+
+
+def test_group_file_count_counts_every_present_file_in_the_folder() -> None:
+    report = _classify(
+        [
+            _f(1, release_id="rel-1"),
+            _f(2, filename="b.mp3", release_id="rel-1"),
+            _f(3, filename="c.mp3", release_id="rel-2"),
+            _f(4, filename="d.mp3", album=None),
+        ],
+    )
+
+    assert report.groups[0].file_count == 4
+
+
+def test_groups_are_sorted_by_folder() -> None:
+    report = _classify(
+        [
+            _f(1, folder=r"C:\m\Z", album="One"),
+            _f(2, folder=r"C:\m\Z", filename="b.mp3", album="Two"),
+            _f(3, folder=r"C:\m\A", album="One"),
+            _f(4, folder=r"C:\m\A", filename="b.mp3", album="Two"),
+        ],
+    )
+
+    assert [g.folder for g in report.groups] == [r"C:\m\A", r"C:\m\Z"]
+
+
 def test_a_context_folder_never_appears_under_a_tier_filter() -> None:
     files = [
         _f(1, folder=r"C:\m\B\Singles", album="One"),
@@ -337,6 +388,45 @@ def test_detect_album_conflicts_end_to_end(
     assert report.flagged == 1
     assert report.rows[0].filename == "c.mp3"
     assert report.medium == 1
+
+
+def test_date_is_read_from_every_format_end_to_end(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    # The release date lives in ``date`` for every container, so a date split is visible.
+    album = music_dir / "Band" / "Album"
+    shared = {"album": ["Real Album"], "albumartist": ["Band"]}
+    make_track(album / "a.mp3", {**shared, "date": ["2005"]})
+    make_track(album / "b.m4a", {**shared, "date": ["2005"]})
+    make_track(album / "c.flac", {**shared, "date": ["2006"]})
+    scan_library(engine_settings)
+
+    report = album_conflicts.detect_album_conflicts(engine_settings)
+
+    assert report.flagged == 1
+    row = report.rows[0]
+    assert row.filename == "c.flac"
+    assert row.tier == "medium"
+    assert row.date == "2006"
+
+
+def test_a_raw_year_tag_stands_in_for_a_blank_date(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    album = music_dir / "Band" / "Album"
+    shared = {"album": ["Real Album"], "albumartist": ["Band"]}
+    make_track(album / "a.flac", {**shared, "date": ["2005"]})
+    make_track(album / "b.flac", {**shared, "date": ["2005"]})
+    make_track(album / "c.flac", {**shared, "year": ["2006"]})
+    scan_library(engine_settings)
+
+    report = album_conflicts.detect_album_conflicts(engine_settings)
+
+    assert report.flagged == 1
+    assert report.rows[0].filename == "c.flac"
+    assert report.rows[0].date == "2006"
 
 
 @pytest.mark.parametrize("spelling", FOLDER_SPELLINGS)
@@ -557,6 +647,19 @@ def test_groups_are_returned_only_for_the_grouped_view() -> None:
     assert len(grouped.groups) == 3
 
 
+def test_folder_wins_over_group() -> None:
+    view = album_conflicts._narrow(
+        _three_folder_report(),
+        tier=None,
+        folder_key=path_keys.path_key(r"C:\m\A\Album"),
+        limit=None,
+        group=True,
+    )
+
+    assert [r.file_id for r in view.rows] == [2]
+    assert view.groups == []
+
+
 def test_a_limit_caps_the_groups_in_the_grouped_view() -> None:
     view = album_conflicts._narrow(
         _three_folder_report(),
@@ -591,9 +694,9 @@ def test_an_albumartist_split_is_not_reported_as_a_disc_suffix() -> None:
 def test_a_year_split_with_a_stray_space_is_not_a_disc_suffix() -> None:
     report = _classify(
         [
-            _f(1, album="Fiction ", year="2005"),
-            _f(2, filename="b.mp3", album="Fiction", year="2005"),
-            _f(3, filename="c.mp3", album="Fiction", year="2006"),
+            _f(1, album="Fiction ", date="2005"),
+            _f(2, filename="b.mp3", album="Fiction", date="2005"),
+            _f(3, filename="c.mp3", album="Fiction", date="2006"),
         ],
     )
 
@@ -620,9 +723,9 @@ def test_two_files_two_artists_and_no_albumartist_is_the_compilation_shape() -> 
 def test_a_two_file_folder_sharing_one_artist_is_not_the_compilation_shape() -> None:
     report = _classify(
         [
-            _f(1, album="One Album", albumartist=None, artist="Band", year="2005"),
+            _f(1, album="One Album", albumartist=None, artist="Band", date="2005"),
             _f(
-                2, filename="b.mp3", album="One Album", albumartist=None, artist="Band", year="2006"
+                2, filename="b.mp3", album="One Album", albumartist=None, artist="Band", date="2006"
             ),
         ],
     )

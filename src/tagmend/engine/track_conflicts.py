@@ -35,12 +35,18 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass, field, replace
-from enum import StrEnum
-from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
 from tagmend.engine import db, path_keys, schema, store
-from tagmend.engine.mismatch import NON_ALBUM_FOLDERS, fold
+from tagmend.engine.detector_core import (
+    TIER_RANK,
+    Tier,
+    fold,
+    group_by_folder,
+    is_non_album_folder,
+    parse_position,
+    validate_tier,
+)
 from tagmend.engine.validation import check_limit
 from tagmend.log import get_logger
 
@@ -54,25 +60,10 @@ logger = get_logger(__name__)
 # The scalar fields the detector reads per file (ordinal-0 value of each).
 _DETECT_FIELDS: Final = ("tracknumber", "discnumber", "title", "album")
 
-# A tracknumber/discnumber may be stored as "7" or as the "7/12" slash form; only the part
-# before the slash is the position.
-_SLASH: Final = "/"
-
 # The disc a file belongs to when it carries no discnumber: single-disc releases routinely
 # omit it, and treating those files as disc-less would make every one of them collide.
 _DEFAULT_DISC: Final = "1"
 
-
-class Tier(StrEnum):
-    """Confidence tier for a flagged file (most to least confident)."""
-
-    HIGH = "high"
-    MEDIUM = "medium"
-    LOW = "low"
-
-
-_TIER_RANK: Final = {Tier.HIGH: 0, Tier.MEDIUM: 1, Tier.LOW: 2}
-_TIERS: Final = frozenset(t.value for t in Tier)
 
 # Per-tier reason strings (named so they stay stable across the row + tests).
 _REASON_HIGH: Final = "different titles share this track slot; the numbering is wrong"
@@ -205,20 +196,13 @@ class TrackConflictsReport:
 # --- pure classifier -----------------------------------------------------------------
 
 
-def _position(value: str | None) -> str | None:
-    """Return the position part of a ``n`` / ``n/total`` tag value, or ``None`` if unusable."""
-    if not value:
-        return None
-    head = value.split(_SLASH, 1)[0].strip()
-    return head if head.isdigit() else None
-
-
 def _slot(tracknumber: str | None, discnumber: str | None) -> tuple[str, int] | None:
     """Return the ``(disc, track)`` slot for a pair of raw tag values, or ``None``."""
-    track = _position(tracknumber)
+    track = parse_position(tracknumber)
     if track is None:
         return None
-    return (_position(discnumber) or _DEFAULT_DISC, int(track))
+    disc = parse_position(discnumber)
+    return (str(disc) if disc is not None else _DEFAULT_DISC, track)
 
 
 def _is_context_folder(files: list[_FileInput]) -> str | None:
@@ -231,8 +215,7 @@ def _is_context_folder(files: list[_FileInput]) -> str | None:
     albums = {f.album for f in files if f.album}
     if len(albums) > 1:
         return _REASON_MULTI_ALBUM
-    leaf = Path(files[0].folder).name
-    if fold(leaf) in {fold(name) for name in NON_ALBUM_FOLDERS}:
+    if is_non_album_folder(files[0].folder):
         return _REASON_NON_ALBUM
     return None
 
@@ -274,9 +257,7 @@ def _rows_for_slot(
 def _classify(files: list[_FileInput]) -> TrackConflictsReport:
     """Classify every folder's colliding track slots into flagged rows + context rows."""
     # Input: bucket files by folder, preserving discovery order within each.
-    by_folder: dict[str, list[_FileInput]] = defaultdict(list)
-    for f in files:
-        by_folder[f.folder].append(f)
+    by_folder = group_by_folder(files)
 
     # Process: per folder, find every slot two or more files claim.
     flagged: list[TrackConflictRow] = []
@@ -299,7 +280,7 @@ def _classify(files: list[_FileInput]) -> TrackConflictsReport:
             flagged.extend(_rows_for_slot(peers, tier, reason))
 
     # Output: deterministic order (tier rank, then file id) and the library-wide counts.
-    flagged.sort(key=lambda r: (_TIER_RANK[Tier(r.tier)], r.file_id))
+    flagged.sort(key=lambda r: (TIER_RANK[Tier(r.tier)], r.file_id))
     context.sort(key=lambda r: r.file_id)
     tiers = {t: sum(1 for r in flagged if r.tier == t.value) for t in Tier}
     return TrackConflictsReport(
@@ -342,22 +323,14 @@ def _summarize(  # noqa: PLR0913 - one keyword per reported count, cohesive by d
 # --- narrowing -----------------------------------------------------------------------
 
 
-def _group_by_folder(rows: list[TrackConflictRow]) -> dict[str, list[TrackConflictRow]]:
-    """Bucket *rows* by their folder, preserving each folder's row order."""
-    grouped: dict[str, list[TrackConflictRow]] = defaultdict(list)
-    for row in rows:
-        grouped[row.folder].append(row)
-    return grouped
-
-
 def _build_groups(
     rows: list[TrackConflictRow],
     context_rows: list[TrackConflictRow],
     file_counts: dict[str, int],
 ) -> list[TrackConflictGroup]:
     """Fold rows into one compact line per folder, flagged and context counted apart."""
-    by_folder = _group_by_folder(rows)
-    context_by_folder = _group_by_folder(context_rows)
+    by_folder = group_by_folder(rows)
+    context_by_folder = group_by_folder(context_rows)
     groups: list[TrackConflictGroup] = []
     for folder in sorted(by_folder.keys() | context_by_folder.keys()):
         folder_rows = by_folder.get(folder, [])
@@ -402,7 +375,7 @@ def _narrow(  # noqa: PLR0913 - the view knobs the public entry forwards, one ea
         return replace(
             report,
             rows=rows[:limit] if limit is not None else rows,
-            folder_context_rows=context_rows,
+            folder_context_rows=context_rows[:limit] if limit is not None else context_rows,
             groups=[],
         )
     if group:
@@ -462,9 +435,7 @@ def detect_track_conflicts(
     *tier*, a negative *limit* or a *folder* outside ``music_path``.
     """
     check_limit(limit)
-    if tier is not None and tier not in _TIERS:
-        message = f"unknown tier {tier!r}; expected one of {sorted(_TIERS)}"
-        raise ValueError(message)
+    validate_tier(tier)
     folder_key = None if folder is None else path_keys.folder_arg_key(settings, folder)
 
     connection = db.connect(settings.db_path)

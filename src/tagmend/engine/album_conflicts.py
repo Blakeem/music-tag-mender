@@ -12,15 +12,16 @@ agrees on:
 
 * ``musicbrainz_albumid`` when present. It is an explicit claim about which release this is,
   and it settles the file on its own.
-* otherwise the display album artist, the album title and the year. The display album artist
-  is ``albumartist``, falling back to ``Various Artists`` when the compilation flag is set,
-  then to ``artist``. The compilation marker outranks the track artist, which is what keeps a
-  various-artists release with no album artist from scattering across every track's artist.
+* otherwise the display album artist, the album title and the release date (``date``, else a
+  raw Vorbis ``year``). The display album artist is ``albumartist``, falling back to
+  ``Various Artists`` when the compilation flag is set, then to ``artist``. The compilation
+  marker outranks the track artist, which is what keeps a various-artists release with no
+  album artist from scattering across every track's artist.
 
 Titles and names are compared under :func:`_group_key`, which folds casing, typographic
 character choice and whitespace runs and nothing else. Punctuation is deliberately
 significant: ``The Crow: City of Angels`` and ``The Crow- City Of Angels`` are two albums
-downstream. A year is compared verbatim, because ``2005`` and ``2005-06-01`` are two grouping
+downstream. A date is compared verbatim, because ``2005`` and ``2005-06-01`` are two grouping
 keys as well.
 
 The report names the **minority**: the files whose identity differs from the one most of the
@@ -43,14 +44,18 @@ from __future__ import annotations
 
 import re
 import unicodedata
-from collections import Counter, defaultdict
+from collections import Counter
 from dataclasses import dataclass, field, replace
-from enum import StrEnum
-from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
 from tagmend.engine import db, path_keys, schema, store
-from tagmend.engine.mismatch import NON_ALBUM_FOLDERS, fold
+from tagmend.engine.detector_core import (
+    TIER_RANK,
+    Tier,
+    group_by_folder,
+    is_non_album_folder,
+    validate_tier,
+)
 from tagmend.engine.validation import check_limit
 from tagmend.log import get_logger
 
@@ -69,6 +74,7 @@ _DETECT_FIELDS: Final = (
     "albumartist",
     "artist",
     "musicbrainz_albumid",
+    "date",
     "year",
     "compilation",
 )
@@ -84,7 +90,7 @@ _COMPILATION_TRUE: Final = frozenset({"1", "t", "T", "true", "TRUE", "True"})
 _DISC_SUFFIX: Final = re.compile(r"\s*[(\[][^()\[\]]*\bdisc\b[^()\[\]]*[)\]]\s*$", re.IGNORECASE)
 
 # Typographic characters a server folds to ASCII before grouping. Deliberately NOT
-# :func:`tagmend.engine.mismatch.fold`, which strips every non-alphanumeric character: that
+# :func:`tagmend.engine.detector_core.fold`, which strips every non-alphanumeric character: that
 # would erase ``The Crow: City of Angels`` against ``The Crow- City Of Angels``, which really
 # are two albums downstream and are exactly what this detector exists to find. Case and
 # surrounding or repeated whitespace are cosmetic. Punctuation is not.
@@ -103,22 +109,11 @@ _UNKNOWN_ARTIST: Final = "[Unknown Artist]"
 _VARIOUS_ARTISTS: Final = "Various Artists"
 
 
-class Tier(StrEnum):
-    """How strongly the folder's files contradict each other about which release they are."""
-
-    HIGH = "high"
-    MEDIUM = "medium"
-    LOW = "low"
-
-
-_TIER_RANK: Final = {Tier.HIGH: 0, Tier.MEDIUM: 1, Tier.LOW: 2}
-_TIERS: Final = frozenset(t.value for t in Tier)
-
 _REASON_HIGH: Final = (
     "this file's release id differs from the rest of the folder's, so it is a separate album"
 )
 _REASON_MEDIUM: Final = (
-    "this file's album artist, album title or year differs from the rest of the folder's"
+    "this file's album artist, album title or release date differs from the rest of the folder's"
 )
 _REASON_LOW: Final = "this file's album carries a different disc suffix on the same release title"
 _REASON_NO_ALBUMARTIST: Final = (
@@ -144,7 +139,7 @@ class _FileInput:
     albumartist: str | None = None
     artist: str | None = None
     release_id: str | None = None
-    year: str | None = None
+    date: str | None = None
     compilation: str | None = None
 
     @property
@@ -175,7 +170,7 @@ class _FileInput:
             "name",
             group_key(self.display_album_artist),
             group_key(self.album or ""),
-            (self.year or "").strip(),
+            (self.date or "").strip(),
         )
 
     @property
@@ -184,8 +179,8 @@ class _FileInput:
         release_id = (self.release_id or "").strip()
         if release_id:
             return f"release:{release_id}"
-        year = (self.year or "").strip()
-        suffix = f" [{year}]" if year else ""
+        date = (self.date or "").strip()
+        suffix = f" [{date}]" if date else ""
         return f"{self.display_album_artist} - {self.album or ''}{suffix}"
 
 
@@ -202,7 +197,7 @@ class AlbumConflictRow:
     album: str | None
     albumartist: str | None
     release_id: str | None
-    year: str | None
+    date: str | None
     identity: str
     majority_identity: str
     tier: str  # Tier value
@@ -217,7 +212,7 @@ class AlbumConflictRow:
             "album": self.album,
             "albumartist": self.albumartist,
             "release_id": self.release_id,
-            "year": self.year,
+            "date": self.date,
             "identity": self.identity,
             "majority_identity": self.majority_identity,
             "tier": self.tier,
@@ -227,7 +222,11 @@ class AlbumConflictRow:
 
 @dataclass(frozen=True, slots=True)
 class AlbumConflictGroup:
-    """One folder's split, compact enough to scan a whole library at a glance."""
+    """One folder's split, compact enough to scan a whole library at a glance.
+
+    ``file_count`` counts every present file in the folder, blank album included. ``file_ids``
+    names the flagged files only, so a fix flow driven off a group never rewrites the majority.
+    """
 
     folder: str
     file_count: int
@@ -303,7 +302,7 @@ def group_key(value: str) -> str:
     cosmetic when it compares the same fields against MusicBrainz.
     """
     # NFC first, so the two byte-forms of one accented string compare equal. Deliberately not
-    # NFKD-with-marks-stripped like :func:`tagmend.engine.mismatch.fold`: that folds an accent
+    # NFKD-with-marks-stripped like :func:`tagmend.engine.detector_core.fold`: that folds an accent
     # away, and an accent really does separate two albums for anything reading these tags.
     folded = "".join(TYPOGRAPHIC.get(ch, ch) for ch in unicodedata.normalize("NFC", value))
     return " ".join(folded.casefold().split())
@@ -354,8 +353,7 @@ def _is_context_folder(files: list[_FileInput]) -> str | None:
     A folder named for a collection rather than a release (``Singles``, ``Remixes``) holds
     several releases by design, so its split is expected and never a defect.
     """
-    leaf = Path(files[0].folder).name
-    if fold(leaf) in {fold(name) for name in NON_ALBUM_FOLDERS}:
+    if is_non_album_folder(files[0].folder):
         return _REASON_NON_ALBUM
     return None
 
@@ -367,8 +365,8 @@ def _tier_for(minority: _FileInput, majority: _FileInput) -> tuple[Tier, str]:
     if minority_id or majority_id:
         return (Tier.HIGH, _REASON_HIGH)
     # Both tests run at fold level. Comparing the raw strings for inequality made a folder
-    # split by album artist or year, whose album strings differ only cosmetically, report a
-    # disc suffix that is not there.
+    # split by album artist or release date, whose album strings differ only cosmetically,
+    # report a disc suffix that is not there.
     minority_album = group_key(minority.album or "")
     majority_album = group_key(majority.album or "")
     if (
@@ -399,7 +397,7 @@ def _rows_for_folder(files: list[_FileInput]) -> tuple[list[AlbumConflictRow], _
                 album=f.album,
                 albumartist=f.albumartist,
                 release_id=f.release_id,
-                year=f.year,
+                date=f.date,
                 identity=f.identity_label,
                 majority_identity=majority.identity_label,
                 tier=tier.value,
@@ -424,7 +422,7 @@ def _compilation_rows(files: list[_FileInput]) -> list[AlbumConflictRow]:
             album=f.album,
             albumartist=f.albumartist,
             release_id=f.release_id,
-            year=f.year,
+            date=f.date,
             identity=f.identity_label,
             majority_identity=shared,
             tier=Tier.HIGH.value,
@@ -441,12 +439,9 @@ def _first_index(files: list[_FileInput], identity: tuple[str, ...]) -> int:
 
 def _classify(files: list[_FileInput]) -> AlbumConflictsReport:
     """Group *files* by folder and report every folder describing more than one release."""
-    # Input: the folders, in first-seen order so the report is stable.
-    by_folder: dict[str, list[_FileInput]] = defaultdict(list)
-    for f in files:
-        if not (f.album or "").strip():
-            continue
-        by_folder[f.folder].append(f)
+    # Input: a folder's size counts its blank-album files too, which the comparison skips.
+    folder_sizes = Counter(f.folder for f in files)
+    by_folder = group_by_folder(f for f in files if (f.album or "").strip())
 
     # Process: one pass per folder, splitting real defects from expected context.
     rows: list[AlbumConflictRow] = []
@@ -471,21 +466,22 @@ def _classify(files: list[_FileInput]) -> AlbumConflictsReport:
         groups.append(
             AlbumConflictGroup(
                 folder=folder,
-                file_count=len(members),
+                file_count=folder_sizes[folder],
                 flagged=0 if context_reason else len(folder_rows),
                 folder_context=len(folder_rows) if context_reason else 0,
                 identities=len({f.identity for f in members}),
                 majority_identity=majority_label,
                 majority_files=majority_files,
                 tiers=dict(Counter(r.tier for r in folder_rows)) if not context_reason else {},
-                file_ids=[f.file_id for f in members],
+                file_ids=[] if context_reason else sorted(r.file_id for r in folder_rows),
             ),
         )
+    groups.sort(key=lambda g: g.folder)
 
     # Output: the whole-library counts, which no later narrowing changes.
     tiers = Counter(r.tier for r in rows)
     return AlbumConflictsReport(
-        rows=sorted(rows, key=lambda r: (_TIER_RANK[Tier(r.tier)], r.folder, r.filename)),
+        rows=sorted(rows, key=lambda r: (TIER_RANK[Tier(r.tier)], r.folder, r.filename)),
         total_files=len(files),
         flagged=len(rows),
         high=tiers.get(Tier.HIGH.value, 0),
@@ -542,7 +538,8 @@ def _narrow(
     Every filter applies to the context rows as well as the flagged ones. Without that, a
     caller expanding one folder also received every ``Singles``/``Remixes`` context row in the
     library. Groups ride only on the grouped view, which is what ``detect_track_conflicts``
-    does, so a flat call does not also ship a line per folder.
+    does, so a flat call does not also ship a line per folder. A *folder_key* wins over
+    *group*: that call returns the folder's flat rows and no groups, like every sibling.
     """
     rows = report.rows
     context_rows = report.folder_context_rows
@@ -556,14 +553,13 @@ def _narrow(
         rows = rows[:limit]
         context_rows = context_rows[:limit]
 
-    groups = report.groups
-    if folder_key is not None:
-        groups = [g for g in groups if path_keys.path_key(g.folder) == folder_key]
+    flat = not group or folder_key is not None
+    groups = [] if flat else report.groups
     if limit is not None:
         groups = groups[:limit]
 
     return AlbumConflictsReport(
-        rows=[] if group else rows,
+        rows=rows if flat else [],
         total_files=report.total_files,
         flagged=report.flagged,
         high=report.high,
@@ -571,8 +567,8 @@ def _narrow(
         low=report.low,
         summary=report.summary,
         folder_context=report.folder_context,
-        folder_context_rows=[] if group else context_rows,
-        groups=groups if group else [],
+        folder_context_rows=context_rows if flat else [],
+        groups=groups,
     )
 
 
@@ -596,7 +592,8 @@ def _load_inputs(connection: sqlite3.Connection) -> list[_FileInput]:
                 albumartist=values.get("albumartist"),
                 artist=values.get("artist"),
                 release_id=values.get("musicbrainz_albumid"),
-                year=values.get("year"),
+                # A raw Vorbis YEAR is the only release-date spelling no alias maps to ``date``.
+                date=(values.get("date") or "").strip() or values.get("year"),
                 compilation=values.get("compilation"),
             ),
         )
@@ -618,9 +615,7 @@ def detect_album_conflicts(
     *tier*, a negative *limit* or a *folder* outside ``music_path``.
     """
     check_limit(limit)
-    if tier is not None and tier not in _TIERS:
-        message = f"unknown tier {tier!r}; expected one of {sorted(_TIERS)}"
-        raise ValueError(message)
+    validate_tier(tier)
     folder_key = None if folder is None else path_keys.folder_arg_key(settings, folder)
 
     connection = db.connect(settings.db_path)

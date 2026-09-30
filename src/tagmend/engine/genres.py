@@ -32,7 +32,7 @@ from typing import TYPE_CHECKING, Final
 
 from tagmend.engine import axis, classify, db, schema, staging, store
 from tagmend.engine.lastfm import LastfmClient, LastfmError
-from tagmend.engine.validation import check_limit
+from tagmend.engine.validation import check_limit, require_choice
 from tagmend.log import get_logger
 
 if TYPE_CHECKING:
@@ -506,9 +506,7 @@ def set_genre_status(
     Returns the number of files affected. Raises :class:`ValueError` for an unknown
     *status*. Owns its transaction.
     """
-    if status not in _USER_STATUSES:
-        message = f"invalid status: {status!r} (expected manual|pending)"
-        raise ValueError(message)
+    require_choice("status", status, _USER_STATUSES)
 
     connection = db.connect(settings.db_path)
     try:

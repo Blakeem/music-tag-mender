@@ -805,7 +805,7 @@ def test_reset_artist_status_by_value_matches_albumartist(
 
 
 def test_set_artist_status_rejects_unknown_status(engine_settings: Settings) -> None:
-    with pytest.raises(ValueError, match="invalid status"):
+    with pytest.raises(ValueError, match="unknown status"):
         artists.set_artist_status(engine_settings, file_ids=[1], status="no_match")
 
 

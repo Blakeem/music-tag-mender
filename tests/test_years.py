@@ -24,7 +24,7 @@ from tagmend.engine import staging, store, versioning, years
 from tagmend.engine.db import connect
 from tagmend.engine.library import list_files as library_list
 from tagmend.engine.library import scan_library
-from tagmend.engine.musicbrainz import MBAlbum
+from tagmend.engine.musicbrainz import MBAlbum, MusicBrainzError
 from tagmend.engine.schema import apply_schema
 
 # Import tags so its module-load RegisterFreeformKey runs before make_track writes an
@@ -281,6 +281,37 @@ def test_no_match_recorded_and_reported(
     assert view.year_source_album == "Demos"
 
 
+class _RaisingAlbumSource(FakeMBAlbumSource):
+    """A fake whose lookup fails for one pair, as during a MusicBrainz outage."""
+
+    def album_first_release(self, artist: str, album: str) -> MBAlbum | None:
+        if (artist, album) == ("Band", "Album"):
+            self.lookups.append((artist, album))
+            message = "503 Service Unavailable"
+            raise MusicBrainzError(message)
+        return super().album_first_release(artist, album)
+
+
+def test_a_musicbrainz_error_is_counted_and_itemized(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    make_track(music_dir / "a.mp3", {"artist": ["Band"], "album": ["Album"]})
+    scan_library(engine_settings)
+    file_id = _file_id(engine_settings, music_dir, "a.mp3")
+
+    result = years.resolve_years(engine_settings, client=_RaisingAlbumSource({}))
+
+    assert result.errors == 1
+    assert result.error_items == [{"key": "Band - Album", "message": "503 Service Unavailable"}]
+    assert result.staged_files == 0
+    assert "errored" in result.summary
+    assert staging.diff_tags(engine_settings) == []
+    # No status row: the group stays pending so the next run retries it.
+    view = next(v for v in library_list(engine_settings) if v.file_id == file_id)
+    assert view.year_status == "pending"
+
+
 def test_no_match_skipped_on_rerun_until_identity_changes(
     engine_settings: Settings,
     music_dir: Path,
@@ -396,7 +427,7 @@ def test_reset_year_status_requeues(
 
 
 def test_set_year_status_rejects_unknown_status(engine_settings: Settings) -> None:
-    with pytest.raises(ValueError, match="invalid status"):
+    with pytest.raises(ValueError, match="unknown status"):
         years.set_year_status(engine_settings, file_ids=[1], status="no_match")
 
 

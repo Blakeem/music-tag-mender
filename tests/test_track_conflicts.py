@@ -219,6 +219,34 @@ def test_missing_discnumber_defaults_to_disc_one() -> None:
     assert track_conflicts._classify(files).flagged == 2
 
 
+def test_a_superscript_track_number_is_ignored_not_fatal() -> None:
+    # "²".isdigit() is True but int() rejects it, which used to abort the whole report.
+    folder = _MUSIC / "A" / "B"
+    files = [
+        _mk(1, folder, "a.mp3", tracknumber="²", title="X", album="B"),
+        _mk(2, folder, "b.mp3", tracknumber="2", title="Y", album="B"),
+    ]
+
+    report = track_conflicts._classify(files)
+
+    assert files[0].slot is None
+    assert report.flagged == 0
+
+
+def test_zero_padded_disc_numbers_share_one_disc() -> None:
+    # "01" and "1" name the same disc, so their track 3 files collide.
+    folder = _MUSIC / "A" / "B"
+    files = [
+        _mk(1, folder, "a.mp3", tracknumber="3", discnumber="01/02", title="X", album="B"),
+        _mk(2, folder, "b.mp3", tracknumber="3", discnumber="1/2", title="Y", album="B"),
+    ]
+
+    report = track_conflicts._classify(files)
+
+    assert report.flagged == 2
+    assert report.high == 2
+
+
 def test_files_without_a_track_number_are_ignored() -> None:
     folder = _MUSIC / "A" / "B"
     files = [
@@ -347,6 +375,19 @@ def test_folder_expansion_is_exact_not_a_prefix() -> None:
     )
 
     assert {r.file_id for r in narrowed.rows} == {1, 2}
+
+
+def test_folder_expansion_caps_context_rows_too() -> None:
+    singles = _MUSIC / "A" / "Singles"
+    files = [_mk(i, singles, f"{i}.mp3", tracknumber="1", title=f"S{i}") for i in (1, 2, 3)]
+    report = track_conflicts._classify(files)
+
+    narrowed = track_conflicts._narrow(
+        report, {}, tier=None, limit=1, group=False, folder_key=path_keys.path_key(singles)
+    )
+
+    assert len(narrowed.folder_context_rows) == 1
+    assert narrowed.folder_context == 3
 
 
 # --- integration: scan real audio, then detect ---------------------------------------

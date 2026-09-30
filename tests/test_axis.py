@@ -108,6 +108,10 @@ def test_no_identity_in_genre_artist_year_but_not_mismatch() -> None:
     assert "no_identity" not in MISMATCH_AXIS.workflow_statuses
 
 
+def test_genre_and_year_share_one_identity_rule() -> None:
+    assert GENRE_AXIS.decision_blocks is YEAR_AXIS.decision_blocks
+
+
 # ---------------------------------------------------------------------------
 # Genre decision_blocks: manual (sticky, identity-independent)
 # ---------------------------------------------------------------------------

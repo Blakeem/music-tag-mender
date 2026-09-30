@@ -579,9 +579,9 @@ def detect_track_conflicts(
         tier: Keep only rows in this tier (``high`` | ``medium`` | ``low``).
         limit: Cap the rows returned, or the groups with ``group=true``.
         group: Return one compact line per folder instead of flat rows.
-        folder: Expand exactly this folder's rows, never a subfolder. Compared as a path:
-            case and ``/`` versus backslash do not matter on Windows, and a relative folder
-            resolves under ``music_path``.
+        folder: Expand exactly this folder's rows, never a subfolder. Takes precedence over
+            ``group``. Compared as a path: case and ``/`` versus backslash do not matter on
+            Windows, and a relative folder resolves under ``music_path``.
 
     Returns:
         ``{"ok": True, rows, total_files, flagged, high, medium, low, folder_context,
@@ -604,10 +604,11 @@ def detect_track_conflicts(
 @_error_envelope
 def detect_disagreements(  # noqa: PLR0913 - one parameter per scope/view knob, cohesive
     tier: Literal["high", "medium", "low"] | None = None,
+    path: str | None = None,
     folder: str | None = None,
     file_ids: list[int] | None = None,
+    release_limit: int | None = None,
     limit: int | None = None,
-    row_limit: int | None = None,
     group: bool = False,  # noqa: FBT001, FBT002 - MCP tool surface, not a Python API
 ) -> dict[str, object]:
     """Find files whose tags contradict the MusicBrainz release their album id names.
@@ -631,50 +632,62 @@ def detect_disagreements(  # noqa: PLR0913 - one parameter per scope/view knob, 
     track: a guest track carries its own. No ``discnumber`` is proposed for a single-medium
     release, since Picard routinely omits it there.
 
-    **A blank field is a fill, not a disagreement.** ``flagged`` counts only fields where the
-    file says one thing and the release says another. Fields the file simply lacks are
-    collected under ``fill_rows``/``fills``, outside ``flagged`` and outside the tier counts.
+    **A blank field is a fill, not a disagreement.** ``flagged`` counts the files with at least
+    one field where the file says one thing and the release says another, and
+    ``flagged_fields`` counts those fields. Fields the file simply lacks are collected under
+    ``fill_rows``/``fills``, outside ``flagged`` and outside the tier counts.
 
     Tiers: ``high`` when the file's release-track id is not on the release at all (a broken
     identity), ``medium`` for a field that decides how a library groups, names or orders the
-    file, ``low`` for release provenance.
+    file, ``low`` for release provenance. Each file counts once, in the tier of its most
+    severe row, so the tier counts sum to ``flagged``. The ``tier`` filter selects rows by
+    each row's own tier.
 
     Each distinct release is fetched once and cached, paced at MusicBrainz's requested one
-    request per second. ``limit`` caps the releases fetched this call (default 200, about
-    three minutes) and the rest are reported under ``releases_remaining``/``more``. Reads the
-    snapshot, so run ``scan_library`` first. Writes no tags and stages nothing.
+    request per second. ``release_limit`` caps the releases fetched this call (default 200,
+    about three minutes) and the rest are reported under ``releases_remaining``/``more``.
+    ``path`` and ``file_ids`` scope the run: the counts describe the run, and no release outside
+    it is fetched. ``folder`` narrows the view of a scoped run and wins over ``group``, so a bare
+    ``folder`` with neither ``path`` nor ``file_ids`` is refused rather than starting a
+    library-wide fetch. Reads the snapshot, so run ``scan_library`` first. Writes no tags and
+    stages nothing.
 
-    Recommended workflow: ``group=true`` for one line per folder, then expand one folder with
-    ``folder="<exact folder path>"``, then fix with ``stage_tags_batch`` -> ``diff_tags`` ->
-    ``commit_tags(path=<folder>)`` -> ``reopen_axes``.
+    Recommended workflow: ``group=true`` for one line per folder, then ``path="<folder>"`` to
+    expand one folder (nested disc folders included), then fix with ``stage_tags_batch`` ->
+    ``diff_tags`` -> ``commit_tags(path=<folder>)`` -> ``reopen_axes``.
 
     Args:
         tier: Keep only rows in this tier (``high`` | ``medium`` | ``low``).
-        folder: Limit to exactly this folder, never a subfolder. Compared as a path: case and
-            ``/`` versus backslash do not matter on Windows, and a relative folder resolves
+        path: Scope the run to this folder and every folder under it. Compared as a path: case
+            and ``/`` versus backslash do not matter on Windows, and a relative path resolves
             under ``music_path``.
-        file_ids: Limit to these specific file ids.
-        limit: Max distinct releases to FETCH this call. ``folder`` and ``file_ids`` scope
-            the run, so the counts then describe only that scope and no release outside it is
-            fetched. ``tier`` narrows the view alone.
-        row_limit: Cap the rows returned without changing any count.
+        folder: Narrow a scoped run's view to exactly this folder, never a subfolder. Takes
+            precedence over ``group``. Needs ``path`` or ``file_ids``. Compared as a path like
+            ``path``.
+        file_ids: Scope the run to these specific file ids.
+        release_limit: Max distinct releases to FETCH this call.
+        limit: Cap the rows returned (or groups, with ``group=true``) without changing any
+            count.
         group: Return one compact line per folder instead of flat rows.
 
     Returns:
-        ``{"ok": True, rows, fill_rows, total_files, flagged, high, medium, low, fills,
-        releases_attempted, releases_checked, releases_remaining, more, skipped_no_release_id,
-        unknown_releases, unmatched_tracks, errors, error_releases, groups, summary}`` — each
-        row is ``{file_id, folder, filename, release_id, release_title, field, have, want,
-        tier, reason}``, and each group's ``flagged`` counts ROWS like the headline does with
-        ``flagged_files`` beside it — or ``{"ok": False, "error": ...}``.
+        ``{"ok": True, rows, fill_rows, total_files, flagged, flagged_fields, high, medium, low,
+        fills, releases_attempted, releases_checked, releases_remaining, more,
+        skipped_no_release_id, unknown_releases, unmatched_tracks, errors, error_releases,
+        groups, summary}``. Each row is ``{file_id, folder, filename, release_id, release_title,
+        field, have, want, tier, reason}``. Each group is ``{folder, file_count, flagged,
+        folder_context, tiers, file_ids, flagged_fields, fills, fields, releases}``, where
+        ``file_ids`` names the flagged files only and ``releases`` lists ``{release_id,
+        release_title, file_count}``. On failure, ``{"ok": False, "error": ...}``.
     """
     report = disagreements.detect_disagreements(
         load_settings(),
         tier=tier,
+        path=Path(path) if path is not None else None,
         folder=folder,
         file_ids=file_ids,
+        release_limit=release_limit,
         limit=limit,
-        row_limit=row_limit,
         group=group,
     )
     return {"ok": True, **report.to_dict()}
@@ -698,25 +711,27 @@ def detect_album_conflicts(
     first.
 
     A file's album identity is ``musicbrainz_albumid`` when it carries one, and otherwise the
-    display album artist, the album title and the year. The display album artist is
-    ``albumartist``, falling back to ``Various Artists`` when the ``compilation`` flag is set,
-    then to ``artist``, then to an unknown-artist placeholder. Casing, typographic character
-    choice and whitespace runs are cosmetic and never split a folder. Punctuation is NOT
+    display album artist, the album title and the release date (``date``, else a raw Vorbis
+    ``year``). The display album artist is ``albumartist``, falling back to ``Various
+    Artists`` when the ``compilation`` flag is set, then to ``artist``, then to an
+    unknown-artist placeholder. Casing, typographic character choice and whitespace runs are
+    cosmetic and never split a folder. Punctuation is NOT
     cosmetic: ``The Crow: City of Angels`` and ``The Crow- City Of Angels`` are two albums
     downstream, which is exactly the kind of split this finds.
 
-    Only the MINORITY is flagged — the files whose identity differs from the one most of the
+    Only the MINORITY is flagged: the files whose identity differs from the one most of the
     folder shares. That is the fix direction, so the flagged ids go straight to
-    ``stage_tags_batch``. ``majority_identity`` on every row and group names what to normalize
-    toward.
+    ``stage_tags_batch``, and a group's ``file_ids`` names those flagged files only.
+    ``majority_identity`` on every row and group names what to normalize toward.
 
     Tiers:
 
-    * ``high`` — the file's ``musicbrainz_albumid`` differs from its folder's, or it has none
+    * ``high``: the file's ``musicbrainz_albumid`` differs from its folder's, or it has none
       while its siblings do. An id is an explicit claim about which release this is, and a
       server keyed on it separates the two however identical the album strings look.
-    * ``medium`` — no ids involved, and the album artist, album title or year disagrees.
-    * ``low`` — the album titles differ only by a ``(disc N: …)`` suffix on one release title.
+    * ``medium``: no ids involved, and the album artist, album title or release date
+      disagrees.
+    * ``low``: the album titles differ only by a ``(disc N: …)`` suffix on one release title.
       That is deliberate Picard output for a titled multi-disc medium. It still shows as
       several albums, so you may still want to normalize it.
 
@@ -728,7 +743,7 @@ def detect_album_conflicts(
     A folder named ``Singles``/``Remixes``/``Featured``/etc. holds several releases by design.
     Its rows are reported under ``folder_context`` instead, outside ``flagged`` and outside the
     tier counts, so ``flagged`` keeps meaning "files that are wrong". Every filter applies to
-    those rows too, and ``groups`` are returned only with ``group=true``.
+    those rows too, and ``groups`` are returned only with ``group=true`` and no ``folder``.
 
     Recommended workflow: start with ``group=true`` for one line per folder, then expand a
     single folder with ``folder="<exact folder path>"``, then fix with ``stage_tags_batch`` ->
@@ -737,19 +752,20 @@ def detect_album_conflicts(
 
     Args:
         tier: Keep only rows in this tier (``high`` | ``medium`` | ``low``).
-        limit: Cap the rows returned.
+        limit: Cap the rows returned, or the groups with ``group=true``.
         group: Return one compact line per folder instead of flat rows.
-        folder: Expand exactly this folder's rows, never a subfolder. Compared as a path:
-            case and ``/`` versus backslash do not matter on Windows, and a relative folder
-            resolves under ``music_path``.
+        folder: Expand exactly this folder's rows, never a subfolder. Takes precedence over
+            ``group``. Compared as a path: case and ``/`` versus backslash do not matter on
+            Windows, and a relative folder resolves under ``music_path``.
 
     Returns:
         ``{"ok": True, rows, total_files, flagged, high, medium, low, folder_context,
-        folder_context_rows, groups, summary}`` — each row is ``{file_id, folder, filename,
-        album, albumartist, release_id, year, identity, majority_identity, tier, reason}``, and
-        each group is ``{folder, file_count, flagged, folder_context, identities,
-        majority_identity, majority_files, tiers, file_ids}`` — or
-        ``{"ok": False, "error": ...}``.
+        folder_context_rows, groups, summary}``. Each row is ``{file_id, folder, filename,
+        album, albumartist, release_id, date, identity, majority_identity, tier, reason}``.
+        Each group is ``{folder, file_count, flagged, folder_context, tiers, file_ids,
+        identities, majority_identity, majority_files}``, sorted by folder, where
+        ``file_count`` counts every present file in the folder and ``file_ids`` names the
+        flagged files only. On failure, ``{"ok": False, "error": ...}``.
     """
     report = album_conflicts.detect_album_conflicts(
         load_settings(),
@@ -773,52 +789,61 @@ def detect_album_gaps(
     The blank-``album`` companion to ``detect_mismatches``: 92-ish files carry no ``album`` at
     all, so ``resolve_years`` skips them and nothing else can even list them. This groups every
     file whose ``album`` is blank (across ALL tag ordinals) by its folder and, per folder,
-    proposes a fill from one of three grounded tiers — or leaves it blank when there is no
-    defensible ground. Writes nothing to tags/status/staging; only the recording tier touches
+    proposes a fill from one of three grounded sources, or leaves it blank when there is no
+    defensible ground. Writes nothing to tags/status/staging. Only the recording source touches
     the ledger (its lookup cache). Run ``scan_library`` first.
 
     Binding guarantee: a proposal is emitted ONLY for a file whose ``album`` is blank on every
     ordinal, so acting on the report can never overwrite a real album value.
 
-    The three tiers:
+    The three sources:
 
-    * ``sibling`` — the blank files' folder mates share a single non-blank ``album`` value
+    * ``sibling``: the blank files' folder mates share a single non-blank ``album`` value
       (unanimous). Confidence is ``green`` (safe to bulk-stage) only when there are >=2
-      witnesses AND the value is neither a known genre nor a placeholder; otherwise ``confirm``
-      with a reason (``genre_like`` — a genre string in the album field, e.g. "Reggaeton";
-      ``placeholder`` — a folder label like "Unreleased"; ``n1_weak`` — a lone witness). Mixed
-      sibling values (no unanimity) yield NO proposal — the folder stays blank.
-    * ``folder_parse`` — a folder with NO sibling values at all whose leaf name parses as
+      witnesses AND the value is neither a known genre nor a placeholder. Otherwise it is
+      ``confirm`` with a reason: ``genre_like`` (a genre string in the album field, e.g.
+      "Reggaeton"), ``placeholder`` (a folder label like "Unreleased") or ``n1_weak`` (a lone
+      witness). Mixed sibling values (no unanimity) yield NO proposal, so the folder stays
+      blank.
+    * ``folder_parse``: a folder with NO sibling values at all whose leaf name parses as
       ``Artist - Year - Album`` / ``Artist - Album``. Proposed (always ``confirm``) only when
       the folder's own filenames self-corroborate the parsed album above a fixed threshold, so a
       junk folder like "Maphra - YouTube" (0 filenames corroborate) stays blank.
-    * ``mb_recording`` — a folder tiers 1-2 leave blank, per blank file carrying a non-blank
-      artist AND title. A cached, paced MusicBrainz ``(artist, title)`` recording search maps to
-      the recording's release-group title. ALWAYS ``confidence: "review"`` (never green) with
-      ``reason: "mb_recording"`` — a human must confirm every one. ``use_musicbrainz=False``
-      skips this tier for a network-free, local-only run; the client is built lazily only when
-      such candidates exist, and results are cached so re-runs are network-free.
+    * ``mb_recording``: a folder the first two sources leave blank, per blank file carrying a
+      non-blank artist AND title. A cached, paced MusicBrainz ``(artist, title)`` recording
+      search maps to the recording's release-group title. ALWAYS ``confidence: "review"``
+      (never green) with ``reason: "mb_recording"``, so a human must confirm every one.
+      ``use_musicbrainz=False`` skips this source for a network-free, local-only run. The
+      client is built lazily only when such candidates exist, and results are cached so re-runs
+      are network-free.
+
+    A transient MusicBrainz error is counted in ``errors`` and itemized in ``error_items``
+    (``{key, message}``), never folded into ``stays_blank``. A folder whose recording lookups
+    all failed has source ``lookup_error``. Re-run to retry it.
 
     Recommended fix flow (the human is the diff-gate for every value): start here, expand one
-    folder with ``folder="<exact folder path>"``, then per tier feed the proposals'
-    ``{file_id, proposed}`` + ``note`` to ``stage_tags_batch`` (one call per tier keeps the
+    folder with ``folder="<exact folder path>"``, then per source feed the proposals'
+    ``{file_id, proposed}`` + ``note`` to ``stage_tags_batch`` (one call per source keeps the
     ``note`` accurate) → review ``diff_tags(path=<folder>)`` → ``commit_tags(path=<folder>)`` →
     ``reopen_axes(commit_id)`` to re-open the filled files' derived genre/year axes.
 
     Args:
-        limit: Cap the number of folder groups returned; the ``green``/``confirm``/``review``/
-            ``stays_blank`` counts still describe the whole library.
+        limit: Cap the number of folder groups returned. The ``total_files``/``green``/
+            ``confirm``/``review``/``stays_blank``/``errors`` counts still describe the whole
+            library.
         folder: Return only the group for exactly this folder, never a subfolder. Compared as
             a path: case and ``/`` versus backslash do not matter on Windows, and a relative
             folder resolves under ``music_path``.
-        use_musicbrainz: When False, skip the ``mb_recording`` review tier entirely (tiers 1-2
-            only, no network). Default True.
+        use_musicbrainz: When False, skip the ``mb_recording`` review source entirely (the
+            sibling and folder-parse sources only, no network). Default True.
 
     Returns:
-        ``{"ok": True, groups, total_blank, green, confirm, review, stays_blank, summary}`` —
-        each group is ``{folder, blank_count, total_files, sibling_histogram, tier, proposals}``
-        and each proposal is ``{file_id, filename, proposed, confidence, reason, note}`` — or
-        ``{"ok": False, "error": ...}`` (e.g. a corrupt genre vocabulary).
+        ``{"ok": True, groups, total_files, total_blank, green, confirm, review, stays_blank,
+        errors, error_items, summary}``, where ``green + confirm + review + stays_blank +
+        errors == total_blank``. Each group is ``{folder, blank_count, file_count, file_ids,
+        sibling_histogram, source, proposals, errors}``, where ``file_ids`` names the folder's
+        blank-album files. Each proposal is ``{file_id, filename, proposed, confidence, reason,
+        note}``. On failure, ``{"ok": False, "error": ...}`` (e.g. a corrupt genre vocabulary).
     """
     report = album_gaps.detect_album_gaps(
         load_settings(),
@@ -1323,7 +1348,8 @@ def resolve_years(
     artist (``skipped_no_artist``), ``manual`` exclusions (``skipped_manual``), and files the
     last scan flagged missing (``skipped_missing``). A group
     MusicBrainz has no usable Album release group for is recorded ``no_match`` (re-opened if
-    the artist or album changes). A transient MusicBrainz error leaves that group pending.
+    the artist or album changes). A transient MusicBrainz error leaves that group pending and
+    is counted in ``errors`` and itemized in ``error_items`` (``{key, message}``).
 
     Args:
         album: Limit to files whose ``album`` tag equals this value.
@@ -1336,7 +1362,8 @@ def resolve_years(
     Returns:
         ``{"ok": True, processed, staged_files, no_match, skipped_present, skipped_no_album,
         skipped_no_artist, skipped_manual, skipped_missing, pending_remaining, more, mappings,
-        summary}``, or ``{"ok": False, "error": ...}`` (e.g. pending changes).
+        errors, error_items, summary}``, or ``{"ok": False, "error": ...}`` (e.g. pending
+        changes).
     """
     result = years.resolve_years(
         load_settings(),

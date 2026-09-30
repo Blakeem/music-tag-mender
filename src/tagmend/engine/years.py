@@ -13,9 +13,9 @@ Design notes (the spec):
 * **Additive blank-fill only:** ``date`` (the reissue year) is never written; a file that
   already carries ``originaldate`` is skipped (``skipped_present``). On a correctly-tagged
   library this is a no-op.
-* **No accidental deletion (P0):** the staged target is built from the file's own managed
-  subset with only ``originaldate`` set, so the commit's delete-on-absent write can never
-  drop ``artist``/``genre``/etc.
+* **No accidental deletion (P0):** the resolver stages only ``originaldate``, the one field
+  it decides, and :func:`tagmend.engine.staging._stage_one` merges it onto the tags read from
+  disk, so the commit's delete-on-absent write can never drop ``artist``/``genre``/etc.
 * **``no_match`` stores the RESOLVED identity** (``albumartist``-else-``artist`` + ``album``)
   — exactly as :func:`tagmend.engine.genres._process_one_group` — so a later change to that
   resolved artist OR the album makes the decision stale and re-processable.
@@ -32,8 +32,9 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
-from tagmend.engine import axis, db, genres, schema, staging, store, versioning
+from tagmend.engine import axis, db, genres, schema, staging, store
 from tagmend.engine.musicbrainz import MusicBrainzClient, MusicBrainzError
+from tagmend.engine.validation import check_limit
 from tagmend.log import get_logger
 
 if TYPE_CHECKING:
@@ -72,6 +73,7 @@ class ResolveYearsResult:
     skipped_no_album: int
     skipped_no_artist: int
     skipped_manual: int
+    skipped_missing: int
     pending_remaining: int
     more: bool
     mappings: list[dict[str, str | None]]
@@ -87,6 +89,7 @@ class ResolveYearsResult:
             "skipped_no_album": self.skipped_no_album,
             "skipped_no_artist": self.skipped_no_artist,
             "skipped_manual": self.skipped_manual,
+            "skipped_missing": self.skipped_missing,
             "pending_remaining": self.pending_remaining,
             "more": self.more,
             "mappings": [dict(m) for m in self.mappings],
@@ -104,6 +107,7 @@ class _Tally:
     skipped_no_album: int = 0
     skipped_no_artist: int = 0
     skipped_manual: int = 0
+    skipped_missing: int = 0
     # identity -> original_date (one mapping per resolved album group).
     mappings: dict[tuple[str | None, str | None], str] = field(default_factory=dict)
 
@@ -139,12 +143,15 @@ def resolve_years(  # noqa: PLR0913 - cohesive keyword-only scope + injection pa
     group pending (no status row) without aborting the call.
 
     *limit* caps the number of groups processed per call; the remainder is reported via
-    ``pending_remaining`` / ``more``. *dry_run* returns the proposed mappings + would-stage
-    count, stages nothing, and works from cache (no precondition). A non-dry-run raises
-    :class:`ValueError` if anything is already staged. *client* lets callers inject an
+    ``pending_remaining`` / ``more``. A file the last scan flagged missing is counted under
+    ``skipped_missing``. *dry_run* returns the proposed mappings + would-stage count, stages
+    nothing, and works from cache (no precondition). A non-dry-run raises
+    :class:`ValueError` if anything is already staged, and any run raises it for a negative
+    *limit*. *client* lets callers inject an
     :class:`tagmend.engine.musicbrainz.MBAlbumSource` (a fake in tests); when ``None`` a real
     :class:`MusicBrainzClient` is built. Owns its connection; ``stage_tags`` opens its own.
     """
+    check_limit(limit)
     effective_limit = limit if limit is not None else settings.album_stage_limit
 
     connection = db.connect(settings.db_path)
@@ -155,9 +162,12 @@ def resolve_years(  # noqa: PLR0913 - cohesive keyword-only scope + injection pa
             message = "commit or unstage pending changes first"
             raise ValueError(message)
 
-        candidate_ids = _candidate_scope(connection, album=album, file_ids=file_ids)
+        scoped_ids = _candidate_scope(connection, album=album, file_ids=file_ids)
 
         tally = _Tally()
+        missing = store.missing_file_ids(connection)
+        candidate_ids = [fid for fid in scoped_ids if fid not in missing]
+        tally.skipped_missing = len(scoped_ids) - len(candidate_ids)
         processable = _select(connection, candidate_ids, tally)
         groups = _group_by_identity(processable)
 
@@ -344,7 +354,7 @@ def _process_one_group(  # noqa: PLR0913 - cohesive per-group inputs
         tally.mappings[(identity.artist, identity.album)] = resolved.original_date
         for fid in file_ids:
             if not dry_run:
-                _stage_resolved(settings, conn, fid, resolved.original_date)
+                _stage_resolved(settings, fid, resolved.original_date)
             tally.staged_files += 1
         return
 
@@ -366,23 +376,17 @@ def _process_one_group(  # noqa: PLR0913 - cohesive per-group inputs
     conn.commit()
 
 
-def _stage_resolved(
-    settings: Settings,
-    conn: sqlite3.Connection,
-    file_id: int,
-    original_date: str,
-) -> None:
-    """Stage *original_date* for *file_id*, setting ONLY ``originaldate`` (P0 — no deletion).
+def _stage_resolved(settings: Settings, file_id: int, original_date: str) -> None:
+    """Stage *original_date* for *file_id*, passing ONLY ``originaldate`` (P0, no deletion).
 
-    The target starts from the file's own managed subset so every other managed tag is
-    preserved through the commit's delete-on-absent write. ``stage_tags`` owns its conn.
+    :func:`tagmend.engine.staging._stage_one` merges it onto the tags read from disk, so
+    every other managed tag keeps its on-disk value through the commit's delete-on-absent
+    write. ``stage_tags`` owns its conn.
     """
-    target = dict(versioning.managed_subset(store.get_tags(conn, file_id)))
-    target[_YEAR_FIELD] = [original_date]
     staging.stage_tags(
         settings,
         file_id=file_id,
-        managed_tags=target,
+        managed_tags={_YEAR_FIELD: [original_date]},
         origin="auto",
         note=f"musicbrainz: {original_date}",
     )
@@ -418,6 +422,7 @@ def _build_result(
         skipped_no_album=tally.skipped_no_album,
         skipped_no_artist=tally.skipped_no_artist,
         skipped_manual=tally.skipped_manual,
+        skipped_missing=tally.skipped_missing,
         pending_remaining=pending_remaining,
         more=more,
         mappings=mappings,
@@ -444,7 +449,8 @@ def _summarize(
         f"Skipped {tally.skipped_present} file(s) present, "
         f"{tally.skipped_no_album} file(s) no_album, "
         f"{tally.skipped_no_artist} file(s) no_artist, "
-        f"{tally.skipped_manual} file(s) manual.",
+        f"{tally.skipped_manual} file(s) manual, "
+        f"{tally.skipped_missing} file(s) missing.",
     ]
     if pending_remaining > 0 and dry_run:
         parts.append(
@@ -591,8 +597,10 @@ def list_albums(
     *year_status* (when given) keeps only groups whose derived status matches. *actionable*
     keeps only the actionable groups, those with ``blank_originaldate > 0``. The two
     compose, and both are applied AFTER ordering and BEFORE *limit*. *limit* (when given)
-    caps the number of rows returned so a large library stays context-cheap.
+    caps the number of rows returned so a large library stays context-cheap. Raises
+    :class:`ValueError` for a negative *limit*.
     """
+    check_limit(limit)
     connection = db.connect(settings.db_path)
     try:
         schema.apply_schema(connection)

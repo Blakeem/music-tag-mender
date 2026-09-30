@@ -116,6 +116,11 @@ class TagDomain:
 
     name: str = "tags"
 
+    @property
+    def per_file_errors(self) -> tuple[type[Exception], ...]:
+        """A locked, read-only or unreadable file fails alone, as it does in ``revert_commit``."""
+        return (OSError, ValueError, mutagen.MutagenError)  # type: ignore[attr-defined]
+
     def list_staged_file_ids(self, conn: sqlite3.Connection) -> list[int]:
         """Return every staged file id, in file_id order."""
         return [s.file_id for s in store.list_staged_tags(conn)]
@@ -135,6 +140,23 @@ class TagDomain:
             return None
         return Path(file_row.folder) / file_row.filename
 
+    def changed_since_stage(self, conn: sqlite3.Connection, file_id: int, path: Path) -> bool:
+        """Whether *path* moved since staging AND no longer holds the staged target.
+
+        A row staged before the signature existed (a NULL base) skips the check. A moved
+        signature whose managed tags already equal the target is a crash after the disk write
+        and before the DB commit, which the next commit must still complete.
+        """
+        staged = _require_staged(conn, file_id)
+        if staged.base_size_bytes is None or staged.base_mtime_ns is None:
+            return False
+        stat_result = path.stat()
+        base = (staged.base_size_bytes, staged.base_mtime_ns)
+        if (stat_result.st_size, stat_result.st_mtime_ns) == base:
+            return False
+        current = versioning.managed_subset(read_tags(path).tags)
+        return bool(versioning.compute_diff(current, staged.managed_tags))
+
     def apply_to_disk(
         self,
         conn: sqlite3.Connection,
@@ -149,25 +171,20 @@ class TagDomain:
         The disk write happens *before* any DB append, so a write failure aborts this
         file's transaction with the staged row intact for a later retry. The revision
         append and the staged-row delete are left in the open transaction (``run_commit``
-        commits them together) — the invariant that prevents double-applying.
+        commits them together), the invariant that prevents double-applying. A target the
+        file already holds is not written, so a no-op commit never rewrites the file.
         """
-        staged = store.get_staged_tag(conn, file_id)
-        if staged is None:  # pragma: no cover - defensive; file_id came from the staged list
-            message = f"staged row vanished for file_id={file_id}"
-            raise RuntimeError(message)
+        staged = _require_staged(conn, file_id)
 
-        # Baseline (version 0) is captured at stage time; this is a defensive no-op. It reads
-        # disk for the same reason stage time does — a baseline is what a revert restores, so
+        # Baseline (version 0) is captured at stage time, so this is a defensive no-op. It reads
+        # disk for the same reason stage time does: a baseline is what a revert restores, so
         # it can never come from the snapshot mirror, which may lag the file.
-        versioning.ensure_baseline(
-            conn,
-            file_id,
-            managed_tags=read_tags(path).tags,
-            now=now,
-        )
+        current = read_tags(path).tags
+        versioning.ensure_baseline(conn, file_id, managed_tags=current, now=now)
 
         # Disk first, before any DB append.
-        write_managed_tags(path, staged.managed_tags)
+        if versioning.compute_diff(versioning.managed_subset(current), staged.managed_tags):
+            write_managed_tags(path, staged.managed_tags)
 
         # Refresh the live snapshot, append the revision, delete the staged row.
         fresh = read_tags(path).tags
@@ -204,6 +221,15 @@ class TagDomain:
         """Tags have no per-file filesystem follow-up."""
 
 
+def _require_staged(conn: sqlite3.Connection, file_id: int) -> store.StagedTag:
+    """Return the staged row the commit loop is working on, which must exist."""
+    staged = store.get_staged_tag(conn, file_id)
+    if staged is None:  # pragma: no cover - defensive, file_id came from the staged list
+        message = f"staged row vanished for file_id={file_id}"
+        raise RuntimeError(message)
+    return staged
+
+
 def _stage_one(  # noqa: PLR0913 - cohesive keyword-only per-file staging payload
     conn: sqlite3.Connection,
     *,
@@ -218,7 +244,8 @@ def _stage_one(  # noqa: PLR0913 - cohesive keyword-only per-file staging payloa
     The shared per-file core of :func:`stage_tags` and :func:`stage_tags_batch`: rejects
     unmanaged keys, rejects an unknown or missing *file_id*, lazily captures the version-0
     baseline, merges *managed_tags* onto the file's current managed subset (P0 — omitted keys
-    are preserved), and upserts the staged row. Raises :class:`ValueError` naming *file_id* on
+    are preserved), and upserts the staged row with the file's signature as its base, so the
+    commit can refuse a file edited since. Raises :class:`ValueError` naming *file_id* on
     any invalid input; leaves the transaction for the caller to commit or roll back.
     """
     unmanaged = sorted(set(managed_tags) - MANAGED_TAGS)
@@ -241,6 +268,9 @@ def _stage_one(  # noqa: PLR0913 - cohesive keyword-only per-file staging payloa
     # never mentioned, unrecoverably.
     path = Path(file_row.folder) / file_row.filename
     try:
+        # Stat before the read: an edit landing between the two makes the base older than the
+        # tags, so the commit refuses the file rather than overwriting the edit.
+        base = path.stat()
         current = read_tags(path).tags
     except (mutagen.MutagenError, OSError) as exc:  # type: ignore[attr-defined]
         # Reject at the boundary rather than staging a target built from nothing: the file
@@ -265,6 +295,8 @@ def _stage_one(  # noqa: PLR0913 - cohesive keyword-only per-file staging payloa
         origin=origin,
         now=now,
         note=note,
+        base_size_bytes=base.st_size,
+        base_mtime_ns=base.st_mtime_ns,
     )
 
 
@@ -290,8 +322,8 @@ def stage_tags(
     staging ``{"genre": [...]}`` on a file rich in title/album/track/MB-id fields cannot
     wipe them at commit time (``commit_tags`` writes the staged target verbatim, and
     :func:`tagmend.engine.tags.write_managed_tags` deletes every managed key *absent* from
-    that target). An explicit empty list still deletes a field, and the resolve flows —
-    which already stage ``managed_subset(current) | {field}`` — are unaffected.
+    that target). An explicit empty list still deletes a field. Each resolver stages only
+    the fields it decides, and :func:`_stage_one` merges them onto the tags read from disk.
     """
     if origin not in _STAGED_ORIGINS:
         message = f"invalid staged origin: {origin!r} (expected auto|manual)"
@@ -533,9 +565,10 @@ def commit_tags(
     the resume-free model), then sweeps every still-staged row (optionally limited to
     *root*) under a fresh commit and applies them file by file via
     :func:`tagmend.engine.commits.run_commit`. A file gone from disk is flagged missing,
-    its staged row dropped, and reported in ``missing_files`` — the rest of the commit
-    still completes. ``commit_id`` is ``None`` when nothing was staged. Owns its
-    transaction.
+    its staged row dropped, and reported in ``missing_files``. A file edited on disk since it
+    was staged reports ``changed_since_stage``, and a file that fails to write reports
+    ``error`` with a ``detail``. Both keep their staged row, and the rest of the commit still
+    completes. ``commit_id`` is ``None`` when nothing was staged. Owns its transaction.
     """
     if origin not in _STAGED_ORIGINS:
         message_text = f"invalid commit origin: {origin!r} (expected auto|manual)"
@@ -577,11 +610,13 @@ def commit_tags(
 
     result = commits._summarize(commit_id=commit_id, applied=applied)  # noqa: SLF001
     logger.info(
-        "commit %d: committed=%d noop=%d missing=%d",
+        "commit %d: committed=%d noop=%d missing=%d changed_since_stage=%d errors=%d",
         commit_id,
         result.committed,
         result.noop,
         result.missing,
+        result.changed_since_stage,
+        result.errors,
     )
     return result
 

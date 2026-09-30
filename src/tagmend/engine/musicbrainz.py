@@ -454,7 +454,7 @@ class MusicBrainzClient:
         if response.is_error:
             message = f"MusicBrainz HTTP {response.status_code} for release-group query"
             raise MusicBrainzError(message)
-        return cast("dict[str, object]", response.json())
+        return _decode_object(response, "release-group query")
 
     def _store_negative(self, request_key: str) -> None:
         """Negative-cache a no-match and commit immediately."""
@@ -519,7 +519,7 @@ class MusicBrainzClient:
         if response.is_error:
             message = f"MusicBrainz HTTP {response.status_code} for recording query"
             raise MusicBrainzError(message)
-        return cast("dict[str, object]", response.json())
+        return _decode_object(response, "recording query")
 
     def _store_negative_recording(self, request_key: str) -> None:
         """Negative-cache a recording no-match and commit immediately."""
@@ -578,7 +578,7 @@ class MusicBrainzClient:
         if response.is_error:
             message = f"MusicBrainz HTTP {response.status_code} for artist lookup"
             raise MusicBrainzError(message)
-        return cast("dict[str, object]", response.json())
+        return _decode_object(response, "artist lookup")
 
     def _store_negative_artist(self, request_key: str) -> None:
         """Negative-cache an MBID MusicBrainz does not know, and commit immediately."""
@@ -653,7 +653,7 @@ class MusicBrainzClient:
         if response.is_error:
             message = f"MusicBrainz HTTP {response.status_code} for release lookup"
             raise MusicBrainzError(message)
-        return cast("dict[str, object]", response.json())
+        return _decode_object(response, "release lookup")
 
     def _get_with_backoff(self, url: str, params: dict[str, str]) -> httpx.Response:
         """Pace, then GET *url*, retrying only while MusicBrainz answers with its throttle code.
@@ -707,6 +707,23 @@ class MusicBrainzClient:
 
 
 # --- module helpers ------------------------------------------------------------------
+
+
+def _decode_object(response: httpx.Response, what: str) -> dict[str, object]:
+    """Decode a 2xx body as a JSON object, or raise :class:`MusicBrainzError` naming *what*.
+
+    A proxy error page or a truncated response arrives as a 200 too, and must fail as one
+    retryable lookup rather than as an unrelated ``ValueError`` that aborts the run.
+    """
+    try:
+        body = response.json()
+    except ValueError as exc:
+        message = f"MusicBrainz returned a non-JSON body for {what}"
+        raise MusicBrainzError(message) from exc
+    if not isinstance(body, dict):
+        message = f"MusicBrainz returned a JSON {type(body).__name__}, not an object, for {what}"
+        raise MusicBrainzError(message)
+    return cast("dict[str, object]", body)
 
 
 def _request_key(artist: str, album: str) -> str:

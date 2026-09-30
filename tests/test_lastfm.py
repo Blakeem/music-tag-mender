@@ -24,7 +24,7 @@ from tagmend.engine.store import get_cached_tags
 
 if TYPE_CHECKING:
     import sqlite3
-    from collections.abc import Callable, Mapping
+    from collections.abc import Callable, Mapping, Sequence
 
 
 def _toptags(*tags: tuple[str, int]) -> dict[str, object]:
@@ -33,19 +33,23 @@ def _toptags(*tags: tuple[str, int]) -> dict[str, object]:
 
 
 def _handler(
-    responses: list[httpx.Response],
+    responses: Sequence[httpx.Response | Exception],
 ) -> tuple[Callable[[httpx.Request], httpx.Response], list[int]]:
     """Return a MockTransport handler serving *responses* in order, plus a call counter.
 
     The returned ``calls`` list grows by one entry per network request, so tests can
-    assert exactly how many times the transport was hit.
+    assert exactly how many times the transport was hit. An exception entry is raised,
+    which is how a transport failure reaches the client.
     """
     calls: list[int] = []
 
     def handle(_request: httpx.Request) -> httpx.Response:
         index = len(calls)
         calls.append(index)
-        return responses[index]
+        served = responses[index]
+        if isinstance(served, Exception):
+            raise served
+        return served
 
     return handle, calls
 
@@ -55,22 +59,30 @@ def _json_response(body: Mapping[str, object], status_code: int = 200) -> httpx.
     return httpx.Response(status_code, json=dict(body))
 
 
-def _client(
+def _client(  # noqa: PLR0913 - mirrors the client's keyword-only injection seams
     db_conn: sqlite3.Connection,
-    responses: list[httpx.Response],
+    responses: Sequence[httpx.Response | Exception],
     *,
     rate_per_sec: float = 0.0,
     monotonic: Callable[[], float] | None = None,
     sleep: Callable[[float], None] | None = None,
+    max_attempts: int | None = None,
 ) -> tuple[LastfmClient, list[int]]:
-    """Build a LastfmClient wired to a MockTransport serving *responses*; pacing off by default."""
+    """Build a LastfmClient wired to a MockTransport serving *responses*, pacing off by default.
+
+    Without an injected *sleep* a retry backoff sleeps through a no-op, never in real time.
+    """
     handle, calls = _handler(responses)
     transport = httpx.MockTransport(handle)
-    kwargs: dict[str, object] = {"rate_per_sec": rate_per_sec, "transport": transport}
+    kwargs: dict[str, object] = {
+        "rate_per_sec": rate_per_sec,
+        "transport": transport,
+        "sleep": sleep if sleep is not None else (lambda _seconds: None),
+    }
     if monotonic is not None:
         kwargs["monotonic"] = monotonic
-    if sleep is not None:
-        kwargs["sleep"] = sleep
+    if max_attempts is not None:
+        kwargs["max_attempts"] = max_attempts
     client = LastfmClient("key", db_conn, **kwargs)  # type: ignore[arg-type]
     return client, calls
 
@@ -224,7 +236,8 @@ def test_artist_correction_non_six_error_raises_and_does_not_cache(
 
 
 def test_artist_correction_http_500_raises_and_does_not_cache(db_conn: sqlite3.Connection) -> None:
-    client, _calls = _client(db_conn, [_json_response({}, status_code=500)])
+    # A 5xx is retried, so every attempt must fail for the lookup to raise.
+    client, _calls = _client(db_conn, [_json_response({}, status_code=500)] * 3)
     with client, pytest.raises(LastfmError):
         client.artist_correction("Anybody")
     key = _request_key("artist.getcorrection", {"artist": "Anybody"})
@@ -245,11 +258,117 @@ def test_non_six_error_raises_and_does_not_cache(db_conn: sqlite3.Connection) ->
 
 
 def test_http_500_raises_and_does_not_cache(db_conn: sqlite3.Connection) -> None:
-    client, _calls = _client(db_conn, [_json_response({}, status_code=500)])
+    # A 5xx is retried, so every attempt must fail for the lookup to raise.
+    client, calls = _client(db_conn, [_json_response({}, status_code=500)] * 3)
     with client, pytest.raises(LastfmError):
+        client.artist_top_tags("Anybody")
+    assert len(calls) == 3
+    key = _request_key("artist.gettoptags", {"artist": "Anybody"})
+    assert get_cached_tags(db_conn, key) is None
+
+
+def test_non_json_body_raises_lastfm_error_and_caches_nothing(db_conn: sqlite3.Connection) -> None:
+    client, calls = _client(db_conn, [httpx.Response(200, content=b"<html>")])
+    with client, pytest.raises(LastfmError, match="non-JSON"):
+        client.artist_top_tags("Anybody")
+    assert len(calls) == 1
+    key = _request_key("artist.gettoptags", {"artist": "Anybody"})
+    assert get_cached_tags(db_conn, key) is None
+
+
+def test_json_body_that_is_not_an_object_raises_lastfm_error(db_conn: sqlite3.Connection) -> None:
+    client, _calls = _client(db_conn, [httpx.Response(200, json=["not", "an", "object"])])
+    with client, pytest.raises(LastfmError, match="not an object"):
+        client.artist_correction("Anybody")
+
+
+def test_malformed_tag_entry_raises_lastfm_error(db_conn: sqlite3.Connection) -> None:
+    body = {"toptags": {"tag": [{"name": "rock"}]}}  # no ``count``
+    client, _calls = _client(db_conn, [_json_response(body)])
+    with client, pytest.raises(LastfmError, match="malformed tag entry"):
         client.artist_top_tags("Anybody")
     key = _request_key("artist.gettoptags", {"artist": "Anybody"})
     assert get_cached_tags(db_conn, key) is None
+
+
+# --- transient failures are retried with a doubling backoff ---------------------------
+
+
+def test_transport_error_is_retried_then_succeeds(db_conn: sqlite3.Connection) -> None:
+    sleeps: list[float] = []
+    client, calls = _client(
+        db_conn,
+        [
+            httpx.ConnectError("connection dropped"),
+            httpx.ConnectError("connection dropped"),
+            _json_response(_toptags(("rock", 100))),
+        ],
+        sleep=sleeps.append,
+    )
+    with client:
+        result = client.artist_top_tags("Anybody")
+    assert result == [Tag("rock", 100)]
+    assert len(calls) == 3
+    assert sleeps == [1.0, 2.0]
+
+
+def test_transport_error_exhausts_into_lastfm_error(db_conn: sqlite3.Connection) -> None:
+    client, calls = _client(
+        db_conn,
+        [httpx.ConnectError("connection dropped")] * 3,
+    )
+    with client, pytest.raises(LastfmError) as raised:
+        client.artist_top_tags("Anybody")
+    assert isinstance(raised.value.__cause__, httpx.ConnectError)
+    assert "api_key" not in str(raised.value)  # the request URL carries the key
+    assert len(calls) == 3
+    key = _request_key("artist.gettoptags", {"artist": "Anybody"})
+    assert get_cached_tags(db_conn, key) is None
+
+
+def test_error_29_is_retried(db_conn: sqlite3.Connection) -> None:
+    sleeps: list[float] = []
+    client, calls = _client(
+        db_conn,
+        [
+            _json_response({"error": 29, "message": "Rate limit exceeded"}),
+            _json_response(_toptags(("rock", 100))),
+        ],
+        sleep=sleeps.append,
+    )
+    with client:
+        result = client.artist_top_tags("Anybody")
+    assert result == [Tag("rock", 100)]
+    assert len(calls) == 2
+    assert sleeps == [1.0]
+
+
+def test_http_503_is_retried(db_conn: sqlite3.Connection) -> None:
+    sleeps: list[float] = []
+    client, calls = _client(
+        db_conn,
+        [_json_response({}, status_code=503), _json_response(_correction("Bjork Official"))],
+        sleep=sleeps.append,
+    )
+    with client:
+        result = client.artist_correction("Bjork")
+    assert result == ArtistCorrection(name="Bjork Official", mbid=None)
+    assert len(calls) == 2
+    assert sleeps == [1.0]
+
+
+def test_max_attempts_one_does_not_sleep(db_conn: sqlite3.Connection) -> None:
+    sleeps: list[float] = []
+    client, calls = _client(
+        db_conn,
+        [_json_response({}, status_code=503)],
+        sleep=sleeps.append,
+        max_attempts=1,
+    )
+    with client, pytest.raises(LastfmError, match="1 attempt"):
+        client.artist_top_tags("Anybody")
+    assert len(calls) == 1
+    assert sleeps == []
 
 
 # --- argument validation -------------------------------------------------------------

@@ -10,10 +10,10 @@ differs it cascade-stages the corrected name across every file carrying that val
 
 Design notes (the spec):
 
-* **No accidental deletion (P0):** the staged target is built from the file's own managed
-  subset (:func:`tagmend.engine.versioning.managed_subset`) with only ``artist`` /
-  ``albumartist`` / ``musicbrainz_artistid`` replaced, so the commit's delete-on-absent
-  write can never drop ``genre`` or any other managed tag.
+* **No accidental deletion (P0):** the resolver stages only the fields it decides (the
+  name fields plus each one's own id and sort field), and
+  :func:`tagmend.engine.staging._stage_one` merges them onto the tags read from disk, so the
+  commit's delete-on-absent write can never drop ``genre`` or any other managed tag.
 * **Per-file accumulation:** a file whose ``artist`` and ``albumartist`` both need
   correction is staged once with both fields set (not two passes clobbering each other).
 * **Guards (skip + report, never rewrite):** the ``feat``/``ft``/``featuring`` family,
@@ -41,9 +41,10 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Final
 
-from tagmend.engine import axis, db, schema, staging, store, versioning
+from tagmend.engine import axis, db, schema, staging, store
 from tagmend.engine.lastfm import LastfmClient, LastfmError
 from tagmend.engine.musicbrainz import MusicBrainzClient, MusicBrainzError
+from tagmend.engine.validation import check_limit
 from tagmend.log import get_logger
 
 if TYPE_CHECKING:
@@ -197,6 +198,7 @@ class ResolveArtistsResult:
     skipped_multi_artist: int
     skipped_sentinel: int
     skipped_manual: int
+    skipped_missing: int
     no_correction: int
     already_canonical: int
     shrinks_credit: int
@@ -225,6 +227,7 @@ class ResolveArtistsResult:
             "skipped_multi_artist": self.skipped_multi_artist,
             "skipped_sentinel": self.skipped_sentinel,
             "skipped_manual": self.skipped_manual,
+            "skipped_missing": self.skipped_missing,
             "no_correction": self.no_correction,
             "already_canonical": self.already_canonical,
             "shrinks_credit": self.shrinks_credit,
@@ -266,6 +269,7 @@ class _Tally:
     skipped_multi_artist: int = 0
     skipped_sentinel: int = 0
     skipped_manual: int = 0
+    skipped_missing: int = 0
     multi_artist_files: list[int] = field(default_factory=list)
     manual_files: list[int] = field(default_factory=list)
     no_correction_values: list[str] = field(default_factory=list)
@@ -305,8 +309,9 @@ def resolve_artists(  # noqa: PLR0913 - cohesive keyword-only scope + injection 
     reported via ``pending_remaining`` / ``more``. It is a cap, not a cursor: a value that
     needs no change leaves no trace, so an identical repeat call re-processes the same
     values. Raise *limit*, or narrow with *artist* / *file_ids*, to reach the rest. A
-    transient Last.fm error leaves that value pending (not cached) and is reported, never
-    aborting.
+    negative *limit* raises :class:`ValueError`. A file the last scan flagged missing is
+    counted under ``skipped_missing``. A transient Last.fm error leaves that value pending
+    (not cached) and is reported, never aborting.
 
     *dry_run* returns the proposed ``value → canonical`` mappings and the would-stage file
     count, stages nothing, and works from cache (no precondition). A non-dry-run raises
@@ -315,6 +320,7 @@ def resolve_artists(  # noqa: PLR0913 - cohesive keyword-only scope + injection 
     (a fake in tests); when ``None`` a real :class:`LastfmClient` is built and requires
     ``settings.lastfm_api_key``. Owns its connection; ``stage_tags`` opens its own.
     """
+    check_limit(limit)
     connection = db.connect(settings.db_path)
     try:
         schema.apply_schema(connection)
@@ -330,7 +336,10 @@ def resolve_artists(  # noqa: PLR0913 - cohesive keyword-only scope + injection 
         )
 
         tally = _Tally()
-        candidate_ids = _drop_manual_excluded(connection, scoped_ids, tally)
+        missing = store.missing_file_ids(connection)
+        present_ids = [fid for fid in scoped_ids if fid not in missing]
+        tally.skipped_missing = len(scoped_ids) - len(present_ids)
+        candidate_ids = _drop_manual_excluded(connection, present_ids, tally)
         values = _distinct_values(connection, candidate_ids, tally)
 
         to_process = values[: limit if limit is not None else len(values)]
@@ -696,14 +705,16 @@ def _build_target(
 ) -> _Target | None:
     """Build the staged target for one file, or ``None`` when nothing changes.
 
-    Starts from the file's managed subset (P0 — every other managed tag preserved), and for
-    each single-valued ``artist``/``albumartist`` whose value has a resolution, replaces it
-    with the canonical name (accumulating both fields). Each field's MBID and sort name ride
-    along on that field's OWN id and sort fields, name-change only: writing
-    ``musicbrainz_artistid`` for an ``albumartist`` correction would rebind the track artist to
-    the album artist, and writing ``artistsort`` there would misfile it in a browse list.
+    Holds only the fields this resolver decides. :func:`tagmend.engine.staging._stage_one`
+    merges them onto the tags read from disk, so every other managed tag keeps its on-disk
+    value (P0). *tags* is read only to find the current name values. For each single-valued
+    ``artist``/``albumartist`` whose value has a resolution, it sets the canonical name
+    (accumulating both fields). Each field's MBID and sort name ride along on that field's
+    OWN id and sort fields, name-change only: writing ``musicbrainz_artistid`` for an
+    ``albumartist`` correction would rebind the track artist to the album artist, and writing
+    ``artistsort`` there would misfile it in a browse list.
     """
-    target = dict(versioning.managed_subset(tags))
+    target: dict[str, list[str]] = {}
     note = ""
     changed = False
     for field_name in _NAME_FIELDS:
@@ -774,6 +785,7 @@ def _build_result(
         skipped_multi_artist=tally.skipped_multi_artist,
         skipped_sentinel=tally.skipped_sentinel,
         skipped_manual=tally.skipped_manual,
+        skipped_missing=tally.skipped_missing,
         no_correction=len(tally.no_correction_values),
         already_canonical=len(tally.already_canonical_values),
         shrinks_credit=len(tally.shrinks_credit_values),
@@ -812,7 +824,8 @@ def _summarize(
         f"staged {tally.staged_files} file(s).",
         f"Skipped multi-artist {tally.skipped_multi_artist}, "
         f"sentinel/feat/empty {tally.skipped_sentinel}, "
-        f"manual {tally.skipped_manual}; "
+        f"manual {tally.skipped_manual}, "
+        f"missing {tally.skipped_missing}; "
         f"{len(tally.already_canonical_values)} already canonical, "
         f"no correction {len(tally.no_correction_values)}.",
         f"Held (reported, never staged): credit shrink {len(tally.shrinks_credit_values)}, "

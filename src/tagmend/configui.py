@@ -192,7 +192,8 @@ def run_test_ping(
     conn = sqlite3.connect(":memory:")
     try:
         apply_schema(conn)
-        with LastfmClient(api_key, conn, transport=transport) as client:
+        # A key check answers on the first attempt. Retrying would stall the form on a down service.
+        with LastfmClient(api_key, conn, transport=transport, max_attempts=1) as client:
             client.artist_top_tags(name="The Beatles")
     except LastfmError as exc:
         return {"ok": False, "error": str(exc)}

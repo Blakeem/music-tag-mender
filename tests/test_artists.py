@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, NamedTuple
 
+import mutagen
 import pytest
 
 from conftest import make_track
@@ -1362,3 +1363,63 @@ def test_the_lastfm_tier_leaves_the_sort_name_alone(
     view = next(iter(staging.diff_tags(engine_settings)))
     assert view.diff["artist"]["to"] == ["The Offspring"]
     assert "artistsort" not in view.diff
+
+
+def _edit_title_on_disk(path: Path, title: str) -> None:
+    """Change ``title`` the way an external tagger would, with no rescan afterwards."""
+    audio = mutagen.File(path, easy=True)  # type: ignore[attr-defined]
+    audio["title"] = [title]
+    audio.save()
+
+
+def _committed_diff_fields(settings: Settings, commit_id: int | None) -> list[set[str]]:
+    assert commit_id is not None
+    conn = connect(settings.db_path)
+    try:
+        apply_schema(conn)
+        return [set(revision.diff) for revision in store.revisions_for_commit(conn, commit_id)]
+    finally:
+        conn.close()
+
+
+def test_resolve_artists_keeps_disk_values_the_mirror_lacks(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    track = make_track(
+        music_dir / "a.mp3",
+        {"artist": ["Miami Nights '84"], "album": ["Turbulence"], "title": ["Old Title"]},
+    )
+    scan_library(engine_settings)
+    _edit_title_on_disk(track, "Title Edited In Picard")
+
+    fake = FakeCorrectionSource({"Miami Nights '84": ArtistCorrection("Miami Nights 1984", "m1")})
+    artists.resolve_artists(engine_settings, client=fake)
+    result = staging.commit_tags(engine_settings)
+
+    on_disk = read_tags(track).tags
+    assert on_disk["title"] == ["Title Edited In Picard"]
+    assert on_disk["artist"] == ["Miami Nights 1984"]
+    assert _committed_diff_fields(engine_settings, result.commit_id) == [
+        {"artist", "musicbrainz_artistid"},
+    ]
+
+
+def test_resolve_artists_skips_missing_files(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    kept = make_track(music_dir / "kept.mp3", {"artist": ["Miami Nights '84"]})
+    gone = make_track(music_dir / "gone.mp3", {"artist": ["Miami Nights '84"]})
+    scan_library(engine_settings)
+    gone.unlink()
+    scan_library(engine_settings)  # flags the deleted file missing
+
+    fake = FakeCorrectionSource({"Miami Nights '84": ArtistCorrection("Miami Nights 1984", "m1")})
+    result = artists.resolve_artists(engine_settings, client=fake)
+
+    assert result.skipped_missing == 1
+    assert result.to_dict()["skipped_missing"] == 1
+    assert "missing 1" in result.summary
+    assert result.staged_files == 1
+    assert [view.filename for view in staging.diff_tags(engine_settings)] == [kept.name]

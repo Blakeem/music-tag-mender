@@ -11,10 +11,13 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import mutagen
 import pytest
 from mutagen.flac import FLAC
 
 from conftest import make_track
+from tagmend import mcp_server
+from tagmend.config import load_settings
 from tagmend.engine import artists, commits, staging, store, versioning
 from tagmend.engine.db import connect
 from tagmend.engine.library import ScanMode, scan_library
@@ -147,6 +150,8 @@ def test_commit_noop_when_target_equals_current(
     file_id = _file_id(engine_settings, music_dir, track.name)
 
     staging.stage_tags(engine_settings, file_id=file_id, managed_tags={"genre": ["Electronic"]})
+    before_bytes = track.read_bytes()
+    before_mtime = track.stat().st_mtime_ns
     result = staging.commit_tags(engine_settings)
 
     assert result.noop == 1
@@ -154,6 +159,9 @@ def test_commit_noop_when_target_equals_current(
     # Only the baseline is recorded — an unchanged commit adds no new revision.
     assert [r.version for r in _revisions(engine_settings, file_id)] == [0]
     assert _staged(engine_settings, file_id) is None
+    # Nothing changed, so the file is never rewritten.
+    assert track.read_bytes() == before_bytes
+    assert track.stat().st_mtime_ns == before_mtime
 
 
 def test_commit_missing_file_is_flagged_and_dropped(
@@ -279,6 +287,167 @@ def test_baseline_captured_at_stage_survives_rescan(
     baseline = _revision(engine_settings, file_id, 0)
     assert baseline is not None
     assert baseline.managed_tags == {"genre": ["Electronic"]}  # original preserved
+
+
+def test_commit_continues_past_an_unwritable_file(
+    engine_settings: Settings,
+    music_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tracks = [make_track(music_dir / f"t{index}.mp3", {"genre": ["Rock"]}) for index in range(3)]
+    scan_library(engine_settings)
+    file_ids = [_file_id(engine_settings, music_dir, track.name) for track in tracks]
+    for file_id in file_ids:
+        staging.stage_tags(engine_settings, file_id=file_id, managed_tags={"genre": ["Jazz"]})
+    locked = tracks[1]
+    real_write = write_managed_tags
+
+    def write_unless_locked(path: Path, managed: dict[str, list[str]]) -> bool:
+        if path.name == locked.name:
+            message = f"file in use by another process: {path}"
+            raise OSError(message)
+        return real_write(path, managed)
+
+    monkeypatch.setattr(staging, "write_managed_tags", write_unless_locked)
+    result = staging.commit_tags(engine_settings)
+
+    assert result.committed == 2
+    assert result.errors == 1
+    failed = next(o for o in result.outcomes if o.file_id == file_ids[1])
+    assert failed.status == "error"
+    assert failed.version is None
+    assert failed.detail is not None
+    assert "file in use by another process" in failed.detail
+    assert _staged(engine_settings, file_ids[1]) is not None  # kept for a retry
+    assert result.commit_id is not None
+    assert _commit_status(engine_settings, result.commit_id) == "applied"
+    assert read_tags(locked).tags["genre"] == ["Rock"]
+    assert result.to_dict()["errors"] == 1
+
+    monkeypatch.setattr(staging, "write_managed_tags", real_write)
+    retry = staging.commit_tags(engine_settings)
+
+    assert retry.committed == 1
+    assert retry.commit_id is not None
+    assert retry.commit_id != result.commit_id
+    assert _revisions(engine_settings, file_ids[1])[-1].commit_id == retry.commit_id
+    assert read_tags(locked).tags["genre"] == ["Jazz"]
+
+
+def test_commit_error_envelope_via_mcp(music_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    track = make_track(music_dir / "locked.mp3", {"genre": ["Rock"]})
+    mcp_server.scan_library(path=str(music_dir))
+    file_id = _file_id(load_settings(), music_dir, track.name)
+    assert mcp_server.stage_tags(file_id, {"genre": ["Jazz"]}) == {"ok": True}
+
+    def always_locked(path: Path, managed: dict[str, list[str]]) -> bool:
+        message = f"file in use by another process: {path} ({len(managed)} tags)"
+        raise OSError(message)
+
+    monkeypatch.setattr(staging, "write_managed_tags", always_locked)
+    payload = mcp_server.commit_tags()
+
+    assert payload["ok"] is True
+    assert payload["errors"] == 1
+    assert payload["committed"] == 0
+    outcomes = payload["outcomes"]
+    assert isinstance(outcomes, list)
+    assert outcomes[0]["status"] == "error"
+    assert "file in use" in outcomes[0]["detail"]
+
+
+def _edit_on_disk(path: Path, field: str, value: str) -> None:
+    """Change one tag the way an external tagger would, with no rescan afterwards."""
+    audio = mutagen.File(path, easy=True)  # type: ignore[attr-defined]
+    audio[field] = [value]
+    audio.save()
+
+
+def test_commit_refuses_a_file_edited_after_staging(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    track = make_track(music_dir / "t.mp3", {"genre": ["Rock"], "title": ["Song"]})
+    scan_library(engine_settings)
+    file_id = _file_id(engine_settings, music_dir, track.name)
+    staging.stage_tags(engine_settings, file_id=file_id, managed_tags={"genre": ["Jazz"]})
+    edited_title = "Song (Picard Edit With A Much Longer Title)"
+    _edit_on_disk(track, "title", edited_title)
+
+    result = staging.commit_tags(engine_settings)
+
+    assert result.changed_since_stage == 1
+    assert result.committed == 0
+    assert result.outcomes[0].status == "changed_since_stage"
+    assert result.outcomes[0].detail is not None
+    assert "Re-stage" in result.outcomes[0].detail
+    on_disk = read_tags(track).tags
+    assert on_disk["title"] == [edited_title]
+    assert on_disk["genre"] == ["Rock"]
+    assert _staged(engine_settings, file_id) is not None
+
+    staging.stage_tags(engine_settings, file_id=file_id, managed_tags={"genre": ["Jazz"]})
+    retry = staging.commit_tags(engine_settings)
+
+    assert retry.committed == 1
+    on_disk = read_tags(track).tags
+    assert on_disk["title"] == [edited_title]
+    assert on_disk["genre"] == ["Jazz"]
+
+
+def test_commit_completes_a_write_that_landed_before_a_crash(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    track = make_track(music_dir / "t.flac", {"genre": ["Rock"]})
+    scan_library(engine_settings)
+    file_id = _file_id(engine_settings, music_dir, track.name)
+    staging.stage_tags(engine_settings, file_id=file_id, managed_tags={"genre": ["Jazz"]})
+    staged = _staged(engine_settings, file_id)
+    assert staged is not None
+    # The crash window: the disk write landed and the DB commit did not.
+    write_managed_tags(track, staged.managed_tags)
+
+    result = staging.commit_tags(engine_settings)
+
+    assert result.committed == 1
+    assert result.changed_since_stage == 0
+    assert [r.version for r in _revisions(engine_settings, file_id)] == [0, 1]
+    assert read_tags(track).tags["genre"] == ["Jazz"]
+    assert _staged(engine_settings, file_id) is None
+
+
+def test_commit_skips_the_check_for_a_legacy_staged_row(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    track = make_track(music_dir / "t.mp3", {"genre": ["Rock"], "title": ["Song"]})
+    scan_library(engine_settings)
+    file_id = _file_id(engine_settings, music_dir, track.name)
+    current = read_tags(track).tags
+    conn = connect(engine_settings.db_path)
+    try:
+        apply_schema(conn)
+        versioning.ensure_baseline(conn, file_id, managed_tags=current, now=_NOW)
+        store.upsert_staged_tag(
+            conn,
+            file_id=file_id,
+            managed_tags=versioning.managed_subset(current) | {"genre": ["Jazz"]},
+            origin="manual",
+            now=_NOW,
+            base_size_bytes=None,
+            base_mtime_ns=None,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    _edit_on_disk(track, "title", "Song (Edited Outside TagMend)")
+
+    result = staging.commit_tags(engine_settings)
+
+    assert result.committed == 1
+    assert result.changed_since_stage == 0
+    assert read_tags(track).tags["genre"] == ["Jazz"]
 
 
 def test_split_batch_recovery_under_new_commit(

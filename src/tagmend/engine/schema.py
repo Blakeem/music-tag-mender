@@ -22,8 +22,13 @@ The change-tracking model mirrors git (PLAN.md §7):
   schema symmetry, but the move/rename logic is deferred to M6.
 
 The two revision logs are append-only, keyed by ``files.id`` with a composite PK
-``(file_id, version)`` (version 0 = baseline with ``commit_id`` NULL, +1 per change;
-never updated/deleted).
+``(file_id, version)`` (version 0 = baseline with ``commit_id`` NULL, +1 per change).
+Triggers enforce it: an ``UPDATE`` or ``DELETE`` on either log aborts, and so does a
+``DELETE FROM files`` that would cascade into one.
+
+:func:`apply_schema` runs the migrations and the DDL only when the stored
+``PRAGMA user_version`` is older than :data:`SCHEMA_VERSION`, so every later schema change
+must bump :data:`SCHEMA_VERSION`.
 
 The M2 Last.fm genre path adds two side tables (PLAN — Last.fm genre tagging, phase 1):
 
@@ -111,6 +116,19 @@ place with every row preserved):
   every detector would keep reading it. :func:`_migrate_v14_reader_version` defaults
   pre-existing rows to 0, below any real reader version, so the next incremental scan
   re-reads each of them exactly once.
+
+The data-safety pass adds two columns, two indexes and four triggers (schema v17, no new
+tables. A v16 ledger upgrades in place with every row preserved):
+
+* ``tag_revisions_staged.base_size_bytes`` / ``base_mtime_ns``: the file's signature when it
+  was staged. A commit refuses a file whose signature moved since, because writing the stored
+  target would overwrite the external edit. :func:`_migrate_staged_base_signature` adds both as
+  NULL on pre-existing rows, which skips the check for them.
+* ``idx_tag_revisions_commit_id`` / ``idx_path_revisions_commit_id``: the per-commit change
+  set that ``revert_commit`` and ``reopen_axes`` read.
+* The four append-only triggers from :func:`apply_append_only_triggers`. A migration that
+  rebuilds or updates a log drops its triggers first and relies on the DDL phase, which runs
+  after every migration, to recreate them.
 """
 
 from __future__ import annotations
@@ -124,7 +142,7 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
-SCHEMA_VERSION: Final = 16
+SCHEMA_VERSION: Final = 17
 
 _FILES_DDL: Final = """
 CREATE TABLE IF NOT EXISTS files (
@@ -174,9 +192,10 @@ CREATE TABLE IF NOT EXISTS commits (
 )
 """
 
-# Append-only managed-tag content history. One row per file per change; never updated
-# or deleted. ``version`` (0 = baseline) is both the ordering key and the restore
-# handle — ``created_at`` is display-only. ``commit_id`` groups the change with the
+# Append-only managed-tag content history. One row per file per change. The
+# :func:`apply_append_only_triggers` triggers abort any UPDATE or DELETE, the cascade from
+# ``files`` included. ``version`` (0 = baseline) is both the ordering key and the restore
+# handle. ``created_at`` is display-only. ``commit_id`` groups the change with the
 # other files in the same commit (NULL for the version-0 baseline, which precedes any
 # commit). ``managed_tags`` is a FULL JSON snapshot, so any version is restorable
 # without replaying the chain. ``managed_set`` records WHICH managed-tag set that
@@ -199,8 +218,9 @@ CREATE TABLE IF NOT EXISTS tag_revisions (
 )
 """
 
-# Append-only location history (file/folder renames + moves). DDL is locked now for
-# symmetry with ``tag_revisions``; the move logic is deferred to M6 (PLAN.md §18).
+# Append-only location history (file/folder renames + moves), enforced by the same
+# :func:`apply_append_only_triggers` triggers as ``tag_revisions``. DDL is locked now for
+# symmetry with ``tag_revisions``. The move logic is deferred to M6 (PLAN.md §18).
 # No ``kind`` column: folders emerge from per-file paths (rename vs move is derivable
 # from ``from_path``/``to_path``), and empty source folders are pruned on move. The
 # old ``plan_id`` grouping is now ``commit_id`` (shared with ``commits``).
@@ -223,13 +243,17 @@ CREATE TABLE IF NOT EXISTS path_revisions (
 # state. There is no ``commit_id`` (no claiming): a staged row stays staged until a
 # commit turns it into a real revision row and deletes it. A crash leaves leftover rows
 # staged, which the next commit sweeps into a new commit. See PLAN.md §7.
+# ``base_size_bytes``/``base_mtime_ns`` are the file's signature at stage time, so a commit can
+# refuse a file edited since. They sit last because the v17 migration appends them there.
 _TAG_REVISIONS_STAGED_DDL: Final = """
 CREATE TABLE IF NOT EXISTS tag_revisions_staged (
-  file_id      INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
-  managed_tags TEXT NOT NULL,
-  origin       TEXT NOT NULL,
-  note         TEXT,
-  staged_at    TEXT NOT NULL,
+  file_id         INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+  managed_tags    TEXT NOT NULL,
+  origin          TEXT NOT NULL,
+  note            TEXT,
+  staged_at       TEXT NOT NULL,
+  base_size_bytes INTEGER,
+  base_mtime_ns   INTEGER,
   PRIMARY KEY (file_id)
 )
 """
@@ -410,6 +434,29 @@ CREATE TABLE IF NOT EXISTS file_mismatch_status (
 """
 
 
+_REVISIONS_COMMIT_INDEX_DDL: Final = (
+    "CREATE INDEX IF NOT EXISTS idx_tag_revisions_commit_id ON tag_revisions(commit_id)",
+    "CREATE INDEX IF NOT EXISTS idx_path_revisions_commit_id ON path_revisions(commit_id)",
+)
+
+_APPEND_ONLY_LOGS: Final = ("tag_revisions", "path_revisions")
+
+
+def apply_append_only_triggers(connection: sqlite3.Connection) -> None:
+    """Create the triggers that abort any ``UPDATE`` or ``DELETE`` on the two revision logs.
+
+    A BEFORE DELETE trigger also blocks the ``ON DELETE CASCADE`` from ``files``, so deleting a
+    file row can never erase its history. Idempotent.
+    """
+    for log in _APPEND_ONLY_LOGS:
+        for event in ("update", "delete"):
+            connection.execute(
+                f"CREATE TRIGGER IF NOT EXISTS {log}_no_{event} "
+                f"BEFORE {event.upper()} ON {log} "
+                f"BEGIN SELECT RAISE(ABORT, '{log} is append-only'); END",
+            )
+
+
 def _table_exists(connection: sqlite3.Connection, name: str) -> bool:
     """Whether a table called *name* exists in this ledger (``sqlite_master`` lookup)."""
     row = connection.execute(
@@ -467,6 +514,8 @@ def _migrate_v13_managed_set(connection: sqlite3.Connection) -> None:
     if _column_exists(connection, "tag_revisions", "managed_set"):
         return
     connection.execute("ALTER TABLE tag_revisions ADD COLUMN managed_set INTEGER")
+    # Test ledgers are built by downgrading a fresh schema that already carries the trigger.
+    connection.execute("DROP TRIGGER IF EXISTS tag_revisions_no_update")
     connection.execute(
         "UPDATE tag_revisions SET managed_set = CASE WHEN created_at >= ? THEN 2 ELSE 1 END",
         (_MANAGED_SET_WIDENING_DATE,),
@@ -499,37 +548,57 @@ def _migrate_v14_reader_version(connection: sqlite3.Connection) -> None:
     logger.info("schema v14: added files.reader_version (pre-existing rows default to 0)")
 
 
+def _migrate_staged_base_signature(connection: sqlite3.Connection) -> None:
+    """v17: add ``tag_revisions_staged.base_size_bytes`` / ``base_mtime_ns`` as NULL.
+
+    Runs BEFORE the DDL, so the guard leads with ``_table_exists``: on a fresh ledger the table
+    does not exist yet and takes both columns from :data:`_TAG_REVISIONS_STAGED_DDL` instead.
+    Idempotent: the ``_column_exists`` half stops a second application. A NULL pair marks a row
+    staged before the signature existed, and the commit skips the changed-since-stage check
+    for it.
+    """
+    if not _table_exists(connection, "tag_revisions_staged"):
+        return
+    if _column_exists(connection, "tag_revisions_staged", "base_size_bytes"):
+        return
+    connection.execute("ALTER TABLE tag_revisions_staged ADD COLUMN base_size_bytes INTEGER")
+    connection.execute("ALTER TABLE tag_revisions_staged ADD COLUMN base_mtime_ns INTEGER")
+    logger.info("schema v17: added tag_revisions_staged base signature columns")
+
+
 def apply_schema(connection: sqlite3.Connection) -> None:
-    """Create all tables (idempotently) and stamp ``PRAGMA user_version``.
+    """Upgrade the ledger to :data:`SCHEMA_VERSION` when its stamp is older, else do nothing.
 
-    Creating tables on a fresh ledger needs no migration: the ``CREATE TABLE IF NOT
-    EXISTS`` statements create whatever is missing and the ``PRAGMA user_version``
-    re-stamp advances the version. NOTE: this does **not** alter columns of tables that
-    already exist, so a *pre-release* dev ledger from an earlier schema must be deleted and
-    rescanned. In particular **a v4 ledger must be deleted before
-    v5**: v5 drops the ``commit_id`` column from both staged tables
-    (``tag_revisions_staged`` / ``path_revisions_staged``) and ``apply_schema`` cannot
-    drop a column. (v4 renamed the staging tables
-    ``staged_tag_revisions``→``tag_revisions_staged`` and
-    ``staged_path_revisions``→``path_revisions_staged``; v3 renamed
-    ``batch_id``→``commit_id`` and dropped ``kind``/``plan_id``.) There is no production
-    data to migrate yet.
+    A current ledger costs one ``PRAGMA user_version`` read and no write, so a read-only caller
+    never waits on the write lock a running scan holds. A ledger stamped newer than this build
+    raises :class:`RuntimeError` rather than being stamped down.
 
-    The in-place migrations are v12's table rename (``file_album_status`` →
-    ``file_year_status``), applied by :func:`_migrate_v12_year_status` before any DDL runs so
-    a v11 ledger upgrades with its dispositions intact. v13 adds
-    ``tag_revisions.managed_set`` the same way (:func:`_migrate_v13_managed_set`), and v14
-    adds ``files.reader_version`` (:func:`_migrate_v14_reader_version`).
-
-    Staged rows no longer carry a ``commit_id``; a lingering ``'applying'`` commit means
-    an interrupted run, recovered by simply committing again.
+    An older ledger, or a fresh one stamped 0, runs the in-place migrations first, then every
+    ``CREATE ... IF NOT EXISTS``, then the append-only triggers, then the stamp. The migrations
+    preserve real data: v12 renames ``file_album_status`` to ``file_year_status``
+    (:func:`_migrate_v12_year_status`), v13 adds and stamps ``tag_revisions.managed_set``
+    (:func:`_migrate_v13_managed_set`), v14 adds ``files.reader_version``
+    (:func:`_migrate_v14_reader_version`) and v17 adds the staged base signature
+    (:func:`_migrate_staged_base_signature`). The triggers come after every migration, so a
+    migration that updates a log runs before they exist.
 
     ``commits`` is created before the revision/staging tables that reference it.
     """
-    logger.debug("applying schema version %d", SCHEMA_VERSION)
+    current = int(connection.execute("PRAGMA user_version").fetchone()[0])
+    if current == SCHEMA_VERSION:
+        return
+    if current > SCHEMA_VERSION:
+        message = (
+            f"ledger schema v{current} is newer than this tagmend (v{SCHEMA_VERSION}); "
+            "upgrade tagmend"
+        )
+        raise RuntimeError(message)
+
+    logger.info("upgrading ledger schema v%d to v%d", current, SCHEMA_VERSION)
     _migrate_v12_year_status(connection)
     _migrate_v13_managed_set(connection)
     _migrate_v14_reader_version(connection)
+    _migrate_staged_base_signature(connection)
     connection.execute(_FILES_DDL)
     connection.execute(_FILE_TAGS_DDL)
     connection.execute(_FILE_TAGS_INDEX_DDL)
@@ -548,4 +617,7 @@ def apply_schema(connection: sqlite3.Connection) -> None:
     connection.execute(_MUSICBRAINZ_RELEASE_CACHE_DDL)
     connection.execute(_VOIDED_AUTO_DDL)
     connection.execute(_FILE_MISMATCH_STATUS_DDL)
+    for index_ddl in _REVISIONS_COMMIT_INDEX_DDL:
+        connection.execute(index_ddl)
+    apply_append_only_triggers(connection)
     connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")

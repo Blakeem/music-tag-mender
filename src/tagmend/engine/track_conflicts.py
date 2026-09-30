@@ -41,6 +41,7 @@ from typing import TYPE_CHECKING, Final
 
 from tagmend.engine import db, schema, store
 from tagmend.engine.mismatch import NON_ALBUM_FOLDERS, fold
+from tagmend.engine.validation import check_limit
 from tagmend.log import get_logger
 
 if TYPE_CHECKING:
@@ -457,8 +458,9 @@ def detect_track_conflicts(
     """Report files that share a ``(disc, track)`` slot with a sibling in the same folder.
 
     Read-only over the snapshot: run ``scan_library`` first. Raises :class:`ValueError` for an
-    unknown *tier*.
+    unknown *tier* or a negative *limit*.
     """
+    check_limit(limit)
     if tier is not None and tier not in _TIERS:
         message = f"unknown tier {tier!r}; expected one of {sorted(_TIERS)}"
         raise ValueError(message)

@@ -3,14 +3,18 @@
 Contains no business logic: each tool marshals arguments, calls into
 :mod:`tagmend.engine`, and returns a JSON-serializable result. Launch it with
 ``tagmend mcp`` (or point an MCP client / the MCP Inspector at that command).
+Every tool returns ``{"ok": False, "error", "error_type"}`` for an expected failure.
 """
 
 from __future__ import annotations
 
+import functools
 import os
+import sqlite3
 from pathlib import Path
-from typing import Literal, cast
+from typing import TYPE_CHECKING, Final, Literal, cast
 
+import mutagen
 from mcp.server.fastmcp import FastMCP
 
 from tagmend import configui
@@ -30,15 +34,50 @@ from tagmend.engine import (
     versioning,
     years,
 )
+from tagmend.engine.lastfm import LastfmError
 from tagmend.engine.library import ScanMode
+from tagmend.engine.musicbrainz import MusicBrainzError
 from tagmend.log import get_logger
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 logger = get_logger(__name__)
 
 mcp = FastMCP("tagmend")
 
+# The failures a tool call can meet in normal use: a bad request, a locked or unreadable
+# file, a ledger another process holds, a lookup service that is down. Anything else is a bug.
+_ENVELOPED_ERRORS: Final = (
+    ValueError,
+    OSError,
+    mutagen.MutagenError,  # type: ignore[attr-defined]
+    sqlite3.OperationalError,
+    LastfmError,
+    MusicBrainzError,
+)
+
+
+def _error_envelope[**P](tool: Callable[P, dict[str, object]]) -> Callable[P, dict[str, object]]:
+    """Wrap *tool* so an expected failure returns an error envelope instead of crossing JSON-RPC.
+
+    ``functools.wraps`` sets ``__wrapped__``, which FastMCP's signature read follows, so the
+    tool's schema is the undecorated function's.
+    """
+
+    @functools.wraps(tool)
+    def enveloped(*args: P.args, **kwargs: P.kwargs) -> dict[str, object]:
+        try:
+            return tool(*args, **kwargs)
+        except _ENVELOPED_ERRORS as exc:
+            logger.warning("tool %s failed: %s: %s", tool.__name__, type(exc).__name__, exc)
+            return {"ok": False, "error": str(exc), "error_type": type(exc).__name__}
+
+    return enveloped
+
 
 @mcp.tool()
+@_error_envelope
 def check_health() -> dict[str, object]:
     """Verify TagMend is ready to use.
 
@@ -53,6 +92,7 @@ def check_health() -> dict[str, object]:
 
 
 @mcp.tool()
+@_error_envelope
 def scan_library(
     path: str | None = None,
     mode: Literal["incremental", "full", "presence"] = "incremental",
@@ -77,19 +117,16 @@ def scan_library(
         identical re-read is an honest no-op and is not tallied). On a configuration/path
         problem, returns ``{"ok": False, "error": <message>}``.
     """
-    settings = load_settings()
-    try:
-        result = library.scan_library(
-            settings,
-            path=Path(path) if path is not None else None,
-            mode=ScanMode(mode),
-        )
-    except ValueError as exc:
-        return {"ok": False, "error": str(exc)}
+    result = library.scan_library(
+        load_settings(),
+        path=Path(path) if path is not None else None,
+        mode=ScanMode(mode),
+    )
     return {"ok": True, **result.to_dict()}
 
 
 @mcp.tool()
+@_error_envelope
 def get_library_stats() -> dict[str, object]:
     """Report library-wide snapshot counts.
 
@@ -112,6 +149,7 @@ def get_library_stats() -> dict[str, object]:
 
 
 @mcp.tool()
+@_error_envelope
 def stage_tags(
     file_id: int,
     tags: dict[str, list[str]],
@@ -139,15 +177,12 @@ def stage_tags(
     Returns:
         ``{"ok": True}`` on success, or ``{"ok": False, "error": ...}`` on a bad request.
     """
-    try:
-        staging.stage_tags(
-            load_settings(),
-            file_id=file_id,
-            managed_tags=tags,
-            note=note,
-        )
-    except ValueError as exc:
-        return {"ok": False, "error": str(exc)}
+    staging.stage_tags(
+        load_settings(),
+        file_id=file_id,
+        managed_tags=tags,
+        note=note,
+    )
     return {"ok": True}
 
 
@@ -180,6 +215,7 @@ def _parse_batch_entries(
 
 
 @mcp.tool()
+@_error_envelope
 def stage_tags_batch(
     entries: list[dict[str, object]],
     note: str | None = None,
@@ -204,15 +240,13 @@ def stage_tags_batch(
         ``{"ok": True, "staged": <count>, "file_ids": [...]}`` on success, or
         ``{"ok": False, "error": ...}`` on a bad request (nothing staged).
     """
-    try:
-        parsed = _parse_batch_entries(entries)
-        staged = staging.stage_tags_batch(load_settings(), entries=parsed, note=note)
-    except ValueError as exc:
-        return {"ok": False, "error": str(exc)}
+    parsed = _parse_batch_entries(entries)
+    staged = staging.stage_tags_batch(load_settings(), entries=parsed, note=note)
     return {"ok": True, "staged": len(staged), "file_ids": staged}
 
 
 @mcp.tool()
+@_error_envelope
 def unstage_tags(file_id: int) -> dict[str, object]:
     """Remove a pending staged change for one file.
 
@@ -224,6 +258,7 @@ def unstage_tags(file_id: int) -> dict[str, object]:
 
 
 @mcp.tool()
+@_error_envelope
 def diff_tags(path: str | None = None) -> dict[str, object]:
     """Show staged-but-uncommitted tag changes, enriched with the current→target diff.
 
@@ -256,15 +291,23 @@ def diff_tags(path: str | None = None) -> dict[str, object]:
 
 
 @mcp.tool()
+@_error_envelope
 def commit_tags(message: str | None = None, path: str | None = None) -> dict[str, object]:
     """Apply all staged tag changes to disk as one revertible commit.
 
     Writes each staged file's target tags to disk and appends an append-only revision
     under a shared commit id, so the whole batch reverts as a unit. Files that vanished
     from disk since staging are flagged missing, dropped, and reported under
-    ``missing_files`` — the commit still completes for the rest. Any commit left
-    ``applying`` by a prior crash is marked interrupted first and its leftover staged rows
-    are swept into this commit.
+    ``missing_files``. Any commit left ``applying`` by a prior crash is marked interrupted
+    first and its leftover staged rows are swept into this commit.
+
+    A file edited on disk after it was staged (by Picard or any other tagger) is refused with
+    ``status: "changed_since_stage"`` and a ``detail``, so the commit never overwrites the
+    edit. Any external change counts, even to an unmanaged tag or the audio: re-staging costs
+    one call, and a lost edit costs the edit. Re-stage it (``stage_tags`` replaces the pending
+    row) or unstage it. A file that fails to write (locked by a player, read-only) is
+    reported with ``status: "error"`` and a ``detail``. Both keep their staged row, and the
+    rest of the commit completes.
 
     Args:
         message: Optional commit message stored on the commit.
@@ -272,21 +315,20 @@ def commit_tags(message: str | None = None, path: str | None = None) -> dict[str
             are committed; otherwise all staged changes are committed.
 
     Returns:
-        ``{"ok": True, ...}`` with per-file ``outcomes`` and ``committed`` / ``noop`` /
-        ``missing`` counts, or ``{"ok": False, "error": ...}`` on a bad request.
+        ``{"ok": True, ...}`` with per-file ``outcomes`` (each ``{file_id, version, status,
+        detail}``) and ``committed`` / ``noop`` / ``missing`` / ``changed_since_stage`` /
+        ``errors`` counts, or ``{"ok": False, "error": ...}`` on a bad request.
     """
-    try:
-        result = staging.commit_tags(
-            load_settings(),
-            message=message,
-            root=Path(path) if path is not None else None,
-        )
-    except ValueError as exc:
-        return {"ok": False, "error": str(exc)}
+    result = staging.commit_tags(
+        load_settings(),
+        message=message,
+        root=Path(path) if path is not None else None,
+    )
     return {"ok": True, **result.to_dict()}
 
 
 @mcp.tool()
+@_error_envelope
 def reopen_axes(commit_id: int) -> dict[str, object]:
     """Re-open the derived axes after a manual identity fix (call this AFTER committing one).
 
@@ -305,14 +347,12 @@ def reopen_axes(commit_id: int) -> dict[str, object]:
         ``{"ok": True, "commit_id": ..., "files": <count>, "artist_status_cleared": <count>}``,
         or ``{"ok": False, "error": ...}`` if the commit id is unknown or is an ``auto`` commit.
     """
-    try:
-        result = staging.reopen_axes(load_settings(), commit_id=commit_id)
-    except ValueError as exc:
-        return {"ok": False, "error": str(exc)}
+    result = staging.reopen_axes(load_settings(), commit_id=commit_id)
     return {"ok": True, **result.to_dict()}
 
 
 @mcp.tool()
+@_error_envelope
 def list_files(  # noqa: PLR0913 - cohesive MCP discovery filters
     path: str | None = None,
     limit: int | None = None,
@@ -370,22 +410,20 @@ def list_files(  # noqa: PLR0913 - cohesive MCP discovery filters
         mismatch_source_value}, ...]}``,
         or ``{"ok": False, "error": ...}`` on a bad request.
     """
-    try:
-        views = library.list_files(
-            load_settings(),
-            root=Path(path) if path is not None else None,
-            limit=limit,
-            genre_status=genre_status,
-            artist_status=artist_status,
-            year_status=year_status,
-            mismatch_status=mismatch_status,
-        )
-    except ValueError as exc:
-        return {"ok": False, "error": str(exc)}
+    views = library.list_files(
+        load_settings(),
+        root=Path(path) if path is not None else None,
+        limit=limit,
+        genre_status=genre_status,
+        artist_status=artist_status,
+        year_status=year_status,
+        mismatch_status=mismatch_status,
+    )
     return {"ok": True, "files": [view.to_dict() for view in views]}
 
 
 @mcp.tool()
+@_error_envelope
 def get_file(file_id: int) -> dict[str, object]:
     """Return one tracked file with its current managed tags, by stable ``file_id``.
 
@@ -402,6 +440,7 @@ def get_file(file_id: int) -> dict[str, object]:
 
 
 @mcp.tool()
+@_error_envelope
 def detect_mismatches(
     tier: Literal["high", "medium", "low"] | None = None,
     limit: int | None = None,
@@ -468,20 +507,18 @@ def detect_mismatches(
         ``{file_id, folder, filename, field, tag_value, path_artist, tier, reason}`` — or
         ``{"ok": False, "error": ...}`` (e.g. no music path configured).
     """
-    try:
-        report = mismatch.detect_mismatches(
-            load_settings(),
-            tier=tier,
-            limit=limit,
-            group=group,
-            folder=folder,
-        )
-    except ValueError as exc:
-        return {"ok": False, "error": str(exc)}
+    report = mismatch.detect_mismatches(
+        load_settings(),
+        tier=tier,
+        limit=limit,
+        group=group,
+        folder=folder,
+    )
     return {"ok": True, **report.to_dict()}
 
 
 @mcp.tool()
+@_error_envelope
 def detect_track_conflicts(
     tier: Literal["high", "medium", "low"] | None = None,
     limit: int | None = None,
@@ -533,20 +570,18 @@ def detect_track_conflicts(
         that slot, and each group is ``{folder, file_count, flagged, folder_context, slots,
         tiers, file_ids}`` — or ``{"ok": False, "error": ...}``.
     """
-    try:
-        report = track_conflicts.detect_track_conflicts(
-            load_settings(),
-            tier=tier,
-            limit=limit,
-            group=group,
-            folder=folder,
-        )
-    except ValueError as exc:
-        return {"ok": False, "error": str(exc)}
+    report = track_conflicts.detect_track_conflicts(
+        load_settings(),
+        tier=tier,
+        limit=limit,
+        group=group,
+        folder=folder,
+    )
     return {"ok": True, **report.to_dict()}
 
 
 @mcp.tool()
+@_error_envelope
 def detect_disagreements(  # noqa: PLR0913 - one parameter per scope/view knob, cohesive
     tier: Literal["high", "medium", "low"] | None = None,
     folder: str | None = None,
@@ -611,22 +646,20 @@ def detect_disagreements(  # noqa: PLR0913 - one parameter per scope/view knob, 
         tier, reason}``, and each group's ``flagged`` counts ROWS like the headline does with
         ``flagged_files`` beside it — or ``{"ok": False, "error": ...}``.
     """
-    try:
-        report = disagreements.detect_disagreements(
-            load_settings(),
-            tier=tier,
-            folder=folder,
-            file_ids=file_ids,
-            limit=limit,
-            row_limit=row_limit,
-            group=group,
-        )
-    except ValueError as exc:
-        return {"ok": False, "error": str(exc)}
+    report = disagreements.detect_disagreements(
+        load_settings(),
+        tier=tier,
+        folder=folder,
+        file_ids=file_ids,
+        limit=limit,
+        row_limit=row_limit,
+        group=group,
+    )
     return {"ok": True, **report.to_dict()}
 
 
 @mcp.tool()
+@_error_envelope
 def detect_album_conflicts(
     tier: Literal["high", "medium", "low"] | None = None,
     limit: int | None = None,
@@ -694,20 +727,18 @@ def detect_album_conflicts(
         majority_identity, majority_files, tiers, file_ids}`` — or
         ``{"ok": False, "error": ...}``.
     """
-    try:
-        report = album_conflicts.detect_album_conflicts(
-            load_settings(),
-            tier=tier,
-            limit=limit,
-            group=group,
-            folder=folder,
-        )
-    except ValueError as exc:
-        return {"ok": False, "error": str(exc)}
+    report = album_conflicts.detect_album_conflicts(
+        load_settings(),
+        tier=tier,
+        limit=limit,
+        group=group,
+        folder=folder,
+    )
     return {"ok": True, **report.to_dict()}
 
 
 @mcp.tool()
+@_error_envelope
 def detect_album_gaps(
     limit: int | None = None,
     folder: str | None = None,
@@ -764,19 +795,17 @@ def detect_album_gaps(
         and each proposal is ``{file_id, filename, proposed, confidence, reason, note}`` — or
         ``{"ok": False, "error": ...}`` (e.g. a corrupt genre vocabulary).
     """
-    try:
-        report = album_gaps.detect_album_gaps(
-            load_settings(),
-            limit=limit,
-            folder=folder,
-            use_musicbrainz=use_musicbrainz,
-        )
-    except ValueError as exc:
-        return {"ok": False, "error": str(exc)}
+    report = album_gaps.detect_album_gaps(
+        load_settings(),
+        limit=limit,
+        folder=folder,
+        use_musicbrainz=use_musicbrainz,
+    )
     return {"ok": True, **report.to_dict()}
 
 
 @mcp.tool()
+@_error_envelope
 def history_tags(file_id: int) -> dict[str, object]:
     """Show the append-only tag-revision log for one file, oldest (version 0) first.
 
@@ -807,6 +836,7 @@ def history_tags(file_id: int) -> dict[str, object]:
 
 
 @mcp.tool()
+@_error_envelope
 def revert_tags(file_id: int, version: int, note: str | None = None) -> dict[str, object]:
     """Restore a file's managed tags to a prior ``version`` (append-only, revertible).
 
@@ -821,14 +851,12 @@ def revert_tags(file_id: int, version: int, note: str | None = None) -> dict[str
     the target state). Returns ``{"ok": False, "error": ...}`` if the file or version is
     unknown, the file is missing on disk, or the file has a pending staged change.
     """
-    try:
-        result = versioning.revert(load_settings(), file_id, version, note=note)
-    except ValueError as exc:
-        return {"ok": False, "error": str(exc)}
+    result = versioning.revert(load_settings(), file_id, version, note=note)
     return {"ok": True, **result.to_dict()}
 
 
 @mcp.tool()
+@_error_envelope
 def revert_commit(
     commit_id: int,
     note: str | None = None,
@@ -862,19 +890,17 @@ def revert_commit(
         ``{"ok": False, "error": ...}`` if the commit id is unknown, the commit is still
         ``applying``, or the staging area is not empty.
     """
-    try:
-        result = versioning.revert_commit(
-            load_settings(),
-            commit_id,
-            note=note,
-            dry_run=dry_run,
-        )
-    except ValueError as exc:
-        return {"ok": False, "error": str(exc)}
+    result = versioning.revert_commit(
+        load_settings(),
+        commit_id,
+        note=note,
+        dry_run=dry_run,
+    )
     return {"ok": True, **result.to_dict()}
 
 
 @mcp.tool()
+@_error_envelope
 def list_commits(limit: int | None = None) -> dict[str, object]:
     """List commits newest first (the revertible units that group tag changes).
 
@@ -887,6 +913,7 @@ def list_commits(limit: int | None = None) -> dict[str, object]:
 
 
 @mcp.tool()
+@_error_envelope
 def get_commit(commit_id: int) -> dict[str, object]:
     """Return one commit by id.
 
@@ -912,6 +939,7 @@ def _commit_to_dict(commit: commits.Commit) -> dict[str, object]:
 
 
 @mcp.tool()
+@_error_envelope
 def resolve_genres(
     artist: str | None = None,
     album: str | None = None,
@@ -926,12 +954,14 @@ def resolve_genres(
     (replacing ONLY ``genre`` — other managed tags are preserved). Review with
     ``diff_tags`` and apply with ``commit_tags``; ``revert_tags`` undoes it.
 
-    It deliberately **skips** files that are already done (already staged, or already have
-    a committed ``auto`` genre revision), files marked ``no_match`` (unless the artist or
-    album tag has changed since), files marked ``manual``, and files with no artist tag at
-    all. Files whose artist isn't on Last.fm (or yield no usable genre) are recorded
-    ``no_match`` and not re-tried until their tags change. A transient Last.fm error leaves
-    that artist pending and is reported under ``errors`` so a re-run retries it.
+    It is refused while anything is staged, since staging would replace that pending
+    change. Commit or unstage it first. It deliberately **skips** files that are already done
+    (a committed ``auto`` genre revision), files marked ``no_match`` (unless the artist or
+    album tag has changed since), files marked ``manual``, files with no artist tag at all,
+    and files the last scan flagged missing. Files whose artist isn't on Last.fm (or yield no
+    usable genre) are recorded ``no_match`` and not re-tried until their tags change. A
+    transient Last.fm error leaves that artist pending and is reported under ``errors`` so a
+    re-run retries it.
 
     Args:
         artist: Limit to files whose ``artist`` tag equals this value.
@@ -942,24 +972,23 @@ def resolve_genres(
             continue.
 
     Returns:
-        ``{"ok": True, processed, staged, no_match, skipped{done,no_match,manual,no_artist},
-        pending_remaining, more, errors, no_match_artists, summary}``, or
-        ``{"ok": False, "error": ...}`` (e.g. no API key configured).
+        ``{"ok": True, processed, staged, no_match,
+        skipped{done,no_match,manual,no_artist,missing}, pending_remaining, more, errors,
+        no_match_artists, summary}``, or ``{"ok": False, "error": ...}`` (e.g. pending
+        changes, a negative ``limit``, or no API key configured).
     """
-    try:
-        result = genres.resolve_genres(
-            load_settings(),
-            artist=artist,
-            album=album,
-            file_ids=file_ids,
-            limit=limit,
-        )
-    except ValueError as exc:
-        return {"ok": False, "error": str(exc)}
+    result = genres.resolve_genres(
+        load_settings(),
+        artist=artist,
+        album=album,
+        file_ids=file_ids,
+        limit=limit,
+    )
     return {"ok": True, **result.to_dict()}
 
 
 @mcp.tool()
+@_error_envelope
 def resolve_artists(
     artist: str | None = None,
     file_ids: list[int] | None = None,
@@ -991,7 +1020,8 @@ def resolve_artists(
 
     It deliberately **skips** (and reports) values in the ``feat``/``ft``/``featuring``
     family, compilation sentinels (``various artists``/``various``/``va``), and empty
-    values; and any file whose ``artist``/``albumartist`` is multi-value. Values already
+    values. It also skips any file whose ``artist``/``albumartist`` is multi-value, and any
+    file the last scan flagged missing (counted under ``skipped_missing``). Values already
     exactly canonical stage nothing but are counted under ``already_canonical``; values with
     no Last.fm correction are reported under ``no_correction``. A correction to a MusicBrainz
     special-purpose placeholder (``[unknown]``, ``[no artist]``, …) is treated as no
@@ -1025,27 +1055,25 @@ def resolve_artists(
 
     Returns:
         ``{"ok": True, processed, staged_files, corrected_values, skipped_multi_artist,
-        skipped_sentinel, no_correction, already_canonical, shrinks_credit, needs_review,
-        name_id_disagreement, errors, pending_remaining, more, mappings (each with
+        skipped_sentinel, skipped_missing, no_correction, already_canonical, shrinks_credit,
+        needs_review, name_id_disagreement, errors, pending_remaining, more, mappings (each with
         ``from``/``to``/``mbid``/``source``), multi_artist_files, no_correction_values,
         already_canonical_values, shrinks_credit_values, needs_review_values,
         name_id_disagreement_values, error_values, summary}``, or
         ``{"ok": False, "error": ...}`` (e.g. pending changes, or no API key configured).
     """
-    try:
-        result = artists.resolve_artists(
-            load_settings(),
-            artist=artist,
-            file_ids=file_ids,
-            limit=limit,
-            dry_run=dry_run,
-        )
-    except ValueError as exc:
-        return {"ok": False, "error": str(exc)}
+    result = artists.resolve_artists(
+        load_settings(),
+        artist=artist,
+        file_ids=file_ids,
+        limit=limit,
+        dry_run=dry_run,
+    )
     return {"ok": True, **result.to_dict()}
 
 
 @mcp.tool()
+@_error_envelope
 def list_artists(limit: int | None = None) -> dict[str, object]:
     """List distinct ``artist`` tag values with file counts (to scope ``resolve_genres``).
 
@@ -1061,6 +1089,7 @@ def list_artists(limit: int | None = None) -> dict[str, object]:
 
 
 @mcp.tool()
+@_error_envelope
 def set_genre_status(
     status: Literal["manual", "pending"],
     file_ids: list[int] | None = None,
@@ -1071,7 +1100,8 @@ def set_genre_status(
     ``manual`` marks the in-scope files as a deliberate human/LLM choice: ``resolve_genres``
     skips them until you reset. ``pending`` removes any status row, re-queuing them. You
     may exclude or re-include files, but cannot set engine-owned outcomes (e.g.
-    ``no_match`` — that is decided by the Last.fm lookup).
+    ``no_match``, which the Last.fm lookup decides). With neither ``file_ids`` nor ``artist``
+    the call changes nothing and returns ``affected: 0``.
 
     Args:
         status: ``manual`` to exclude, ``pending`` to re-queue.
@@ -1082,19 +1112,17 @@ def set_genre_status(
     Returns:
         ``{"ok": True, "affected": <count>}``, or ``{"ok": False, "error": ...}``.
     """
-    try:
-        affected = genres.set_genre_status(
-            load_settings(),
-            file_ids=file_ids,
-            artist=artist,
-            status=status,
-        )
-    except ValueError as exc:
-        return {"ok": False, "error": str(exc)}
+    affected = genres.set_genre_status(
+        load_settings(),
+        file_ids=file_ids,
+        artist=artist,
+        status=status,
+    )
     return {"ok": True, "affected": affected}
 
 
 @mcp.tool()
+@_error_envelope
 def reset_genre_status(
     file_ids: list[int] | None = None,
     artist: str | None = None,
@@ -1102,7 +1130,8 @@ def reset_genre_status(
     """Clear any genre status row for in-scope files, returning them to ``pending``.
 
     Removes both ``no_match`` and ``manual`` decisions so ``resolve_genres`` will reconsider
-    the files on its next run.
+    the files on its next run. With neither ``file_ids`` nor ``artist`` the call changes
+    nothing and returns ``affected: 0``.
 
     Args:
         file_ids: Limit to these file ids.
@@ -1121,6 +1150,7 @@ def reset_genre_status(
 
 
 @mcp.tool()
+@_error_envelope
 def set_artist_status(
     status: Literal["manual", "pending"],
     file_ids: list[int] | None = None,
@@ -1144,19 +1174,17 @@ def set_artist_status(
     Returns:
         ``{"ok": True, "affected": <count>}``, or ``{"ok": False, "error": ...}``.
     """
-    try:
-        affected = artists.set_artist_status(
-            load_settings(),
-            file_ids=file_ids,
-            value=value,
-            status=status,
-        )
-    except ValueError as exc:
-        return {"ok": False, "error": str(exc)}
+    affected = artists.set_artist_status(
+        load_settings(),
+        file_ids=file_ids,
+        value=value,
+        status=status,
+    )
     return {"ok": True, "affected": affected}
 
 
 @mcp.tool()
+@_error_envelope
 def reset_artist_status(
     file_ids: list[int] | None = None,
     value: str | None = None,
@@ -1183,6 +1211,7 @@ def reset_artist_status(
 
 
 @mcp.tool()
+@_error_envelope
 def set_mismatch_status(
     status: Literal["legit_ignore", "misfiled_deferred", "pending"],
     file_ids: list[int] | None = None,
@@ -1210,19 +1239,17 @@ def set_mismatch_status(
     Returns:
         ``{"ok": True, "affected": <count>}``, or ``{"ok": False, "error": ...}``.
     """
-    try:
-        affected = mismatch.set_mismatch_status(
-            load_settings(),
-            file_ids=file_ids,
-            value=value,
-            status=status,
-        )
-    except ValueError as exc:
-        return {"ok": False, "error": str(exc)}
+    affected = mismatch.set_mismatch_status(
+        load_settings(),
+        file_ids=file_ids,
+        value=value,
+        status=status,
+    )
     return {"ok": True, "affected": affected}
 
 
 @mcp.tool()
+@_error_envelope
 def reset_mismatch_status(
     file_ids: list[int] | None = None,
     value: str | None = None,
@@ -1249,6 +1276,7 @@ def reset_mismatch_status(
 
 
 @mcp.tool()
+@_error_envelope
 def resolve_years(
     album: str | None = None,
     file_ids: list[int] | None = None,
@@ -1267,7 +1295,8 @@ def resolve_years(
 
     It deliberately **skips** files that already have an ``originaldate``
     (``skipped_present``), files with no ``album`` (``skipped_no_album``), files with no
-    artist (``skipped_no_artist``), and ``manual`` exclusions (``skipped_manual``). A group
+    artist (``skipped_no_artist``), ``manual`` exclusions (``skipped_manual``), and files the
+    last scan flagged missing (``skipped_missing``). A group
     MusicBrainz has no usable Album release group for is recorded ``no_match`` (re-opened if
     the artist or album changes). A transient MusicBrainz error leaves that group pending.
 
@@ -1281,23 +1310,21 @@ def resolve_years(
 
     Returns:
         ``{"ok": True, processed, staged_files, no_match, skipped_present, skipped_no_album,
-        skipped_no_artist, skipped_manual, pending_remaining, more, mappings, summary}``, or
-        ``{"ok": False, "error": ...}`` (e.g. pending changes).
+        skipped_no_artist, skipped_manual, skipped_missing, pending_remaining, more, mappings,
+        summary}``, or ``{"ok": False, "error": ...}`` (e.g. pending changes).
     """
-    try:
-        result = years.resolve_years(
-            load_settings(),
-            album=album,
-            file_ids=file_ids,
-            limit=limit,
-            dry_run=dry_run,
-        )
-    except ValueError as exc:
-        return {"ok": False, "error": str(exc)}
+    result = years.resolve_years(
+        load_settings(),
+        album=album,
+        file_ids=file_ids,
+        limit=limit,
+        dry_run=dry_run,
+    )
     return {"ok": True, **result.to_dict()}
 
 
 @mcp.tool()
+@_error_envelope
 def list_albums(
     year_status: Literal["pending", "no_identity", "no_match", "manual", "staged", "done"]
     | None = None,
@@ -1336,6 +1363,7 @@ def list_albums(
 
 
 @mcp.tool()
+@_error_envelope
 def set_year_status(
     status: Literal["manual", "pending"],
     file_ids: list[int] | None = None,
@@ -1358,19 +1386,17 @@ def set_year_status(
     Returns:
         ``{"ok": True, "affected": <count>}``, or ``{"ok": False, "error": ...}``.
     """
-    try:
-        affected = years.set_year_status(
-            load_settings(),
-            file_ids=file_ids,
-            value=value,
-            status=status,
-        )
-    except ValueError as exc:
-        return {"ok": False, "error": str(exc)}
+    affected = years.set_year_status(
+        load_settings(),
+        file_ids=file_ids,
+        value=value,
+        status=status,
+    )
     return {"ok": True, "affected": affected}
 
 
 @mcp.tool()
+@_error_envelope
 def reset_year_status(
     file_ids: list[int] | None = None,
     value: str | None = None,

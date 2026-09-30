@@ -26,6 +26,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Final, Protocol, SupportsInt, cast
 
 from tagmend.engine import db, schema
+from tagmend.engine.validation import check_limit
 from tagmend.log import get_logger
 
 if TYPE_CHECKING:
@@ -151,7 +152,11 @@ def mark_interrupted(conn: sqlite3.Connection) -> int:
 
 
 def list_commits_for(settings: Settings, *, limit: int | None = None) -> list[Commit]:
-    """Conn-owning :func:`list_commits`: open the ledger and return commits. Read-only."""
+    """Conn-owning :func:`list_commits`: open the ledger and return commits. Read-only.
+
+    Raises :class:`ValueError` for a negative *limit*.
+    """
+    check_limit(limit)
     connection = db.connect(settings.db_path)
     try:
         schema.apply_schema(connection)
@@ -175,11 +180,17 @@ def get_commit_for(settings: Settings, commit_id: int) -> Commit | None:
 
 @dataclass(frozen=True, slots=True)
 class FileCommitOutcome:
-    """What happened to one file during a commit."""
+    """What happened to one file during a commit.
+
+    ``status`` is ``committed``, ``noop``, ``missing``, ``changed_since_stage`` or ``error``.
+    ``version`` is the new revision version, ``None`` for every status but ``committed``.
+    ``detail`` says why a ``changed_since_stage`` or ``error`` file was left staged.
+    """
 
     file_id: int
-    version: int | None  # new revision version; None for a no-op or a missing file
-    status: str  # 'committed' | 'noop' | 'missing'
+    version: int | None
+    status: str
+    detail: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -198,6 +209,8 @@ class CommitResult:
     committed: int
     noop: int
     missing: int
+    changed_since_stage: int
+    errors: int
     outcomes: tuple[FileCommitOutcome, ...]
     missing_files: tuple[MissingFile, ...]
 
@@ -208,8 +221,15 @@ class CommitResult:
             "committed": self.committed,
             "noop": self.noop,
             "missing": self.missing,
+            "changed_since_stage": self.changed_since_stage,
+            "errors": self.errors,
             "outcomes": [
-                {"file_id": o.file_id, "version": o.version, "status": o.status}
+                {
+                    "file_id": o.file_id,
+                    "version": o.version,
+                    "status": o.status,
+                    "detail": o.detail,
+                }
                 for o in self.outcomes
             ],
             "missing_files": [{"file_id": m.file_id, "path": m.path} for m in self.missing_files],
@@ -229,11 +249,15 @@ def _summarize(*, commit_id: int | None, applied: list[_Applied]) -> CommitResul
     committed = sum(1 for a in applied if a.outcome.status == "committed")
     noop = sum(1 for a in applied if a.outcome.status == "noop")
     missing = sum(1 for a in applied if a.outcome.status == "missing")
+    changed_since_stage = sum(1 for a in applied if a.outcome.status == "changed_since_stage")
+    errors = sum(1 for a in applied if a.outcome.status == "error")
     return CommitResult(
         commit_id=commit_id,
         committed=committed,
         noop=noop,
         missing=missing,
+        changed_since_stage=changed_since_stage,
+        errors=errors,
         outcomes=tuple(a.outcome for a in applied),
         missing_files=tuple(a.missing for a in applied if a.missing is not None),
     )
@@ -255,6 +279,14 @@ class RevisionDomain(Protocol):
         """A short domain label used only in log messages."""
         ...
 
+    @property
+    def per_file_errors(self) -> tuple[type[Exception], ...]:
+        """The exception classes that fail one file and leave the rest of the commit running.
+
+        The domain names them, so this module never imports the disk library that raises them.
+        """
+        ...
+
     def list_staged_file_ids(self, conn: sqlite3.Connection) -> list[int]:
         """Return every staged file id, in a stable order."""
         ...
@@ -272,6 +304,14 @@ class RevisionDomain(Protocol):
 
     def resolve_path(self, conn: sqlite3.Connection, file_id: int) -> Path | None:
         """Return the on-disk path to act on, or ``None`` if the file is gone/unknown."""
+        ...
+
+    def changed_since_stage(self, conn: sqlite3.Connection, file_id: int, path: Path) -> bool:
+        """Whether the file changed on disk after it was staged, in a way the commit would lose.
+
+        ``False`` when the change already landed on disk (a crash before the DB commit), so
+        the next commit still completes it.
+        """
         ...
 
     def apply_to_disk(
@@ -299,6 +339,12 @@ class RevisionDomain(Protocol):
         ...
 
 
+_CHANGED_SINCE_STAGE_DETAIL: Final = (
+    "file changed on disk after it was staged. "
+    "Re-stage it (stage_tags replaces the pending row) or unstage it."
+)
+
+
 def run_commit(
     conn: sqlite3.Connection,
     domain: RevisionDomain,
@@ -310,11 +356,16 @@ def run_commit(
 
     The one place the crash invariant lives. For each file, in ``plan_order``:
 
-    * a path that is gone -> ``flag_and_drop_missing`` + commit -> a ``missing`` outcome;
+    * a path that is gone -> ``flag_and_drop_missing`` + commit -> a ``missing`` outcome.
+    * a file edited on disk since it was staged -> nothing written, the staged row kept -> a
+      ``changed_since_stage`` outcome.
     * otherwise the domain writes disk FIRST then appends the revision and deletes the
-      staged row (leaving the tx dirty); this function owns the ``conn.commit()`` so a
+      staged row, leaving the tx dirty. This function owns the ``conn.commit()`` so a
       revision never becomes durable without its staged row already gone. A crash before
       that commit rolls both back, leaving the staged row for the next commit to re-apply.
+    * one of ``domain.per_file_errors`` raised by the check or the apply -> rolled back, the
+      staged row kept for a retry -> an ``error`` outcome, and the loop moves on. Any other
+      exception is a bug and propagates.
     """
     applied: list[_Applied] = []
     for file_id in domain.plan_order(conn, file_ids):
@@ -332,16 +383,41 @@ def run_commit(
             )
             continue
 
-        version = domain.apply_to_disk(conn, file_id, path, commit_id=commit_id, now=_utc_now())
-        conn.commit()  # disk already done inside; append + delete now durable
-        domain.post_commit_file(conn, file_id)
-        conn.commit()
-
-        status = "committed" if version is not None else "noop"
         applied.append(
             _Applied(
-                outcome=FileCommitOutcome(file_id=file_id, version=version, status=status),
+                outcome=_commit_one(conn, domain, file_id, path, commit_id=commit_id),
                 missing=None,
             ),
         )
     return applied
+
+
+def _commit_one(
+    conn: sqlite3.Connection,
+    domain: RevisionDomain,
+    file_id: int,
+    path: Path,
+    *,
+    commit_id: int,
+) -> FileCommitOutcome:
+    """Commit one present file: refuse it if changed since stage, else apply it durably."""
+    try:
+        if domain.changed_since_stage(conn, file_id, path):
+            return FileCommitOutcome(
+                file_id=file_id,
+                version=None,
+                status="changed_since_stage",
+                detail=_CHANGED_SINCE_STAGE_DETAIL,
+            )
+        version = domain.apply_to_disk(conn, file_id, path, commit_id=commit_id, now=_utc_now())
+        conn.commit()  # disk already done inside, so append + delete are now durable
+    except domain.per_file_errors as exc:
+        # Undoes only this file's uncommitted writes, so its staged row stays for a retry.
+        conn.rollback()
+        logger.warning("commit %d: file_id=%d failed: %s", commit_id, file_id, exc)
+        return FileCommitOutcome(file_id=file_id, version=None, status="error", detail=str(exc))
+
+    domain.post_commit_file(conn, file_id)
+    conn.commit()
+    status = "committed" if version is not None else "noop"
+    return FileCommitOutcome(file_id=file_id, version=version, status=status)

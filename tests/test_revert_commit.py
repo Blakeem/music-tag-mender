@@ -22,7 +22,7 @@ from conftest import make_track
 from tagmend.engine import commits, staging, store, versioning
 from tagmend.engine.db import connect
 from tagmend.engine.library import scan_library
-from tagmend.engine.schema import apply_schema
+from tagmend.engine.schema import apply_append_only_triggers, apply_schema
 from tagmend.engine.tags import read_tags, write_managed_tags
 
 if TYPE_CHECKING:
@@ -447,10 +447,13 @@ def _stamp_managed_set(settings: Settings, file_id: int, version: int, managed_s
     conn = connect(settings.db_path)
     try:
         apply_schema(conn)
+        # The log is append-only, so the fabrication lifts its update trigger for one statement.
+        conn.execute("DROP TRIGGER tag_revisions_no_update")
         conn.execute(
             "UPDATE tag_revisions SET managed_set = ? WHERE file_id = ? AND version = ?",
             (managed_set, file_id, version),
         )
+        apply_append_only_triggers(conn)
         conn.commit()
     finally:
         conn.close()

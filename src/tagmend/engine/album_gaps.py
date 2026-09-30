@@ -40,6 +40,7 @@ from typing import TYPE_CHECKING, Final
 
 from tagmend.engine import classify, db, genres, parsing, schema, store
 from tagmend.engine.musicbrainz import MusicBrainzClient, MusicBrainzError
+from tagmend.engine.validation import check_limit
 from tagmend.log import get_logger
 
 if TYPE_CHECKING:
@@ -582,8 +583,10 @@ def detect_album_gaps(
     *folder* returns exactly that folder's group (exact path equality); *limit* caps the
     number of groups. The ``green``/``confirm``/``review``/``stays_blank`` counts always
     describe the whole library. Loads the genre vocabulary once per run (:class:`ValueError` on
-    a corrupt vocabulary propagates to the MCP envelope). Owns its connection.
+    a corrupt vocabulary propagates to the MCP envelope). Raises :class:`ValueError` for a
+    negative *limit*. Owns its connection.
     """
+    check_limit(limit)
     vocab = classify.load_vocabulary()
 
     connection = db.connect(settings.db_path)

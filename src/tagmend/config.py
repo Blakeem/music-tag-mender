@@ -168,7 +168,7 @@ def load_settings() -> Settings:
             _resolve_raw("lastfm_rate_per_sec", raw),
             _LASTFM_RATE_PER_SEC_DEFAULT,
         ),
-        genre_stage_limit=_coerce_int(
+        genre_stage_limit=_coerce_non_negative_int(
             "genre_stage_limit",
             _resolve_raw("genre_stage_limit", raw),
             _GENRE_STAGE_LIMIT_DEFAULT,
@@ -180,7 +180,7 @@ def load_settings() -> Settings:
         ),
         musicbrainz_contact=_resolve_raw("musicbrainz_contact", raw)
         or _MUSICBRAINZ_CONTACT_DEFAULT,
-        album_stage_limit=_coerce_int(
+        album_stage_limit=_coerce_non_negative_int(
             "album_stage_limit",
             _resolve_raw("album_stage_limit", raw),
             _ALBUM_STAGE_LIMIT_DEFAULT,
@@ -203,6 +203,18 @@ def _coerce_int(key: str, value: str | None, default: int) -> int:
     except ValueError:
         logger.warning("invalid %s=%r; using default %d", key, value, default)
         return default
+
+
+def _coerce_non_negative_int(key: str, value: str | None, default: int) -> int:
+    """Parse *value* like :func:`_coerce_int`, and also warn and use *default* when negative.
+
+    A stage limit caps a Python slice, where a negative value means "all but the last N".
+    """
+    parsed = _coerce_int(key, value, default)
+    if parsed < 0:
+        logger.warning("invalid %s=%r; using default %d", key, value, default)
+        return default
+    return parsed
 
 
 def _coerce_float(key: str, value: str | None, default: float) -> float:

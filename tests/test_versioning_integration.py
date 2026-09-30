@@ -20,7 +20,7 @@ from conftest import make_track
 from tagmend.engine import commits, store, versioning
 from tagmend.engine.db import connect
 from tagmend.engine.library import scan_library
-from tagmend.engine.schema import apply_schema
+from tagmend.engine.schema import apply_append_only_triggers, apply_schema
 from tagmend.engine.tags import MANAGED_TAGS, read_tags, write_managed_tags
 
 if TYPE_CHECKING:
@@ -89,10 +89,13 @@ def _stamp_managed_set(settings: Settings, file_id: int, version: int, managed_s
     conn = connect(settings.db_path)
     try:
         apply_schema(conn)
+        # The log is append-only, so the fabrication lifts its update trigger for one statement.
+        conn.execute("DROP TRIGGER tag_revisions_no_update")
         conn.execute(
             "UPDATE tag_revisions SET managed_set = ? WHERE file_id = ? AND version = ?",
             (managed_set, file_id, version),
         )
+        apply_append_only_triggers(conn)
         conn.commit()
     finally:
         conn.close()
@@ -286,6 +289,24 @@ def test_revert_with_no_change_still_appends(
     revisions = _revisions(engine_settings, file_id)
     assert revisions[-1].origin == "revert"
     assert revisions[-1].diff == {}
+
+
+def test_noop_revert_does_not_rewrite_the_file(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    track = make_track(music_dir / "t.mp3", {"genre": ["Electronic"], "title": ["Song"]})
+    scan_library(engine_settings)
+    file_id = _file_id(engine_settings, music_dir, track.name)
+    _baseline(engine_settings, file_id, read_tags(track).tags)
+    before_bytes = track.read_bytes()
+    before_mtime = track.stat().st_mtime_ns
+
+    result = versioning.revert(engine_settings, file_id, 0)
+
+    assert result.status == "noop"
+    assert track.read_bytes() == before_bytes
+    assert track.stat().st_mtime_ns == before_mtime
 
 
 def test_revert_to_empty_baseline_clears_every_managed_tag(

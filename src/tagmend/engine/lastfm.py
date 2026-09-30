@@ -12,6 +12,8 @@ so every unique entity is queried at most once ever and re-runs are free. The ne
 result (genuinely absent — Last.fm ``error 6``) is cached too, distinct from a found
 result that simply has no tags. Transient/auth failures (HTTP non-2xx, any other error
 code) raise :class:`LastfmError` and are **never** cached, so a re-run retries them.
+A transport error, an HTTP 429 or 5xx, or a temporary Last.fm error code (11, 16, 29) is
+retried first, with a doubling backoff, up to ``max_attempts`` times.
 
 A small in-process rate limiter paces *network* requests (never cache hits) to
 ``rate_per_sec``. The httpx transport, clock, and sleep are injectable so the whole thing
@@ -46,6 +48,14 @@ _API_URL: Final = "https://ws.audioscrobbler.com/2.0/"
 # the one error we negative-cache (the entity genuinely is not on Last.fm). Every other
 # code (e.g. ``10`` invalid key) is transient/auth and must stay retryable.
 _ERROR_NOT_FOUND: Final = 6
+
+# Last.fm documents these codes as temporary: 11 service offline, 16 temporary error, 29 rate
+# limit exceeded. Each is retried like a dropped connection rather than failing the lookup.
+_TEMPORARY_ERROR_CODES: Final = frozenset({11, 16, 29})
+_HTTP_TOO_MANY_REQUESTS: Final = 429
+_HTTP_SERVER_ERROR: Final = 500
+_RETRY_ATTEMPTS: Final = 3
+_RETRY_BACKOFF_SECONDS: Final = 1.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,7 +118,9 @@ class LastfmClient:
     Owns one :class:`httpx.Client` for its lifetime via the context-manager protocol;
     use it as ``with LastfmClient(...) as client:``. The cache connection is supplied by
     the caller (the orchestrator owns it) and is committed eagerly after each network
-    fetch so an error later in a batch never loses prior cache work.
+    fetch so an error later in a batch never loses prior cache work. Each request is tried
+    up to ``max_attempts`` times while the failure is transient, and a failure that outlasts
+    them raises :class:`LastfmError`.
     """
 
     def __init__(  # noqa: PLR0913 - cohesive keyword-only injection seams for testing
@@ -120,6 +132,7 @@ class LastfmClient:
         transport: httpx.BaseTransport | None = None,
         monotonic: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
+        max_attempts: int = _RETRY_ATTEMPTS,
     ) -> None:
         """Configure the client; injectables default to the real httpx transport + clock."""
         self._api_key = api_key
@@ -128,6 +141,7 @@ class LastfmClient:
         self._transport = transport
         self._monotonic = monotonic
         self._sleep = sleep
+        self._max_attempts = max(1, max_attempts)
         self._last_request_at: float | None = None
         self._client: httpx.Client | None = None
 
@@ -235,7 +249,11 @@ class LastfmClient:
             message = f"Last.fm error {error}: {body.get('message', 'unknown')}"
             raise LastfmError(message)
 
-        tags = _parse_top_tags(body)
+        try:
+            tags = _parse_top_tags(body)
+        except (KeyError, TypeError, ValueError) as exc:
+            message = f"Last.fm returned a malformed tag entry for {method}"
+            raise LastfmError(message) from exc
 
         # Output: cache the found result eagerly, then return it.
         self._store(request_key, found=True, tags=[(t.name, t.weight) for t in tags])
@@ -278,22 +296,42 @@ class LastfmClient:
         return correction
 
     def _request(self, method: str, identity: dict[str, str]) -> dict[str, object]:
-        """Pace, then perform one Last.fm GET, returning the decoded JSON object.
+        """Pace, then GET one Last.fm method, returning the decoded JSON object.
 
-        Raises :class:`LastfmError` on an HTTP non-2xx status (transient/auth).
+        A transport error, an HTTP 429 or 5xx, or a temporary Last.fm error code is retried
+        with a doubling backoff. Any other answer returns at once. A failure that outlasts
+        every attempt, any other HTTP non-2xx and a body that is not a JSON object each raise
+        :class:`LastfmError`. No message carries the request URL, since it holds the API key.
         """
         if self._client is None:  # pragma: no cover - guard against misuse outside `with`
             message = "LastfmClient must be used as a context manager"
             raise RuntimeError(message)
 
         params = {"method": method, "api_key": self._api_key, "format": "json", **identity}
-        self._pace()
+        delay = _RETRY_BACKOFF_SECONDS
+        failure = "no attempt made"
+        cause: httpx.HTTPError | None = None
+
         logger.debug("last.fm request method=%s identity=%s", method, identity)
-        response = self._client.get(_API_URL, params=params)
-        if response.is_error:
-            message = f"Last.fm HTTP {response.status_code} for {method}"
-            raise LastfmError(message)
-        return cast("dict[str, object]", response.json())
+        for attempt in range(self._max_attempts):
+            self._pace()
+            try:
+                response = self._client.get(_API_URL, params=params)
+            except httpx.HTTPError as exc:
+                cause = exc
+                failure = f"transport error ({type(exc).__name__})"
+            else:
+                cause = None
+                body, failure = _classify_response(response, method)
+                if body is not None:
+                    return body
+            if attempt < self._max_attempts - 1:
+                logger.debug("last.fm %s for %s, backing off %ss", failure, method, delay)
+                self._sleep(delay)
+                delay *= 2
+
+        message = f"Last.fm {method} failed after {self._max_attempts} attempt(s): {failure}"
+        raise LastfmError(message) from cause
 
     def _store(self, request_key: str, *, found: bool, tags: list[tuple[str, int]]) -> None:
         """Cache a parsed result and commit immediately (so a later error can't lose it)."""
@@ -336,6 +374,37 @@ def _request_key(method: str, identity: dict[str, str]) -> str:
     parts.extend(f"{key}={value}" for key, value in sorted(identity.items()))
     payload = "\x00".join(parts)
     return hashlib.sha1(payload.encode("utf-8")).hexdigest()  # noqa: S324 - cache key, not security
+
+
+def _classify_response(
+    response: httpx.Response,
+    method: str,
+) -> tuple[dict[str, object] | None, str]:
+    """Return ``(body, "")`` for a final answer or ``(None, reason)`` for a temporary one.
+
+    Raises :class:`LastfmError` for a permanent failure: an HTTP non-2xx other than 429 or 5xx,
+    or a body that is not a JSON object.
+    """
+    status = response.status_code
+    if status == _HTTP_TOO_MANY_REQUESTS or status >= _HTTP_SERVER_ERROR:
+        return None, f"HTTP {status}"
+    if response.is_error:
+        message = f"Last.fm HTTP {status} for {method}"
+        raise LastfmError(message)
+
+    try:
+        body = response.json()
+    except ValueError as exc:
+        message = f"Last.fm returned a non-JSON body for {method}"
+        raise LastfmError(message) from exc
+    if not isinstance(body, dict):
+        message = f"Last.fm returned a JSON {type(body).__name__}, not an object, for {method}"
+        raise LastfmError(message)
+
+    error = body.get("error")
+    if error in _TEMPORARY_ERROR_CODES:
+        return None, f"error {error}"
+    return cast("dict[str, object]", body), ""
 
 
 def _parse_top_tags(body: dict[str, object]) -> list[Tag]:

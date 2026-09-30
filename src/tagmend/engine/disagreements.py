@@ -41,6 +41,7 @@ from typing import TYPE_CHECKING, Final
 from tagmend.engine import db, schema, store
 from tagmend.engine.album_conflicts import group_key
 from tagmend.engine.musicbrainz import MusicBrainzClient, MusicBrainzError
+from tagmend.engine.validation import check_limit
 from tagmend.log import get_logger
 
 if TYPE_CHECKING:
@@ -726,8 +727,10 @@ def detect_disagreements(  # noqa: PLR0913 - cohesive keyword-only scope + injec
     and the remainder is reported via ``releases_remaining``/``more``. *row_limit* caps the
     rows returned without changing any count.
     *client* injects an :class:`tagmend.engine.musicbrainz.MBReleaseSource` for tests. Raises
-    :class:`ValueError` for an unknown *tier*.
+    :class:`ValueError` for an unknown *tier* or a negative *limit* or *row_limit*.
     """
+    check_limit(limit)
+    check_limit(row_limit, name="row_limit")
     if tier is not None and tier not in _TIERS:
         message = f"unknown tier {tier!r}; expected one of {sorted(_TIERS)}"
         raise ValueError(message)

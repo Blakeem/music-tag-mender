@@ -31,6 +31,8 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
     from pathlib import Path
 
+    from mutagen._file import FileType
+
 logger = get_logger(__name__)
 
 # ``originaldate`` (the original/first-release year) is native on ID3 (``TDOR``) and Vorbis
@@ -245,16 +247,49 @@ def read_tags(path: Path) -> TrackTags:
     return TrackTags(normalized)
 
 
-def write_managed_tags(path: Path, managed: dict[str, list[str]]) -> None:
+def _plan_changes(
+    audio: FileType,
+    managed: dict[str, list[str]],
+) -> list[tuple[str, list[str] | None]]:
+    """Return the ``(written key, values)`` edits that turn *audio* into *managed*.
+
+    ``None`` values mean delete. A key whose current values already equal the target is left
+    out, because the easy layers build a fresh frame on assignment and would re-encode an
+    unchanged one. Sorted because a Vorbis assignment appends the field, so set order would
+    shuffle them.
+    """
+    vorbis = isinstance(audio.tags, VCommentDict)
+    changes: list[tuple[str, list[str] | None]] = []
+    for key in sorted(MANAGED_TAGS):
+        written = _vorbis_field(key) if vorbis else key
+        values = managed.get(key)
+        current = [str(value) for value in audio[written]] if written in audio else []
+        if values and current != list(values):
+            changes.append((written, list(values)))
+        elif not values and written in audio:
+            changes.append((written, None))
+        # Drop the other spelling of the same concept so the file never carries two values
+        # for one tag, contradicting whichever reader picks the other name. Only Vorbis has
+        # a second spelling to drop: on ID3 and MP4 the easy layer owns the frame/atom name,
+        # and reaching a foreign one (a TXXX:ALBUMARTISTSORT some other tagger wrote) would
+        # need raw container access the easy layer does not expose.
+        if vorbis and key in _VORBIS_SPELLINGS and key in audio:
+            changes.append((key, None))
+    return changes
+
+
+def write_managed_tags(path: Path, managed: dict[str, list[str]]) -> bool:
     """Surgically write the managed-tag set on *path*, leaving all other tags intact.
 
     For each key in :data:`MANAGED_TAGS`: a non-empty value list in *managed* is written
     (replacing any existing values); a key absent from *managed* (or mapped to an empty
     list) is deleted from the file, so reverting to a baseline that lacked a tag removes
     a later-added one. Keys outside :data:`MANAGED_TAGS` are never read, written, or
-    removed; passing one raises :class:`ValueError` (a caller bug).
+    removed. Passing one raises :class:`ValueError` (a caller bug). Only the keys whose
+    values differ are touched, so an unchanged frame keeps its encoding.
 
-    The write is atomic: tags are applied to a sibling temp copy which then atomically
+    Returns ``False`` without touching the file when nothing differs, and ``True`` after a
+    write. The write is atomic: tags are applied to a sibling temp copy which then atomically
     replaces the original via :meth:`Path.replace`, so an interrupted write leaves the
     original file untouched (PLAN.md §11). Lets :class:`mutagen.MutagenError` / ``OSError``
     propagate, mirroring :func:`read_tags`.
@@ -264,8 +299,17 @@ def write_managed_tags(path: Path, managed: dict[str, list[str]]) -> None:
     if unknown:
         message = f"refusing to write non-managed tags: {sorted(unknown)}"
         raise ValueError(message)
+    original = mutagen.File(path, easy=True)  # type: ignore[attr-defined]
+    if original is None:
+        message = f"mutagen could not identify {path} for writing"
+        raise ValueError(message)
 
-    # Process — apply to a temp copy, then atomically swap it in.
+    # Process: plan against the original, so a no-op never copies or rewrites the file.
+    changes = _plan_changes(original, managed)
+    if not changes:
+        return False
+
+    # Output: apply the plan to a temp copy, then atomically swap it in.
     tmp = path.with_name(f"{path.name}.tagmend.tmp")
     shutil.copy2(path, tmp)
     replaced = False
@@ -274,25 +318,15 @@ def write_managed_tags(path: Path, managed: dict[str, list[str]]) -> None:
         if audio is None:
             message = f"mutagen could not identify {path} for writing"
             raise ValueError(message)
-        vorbis = isinstance(audio.tags, VCommentDict)
-        # Sorted because a Vorbis assignment appends the field, so set order would shuffle them.
-        for key in sorted(MANAGED_TAGS):
-            written = _vorbis_field(key) if vorbis else key
-            values = managed.get(key)
-            if values:
-                audio[written] = list(values)
-            elif written in audio:
+        for written, values in changes:
+            if values is None:
                 del audio[written]
-            # Drop the other spelling of the same concept so the file never carries two values
-            # for one tag, contradicting whichever reader picks the other name. Only Vorbis has
-            # a second spelling to drop: on ID3 and MP4 the easy layer owns the frame/atom name,
-            # and reaching a foreign one (a TXXX:ALBUMARTISTSORT some other tagger wrote) would
-            # need raw container access the easy layer does not expose.
-            if vorbis and key in _VORBIS_SPELLINGS and key in audio:
-                del audio[key]
+            else:
+                audio[written] = values
         audio.save()
         tmp.replace(path)
         replaced = True
     finally:
         if not replaced:
             tmp.unlink(missing_ok=True)
+    return True

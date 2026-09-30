@@ -5,7 +5,9 @@ from __future__ import annotations
 import sqlite3
 from typing import TYPE_CHECKING
 
-from tagmend.engine.schema import SCHEMA_VERSION, apply_schema
+import pytest
+
+from tagmend.engine.schema import SCHEMA_VERSION, apply_append_only_triggers, apply_schema
 from tagmend.engine.tags import TAG_READER_VERSION
 
 if TYPE_CHECKING:
@@ -21,7 +23,7 @@ def test_apply_schema_stamps_current_version(db_conn: sqlite3.Connection) -> Non
     # db_conn already applied the schema; the stamp must match the constant the code ships.
     version = db_conn.execute("PRAGMA user_version").fetchone()[0]
     assert version == SCHEMA_VERSION
-    assert SCHEMA_VERSION == 16
+    assert SCHEMA_VERSION == 17
 
 
 def test_apply_schema_creates_genre_tables(db_conn: sqlite3.Connection) -> None:
@@ -81,6 +83,45 @@ def test_apply_schema_is_idempotent() -> None:
         apply_schema(conn)
         apply_schema(conn)  # second application must not raise
         assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+    finally:
+        conn.close()
+
+
+def test_apply_schema_is_read_only_on_a_current_ledger(tmp_path: Path) -> None:
+    # A running scan holds the write lock for its whole transaction. A read-only caller on a
+    # current ledger must not need that lock just to confirm the schema.
+    db_path = tmp_path / "ledger.sqlite3"
+    setup = sqlite3.connect(db_path)
+    try:
+        apply_schema(setup)
+        setup.commit()
+    finally:
+        setup.close()
+
+    writer = sqlite3.connect(db_path)
+    reader = sqlite3.connect(db_path, timeout=0.2)
+    try:
+        writer.execute("BEGIN IMMEDIATE")
+
+        apply_schema(reader)  # must not raise "database is locked"
+
+        assert reader.execute("SELECT COUNT(*) FROM files").fetchone()[0] == 0
+    finally:
+        reader.close()
+        writer.rollback()
+        writer.close()
+
+
+def test_apply_schema_refuses_a_newer_ledger() -> None:
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION + 1}")
+
+        with pytest.raises(RuntimeError, match="newer than this tagmend"):
+            apply_schema(conn)
+
+        # Refused, not stamped down.
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION + 1
     finally:
         conn.close()
 
@@ -242,6 +283,7 @@ def test_v13_migration_does_not_restamp_on_reapply() -> None:
         conn.commit()
 
         apply_schema(conn)
+        conn.execute("DROP TRIGGER tag_revisions_no_update")
         conn.execute("UPDATE tag_revisions SET managed_set = 2")
         apply_schema(conn)  # must not raise, must not restamp
 
@@ -314,6 +356,143 @@ def test_v14_migration_does_not_reset_a_stamped_row() -> None:
             (file_id,),
         ).fetchone()[0]
         assert stamped == TAG_READER_VERSION
+    finally:
+        conn.close()
+
+
+_APPEND_ONLY_TRIGGERS = (
+    "tag_revisions_no_update",
+    "tag_revisions_no_delete",
+    "path_revisions_no_update",
+    "path_revisions_no_delete",
+)
+_COMMIT_ID_INDEXES = ("idx_tag_revisions_commit_id", "idx_path_revisions_commit_id")
+
+
+def _schema_objects(conn: sqlite3.Connection, kind: str) -> set[str]:
+    cursor = conn.execute("SELECT name FROM sqlite_master WHERE type = ?", (kind,))
+    return {str(row[0]) for row in cursor.fetchall()}
+
+
+def _insert_path_revision_row(conn: sqlite3.Connection, file_id: int) -> None:
+    conn.execute(
+        """
+        INSERT INTO path_revisions (file_id, version, created_at, origin, from_path, to_path)
+        VALUES (?, 0, '2026-06-08T00:00:00+00:00', 'manual', '/lib/a.mp3', '/lib/b.mp3')
+        """,
+        (file_id,),
+    )
+
+
+def test_tag_revisions_reject_update_and_delete(db_conn: sqlite3.Connection) -> None:
+    file_id = _insert_file(db_conn)
+    _insert_revision_row(db_conn, file_id, 0, "2026-06-08T00:00:00+00:00")
+
+    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+        db_conn.execute("UPDATE tag_revisions SET note = 'rewritten'")
+    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+        db_conn.execute("DELETE FROM tag_revisions")
+
+    row = db_conn.execute("SELECT note FROM tag_revisions WHERE file_id = ?", (file_id,))
+    assert row.fetchall() == [(None,)]
+
+
+def test_path_revisions_reject_update_and_delete(db_conn: sqlite3.Connection) -> None:
+    file_id = _insert_file(db_conn)
+    _insert_path_revision_row(db_conn, file_id)
+
+    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+        db_conn.execute("UPDATE path_revisions SET to_path = '/lib/c.mp3'")
+    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+        db_conn.execute("DELETE FROM path_revisions")
+
+    row = db_conn.execute("SELECT to_path FROM path_revisions WHERE file_id = ?", (file_id,))
+    assert row.fetchall() == [("/lib/b.mp3",)]
+
+
+def test_revisions_by_commit_use_the_index(db_conn: sqlite3.Connection) -> None:
+    plan = db_conn.execute(
+        "EXPLAIN QUERY PLAN SELECT * FROM tag_revisions WHERE commit_id = ?",
+        (1,),
+    ).fetchall()
+
+    assert any("idx_tag_revisions_commit_id" in str(row[-1]) for row in plan)
+
+
+def test_apply_append_only_triggers_is_idempotent(db_conn: sqlite3.Connection) -> None:
+    apply_append_only_triggers(db_conn)  # already present: must not raise
+
+    assert set(_APPEND_ONLY_TRIGGERS) <= _schema_objects(db_conn, "trigger")
+
+
+def test_v16_ledger_gains_the_triggers_and_indexes_in_place() -> None:
+    # A v16 ledger has neither. The upgrade creates both without rewriting a row.
+    conn = sqlite3.connect(":memory:")
+    try:
+        apply_schema(conn)
+        file_id = _insert_file(conn)
+        for trigger in _APPEND_ONLY_TRIGGERS:
+            conn.execute(f"DROP TRIGGER {trigger}")
+        for index in _COMMIT_ID_INDEXES:
+            conn.execute(f"DROP INDEX {index}")
+        conn.execute("PRAGMA user_version = 16")
+        _insert_revision_row(conn, file_id, 0, "2026-06-08T00:00:00+00:00")
+        conn.commit()
+
+        apply_schema(conn)  # the in-place upgrade
+
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        assert set(_APPEND_ONLY_TRIGGERS) <= _schema_objects(conn, "trigger")
+        assert set(_COMMIT_ID_INDEXES) <= _schema_objects(conn, "index")
+        kept = conn.execute("SELECT file_id, version FROM tag_revisions").fetchall()
+        assert kept == [(file_id, 0)]
+    finally:
+        conn.close()
+
+
+def _staged_columns(conn: sqlite3.Connection) -> list[str]:
+    return [str(row[1]) for row in conn.execute("PRAGMA table_info(tag_revisions_staged)")]
+
+
+def test_v16_ledger_gains_the_staged_base_signature_in_place() -> None:
+    # A v16 staged row predates the signature. It survives with a NULL pair, which the commit
+    # reads as "skip the changed-since-stage check".
+    fresh = sqlite3.connect(":memory:")
+    try:
+        apply_schema(fresh)
+        fresh_columns = _staged_columns(fresh)
+    finally:
+        fresh.close()
+
+    conn = sqlite3.connect(":memory:")
+    try:
+        apply_schema(conn)
+        file_id = _insert_file(conn)
+        conn.execute("ALTER TABLE tag_revisions_staged DROP COLUMN base_size_bytes")
+        conn.execute("ALTER TABLE tag_revisions_staged DROP COLUMN base_mtime_ns")
+        conn.execute("PRAGMA user_version = 16")
+        conn.execute(
+            """
+            INSERT INTO tag_revisions_staged (file_id, managed_tags, origin, note, staged_at)
+            VALUES (?, '{"genre":["Rock"]}', 'manual', 'kept', '2026-06-08T00:00:00+00:00')
+            """,
+            (file_id,),
+        )
+        conn.commit()
+
+        apply_schema(conn)  # the in-place upgrade
+        apply_schema(conn)  # a second application must not re-add the columns
+
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        assert _staged_columns(conn) == fresh_columns
+        row = conn.execute(
+            """
+            SELECT managed_tags, note, base_size_bytes, base_mtime_ns
+            FROM tag_revisions_staged WHERE file_id = ?
+            """,
+            (file_id,),
+        ).fetchone()
+        assert row == ('{"genre":["Rock"]}', "kept", None, None)
     finally:
         conn.close()
 

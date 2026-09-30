@@ -12,9 +12,10 @@ Design notes (the spec):
   / ``manual``) live in ``file_genre_status``.
 * **Lookup identity** is ``albumartist`` when present (better for compilations), else
   ``artist``; ``album`` is used only when ``genre_use_album_tags`` is on.
-* **No accidental deletion (P0):** the staged target is built from the file's own managed
-  subset with *only* ``genre`` replaced, so ``write_managed_tags``'s delete-on-absent
-  behavior can never drop ``artist``/``albumartist``.
+* **No accidental deletion (P0):** the resolver stages only ``genre``, the one field it
+  decides, and :func:`tagmend.engine.staging._stage_one` merges it onto the tags read from
+  disk, so ``write_managed_tags``'s delete-on-absent behavior can never drop
+  ``artist``/``albumartist`` and a lagging snapshot mirror can never overwrite a newer value.
 * **One connection** is owned here for selection, cache, and status writes; the
   :class:`tagmend.engine.lastfm.LastfmClient` shares it (eager cache commits), while
   :func:`tagmend.engine.staging.stage_tags` opens and owns its own connection per call.
@@ -29,8 +30,9 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Final
 
-from tagmend.engine import axis, classify, db, schema, staging, store, versioning
+from tagmend.engine import axis, classify, db, schema, staging, store
 from tagmend.engine.lastfm import LastfmClient, LastfmError
+from tagmend.engine.validation import check_limit
 from tagmend.log import get_logger
 
 if TYPE_CHECKING:
@@ -138,6 +140,7 @@ class _Tally:
     skipped_no_match: int = 0
     skipped_manual: int = 0
     skipped_no_artist: int = 0
+    skipped_missing: int = 0
     errors: list[dict[str, str]] = field(default_factory=list)
     no_match_artists: set[str] = field(default_factory=set)
 
@@ -229,25 +232,36 @@ def resolve_genres(  # noqa: PLR0913 - cohesive keyword-only scope + injection p
 ) -> StageGenresResult:
     """Look up Last.fm genres for the in-scope, not-yet-done files and stage the result.
 
-    Selects the files in scope that are not already done (staged or committed ``auto``),
-    not sticky ``manual``, and have no non-stale ``no_match``; caps them at *limit*
-    (default ``genre_stage_limit``); groups them by ``(artist, album)``; and per group
-    looks up Last.fm top tags, classifies them, and either stages the resolved genres
-    (``origin='auto'``, only ``genre`` changed) or records a ``no_match``. A transient
-    Last.fm error leaves the group pending and is reported, never aborting the call.
+    Selects the files in scope that are present on disk, not already done (a committed
+    ``auto`` genre revision), not sticky ``manual``, and have no non-stale ``no_match``. It caps
+    them at *limit* (default ``genre_stage_limit``) and groups them by ``(artist, album)``.
+    Per group it looks up Last.fm top tags, classifies them, and either stages the resolved
+    genres (``origin='auto'``, only ``genre`` changed) or records a ``no_match``. A file the
+    last scan flagged missing is counted under ``skipped["missing"]``. A transient Last.fm
+    error leaves the group pending and is reported, never aborting the call.
 
     *client* lets callers inject a :class:`tagmend.engine.lastfm.TagSource` (a fake in
-    tests); when ``None`` a real :class:`LastfmClient` is built and requires
-    ``settings.lastfm_api_key``. Raises :class:`ValueError` when a real client is needed
-    but no API key is configured. Owns its connection; ``stage_tags`` opens its own.
+    tests). When ``None`` a real :class:`LastfmClient` is built and requires
+    ``settings.lastfm_api_key``. Raises :class:`ValueError` if anything is already staged
+    ("commit or unstage pending changes first"), for a negative *limit*, or when a real
+    client is needed but no API key is configured. Owns its connection, and ``stage_tags``
+    opens its own.
     """
+    check_limit(limit)
     effective_limit = limit if limit is not None else settings.genre_stage_limit
     vocab = classify.load_vocabulary()
 
     connection = db.connect(settings.db_path)
     try:
         schema.apply_schema(connection)
-        candidate_ids = store.files_in_scope(
+
+        # Staging replaces a file's pending row, so a genre run would silently discard a
+        # manual fix to another field that is still waiting for its commit.
+        if store.any_staged(connection):
+            message = "commit or unstage pending changes first"
+            raise ValueError(message)
+
+        scoped_ids = store.files_in_scope(
             connection,
             artist=artist,
             album=album,
@@ -255,6 +269,9 @@ def resolve_genres(  # noqa: PLR0913 - cohesive keyword-only scope + injection p
         )
 
         tally = _Tally()
+        missing = store.missing_file_ids(connection)
+        candidate_ids = [fid for fid in scoped_ids if fid not in missing]
+        tally.skipped_missing = len(scoped_ids) - len(candidate_ids)
         processable = _select(connection, candidate_ids, tally)
 
         to_process = processable[:effective_limit]
@@ -336,7 +353,7 @@ def _process_one_group(  # noqa: PLR0913 - cohesive per-group inputs
 
     if resolved:
         for fid in file_ids:
-            _stage_resolved(settings, conn, fid, resolved)
+            _stage_resolved(settings, fid, resolved)
             tally.staged += 1
         return
 
@@ -380,24 +397,17 @@ def _resolve_group(
     return classify.classify_genres(artist_tags, album_tags, vocab, settings)
 
 
-def _stage_resolved(
-    settings: Settings,
-    conn: sqlite3.Connection,
-    file_id: int,
-    resolved: list[str],
-) -> None:
-    """Stage *resolved* genres for *file_id*, replacing ONLY ``genre`` (P0 — no deletion).
+def _stage_resolved(settings: Settings, file_id: int, resolved: list[str]) -> None:
+    """Stage *resolved* genres for *file_id*, passing ONLY ``genre`` (P0, no deletion).
 
-    The target starts from the file's own managed subset so every other managed tag
-    (``artist``/``albumartist``/MBID) is preserved through the commit's delete-on-absent
+    :func:`tagmend.engine.staging._stage_one` merges it onto the tags read from disk, so
+    every other managed tag keeps its on-disk value through the commit's delete-on-absent
     write. ``stage_tags`` opens and owns its own connection.
     """
-    target = dict(versioning.managed_subset(store.get_tags(conn, file_id)))
-    target["genre"] = resolved
     staging.stage_tags(
         settings,
         file_id=file_id,
-        managed_tags=target,
+        managed_tags={"genre": resolved},
         origin="auto",
         note=f"lastfm: {', '.join(resolved)}",
     )
@@ -415,6 +425,7 @@ def _build_result(
         "no_match": tally.skipped_no_match,
         "manual": tally.skipped_manual,
         "no_artist": tally.skipped_no_artist,
+        "missing": tally.skipped_missing,
     }
     more = pending_remaining > 0
     summary = _summarize(
@@ -449,7 +460,8 @@ def _summarize(
         f"Processed {processed} file(s): staged {tally.staged}, no_match {tally.no_match}.",
         f"Skipped {skipped_total} "
         f"(done {skipped['done']}, no_match {skipped['no_match']}, "
-        f"manual {skipped['manual']}, no_artist {skipped['no_artist']}).",
+        f"manual {skipped['manual']}, no_artist {skipped['no_artist']}, "
+        f"missing {skipped['missing']}).",
     ]
     if pending_remaining > 0:
         parts.append(f"{pending_remaining} still pending — call again to continue.")
@@ -459,6 +471,24 @@ def _summarize(
 
 
 # --- status tools --------------------------------------------------------------------
+
+
+def _genre_scope(
+    conn: sqlite3.Connection,
+    *,
+    file_ids: list[int] | None,
+    artist: str | None,
+) -> list[int]:
+    """Resolve the in-scope file ids for the genre status tools, in ascending id order.
+
+    *file_ids* (when given) win, else *artist*. With neither, the scope is empty rather than
+    the whole library, as it is for the artist, year and mismatch status tools.
+    """
+    if file_ids is not None:
+        return store.files_in_scope(conn, file_ids=file_ids)
+    if artist is not None:
+        return store.files_in_scope(conn, artist=artist)
+    return []
 
 
 def set_genre_status(
@@ -472,8 +502,9 @@ def set_genre_status(
 
     ``manual`` writes a sticky status row recording the file's current lookup identity, so
     it is skipped until an explicit reset. ``pending`` deletes any status row, re-queuing
-    the file. Returns the number of files affected. Raises :class:`ValueError` for an
-    unknown *status*. Owns its transaction.
+    the file. With neither *file_ids* nor *artist* the call changes nothing and returns 0.
+    Returns the number of files affected. Raises :class:`ValueError` for an unknown
+    *status*. Owns its transaction.
     """
     if status not in _USER_STATUSES:
         message = f"invalid status: {status!r} (expected manual|pending)"
@@ -482,11 +513,7 @@ def set_genre_status(
     connection = db.connect(settings.db_path)
     try:
         schema.apply_schema(connection)
-        scoped = store.files_in_scope(
-            connection,
-            artist=artist,
-            file_ids=file_ids,
-        )
+        scoped = _genre_scope(connection, file_ids=file_ids, artist=artist)
         now = _utc_now()
         for fid in scoped:
             if status == "manual":
@@ -517,16 +544,14 @@ def reset_genre_status(
 ) -> int:
     """Delete the genre status row for every file in scope (back to ``pending``).
 
-    Returns the number of files affected. Owns its transaction.
+    With neither *file_ids* nor *artist* the call changes nothing and returns 0, because a
+    deleted ``manual`` exclusion has no history to restore it from. Returns the number of
+    files affected. Owns its transaction.
     """
     connection = db.connect(settings.db_path)
     try:
         schema.apply_schema(connection)
-        scoped = store.files_in_scope(
-            connection,
-            artist=artist,
-            file_ids=file_ids,
-        )
+        scoped = _genre_scope(connection, file_ids=file_ids, artist=artist)
         for fid in scoped:
             store.delete_genre_status(connection, fid)
         connection.commit()
@@ -554,8 +579,9 @@ def list_artists(settings: Settings, *, limit: int | None = None) -> list[Artist
 
     A discovery aid for scoping ``resolve_genres`` by artist. Read-only. *limit* (when given)
     caps the number of rows returned, applied AFTER the value ordering so the cap is
-    deterministic.
+    deterministic. Raises :class:`ValueError` for a negative *limit*.
     """
+    check_limit(limit)
     connection = db.connect(settings.db_path)
     try:
         schema.apply_schema(connection)

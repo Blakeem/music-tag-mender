@@ -25,6 +25,7 @@ import mutagen
 
 from tagmend.engine import db, scan, schema, store, versioning
 from tagmend.engine.tags import TAG_READER_VERSION, read_tags
+from tagmend.engine.validation import check_limit
 from tagmend.log import get_logger
 
 if TYPE_CHECKING:
@@ -192,8 +193,10 @@ def list_files(  # noqa: PLR0913 - cohesive keyword-only discovery filters
     that carry neither ``artist`` nor ``albumartist`` (every resolver skips them). With NO
     status filter the cap is applied before reading tags, so a large library stays cheap to
     browse; with any filter, all candidate rows are examined, ALL filters are applied, and the
-    cap counts the *matching* files. Raises :class:`ValueError` for an unknown status. Read-only.
+    cap counts the *matching* files. Raises :class:`ValueError` for an unknown status or a
+    negative *limit*. Read-only.
     """
+    check_limit(limit)
     if genre_status is not None and genre_status not in store.GENRE_WORKFLOW_STATUSES:
         message = (
             f"unknown genre_status: {genre_status!r} "

@@ -430,18 +430,27 @@ def max_version(conn: sqlite3.Connection, file_id: int) -> int | None:
 
 # The ``commits`` table ops and the shared commit loop live in
 # :mod:`tagmend.engine.commits`; staged rows here no longer carry a ``commit_id``.
-_STAGED_TAG_COLUMNS = "file_id, managed_tags, origin, note, staged_at"
+_STAGED_TAG_COLUMNS = (
+    "file_id, managed_tags, origin, note, staged_at, base_size_bytes, base_mtime_ns"
+)
+_STAGED_TAG_WIDTH: Final = 7
 
 
 @dataclass(frozen=True, slots=True)
 class StagedTag:
-    """One pending change from ``tag_revisions_staged`` (the staging area)."""
+    """One pending change from ``tag_revisions_staged`` (the staging area).
+
+    ``base_size_bytes``/``base_mtime_ns`` are the file's signature when it was staged, so a
+    commit can refuse a file edited since. Both are ``None`` on a row staged before v17.
+    """
 
     file_id: int
     managed_tags: dict[str, list[str]]
     origin: str
     note: str | None
     staged_at: str
+    base_size_bytes: int | None
+    base_mtime_ns: int | None
 
 
 def _row_to_staged_tag(row: tuple[object, ...]) -> StagedTag:
@@ -452,6 +461,8 @@ def _row_to_staged_tag(row: tuple[object, ...]) -> StagedTag:
         origin=str(row[2]),
         note=None if row[3] is None else str(row[3]),
         staged_at=str(row[4]),
+        base_size_bytes=None if row[5] is None else _as_int(row[5]),
+        base_mtime_ns=None if row[6] is None else _as_int(row[6]),
     )
 
 
@@ -463,20 +474,32 @@ def upsert_staged_tag(  # noqa: PLR0913 - cohesive keyword-only staging payload
     origin: str,
     now: str,
     note: str | None = None,
+    base_size_bytes: int | None = None,
+    base_mtime_ns: int | None = None,
 ) -> None:
     """Insert or replace the single pending change for *file_id*.
 
     A re-stage overwrites any prior pending change; the ``file_id`` PK keeps exactly one
-    pending change per file (the latest staged target wins).
+    pending change per file (the latest staged target wins). *base_size_bytes* and
+    *base_mtime_ns* record the file's signature at stage time. A ``None`` pair skips the
+    commit's changed-since-stage check.
     """
     conn.execute(
         """
         INSERT OR REPLACE INTO tag_revisions_staged (
-            file_id, managed_tags, origin, note, staged_at
+            file_id, managed_tags, origin, note, staged_at, base_size_bytes, base_mtime_ns
         )
-        VALUES (?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
-        (file_id, _dump_json(managed_tags), origin, note, now),
+        (
+            file_id,
+            _dump_json(managed_tags),
+            origin,
+            note,
+            now,
+            base_size_bytes,
+            base_mtime_ns,
+        ),
     )
 
 
@@ -507,7 +530,7 @@ def list_staged_tags_under(conn: sqlite3.Connection, root: Path) -> list[StagedT
     cursor = conn.execute(
         """
         SELECT s.file_id, s.managed_tags, s.origin, s.note, s.staged_at,
-               f.folder
+               s.base_size_bytes, s.base_mtime_ns, f.folder
         FROM tag_revisions_staged s
         JOIN files f ON f.id = s.file_id
         ORDER BY s.file_id
@@ -516,9 +539,9 @@ def list_staged_tags_under(conn: sqlite3.Connection, root: Path) -> list[StagedT
     result: list[StagedTag] = []
     for raw in cursor.fetchall():
         row = tuple(raw)
-        folder = Path(str(row[5]))
+        folder = Path(str(row[_STAGED_TAG_WIDTH]))
         if folder == root or folder.is_relative_to(root):
-            result.append(_row_to_staged_tag(row[:5]))
+            result.append(_row_to_staged_tag(row[:_STAGED_TAG_WIDTH]))
     return result
 
 
@@ -1492,6 +1515,12 @@ def files_by_tag_value(conn: sqlite3.Connection, name: str, value: str) -> list[
         (name, value),
     )
     return [_as_int(row[0]) for row in cursor.fetchall()]
+
+
+def missing_file_ids(conn: sqlite3.Connection) -> set[int]:
+    """Return the ids of every file the last scan flagged missing from disk."""
+    cursor = conn.execute("SELECT id FROM files WHERE is_missing = 1")
+    return {_as_int(row[0]) for row in cursor.fetchall()}
 
 
 def files_in_scope(

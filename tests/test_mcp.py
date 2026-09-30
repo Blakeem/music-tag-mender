@@ -10,16 +10,21 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
+import mutagen
+import pytest
 from mcp.types import TextContent
 
 from conftest import make_track
 from tagmend import mcp_server
 from tagmend.config import load_settings
-from tagmend.engine import store
+from tagmend.engine import staging, store
 from tagmend.engine.db import connect
+from tagmend.engine.lastfm import LastfmError
+from tagmend.engine.musicbrainz import MusicBrainzError
 from tagmend.engine.tags import read_tags
 
 if TYPE_CHECKING:
@@ -500,3 +505,90 @@ def test_revert_commit_unknown_id_returns_error() -> None:
     payload = mcp_server.revert_commit(9999)
     assert payload["ok"] is False
     assert "error" in payload
+
+
+# --- the error envelope ----------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        ValueError("bad request"),
+        OSError("file in use by another process"),
+        mutagen.MutagenError("unreadable frame"),  # type: ignore[attr-defined]
+        sqlite3.OperationalError("database is locked"),
+        LastfmError("Last.fm artist.gettoptags failed after 3 attempt(s)"),
+        MusicBrainzError("MusicBrainz HTTP 500 for release lookup"),
+    ],
+    ids=lambda error: type(error).__name__,
+)
+def test_error_envelope_maps_each_expected_error(
+    monkeypatch: pytest.MonkeyPatch,
+    error: Exception,
+) -> None:
+    def fail(*_args: object, **_kwargs: object) -> object:
+        raise error
+
+    monkeypatch.setattr(staging, "commit_tags", fail)
+
+    payload = mcp_server.commit_tags()
+
+    assert payload["ok"] is False
+    assert payload["error_type"] == type(error).__name__
+    assert payload["error"] == str(error)
+
+
+def test_error_envelope_lets_a_bug_raise(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fail(*_args: object, **_kwargs: object) -> object:
+        message = "a bug, not an expected failure"
+        raise RuntimeError(message)
+
+    monkeypatch.setattr(staging, "commit_tags", fail)
+
+    with pytest.raises(RuntimeError, match="a bug"):
+        mcp_server.commit_tags()
+
+
+def test_every_tool_is_enveloped() -> None:
+    tools = mcp_server.mcp._tool_manager.list_tools()
+
+    assert len(tools) == 34
+    assert [tool.name for tool in tools if not hasattr(tool.fn, "__wrapped__")] == []
+
+
+def test_tool_schemas_survive_the_envelope() -> None:
+    tools = asyncio.run(mcp_server.mcp.list_tools())
+
+    stage_tool = next(tool for tool in tools if tool.name == "stage_tags")
+    assert set(stage_tool.inputSchema["properties"]) == {"file_id", "tags", "note"}
+
+
+_NEGATIVE_LIMIT_CALLS = [
+    ("list_files", {"limit": -1}),
+    ("list_commits", {"limit": -1}),
+    ("list_artists", {"limit": -1}),
+    ("list_albums", {"limit": -1}),
+    ("resolve_genres", {"limit": -1}),
+    ("resolve_artists", {"limit": -1}),
+    ("resolve_years", {"limit": -1}),
+    ("detect_mismatches", {"limit": -1}),
+    ("detect_track_conflicts", {"limit": -1}),
+    ("detect_album_conflicts", {"limit": -1}),
+    ("detect_album_gaps", {"limit": -1}),
+    ("detect_disagreements", {"limit": -1}),
+    ("detect_disagreements", {"row_limit": -1}),
+]
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "kwargs"),
+    _NEGATIVE_LIMIT_CALLS,
+    ids=[f"{name}-{next(iter(kwargs))}" for name, kwargs in _NEGATIVE_LIMIT_CALLS],
+)
+def test_negative_limit_is_rejected_everywhere(tool_name: str, kwargs: dict[str, int]) -> None:
+    # SQL reads LIMIT -1 as "no limit" and a slice reads [:-1] as "all but one", so the same
+    # argument meant two things before every entry point refused it.
+    payload = getattr(mcp_server, tool_name)(**kwargs)
+
+    assert payload["ok"] is False
+    assert "must be >= 0" in payload["error"]

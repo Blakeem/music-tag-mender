@@ -21,7 +21,7 @@ from tagmend.engine.musicbrainz import (
     _release_request_key,
     _request_key,
 )
-from tagmend.engine.store import get_cached_mb_album, get_cached_mb_recording
+from tagmend.engine.store import get_cached_mb_album, get_cached_mb_recording, get_cached_mb_release
 
 if TYPE_CHECKING:
     import sqlite3
@@ -318,6 +318,31 @@ def test_http_error_raises_and_caches_nothing(db_conn: sqlite3.Connection) -> No
         client.album_first_release("Artist", "Album")
     # Nothing cached → a re-run would retry.
     assert get_cached_mb_album(db_conn, _request_key("Artist", "Album")) is None
+
+
+def test_non_json_body_raises_musicbrainz_error(db_conn: sqlite3.Connection) -> None:
+    # A proxy error page arrives as a 200. It must fail as one lookup, not as a ValueError.
+    client, calls = _client(
+        db_conn,
+        [httpx.Response(200, content=b"<html>"), httpx.Response(200, content=b"<html>")],
+    )
+    with client:
+        with pytest.raises(MusicBrainzError, match="non-JSON body for release-group query"):
+            client.album_first_release("Artist", "Album")
+        with pytest.raises(MusicBrainzError, match="non-JSON body for release lookup"):
+            client.release_by_mbid("rel-1")
+
+    assert len(calls) == 2
+    assert get_cached_mb_album(db_conn, _request_key("Artist", "Album")) is None
+    assert get_cached_mb_release(db_conn, _release_request_key("rel-1")) is None
+
+
+def test_json_body_that_is_not_an_object_raises_musicbrainz_error(
+    db_conn: sqlite3.Connection,
+) -> None:
+    client, _ = _client(db_conn, [httpx.Response(200, json=["not", "an", "object"])])
+    with client, pytest.raises(MusicBrainzError, match="not an object"):
+        client.album_first_release("Artist", "Album")
 
 
 # --- pacing --------------------------------------------------------------------------

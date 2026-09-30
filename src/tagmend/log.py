@@ -25,6 +25,10 @@ _LOG_FORMAT: Final = "%(asctime)s %(levelname)-8s %(name)s: %(message)s"
 
 def _configure_root() -> logging.Logger:
     """Configure the ``tagmend`` root logger exactly once and return it."""
+    # Their INFO lines carry full request URLs, and the Last.fm key rides in the query string.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+
     root = logging.getLogger(_ROOT_NAME)
     if root.handlers:
         return root

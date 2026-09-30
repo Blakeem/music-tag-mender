@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import mutagen
 import pytest
 
 from conftest import make_track
@@ -697,3 +698,60 @@ def test_dry_run_counts_no_match_without_recording_it(
     # ...but nothing is recorded, so the real run still has the group to do.
     view = next(v for v in library_list(engine_settings) if v.file_id == file_id)
     assert view.year_status == "pending"
+
+
+def _edit_title_on_disk(path: Path, title: str) -> None:
+    """Change ``title`` the way an external tagger would, with no rescan afterwards."""
+    audio = mutagen.File(path, easy=True)  # type: ignore[attr-defined]
+    audio["title"] = [title]
+    audio.save()
+
+
+def _committed_diff_fields(settings: Settings, commit_id: int | None) -> list[set[str]]:
+    assert commit_id is not None
+    conn = connect(settings.db_path)
+    try:
+        apply_schema(conn)
+        return [set(revision.diff) for revision in store.revisions_for_commit(conn, commit_id)]
+    finally:
+        conn.close()
+
+
+def test_resolve_years_keeps_disk_values_the_mirror_lacks(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    track = make_track(
+        music_dir / "a.mp3",
+        {"artist": ["Black Sabbath"], "album": ["Paranoid"], "title": ["Old Title"]},
+    )
+    scan_library(engine_settings)
+    _edit_title_on_disk(track, "Title Edited In Picard")
+
+    fake = FakeMBAlbumSource({("Black Sabbath", "Paranoid"): _mb("1970")})
+    years.resolve_years(engine_settings, client=fake)
+    result = staging.commit_tags(engine_settings)
+
+    assert read_tags(track).tags["title"] == ["Title Edited In Picard"]
+    assert read_tags(track).tags["originaldate"] == ["1970"]
+    assert _committed_diff_fields(engine_settings, result.commit_id) == [{"originaldate"}]
+
+
+def test_resolve_years_skips_missing_files(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    kept = make_track(music_dir / "kept.mp3", {"artist": ["Black Sabbath"], "album": ["Paranoid"]})
+    gone = make_track(music_dir / "gone.mp3", {"artist": ["Black Sabbath"], "album": ["Paranoid"]})
+    scan_library(engine_settings)
+    gone.unlink()
+    scan_library(engine_settings)  # flags the deleted file missing
+
+    fake = FakeMBAlbumSource({("Black Sabbath", "Paranoid"): _mb("1970")})
+    result = years.resolve_years(engine_settings, client=fake)
+
+    assert result.skipped_missing == 1
+    assert result.to_dict()["skipped_missing"] == 1
+    assert "1 file(s) missing" in result.summary
+    assert result.staged_files == 1
+    assert [view.filename for view in staging.diff_tags(engine_settings)] == [kept.name]

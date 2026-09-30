@@ -16,12 +16,13 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import mutagen
 import pytest
 
 from conftest import make_track
 from tagmend.engine import genres, staging, store, versioning
 from tagmend.engine.db import connect
-from tagmend.engine.lastfm import Tag
+from tagmend.engine.lastfm import LastfmError, Tag
 from tagmend.engine.library import ScanMode, list_files, scan_library
 from tagmend.engine.schema import apply_schema
 from tagmend.engine.tags import read_tags, write_managed_tags
@@ -236,20 +237,54 @@ def test_committed_auto_revision_is_skipped_as_done_on_rerun(
     assert second.skipped["done"] == 1
 
 
-def test_already_staged_file_is_skipped_as_done(
+def test_already_staged_file_refuses_a_second_run_and_reads_staged(
     engine_settings: Settings,
     music_dir: Path,
 ) -> None:
-    make_track(music_dir / "t.mp3", {"artist": ["Daft Punk"], "genre": ["Old"]})
+    track = make_track(music_dir / "t.mp3", {"artist": ["Daft Punk"], "genre": ["Old"]})
     scan_library(engine_settings)
+    file_id = _file_id(engine_settings, music_dir, track.name)
 
     fake = FakeTagSource({"Daft Punk": _DAFT_PUNK_TAGS})
     genres.resolve_genres(engine_settings, client=fake)  # stages but does NOT commit
 
-    # Without committing, the staged row alone derives "done".
-    second = genres.resolve_genres(engine_settings, client=fake)
-    assert second.processed == 0
-    assert second.skipped["done"] == 1
+    # A second run refuses rather than restaging over pending work.
+    with pytest.raises(ValueError, match="commit or unstage pending changes first"):
+        genres.resolve_genres(engine_settings, client=fake)
+
+    conn = connect(engine_settings.db_path)
+    try:
+        apply_schema(conn)
+        assert store.derived_genre_status(conn, file_id) == "staged"
+    finally:
+        conn.close()
+
+
+def test_resolve_genres_refuses_while_anything_is_staged(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    make_track(music_dir / "a.mp3", {"artist": ["Daft Punk"], "album": ["Discovery"]})
+    make_track(music_dir / "b.mp3", {"artist": ["Daft Punk"], "genre": ["Old"]})
+    scan_library(engine_settings)
+    fixed_id = _file_id(engine_settings, music_dir, "a.mp3")
+    staging.stage_tags_batch(
+        engine_settings,
+        entries=[(fixed_id, {"album": ["Discovery (Remastered)"]})],
+    )
+    before = staging.diff_tags(engine_settings)
+
+    fake = FakeTagSource({"Daft Punk": _DAFT_PUNK_TAGS})
+    with pytest.raises(ValueError, match="commit or unstage pending changes first"):
+        genres.resolve_genres(engine_settings, client=fake)
+
+    after = staging.diff_tags(engine_settings)
+    assert fake.artist_lookups == []
+    assert [(v.file_id, v.origin, v.target) for v in after] == [
+        (v.file_id, v.origin, v.target) for v in before
+    ]
+    assert after[0].origin == "manual"
+    assert after[0].target["album"] == ["Discovery (Remastered)"]
 
 
 def test_genre_pipeline_is_field_aware_artist_only_change_stays_processable(
@@ -298,17 +333,25 @@ def test_genre_pipeline_is_field_aware_artist_only_change_stays_processable(
         # The status view agrees: an artist-only change is genre-PENDING, not done.
         assert store.derived_genre_status(conn, committed_id) == "pending"
         assert store.derived_genre_status(conn, staged_id) == "pending"
+
+        # resolve_genres refuses while anything is staged, so the staged half is checked at
+        # the selection itself: an artist-only staged row leaves the file processable.
+        tally = genres._Tally()
+        selected = genres._select(conn, [staged_id], tally)
+        assert [candidate.file_id for candidate in selected] == [staged_id]
+        assert tally.skipped_done == 0
+
+        store.delete_staged_tag(conn, staged_id)
+        conn.commit()
     finally:
         conn.close()
 
     fake = FakeTagSource({"Daft Punk": _DAFT_PUNK_TAGS})
-    result = genres.resolve_genres(engine_settings, client=fake)
+    result = genres.resolve_genres(engine_settings, client=fake, file_ids=[committed_id])
 
-    # Neither file is skipped as done; the committed one is processed + genre-staged.
-    # (The staged-id already has a staged genre? No — its staged row is artist-only, so it
-    # is also processable.) Both are processed; none land in skipped['done'].
+    # The committed artist-only revision does not mark the file genre-done.
     assert result.skipped["done"] == 0
-    assert result.processed == 2
+    assert result.processed == 1
 
 
 # --- no_match + staleness ------------------------------------------------------------
@@ -396,6 +439,123 @@ def test_set_genre_status_rejects_unknown_status(engine_settings: Settings) -> N
         genres.set_genre_status(engine_settings, file_ids=[1], status="no_match")
 
 
+def _genre_status_rows(settings: Settings) -> list[tuple[int, str]]:
+    conn = connect(settings.db_path)
+    try:
+        apply_schema(conn)
+        rows = conn.execute("SELECT file_id, status FROM file_genre_status ORDER BY file_id")
+        return [(int(row[0]), str(row[1])) for row in rows.fetchall()]
+    finally:
+        conn.close()
+
+
+def test_set_genre_status_without_scope_changes_nothing(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    make_track(music_dir / "a.mp3", {"artist": ["Daft Punk"]})
+    make_track(music_dir / "b.mp3", {"artist": ["Justice"]})
+    scan_library(engine_settings)
+
+    assert genres.set_genre_status(engine_settings, status="manual") == 0
+    assert _genre_status_rows(engine_settings) == []
+
+
+def test_reset_genre_status_without_scope_keeps_manual_rows(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    track = make_track(music_dir / "a.mp3", {"artist": ["Daft Punk"]})
+    scan_library(engine_settings)
+    file_id = _file_id(engine_settings, music_dir, track.name)
+    genres.set_genre_status(engine_settings, file_ids=[file_id], status="manual")
+
+    assert genres.reset_genre_status(engine_settings) == 0
+    assert _genre_status_rows(engine_settings) == [(file_id, "manual")]
+
+
+def test_resolve_genres_keeps_disk_values_the_mirror_lacks(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    # An external edit with no rescan since leaves the snapshot mirror behind the file.
+    track = make_track(
+        music_dir / "t.mp3",
+        {"artist": ["Daft Punk"], "album": ["Discovery"], "title": ["Old Title"]},
+    )
+    scan_library(engine_settings)
+    audio = mutagen.File(track, easy=True)  # type: ignore[attr-defined]
+    audio["title"] = ["Title Edited In Picard"]
+    audio.save()
+
+    genres.resolve_genres(engine_settings, client=FakeTagSource({"Daft Punk": _DAFT_PUNK_TAGS}))
+    result = staging.commit_tags(engine_settings)
+
+    assert read_tags(track).tags["title"] == ["Title Edited In Picard"]
+    assert result.commit_id is not None
+    conn = connect(engine_settings.db_path)
+    try:
+        apply_schema(conn)
+        revisions = store.revisions_for_commit(conn, result.commit_id)
+    finally:
+        conn.close()
+    assert [set(revision.diff) for revision in revisions] == [{"genre"}]
+
+
+def test_resolve_genres_skips_missing_files(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    kept = make_track(music_dir / "kept.mp3", {"artist": ["Daft Punk"], "genre": ["Old"]})
+    gone = make_track(music_dir / "gone.mp3", {"artist": ["Justice"], "genre": ["Old"]})
+    scan_library(engine_settings)
+    gone.unlink()
+    scan_library(engine_settings)  # flags the deleted file missing
+
+    fake = FakeTagSource({"Daft Punk": _DAFT_PUNK_TAGS, "Justice": _DAFT_PUNK_TAGS})
+    result = genres.resolve_genres(engine_settings, client=fake)
+
+    assert result.skipped["missing"] == 1
+    assert "missing 1" in result.summary
+    assert result.staged == 1
+    assert [view.filename for view in staging.diff_tags(engine_settings)] == [kept.name]
+
+
+class _FailingTagSource(FakeTagSource):
+    """A :class:`FakeTagSource` whose lookups for the given artists fail like a dropped link."""
+
+    def __init__(self, artists: dict[str, list[Tag] | None], failing: set[str]) -> None:
+        super().__init__(artists)
+        self._failing = failing
+
+    def artist_top_tags(
+        self,
+        name: str | None = None,
+        *,
+        mbid: str | None = None,
+    ) -> list[Tag] | None:
+        if name in self._failing:
+            message = "Last.fm artist.gettoptags failed after 3 attempt(s): transport error"
+            raise LastfmError(message)
+        return super().artist_top_tags(name, mbid=mbid)
+
+
+def test_lastfm_transport_failure_is_reported_not_raised(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    make_track(music_dir / "a.mp3", {"artist": ["Daft Punk"], "genre": ["Old"]})
+    make_track(music_dir / "b.mp3", {"artist": ["Justice"], "genre": ["Old"]})
+    scan_library(engine_settings)
+
+    fake = _FailingTagSource({"Daft Punk": _DAFT_PUNK_TAGS}, failing={"Justice"})
+    result = genres.resolve_genres(engine_settings, client=fake)
+
+    assert result.staged == 1
+    assert [error["artist"] for error in result.errors] == ["Justice"]
+    assert "transport error" in result.errors[0]["message"]
+
+
 # --- limit / more loop ---------------------------------------------------------------
 
 
@@ -419,6 +579,7 @@ def test_limit_caps_and_reports_pending_then_continues(
     assert first.more is True
 
     # A second call continues with the remaining candidate (the first two are now "done").
+    staging.commit_tags(engine_settings)
     second = genres.resolve_genres(engine_settings, client=fake, limit=2)
     assert second.processed == 1
     assert second.staged == 1

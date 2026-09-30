@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 import mutagen
 import pytest
 from mutagen.flac import FLAC
-from mutagen.id3 import ID3, TSO2  # type: ignore[attr-defined]
+from mutagen.id3 import ID3, TRCK, TSO2  # type: ignore[attr-defined]
 from mutagen.mp4 import MP4
 from mutagen.oggvorbis import OggVorbis
 
@@ -514,3 +514,36 @@ def test_managed_set_version_3_registered() -> None:
     assert MANAGED_SETS[1] == ORIGINAL_MANAGED_TAGS
     assert len(MANAGED_SETS[2]) == 18
     assert TAG_READER_VERSION == 5
+
+
+def test_write_leaves_unchanged_frames_untouched(tmp_path: Path) -> None:
+    # The easy layer builds a fresh UTF-8 frame on every assignment, so rewriting an unchanged
+    # value would flip its encoding. Only the changed frame may move.
+    track = make_track(tmp_path / "latin1.mp3", {"genre": ["Rock"]})
+    raw = ID3(track)  # type: ignore[no-untyped-call]
+    raw.add(TRCK(encoding=0, text=["3/10"]))  # type: ignore[no-untyped-call]
+    raw.save()
+    managed = read_tags(track).tags
+
+    written = write_managed_tags(track, {**managed, "genre": ["Jazz"]})
+
+    after = ID3(track)  # type: ignore[no-untyped-call]
+    assert written is True
+    assert after["TRCK"].encoding == 0
+    assert after["TRCK"].text == ["3/10"]
+    assert read_tags(track).tags["genre"] == ["Jazz"]
+
+
+@pytest.mark.parametrize("suffix", _ALL_FORMATS)
+def test_write_with_no_change_does_not_touch_the_file(tmp_path: Path, suffix: str) -> None:
+    track = make_track(tmp_path / f"same{suffix}", {"genre": ["Rock"], "title": ["Song"]})
+    managed = {key: values for key, values in read_tags(track).tags.items() if key in MANAGED_TAGS}
+    before_bytes = track.read_bytes()
+    before_mtime = track.stat().st_mtime_ns
+
+    written = write_managed_tags(track, managed)
+
+    assert written is False
+    assert track.read_bytes() == before_bytes
+    assert track.stat().st_mtime_ns == before_mtime
+    assert not list(tmp_path.glob("*.tagmend.tmp"))

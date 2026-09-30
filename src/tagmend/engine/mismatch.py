@@ -50,6 +50,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
 from tagmend.engine import axis, db, schema, store
+from tagmend.engine.validation import check_limit
 from tagmend.log import get_logger
 
 if TYPE_CHECKING:
@@ -868,8 +869,10 @@ def detect_mismatches(
     (``rows`` then empty); *folder* returns the flat rows of exactly that folder (exact path
     equality, never a prefix/LIKE match) and takes precedence over *group*. Raises
     :class:`ValueError` when no music path is configured (mirrors
-    :func:`tagmend.engine.library.scan_library`) or for an unknown *tier*.
+    :func:`tagmend.engine.library.scan_library`), for an unknown *tier* or for a negative
+    *limit*.
     """
+    check_limit(limit)
     if settings.music_path is None:
         message = "music_path not configured — run `tagmend config-set music_path <dir>`"
         raise ValueError(message)

@@ -285,17 +285,21 @@ def test_duplicate_revision_version_raises(db_conn: sqlite3.Connection) -> None:
         _insert_revision(db_conn, file_id, version=0)
 
 
-def test_revisions_cascade_on_file_delete(db_conn: sqlite3.Connection) -> None:
+def test_file_delete_is_blocked_while_it_has_history(db_conn: sqlite3.Connection) -> None:
+    # The cascade from files would erase the file's whole history, so the log's trigger aborts it.
     file_id = _insert(db_conn, folder="/lib", filename="a.mp3")
     _insert_revision(db_conn, file_id, version=0, managed_tags={"genre": ["X"]})
 
-    db_conn.execute("DELETE FROM files WHERE id = ?", (file_id,))
+    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+        db_conn.execute("DELETE FROM files WHERE id = ?", (file_id,))
 
-    remaining = db_conn.execute(
+    files_left = db_conn.execute("SELECT COUNT(*) FROM files WHERE id = ?", (file_id,))
+    assert files_left.fetchone()[0] == 1
+    revisions_left = db_conn.execute(
         "SELECT COUNT(*) FROM tag_revisions WHERE file_id = ?",
         (file_id,),
-    ).fetchone()
-    assert remaining[0] == 0
+    )
+    assert revisions_left.fetchone()[0] == 1
 
 
 def test_revision_json_serialized_with_sorted_keys(db_conn: sqlite3.Connection) -> None:

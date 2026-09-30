@@ -50,6 +50,17 @@ def test_malformed_int_falls_back_to_default() -> None:
     assert settings.lastfm_rate_per_sec == 1.0
 
 
+def test_negative_stage_limit_falls_back_to_default() -> None:
+    # A stage limit caps a Python slice, where -1 would mean "all but the last one".
+    defaults = config.load_settings()
+    config.set_setting("genre_stage_limit", "-1")
+    config.set_setting("album_stage_limit", "-5")
+
+    settings = config.load_settings()
+    assert settings.genre_stage_limit == defaults.genre_stage_limit
+    assert settings.album_stage_limit == defaults.album_stage_limit
+
+
 @pytest.mark.parametrize("token", ["", "0", "none", "NULL", "None"])
 def test_genre_max_count_none_sentinel(token: str) -> None:
     config.set_setting("genre_max_count", token)

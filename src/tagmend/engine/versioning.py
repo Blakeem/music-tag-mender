@@ -230,12 +230,12 @@ def _revert_file(
 
     # Disk write first, before any DB append: a write failure aborts with no row. The
     # snapshot is merged onto the file's current values for every field OUTSIDE the target
-    # revision's own managed set, which it never governed (see _revert_target_tags).
+    # revision's own managed set, which it never governed (see _revert_target_tags). A revert
+    # that moves nothing skips the write, so it never rewrites the file.
     path = Path(file_row.folder) / file_row.filename
-    write_managed_tags(
-        path,
-        _revert_target_tags(path, target.managed_tags, target.managed_set),
-    )
+    planned = _revert_target_tags(path, target.managed_tags, target.managed_set)
+    if compute_diff(managed_subset(read_tags(path).tags), planned):
+        write_managed_tags(path, planned)
 
     # Refresh the live snapshot so file_tags reflects the actual on-disk state.
     now = _utc_now()

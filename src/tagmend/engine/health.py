@@ -186,9 +186,15 @@ def _check_lastfm(
 
     conn = _memory_conn()
     try:
-        with LastfmClient(settings.lastfm_api_key, conn, transport=transport) as client:
+        with LastfmClient(
+            settings.lastfm_api_key,
+            conn,
+            transport=transport,
+            # A readiness probe answers on the first attempt, like the MusicBrainz check.
+            max_attempts=1,
+        ) as client:
             client.artist_correction(_LASTFM_PING_ARTIST)
-    except (LastfmError, httpx.HTTPError) as exc:
+    except LastfmError as exc:
         return Check(name=name, ok=False, detail=f"unreachable: {exc}")
     finally:
         conn.close()

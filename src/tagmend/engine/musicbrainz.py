@@ -46,9 +46,8 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final, Literal, Protocol, Self, cast, overload
 
-import httpx
-
 from tagmend.engine import clock
+from tagmend.engine.lookup_clients import RETRY_ATTEMPTS, PacedHttp, Retry, decode_object
 from tagmend.engine.store import (
     get_cached_mb_artist,
     get_cached_mb_recording,
@@ -66,6 +65,8 @@ if TYPE_CHECKING:
     import sqlite3
     from collections.abc import Callable
     from types import TracebackType
+
+    import httpx
 
     from tagmend.config import Settings
 
@@ -121,8 +122,6 @@ _HTTP_NOT_FOUND: Final = 404
 # sweep of 876 releases lost 52 of them to this before the retry existed. Every other
 # non-2xx is a real failure and is raised on the first attempt.
 _HTTP_THROTTLED: Final = 503
-_THROTTLE_ATTEMPTS: Final = 3
-_THROTTLE_BACKOFF_SECONDS: Final = 1.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -324,20 +323,20 @@ class MusicBrainzClient:
         transport: httpx.BaseTransport | None = None,
         monotonic: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
-        max_attempts: int = _THROTTLE_ATTEMPTS,
+        max_attempts: int = RETRY_ATTEMPTS,
     ) -> None:
         """Configure the client; injectables default to the real httpx transport + clock."""
-        self._user_agent = user_agent
         self._conn = conn
-        self._rate_per_sec = rate_per_sec
-        self._transport = transport
-        self._monotonic = monotonic
-        self._sleep = sleep
         # A readiness probe wants one attempt and a fast answer. A long sweep wants the
         # retries, because it meets a throttle or a dropped connection sooner or later.
-        self._max_attempts = max(1, max_attempts)
-        self._last_request_at: float | None = None
-        self._client: httpx.Client | None = None
+        self._http = PacedHttp(
+            rate_per_sec=rate_per_sec,
+            transport=transport,
+            monotonic=monotonic,
+            sleep=sleep,
+            max_attempts=max_attempts,
+            headers={"User-Agent": user_agent},
+        )
 
     @classmethod
     def from_settings(cls, settings: Settings, conn: sqlite3.Connection) -> Self:
@@ -352,11 +351,7 @@ class MusicBrainzClient:
 
     def __enter__(self) -> Self:
         """Open the underlying :class:`httpx.Client` with the mandatory User-Agent."""
-        self._client = httpx.Client(
-            transport=self._transport,
-            timeout=30.0,
-            headers={"User-Agent": self._user_agent},
-        )
+        self._http.open()
         return self
 
     def __exit__(
@@ -366,9 +361,7 @@ class MusicBrainzClient:
         tb: TracebackType | None,
     ) -> None:
         """Close the underlying :class:`httpx.Client`."""
-        if self._client is not None:
-            self._client.close()
-            self._client = None
+        self._http.close()
 
     # --- public API ------------------------------------------------------------------
 
@@ -691,85 +684,33 @@ class MusicBrainzClient:
         """GET *url* and decode its JSON object body, or raise :class:`MusicBrainzError`.
 
         A 404 returns ``None`` only when *not_found_ok*, because a lookup by id treats it as
-        the real answer "no such entity" while a search never answers 404.
+        the real answer "no such entity" while a search never answers 404. A 503 that outlasts
+        every attempt is raised like any other failure, so it is never cached.
         """
-        response = self._get_with_backoff(url, params)
+        response = self._http.send(
+            lambda client: client.get(url, params=params),
+            verdict=_throttle_verdict,
+            error=lambda failure, attempts: MusicBrainzError(
+                f"MusicBrainz {failure} after {attempts} attempt(s) for {what}",
+            ),
+            label=f"musicbrainz {what}",
+        )
         if not_found_ok and response.status_code == _HTTP_NOT_FOUND:
             return None
         if response.is_error:
             message = f"MusicBrainz HTTP {response.status_code} for {what}"
             raise MusicBrainzError(message)
-        return _decode_object(response, what)
-
-    def _get_with_backoff(self, url: str, params: dict[str, str]) -> httpx.Response:
-        """Pace, then GET *url*, retrying only while MusicBrainz answers with its throttle code.
-
-        The backoff doubles between attempts. After the last one the 503 is raised like any
-        other failure, so it is reported and never cached, and a re-run retries it.
-        """
-        if self._client is None:  # pragma: no cover - guard against misuse outside `with`
-            message = "MusicBrainzClient must be used as a context manager"
-            raise RuntimeError(message)
-
-        delay = _THROTTLE_BACKOFF_SECONDS
-        last_error: httpx.HTTPError | None = None
-        for attempt in range(self._max_attempts):
-            self._pace()
-            try:
-                response = self._client.get(url, params=params)
-            except httpx.HTTPError as exc:
-                # A dropped connection or a timeout is as transient as the throttle code, and
-                # a long sweep meets both. Letting it escape aborts the whole run over one
-                # lookup, which is what happened to a 370-lookup artist pass.
-                last_error = exc
-                logger.debug("musicbrainz transport error, backing off %ss: %s", delay, exc)
-            else:
-                if response.status_code != _HTTP_THROTTLED:
-                    return response
-                last_error = None
-                logger.debug("musicbrainz throttled, backing off %ss", delay)
-            if attempt < self._max_attempts - 1:
-                self._sleep(delay)
-                delay *= 2
-
-        if last_error is not None:
-            message = f"MusicBrainz transport failure after {self._max_attempts} attempt(s)"
-            raise MusicBrainzError(message) from last_error
-        return response
-
-    def _pace(self) -> None:
-        """Sleep just enough so consecutive network requests honor ``rate_per_sec``.
-
-        Uses the injected ``monotonic``/``sleep`` so tests assert pacing without waiting.
-        ``rate_per_sec <= 0`` disables pacing.
-        """
-        if self._rate_per_sec > 0 and self._last_request_at is not None:
-            interval = 1.0 / self._rate_per_sec
-            elapsed = self._monotonic() - self._last_request_at
-            remaining = interval - elapsed
-            if remaining > 0:
-                self._sleep(remaining)
-        self._last_request_at = self._monotonic()
+        return decode_object(response, MusicBrainzError, source="MusicBrainz", what=what)
 
 
 # --- module helpers ------------------------------------------------------------------
 
 
-def _decode_object(response: httpx.Response, what: str) -> dict[str, object]:
-    """Decode a 2xx body as a JSON object, or raise :class:`MusicBrainzError` naming *what*.
-
-    A proxy error page or a truncated response arrives as a 200 too, and must fail as one
-    retryable lookup rather than as an unrelated ``ValueError`` that aborts the run.
-    """
-    try:
-        body = response.json()
-    except ValueError as exc:
-        message = f"MusicBrainz returned a non-JSON body for {what}"
-        raise MusicBrainzError(message) from exc
-    if not isinstance(body, dict):
-        message = f"MusicBrainz returned a JSON {type(body).__name__}, not an object, for {what}"
-        raise MusicBrainzError(message)
-    return cast("dict[str, object]", body)
+def _throttle_verdict(response: httpx.Response) -> httpx.Response | Retry:
+    """Retry MusicBrainz's throttle answer and hand every other response back."""
+    if response.status_code == _HTTP_THROTTLED:
+        return Retry(f"HTTP {response.status_code}")
+    return response
 
 
 def _request_key(artist: str, album: str) -> str:

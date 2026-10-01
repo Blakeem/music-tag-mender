@@ -35,15 +35,16 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, Self, cast
 
-import httpx
-
 from tagmend.config import PROJECT_URL, build_user_agent
+from tagmend.engine.lookup_clients import RETRY_ATTEMPTS, PacedHttp, Retry, decode_object
 from tagmend.log import get_logger
 
 if TYPE_CHECKING:
     import sqlite3
     from collections.abc import Callable, Mapping, Sequence
     from types import TracebackType
+
+    import httpx
 
     from tagmend.config import Settings
 
@@ -60,8 +61,6 @@ _FORM_HEADERS: Final = {
     "Content-Encoding": "gzip",
 }
 
-_RETRY_ATTEMPTS: Final = 3
-_RETRY_BACKOFF_SECONDS: Final = 1.0
 _HTTP_TOO_MANY_REQUESTS: Final = 429
 _HTTP_SERVER_ERROR: Final = 500
 _ERROR_INVALID_FINGERPRINT: Final = 3
@@ -359,18 +358,19 @@ class AcoustidClient:
         transport: httpx.BaseTransport | None = None,
         monotonic: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
-        max_attempts: int = _RETRY_ATTEMPTS,
+        max_attempts: int = RETRY_ATTEMPTS,
     ) -> None:
         """Configure the client. The injectables default to the real transport and clock."""
         self._api_key = api_key
-        self._rate_per_sec = rate_per_sec
-        self._transport = transport
-        self._monotonic = monotonic
-        self._sleep = sleep
         # A readiness probe wants one attempt and a fast answer. A long sweep wants the retries.
-        self._max_attempts = max(1, max_attempts)
-        self._last_request_at: float | None = None
-        self._client: httpx.Client | None = None
+        self._http = PacedHttp(
+            rate_per_sec=rate_per_sec,
+            transport=transport,
+            monotonic=monotonic,
+            sleep=sleep,
+            max_attempts=max_attempts,
+            headers={"User-Agent": _USER_AGENT},
+        )
 
     @classmethod
     def from_settings(cls, settings: Settings) -> Self:
@@ -389,11 +389,7 @@ class AcoustidClient:
 
     def __enter__(self) -> Self:
         """Open the underlying :class:`httpx.Client` with the project User-Agent."""
-        self._client = httpx.Client(
-            transport=self._transport,
-            timeout=30.0,
-            headers={"User-Agent": _USER_AGENT},
-        )
+        self._http.open()
         return self
 
     def __exit__(
@@ -403,9 +399,7 @@ class AcoustidClient:
         tb: TracebackType | None,
     ) -> None:
         """Close the underlying :class:`httpx.Client`."""
-        if self._client is not None:
-            self._client.close()
-            self._client = None
+        self._http.close()
 
     def lookup(self, fp: Fingerprint) -> AcoustidResult:
         """Return every recording AcoustID links to *fp*.
@@ -414,57 +408,27 @@ class AcoustidClient:
         the same answer. Raises :class:`AcoustidKeyError` when AcoustID rejects the key and
         :class:`AcoustidError` on any other failure.
         """
+        content = _encode_form(self._api_key, fp)
+
         logger.debug("acoustid lookup duration=%d", fp.duration)
-        response = self._post_with_backoff(_encode_form(self._api_key, fp))
-        body = _decode_object(response)
+        response = self._http.send(
+            lambda client: client.post(_LOOKUP_URL, content=content, headers=_FORM_HEADERS),
+            verdict=_retry_verdict,
+            error=lambda failure, attempts: AcoustidError(
+                f"AcoustID {failure} after {attempts} attempt(s)",
+            ),
+            label="acoustid lookup",
+        )
+        body = decode_object(response, AcoustidError, source="AcoustID", what="fingerprint lookup")
         return _interpret(body, response.status_code)
 
-    def _post_with_backoff(self, content: bytes) -> httpx.Response:
-        """Pace, then POST *content*, retrying transport errors, 429 and 5xx with a backoff.
 
-        The backoff doubles between attempts. After the last one the failure is raised as
-        :class:`AcoustidError`, so it is reported and never cached.
-        """
-        if self._client is None:  # pragma: no cover - guard against misuse outside `with`
-            message = "AcoustidClient must be used as a context manager"
-            raise RuntimeError(message)
-
-        delay = _RETRY_BACKOFF_SECONDS
-        failure = ""
-        cause: httpx.HTTPError | None = None
-        for attempt in range(self._max_attempts):
-            self._pace()
-            try:
-                response = self._client.post(_LOOKUP_URL, content=content, headers=_FORM_HEADERS)
-            except httpx.HTTPError as exc:
-                failure = f"transport failure ({type(exc).__name__})"
-                cause = exc
-            else:
-                if not _is_retryable(response.status_code):
-                    return response
-                failure = f"HTTP {response.status_code}"
-                cause = None
-            logger.debug("acoustid %s, attempt %d of %d", failure, attempt + 1, self._max_attempts)
-            if attempt < self._max_attempts - 1:
-                self._sleep(delay)
-                delay *= 2
-
-        message = f"AcoustID {failure} after {self._max_attempts} attempt(s)"
-        raise AcoustidError(message) from cause
-
-    def _pace(self) -> None:
-        """Sleep just enough so consecutive requests honor ``rate_per_sec``."""
-        if self._rate_per_sec > 0 and self._last_request_at is not None:
-            interval = 1.0 / self._rate_per_sec
-            remaining = interval - (self._monotonic() - self._last_request_at)
-            if remaining > 0:
-                self._sleep(remaining)
-        self._last_request_at = self._monotonic()
-
-
-def _is_retryable(status_code: int) -> bool:
-    """Return whether an HTTP status is a throttle or a server fault worth retrying."""
-    return status_code == _HTTP_TOO_MANY_REQUESTS or status_code >= _HTTP_SERVER_ERROR
+def _retry_verdict(response: httpx.Response) -> httpx.Response | Retry:
+    """Retry a throttle or a server fault and hand every other response back."""
+    status = response.status_code
+    if status == _HTTP_TOO_MANY_REQUESTS or status >= _HTTP_SERVER_ERROR:
+        return Retry(f"HTTP {status}")
+    return response
 
 
 def _encode_form(api_key: str, fp: Fingerprint) -> bytes:
@@ -479,19 +443,6 @@ def _encode_form(api_key: str, fp: Fingerprint) -> bytes:
         },
     )
     return gzip.compress(form.encode("ascii"))
-
-
-def _decode_object(response: httpx.Response) -> dict[str, object]:
-    """Decode a response body as a JSON object, or raise :class:`AcoustidError`."""
-    try:
-        body: object = response.json()
-    except ValueError as exc:
-        message = f"AcoustID returned a non-JSON body (HTTP {response.status_code})"
-        raise AcoustidError(message) from exc
-    if not isinstance(body, dict):
-        message = f"AcoustID returned a JSON {type(body).__name__}, not an object"
-        raise AcoustidError(message)
-    return cast("dict[str, object]", body)
 
 
 def _interpret(body: Mapping[str, object], status_code: int) -> AcoustidResult:

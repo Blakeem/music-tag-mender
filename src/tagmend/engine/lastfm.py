@@ -32,9 +32,8 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final, Protocol, Self, cast
 
-import httpx
-
 from tagmend.engine import clock
+from tagmend.engine.lookup_clients import RETRY_ATTEMPTS, PacedHttp, Retry, decode_object
 from tagmend.engine.store import (
     get_cached_correction,
     get_cached_tags,
@@ -47,6 +46,8 @@ if TYPE_CHECKING:
     import sqlite3
     from collections.abc import Callable, Mapping
     from types import TracebackType
+
+    import httpx
 
     from tagmend.config import Settings
 
@@ -64,8 +65,6 @@ _ERROR_NOT_FOUND: Final = 6
 _TEMPORARY_ERROR_CODES: Final = frozenset({11, 16, 29})
 _HTTP_TOO_MANY_REQUESTS: Final = 429
 _HTTP_SERVER_ERROR: Final = 500
-_RETRY_ATTEMPTS: Final = 3
-_RETRY_BACKOFF_SECONDS: Final = 1.0
 
 # A cache hit never re-parses, so bump a method's entry when its parse changes and its cached
 # rows are re-fetched instead of replayed. Version 1 keeps the original key bytes.
@@ -150,18 +149,18 @@ class LastfmClient:
         transport: httpx.BaseTransport | None = None,
         monotonic: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
-        max_attempts: int = _RETRY_ATTEMPTS,
+        max_attempts: int = RETRY_ATTEMPTS,
     ) -> None:
         """Configure the client; injectables default to the real httpx transport + clock."""
         self._api_key = api_key
         self._conn = conn
-        self._rate_per_sec = rate_per_sec
-        self._transport = transport
-        self._monotonic = monotonic
-        self._sleep = sleep
-        self._max_attempts = max(1, max_attempts)
-        self._last_request_at: float | None = None
-        self._client: httpx.Client | None = None
+        self._http = PacedHttp(
+            rate_per_sec=rate_per_sec,
+            transport=transport,
+            monotonic=monotonic,
+            sleep=sleep,
+            max_attempts=max_attempts,
+        )
 
     @classmethod
     def from_settings(cls, settings: Settings, conn: sqlite3.Connection) -> Self:
@@ -181,7 +180,7 @@ class LastfmClient:
 
     def __enter__(self) -> Self:
         """Open the underlying :class:`httpx.Client`."""
-        self._client = httpx.Client(transport=self._transport, timeout=30.0)
+        self._http.open()
         return self
 
     def __exit__(
@@ -191,9 +190,7 @@ class LastfmClient:
         tb: TracebackType | None,
     ) -> None:
         """Close the underlying :class:`httpx.Client`."""
-        if self._client is not None:
-            self._client.close()
-            self._client = None
+        self._http.close()
 
     # --- public API ------------------------------------------------------------------
 
@@ -328,35 +325,17 @@ class LastfmClient:
         every attempt, any other HTTP non-2xx and a body that is not a JSON object each raise
         :class:`LastfmError`. No message carries the request URL, since it holds the API key.
         """
-        if self._client is None:  # pragma: no cover - guard against misuse outside `with`
-            message = "LastfmClient must be used as a context manager"
-            raise RuntimeError(message)
-
         params = {"method": method, "api_key": self._api_key, "format": "json", **identity}
-        delay = _RETRY_BACKOFF_SECONDS
-        failure = "no attempt made"
-        cause: httpx.HTTPError | None = None
 
         logger.debug("last.fm request method=%s identity=%s", method, identity)
-        for attempt in range(self._max_attempts):
-            self._pace()
-            try:
-                response = self._client.get(_API_URL, params=params)
-            except httpx.HTTPError as exc:
-                cause = exc
-                failure = f"transport error ({type(exc).__name__})"
-            else:
-                cause = None
-                body, failure = _classify_response(response, method)
-                if body is not None:
-                    return body
-            if attempt < self._max_attempts - 1:
-                logger.debug("last.fm %s for %s, backing off %ss", failure, method, delay)
-                self._sleep(delay)
-                delay *= 2
-
-        message = f"Last.fm {method} failed after {self._max_attempts} attempt(s): {failure}"
-        raise LastfmError(message) from cause
+        return self._http.send(
+            lambda client: client.get(_API_URL, params=params),
+            verdict=lambda response: _classify_response(response, method),
+            error=lambda failure, attempts: LastfmError(
+                f"Last.fm {method} failed after {attempts} attempt(s): {failure}",
+            ),
+            label=f"last.fm {method}",
+        )
 
     def _store(self, request_key: str, *, found: bool, tags: list[tuple[str, int]]) -> None:
         """Cache a parsed result and commit immediately (so a later error can't lose it)."""
@@ -381,21 +360,6 @@ class LastfmClient:
         )
         self._conn.commit()
 
-    def _pace(self) -> None:
-        """Sleep just enough so consecutive network requests honor ``rate_per_sec``.
-
-        Uses the injected ``monotonic``/``sleep`` so tests assert pacing without waiting.
-        ``rate_per_sec <= 0`` disables pacing. Records each request's time on the
-        instance, so reusing one client across a batch keeps the gate honest.
-        """
-        if self._rate_per_sec > 0 and self._last_request_at is not None:
-            interval = 1.0 / self._rate_per_sec
-            elapsed = self._monotonic() - self._last_request_at
-            remaining = interval - elapsed
-            if remaining > 0:
-                self._sleep(remaining)
-        self._last_request_at = self._monotonic()
-
 
 # --- module helpers ------------------------------------------------------------------
 
@@ -417,35 +381,24 @@ def _request_key(method: str, identity: dict[str, str]) -> str:
     return hashlib.sha1(payload.encode("utf-8")).hexdigest()  # noqa: S324 - cache key, not security
 
 
-def _classify_response(
-    response: httpx.Response,
-    method: str,
-) -> tuple[dict[str, object] | None, str]:
-    """Return ``(body, "")`` for a final answer or ``(None, reason)`` for a temporary one.
+def _classify_response(response: httpx.Response, method: str) -> dict[str, object] | Retry:
+    """Return the decoded body of a final answer, or a :class:`Retry` for a temporary one.
 
     Raises :class:`LastfmError` for a permanent failure: an HTTP non-2xx other than 429 or 5xx,
     or a body that is not a JSON object.
     """
     status = response.status_code
     if status == _HTTP_TOO_MANY_REQUESTS or status >= _HTTP_SERVER_ERROR:
-        return None, f"HTTP {status}"
+        return Retry(f"HTTP {status}")
     if response.is_error:
         message = f"Last.fm HTTP {status} for {method}"
         raise LastfmError(message)
 
-    try:
-        body = response.json()
-    except ValueError as exc:
-        message = f"Last.fm returned a non-JSON body for {method}"
-        raise LastfmError(message) from exc
-    if not isinstance(body, dict):
-        message = f"Last.fm returned a JSON {type(body).__name__}, not an object, for {method}"
-        raise LastfmError(message)
-
+    body = decode_object(response, LastfmError, source="Last.fm", what=method)
     error = body.get("error")
     if error in _TEMPORARY_ERROR_CODES:
-        return None, f"error {error}"
-    return cast("dict[str, object]", body), ""
+        return Retry(f"error {error}")
+    return body
 
 
 def _parse_top_tags(body: dict[str, object]) -> list[Tag]:

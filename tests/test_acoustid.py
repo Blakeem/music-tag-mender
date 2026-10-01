@@ -415,6 +415,15 @@ def test_a_429_is_retried_after_a_backoff() -> None:
     assert slept == [1.0]
 
 
+def test_a_500_is_retried() -> None:
+    client, seen = _client([httpx.Response(500, text="broken"), httpx.Response(200, json=_OK_BODY)])
+    with client:
+        result = client.lookup(_FP)
+
+    assert result == _EXPECTED_RESULT
+    assert len(seen) == 2
+
+
 def test_three_server_errors_raise_after_a_doubling_backoff() -> None:
     slept: list[float] = []
     client, seen = _client([httpx.Response(503, text="busy")] * 3, sleep=slept.append)

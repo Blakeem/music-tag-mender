@@ -384,6 +384,11 @@ class _Container(StrEnum):
     OTHER = "other"
 
 
+# The suffixes that open as a container the verifier knows, so a caller holding only a filename
+# can tell which files staging would refuse. WAV, AIFF, WMA and raw AAC open as OTHER.
+VERIFIABLE_SUFFIXES: Final[frozenset[str]] = frozenset({".mp3", ".flac", ".m4a", ".ogg", ".opus"})
+
+
 def _container_of(audio: FileType) -> _Container:
     """Return the container family of an opened *audio* file."""
     if isinstance(audio, ID3FileType):

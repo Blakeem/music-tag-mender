@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import wave
 from typing import TYPE_CHECKING
 
 import mutagen
@@ -899,3 +900,28 @@ def test_write_does_not_promote_id3v1_only_fields(tmp_path: Path) -> None:
     v1 = ParseID3v1(track.read_bytes()[-128:])  # type: ignore[no-untyped-call]
     assert v1 is not None
     assert v1["TIT2"].text == ["Short Title"]
+
+
+@pytest.mark.parametrize("suffix", _ALL_FORMATS)
+def test_a_verifiable_suffix_opens_as_a_container_staging_accepts(
+    tmp_path: Path, suffix: str
+) -> None:
+    track = make_track(tmp_path / f"track{suffix}")
+
+    tags.ensure_writable(track)
+
+    assert suffix in tags.VERIFIABLE_SUFFIXES
+
+
+def test_a_wav_suffix_is_not_verifiable(tmp_path: Path) -> None:
+    clip = tmp_path / "clip.wav"
+    with wave.open(str(clip), "wb") as stream:
+        stream.setnchannels(1)
+        stream.setsampwidth(2)
+        stream.setframerate(8000)
+        stream.writeframes(bytes(1600))
+
+    with pytest.raises(TagWriteError, match="no layout for the WAVE container"):
+        tags.ensure_writable(clip)
+
+    assert ".wav" not in tags.VERIFIABLE_SUFFIXES

@@ -12,7 +12,7 @@ from __future__ import annotations
 import gzip
 import json
 import urllib.parse
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -76,14 +76,21 @@ class FakeAcoustid:
 
 
 class FakeReleases:
-    """An in-memory :class:`tagmend.engine.musicbrainz.MBReleaseSource` that records lookups."""
+    """An in-memory :class:`tagmend.engine.musicbrainz.MBReleaseSource` that records lookups.
+
+    The releases it holds act as the cache. A fresh lookup answers from ``upstream`` when it
+    holds the release, as MusicBrainz would now, and replaces the cached one.
+    """
 
     def __init__(self, *releases: MBRelease) -> None:
         self._releases = {release.mbid: release for release in releases}
+        self.upstream: dict[str, MBRelease] = {}
         self.lookups: list[str] = []
 
-    def release_by_mbid(self, mbid: str) -> MBRelease | None:
+    def release_by_mbid(self, mbid: str, *, fresh: bool = False) -> MBRelease | None:
         self.lookups.append(mbid)
+        if fresh and mbid in self.upstream:
+            self._releases[mbid] = self.upstream[mbid]
         return self._releases.get(mbid)
 
 
@@ -590,6 +597,65 @@ def test_manual_release_path_stages_the_whole_stamp_in_one_batch(
     assert _status(engine_settings, ids[_NAMES[1]]) == "manual"
 
 
+@pytest.mark.parametrize(
+    ("album_id", "date"),
+    [
+        pytest.param(_LP, ["2007-05-22"], id="own-release-keeps"),
+        pytest.param("rel-wrong", [], id="rebind-clears"),
+    ],
+)
+def test_manual_release_path_keeps_a_date_only_on_the_files_own_dateless_release(
+    engine_settings: Settings,
+    music_dir: Path,
+    album_id: str,
+    date: list[str],
+) -> None:
+    folder = music_dir / "LP"
+    stamp = {"date": ["2007-05-22"], "musicbrainz_albumid": [album_id]}
+    _make_folder(
+        folder,
+        [
+            {"title": [title], "tracknumber": [str(n)], **stamp}
+            for n, title in enumerate(_TITLES, 1)
+        ],
+    )
+    library.scan_library(engine_settings)
+    dateless = replace(_release(_LP), date="")
+    kit = Kit(acoustid=FakeAcoustid(_lp_bodies(_NAMES)), releases=FakeReleases(dateless))
+
+    result = _resolve(engine_settings, kit, folder=str(folder), release_id=_LP)
+
+    assert result.staged_files == 4
+    assert _diffs(engine_settings)[_NAMES[1]].target.get("date", []) == date
+
+
+def test_manual_release_path_stamps_the_track_ids_musicbrainz_lists_now(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    folder = _wrong_stamp_folder(music_dir)
+    library.scan_library(engine_settings)
+    kit = _wrong_stamp_kit()
+    current = _release(_LP)
+    medium = current.media[0]
+    retired = tuple(
+        replace(track, release_track_mbid=f"{track.release_track_mbid}-retired")
+        for track in medium.tracks
+    )
+    kit.releases = FakeReleases(replace(current, media=(replace(medium, tracks=retired),)))
+    kit.releases.upstream[_LP] = current
+
+    preview = _resolve(engine_settings, kit, folder=str(folder), release_id=_LP, dry_run=True)
+    result = _resolve(engine_settings, kit, folder=str(folder), release_id=_LP)
+
+    # The dry run reads the cached tracklist, whose retired ids AcoustID no longer names.
+    assert preview.unassigned is not None
+    assert {row["reason"] for row in preview.unassigned} == {"not_on_release"}
+    assert result.staged_files == 4
+    target = _diffs(engine_settings)[_NAMES[1]].target
+    assert target["musicbrainz_releasetrackid"] == [_track_id(_LP, 2)]
+
+
 def test_manual_release_path_stages_nothing_when_a_file_is_not_on_the_release(
     engine_settings: Settings,
     music_dir: Path,
@@ -820,7 +886,7 @@ _MOBY = ("art-moby", "Moby")
 class FailingReleases(FakeReleases):
     """A release source whose every lookup fails transiently."""
 
-    def release_by_mbid(self, mbid: str) -> MBRelease | None:
+    def release_by_mbid(self, mbid: str, *, fresh: bool = False) -> MBRelease | None:
         self.lookups.append(mbid)
         message = f"MusicBrainz answered HTTP 503 for {mbid}"
         raise MusicBrainzError(message)

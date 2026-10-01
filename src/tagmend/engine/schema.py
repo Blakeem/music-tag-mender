@@ -654,6 +654,19 @@ def apply_append_only_triggers(connection: sqlite3.Connection) -> None:
     connection.execute(_MANAGED_SET_REQUIRED_TRIGGER_DDL)
 
 
+def _log_schema_change(connection: sqlite3.Connection, current: int) -> None:
+    """Log the schema step about to run: a new ledger is created, an older one is upgraded.
+
+    A new ledger is one stamped 0 that holds no table yet, so a fresh ledger and the in-memory
+    health probe never log a migration that did not happen.
+    """
+    tables = connection.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' LIMIT 1")
+    if current == 0 and tables.fetchone() is None:
+        logger.info("creating ledger schema v%d", SCHEMA_VERSION)
+        return
+    logger.info("upgrading ledger schema v%d to v%d", current, SCHEMA_VERSION)
+
+
 def _table_exists(connection: sqlite3.Connection, name: str) -> bool:
     """Whether a table called *name* exists in this ledger (``sqlite_master`` lookup)."""
     row = connection.execute(
@@ -1294,7 +1307,7 @@ def apply_schema(connection: sqlite3.Connection) -> None:
         )
         raise RuntimeError(message)
 
-    logger.info("upgrading ledger schema v%d to v%d", current, SCHEMA_VERSION)
+    _log_schema_change(connection, current)
     _migrate_v12_year_status(connection)
     _migrate_v13_managed_set(connection)
     _migrate_v14_reader_version(connection)

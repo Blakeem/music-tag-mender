@@ -297,6 +297,27 @@ def test_merging_disc_folders_keep_the_lower_file_ids_cover(
     assert not (music_dir / _CD1).exists()
 
 
+def test_a_held_sidecar_under_two_vacated_folders_is_listed_once(
+    engine_settings: Settings, music_dir: Path
+) -> None:
+    # The album folder holds audio of its own above the disc folders, so the commit vacates
+    # both it and CD2, and the losing cover sits under each.
+    _library(engine_settings, music_dir, _ALBUM / "00.mp3", _CD1 / "01.mp3", _CD2 / "01.mp3")
+    (music_dir / _CD1 / "Folder.jpg").write_bytes(b"one")
+    (music_dir / _CD2 / "Folder.jpg").write_bytes(b"two")
+    moves = [
+        (_id_at(engine_settings, music_dir / _ALBUM / "00.mp3"), _MERGED / "000.mp3"),
+        (_id_at(engine_settings, music_dir / _CD1 / "01.mp3"), _MERGED / "101.mp3"),
+        (_id_at(engine_settings, music_dir / _CD2 / "01.mp3"), _MERGED / "201.mp3"),
+    ]
+    _stage(engine_settings, *moves)
+
+    result = paths.commit_paths(engine_settings)
+
+    assert result.committed == len(moves)
+    assert result.sidecars_held == (str(_CD2 / "Folder.jpg"),)
+
+
 @pytest.mark.skipif(path_keys.path_key("A") == "A", reason="keys fold case only on Windows")
 def test_a_target_taken_under_another_casing_holds_the_sidecar(album: _Album) -> None:
     (album.music / _NEW).mkdir(parents=True)

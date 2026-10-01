@@ -127,6 +127,15 @@ _RELEASE_ONLY_TAGS: Final = (
     "originaldate",
 )
 _RECORDING_ONLY_TAGS: Final = ("isrc",)
+# A release that holds no value for one of these says nothing against the file's own value, so
+# a stamp onto the release the file already names keeps it. A rebind still clears it.
+_KEPT_ON_OWN_RELEASE: Final = (
+    "date",
+    "releasecountry",
+    "musicbrainz_albumstatus",
+    "barcode",
+    "media",
+)
 
 _HELD_KINDS: Final = ("disagreement", "slot_collision", "release_mismatch", "unconverged")
 
@@ -400,14 +409,17 @@ class _Lookups:
             self._acoustid = self._stack.enter_context(AcoustidClient.from_settings(self._settings))
         return self._acoustid
 
-    def release(self, mbid: str) -> MBRelease | None:
-        """Return the release MusicBrainz holds under *mbid*. Raises :class:`MusicBrainzError`."""
-        if mbid in self._release_memo:
+    def release(self, mbid: str, *, fresh: bool = False) -> MBRelease | None:
+        """Return the release MusicBrainz holds under *mbid*. Raises :class:`MusicBrainzError`.
+
+        *fresh* fetches past the memo and the cache, and the answer replaces both.
+        """
+        if mbid in self._release_memo and not fresh:
             return self._release_memo[mbid]
         if self._releases is None:
             client = MusicBrainzClient.from_settings(self._settings, self._conn)
             self._releases = self._stack.enter_context(client)
-        found = self._releases.release_by_mbid(mbid)
+        found = self._releases.release_by_mbid(mbid, fresh=fresh)
         self._release_memo[mbid] = found
         return found
 
@@ -1397,7 +1409,9 @@ def _resolve_release(  # noqa: PLR0913 - cohesive keyword-only run inputs
     unassigned rows. Raises :class:`ValueError` when MusicBrainz holds no such release or a
     listed file is missing on disk.
     """
-    release = lookups.release(release_id)
+    # A stamp writes the release's track ids, which MusicBrainz replaces over time, so a real
+    # run reads the current tracklist and a dry run keeps reading the cache.
+    release = lookups.release(release_id, fresh=not dry_run)
     if release is None:
         message = f"MusicBrainz holds no release {release_id}"
         raise ValueError(message)
@@ -1505,7 +1519,8 @@ def _stamp(release: MBRelease, track: MBTrack, voter: _Voter) -> dict[str, list[
 
     Sort names are replaced from the credits, never cleared, because a library server keeps a
     stored sort name after the tag goes empty. ``artists`` is cleared because the credit
-    carries no per-artist names to align with the ids written.
+    carries no per-artist names to align with the ids written. On the file's own release a
+    field of :data:`_KEPT_ON_OWN_RELEASE` the release leaves blank is left out, so it is kept.
     """
     medium = _medium(release, track)
     track_count = _track_count(medium)
@@ -1523,7 +1538,7 @@ def _stamp(release: MBRelease, track: MBTrack, voter: _Voter) -> dict[str, list[
         "album": [release.title],
         "date": _one(release.date),
         "releasecountry": _one(release.country),
-        "musicbrainz_albumstatus": _one(release.status.lower()),
+        "musicbrainz_albumstatus": _one(release_match.album_status(release)),
         "barcode": _one(release.barcode),
         "media": _one("" if medium is None else medium.format),
         _ALBUM_ID: [release.mbid],
@@ -1532,6 +1547,10 @@ def _stamp(release: MBRelease, track: MBTrack, voter: _Voter) -> dict[str, list[
     }
     if voter.value(_ALBUM_ID) != release.mbid:
         stamp.update({name: [] for name in _RELEASE_ONLY_TAGS})
+    else:
+        for name in _KEPT_ON_OWN_RELEASE:
+            if not stamp[name]:
+                del stamp[name]
     if voter.value(_RECORDING_ID) != track.recording_mbid:
         stamp.update({name: [] for name in _RECORDING_ONLY_TAGS})
     return stamp

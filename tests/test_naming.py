@@ -147,6 +147,19 @@ def test_a_single_disc_album_renders_no_prefix() -> None:
     ]
 
 
+def test_a_kept_folder_judges_each_album_on_its_own_discs() -> None:
+    kept = ("Various", "Featured")
+    inputs = [
+        _input(1, kept_folder=kept, album="Double", discnumber="1/2"),
+        _input(2, kept_folder=kept, album="Single", discnumber="1/1"),
+    ]
+
+    assert [Path(p).name for p in _paths(inputs)] == [
+        "Artist - Double - 1-01 - Song 1.flac",
+        "Artist - Single - 02 - Song 2.flac",
+    ]
+
+
 def test_an_empty_group_drops_and_artist_falls_back() -> None:
     item = _input(1, albumartist="", artist="Solo", date="", tracknumber="7/12")
 

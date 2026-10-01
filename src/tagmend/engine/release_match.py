@@ -32,6 +32,15 @@ def text_key(value: str) -> str:
     return display_key(value)
 
 
+def album_status(release: MBRelease) -> str:
+    """Return *release*'s status as Picard writes ``musicbrainz_albumstatus``.
+
+    MusicBrainz answers the display form (``Official``) and Picard writes it lowercase, so a
+    proposal and a stamp spell it the way the rest of the library already does.
+    """
+    return release.status.lower()
+
+
 def position(value: str | None) -> str:
     """Return the position part of an ``n`` / ``n/total`` tag value, without leading zeros.
 

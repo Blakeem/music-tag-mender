@@ -35,7 +35,7 @@ class FakeReleaseSource:
         self._table = table
         self.lookups: list[str] = []
 
-    def release_by_mbid(self, mbid: str) -> MBRelease | None:
+    def release_by_mbid(self, mbid: str, *, fresh: bool = False) -> MBRelease | None:
         self.lookups.append(mbid)
         return self._table.get(mbid)
 
@@ -263,6 +263,14 @@ def test_a_blank_field_is_a_fill_not_a_disagreement() -> None:
     assert report.fill_rows[0].field == "tracknumber"
     assert report.fill_rows[0].have == ""
     assert report.fill_rows[0].want == "1"
+
+
+def test_a_blank_status_fill_proposes_the_lowercase_status_a_stamp_writes() -> None:
+    report = _run([_f(musicbrainz_albumstatus=None)])
+
+    assert [(r.field, r.want) for r in report.fill_rows] == [
+        ("musicbrainz_albumstatus", "official"),
+    ]
 
 
 def test_a_track_number_with_a_total_compares_on_the_position() -> None:
@@ -953,7 +961,7 @@ def test_releases_checked_counts_what_was_actually_fetched() -> None:
         def __init__(self) -> None:
             self.lookups: list[str] = []
 
-        def release_by_mbid(self, mbid: str) -> MBRelease | None:
+        def release_by_mbid(self, mbid: str, *, fresh: bool = False) -> MBRelease | None:
             self.lookups.append(mbid)
             if mbid == "rel-a":
                 message = "boom"

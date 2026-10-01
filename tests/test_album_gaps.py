@@ -13,6 +13,7 @@ end-to-end stage -> diff -> commit -> reopen flow, and the MCP wiring smoke chec
 from __future__ import annotations
 
 import asyncio
+import wave
 from pathlib import Path
 
 import pytest
@@ -65,6 +66,7 @@ def _mk(  # noqa: PLR0913 - cohesive keyword-only test-input fields
     album: str | None = None,
     artist: str | None = None,
     title: str | None = None,
+    writable: bool = True,
 ) -> album_gaps._FileInput:
     return album_gaps._FileInput(
         file_id=file_id,
@@ -73,6 +75,7 @@ def _mk(  # noqa: PLR0913 - cohesive keyword-only test-input fields
         album=album,
         artist=artist,
         title=title,
+        writable=writable,
     )
 
 
@@ -618,6 +621,7 @@ def test_to_dict_shape() -> None:
         "stays_blank",
         "errors",
         "error_items",
+        "unwritable",
         "summary",
     }
     groups = payload["groups"]
@@ -632,6 +636,7 @@ def test_to_dict_shape() -> None:
         "source",
         "proposals",
         "errors",
+        "unwritable",
     }
     proposals = group["proposals"]
     assert isinstance(proposals, list)
@@ -741,6 +746,53 @@ def test_detect_integration_read_only_then_fix_flow(
 
     reopen = staging.reopen_axes(engine_settings, commit_id=result.commit_id)
     assert reopen.files == 1
+
+
+def test_a_folder_of_only_unwritable_blank_files_proposes_nothing() -> None:
+    folder = _MUSIC / "A" / "Wav"
+    files = [
+        _mk(1, folder, "01.wav", album="LP", writable=False),
+        _mk(2, folder, "02.wav", artist="A", title="Two", writable=False),
+    ]
+    client = FakeMBRecordingSource({("A", "Two"): _rec("LP")})
+
+    report = album_gaps._classify(files, _VOCAB, client=client)
+
+    group = _group_for(report, folder)
+    assert group is not None
+    assert (group.source, group.proposals, group.unwritable) == ("unwritable", [], 1)
+    assert (report.total_blank, report.stays_blank, report.unwritable) == (1, 0, 1)
+    assert client.lookups == []
+
+
+def _write_wav(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(path), "wb") as stream:
+        stream.setnchannels(1)
+        stream.setsampwidth(2)
+        stream.setframerate(8000)
+        stream.writeframes(bytes(1600))
+
+
+def test_a_blank_file_the_writer_cannot_verify_is_counted_never_proposed(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    folder = music_dir / "Artist" / "Album"
+    make_track(folder / "01.mp3", {"album": ["Album"]})
+    make_track(folder / "02.mp3", {"album": ["Album"]})
+    make_track(folder / "03.mp3", {"title": ["Three"]})
+    _write_wav(folder / "04.wav")
+    scan_library(engine_settings)
+
+    report = detect_album_gaps(engine_settings, use_musicbrainz=False)
+
+    group = _group_for(report, folder)
+    assert group is not None
+    assert [proposal.filename for proposal in group.proposals] == ["03.mp3"]
+    assert (group.blank_count, group.unwritable) == (2, 1)
+    assert (report.green, report.stays_blank, report.unwritable) == (1, 0, 1)
+    assert "1 file(s) get no proposal" in report.summary
 
 
 # --- MCP wiring ----------------------------------------------------------------------

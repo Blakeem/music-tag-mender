@@ -42,6 +42,7 @@ from typing import TYPE_CHECKING, Final
 from tagmend.engine import axis, classify, db, lookup_clients, parsing, path_keys, schema, store
 from tagmend.engine.detector_core import group_by_folder
 from tagmend.engine.musicbrainz import MusicBrainzClient, MusicBrainzError
+from tagmend.engine.tags import VERIFIABLE_SUFFIXES
 from tagmend.engine.text_keys import alnum_key
 from tagmend.engine.validation import check_limit
 from tagmend.log import get_logger
@@ -77,6 +78,8 @@ _SOURCE_MB_RECORDING: Final = "mb_recording"
 _SOURCE_STAYS_BLANK: Final = "stays_blank"
 # A folder whose recording lookups failed and proposed nothing, kept apart from a real miss.
 _SOURCE_LOOKUP_ERROR: Final = "lookup_error"
+# A folder whose every blank file has a format the writer refuses, so no fill could be staged.
+_SOURCE_UNWRITABLE: Final = "unwritable"
 
 # Per-proposal confidence labels + the confirm-reason vocabulary.
 _CONF_GREEN: Final = "green"
@@ -104,7 +107,8 @@ class _FileInput:
     everywhere, the only files that may ever be proposed. ``artist`` (the
     ``albumartist``-else-``artist`` identity) and ``title`` are the ``(artist, title)`` the
     MusicBrainz recording source looks a blank file up against. Each is ``None`` when blank
-    (the Python-strip rule), in which case the file is never sent to MusicBrainz.
+    (the Python-strip rule), in which case the file is never sent to MusicBrainz. ``writable``
+    is whether the file's extension names a container the tag writer can verify.
     """
 
     file_id: int
@@ -113,6 +117,7 @@ class _FileInput:
     album: str | None
     artist: str | None = None
     title: str | None = None
+    writable: bool = True
 
 
 # --- public result types -------------------------------------------------------------
@@ -153,6 +158,7 @@ class AlbumGapGroup:
     source: str  # one of the _SOURCE_* labels
     proposals: list[AlbumGapProposal]  # at most one per blank file (empty for stays_blank)
     errors: int = 0  # recording lookups in this folder that failed
+    unwritable: int = 0  # blank files whose format the writer refuses, never proposed
 
     def to_dict(self) -> dict[str, object]:
         """JSON-serializable form for the MCP tool."""
@@ -165,6 +171,7 @@ class AlbumGapGroup:
             "source": self.source,
             "proposals": [p.to_dict() for p in self.proposals],
             "errors": self.errors,
+            "unwritable": self.unwritable,
         }
 
 
@@ -173,12 +180,13 @@ class AlbumGapsReport:
     """Immutable summary of one :func:`detect_album_gaps` run, JSON-ready for the MCP tool.
 
     ``groups`` is the (folder-sorted, optionally narrowed) worklist. ``total_files`` and the
-    ``green`` / ``confirm`` / ``review`` / ``stays_blank`` / ``errors`` counts describe the
-    WHOLE library and are unaffected by a ``limit``/``folder`` narrowing (mirroring the
-    mismatch report). Every blank file lands in exactly one of those five, so
-    ``green + confirm + review + stays_blank + errors == total_blank``. ``review`` is the
-    MusicBrainz recording source (never green), and ``errors`` counts its failed lookups,
-    itemized in ``error_items``.
+    ``green`` / ``confirm`` / ``review`` / ``stays_blank`` / ``errors`` / ``unwritable`` counts
+    describe the WHOLE library and are unaffected by a ``limit``/``folder`` narrowing (mirroring
+    the mismatch report). Every blank file lands in exactly one of those six, so
+    ``green + confirm + review + stays_blank + errors + unwritable == total_blank``. ``review``
+    is the MusicBrainz recording source (never green), and ``errors`` counts its failed lookups,
+    itemized in ``error_items``. ``unwritable`` counts the blank files whose format the tag
+    writer refuses (WAV, AIFF, WMA, raw AAC). They get no proposal, since staging refuses them.
     """
 
     groups: list[AlbumGapGroup]
@@ -191,6 +199,7 @@ class AlbumGapsReport:
     summary: str
     errors: int = 0
     error_items: list[dict[str, str]] = field(default_factory=list)
+    unwritable: int = 0
 
     def to_dict(self) -> dict[str, object]:
         """JSON-serializable form for the MCP tool."""
@@ -204,6 +213,7 @@ class AlbumGapsReport:
             "stays_blank": self.stays_blank,
             "errors": self.errors,
             "error_items": [dict(e) for e in self.error_items],
+            "unwritable": self.unwritable,
             "summary": self.summary,
         }
 
@@ -382,16 +392,20 @@ def _classify_folder(
 
     The sibling and folder-parse sources run purely. When they yield nothing and a *client* is
     supplied, the review-only MusicBrainz recording source gets a last pass at the blank files.
+    A blank file the writer cannot verify is counted in ``unwritable`` and given to no source.
     Returns the group plus the recording lookups that failed.
     """
     error_items: list[dict[str, str]] = []
     histogram = _sibling_histogram(folder_files)
-    if histogram:
-        source, proposals = _sibling_source(blank_files, histogram, vocab)
-    else:
-        source, proposals = _folder_parse_source(folder, folder_files, blank_files)
+    writable_blanks = [f for f in blank_files if f.writable]
+    source = _SOURCE_UNWRITABLE
+    proposals: list[AlbumGapProposal] = []
+    if writable_blanks and histogram:
+        source, proposals = _sibling_source(writable_blanks, histogram, vocab)
+    elif writable_blanks:
+        source, proposals = _folder_parse_source(folder, folder_files, writable_blanks)
     if source == _SOURCE_STAYS_BLANK and client is not None:
-        source, proposals, error_items = _recording_source(blank_files, client)
+        source, proposals, error_items = _recording_source(writable_blanks, client)
     group = AlbumGapGroup(
         folder=folder,
         blank_count=len(blank_files),
@@ -401,6 +415,7 @@ def _classify_folder(
         source=source,
         proposals=proposals,
         errors=len(error_items),
+        unwritable=len(blank_files) - len(writable_blanks),
     )
     return group, error_items
 
@@ -442,6 +457,7 @@ def _assemble_report(
     confirm = 0
     review = 0
     stays_blank = 0
+    unwritable = 0
     for group in groups:
         for proposal in group.proposals:
             if proposal.confidence == _CONF_GREEN:
@@ -453,7 +469,8 @@ def _assemble_report(
         # A blank file with no proposal and no failed lookup stays blank (mixed siblings, an
         # uncorroborated folder-parse, or an MB recording miss). A failed lookup is an error,
         # never a miss, so a caller can tell an unreachable MusicBrainz from no ground.
-        stays_blank += group.blank_count - len(group.proposals) - group.errors
+        stays_blank += group.blank_count - len(group.proposals) - group.errors - group.unwritable
+        unwritable += group.unwritable
     total_blank = sum(group.blank_count for group in groups)
     summary = _summarize(
         groups=len(groups),
@@ -463,6 +480,7 @@ def _assemble_report(
         review=review,
         stays_blank=stays_blank,
         errors=len(error_items),
+        unwritable=unwritable,
     )
     return AlbumGapsReport(
         groups=groups,
@@ -475,6 +493,7 @@ def _assemble_report(
         summary=summary,
         errors=len(error_items),
         error_items=error_items,
+        unwritable=unwritable,
     )
 
 
@@ -487,6 +506,7 @@ def _summarize(  # noqa: PLR0913 - cohesive keyword-only summary counts
     review: int,
     stays_blank: int,
     errors: int,
+    unwritable: int,
 ) -> str:
     """Build a short, plain human summary of the run."""
     head = (
@@ -496,6 +516,8 @@ def _summarize(  # noqa: PLR0913 - cohesive keyword-only summary counts
     )
     if errors:
         head += f" {errors} lookup(s) failed and stay unresolved. Re-run to retry."
+    if unwritable:
+        head += f" {unwritable} file(s) get no proposal: the tag writer refuses their format."
     return head
 
 
@@ -542,6 +564,7 @@ def _gather_inputs(conn: sqlite3.Connection) -> list[_FileInput]:
                 album=identity.album,
                 artist=identity.artist,
                 title=title,
+                writable=Path(row.filename).suffix.lower() in VERIFIABLE_SUFFIXES,
             ),
         )
     return files
@@ -559,6 +582,7 @@ def _has_recording_candidates(report: AlbumGapsReport, files: list[_FileInput]) 
     return any(
         f.folder in blank_folders
         and f.album is None
+        and f.writable
         and f.artist is not None
         and f.title is not None
         for f in files
@@ -616,8 +640,9 @@ def detect_album_gaps(
 
     *folder* returns exactly that folder's group, never a subfolder, compared as a path
     (:func:`tagmend.engine.path_keys.folder_arg_key`). *limit* caps the number of groups. The
-    ``total_files``/``green``/``confirm``/``review``/``stays_blank``/``errors`` counts always
-    describe the whole library.
+    ``total_files``/``green``/``confirm``/``review``/``stays_blank``/``errors``/``unwritable``
+    counts always describe the whole library. A blank file the tag writer cannot verify (WAV,
+    AIFF, WMA, raw AAC) gets no proposal and is counted in ``unwritable``.
     Loads the genre vocabulary once per run (:class:`ValueError` on a corrupt vocabulary
     propagates to the MCP envelope). Raises :class:`ValueError` for a negative *limit* or a
     *folder* outside ``music_path``. Owns its connection.

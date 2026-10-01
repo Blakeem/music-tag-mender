@@ -30,7 +30,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
-from tagmend.engine import path_keys
+from tagmend.engine import path_keys, text_keys
 from tagmend.engine.detector_core import parse_position
 from tagmend.engine.path_text import clean_value, is_reserved, part_problems
 from tagmend.engine.tags import MANAGED_TAGS
@@ -494,6 +494,15 @@ def _album_key(parts: tuple[str, ...]) -> str:
     return path_keys.path_key(Path(*parts[:-1])) if len(parts) > 1 else ""
 
 
+def album_title_key(values: Mapping[str, str]) -> str:
+    """Return the key of a file's album title as a folder name spells it.
+
+    Two spellings that render alike share one key. The renderer's multi-disc judgment and the
+    planner's track slots both count albums by it, so they agree on what an album is.
+    """
+    return text_keys.display_key(clean_value(values.get("album", "")).rstrip(". "))
+
+
 def _multi_disc(members: list[RenderInput]) -> bool:
     """Whether an album's files carry more than one disc number, or any total above 1."""
     discs = {parse_position(member.values.get("discnumber")) for member in members}
@@ -505,27 +514,31 @@ def render_library(pattern: Pattern, inputs: Sequence[RenderInput]) -> dict[int,
     """Render every file in *inputs*, judging multi-disc albums across them.
 
     A first pass renders each file with ``disc`` empty, holding a file whose required field
-    renders empty, and keys the rest by their album folder. An album is multi-disc when its
-    files carry more than one disc number, or when any file's disc total is above 1. The
-    second pass renders each file with its disc number when its album is multi-disc.
+    renders empty, and keys the rest by their album folder and :func:`album_title_key`, since a
+    kept folder may hold several albums. An album is multi-disc when its files carry more than
+    one disc number, or when any file's disc total is above 1. The second pass renders each
+    file with its disc number when its album is multi-disc.
     """
     results: dict[int, Rendered] = {}
-    albums: dict[str, list[RenderInput]] = {}
+    albums: dict[tuple[str, str], list[RenderInput]] = {}
     album_of: dict[int, str] = {}
+    unit_of: dict[int, tuple[str, str]] = {}
     for item in inputs:
         first = _render_one(pattern, item, _values(item, ""), lenient=True)
         if isinstance(first, _Missing):
             results[item.file_id] = Rendered(item.file_id, (), (), None, None, first.name)
             continue
         album_of[item.file_id] = _album_key(first[0])
-        albums.setdefault(album_of[item.file_id], []).append(item)
+        unit_of[item.file_id] = (album_of[item.file_id], album_title_key(item.values))
+        albums.setdefault(unit_of[item.file_id], []).append(item)
 
-    multi = {key: _multi_disc(members) for key, members in albums.items()}
+    multi = {unit: _multi_disc(members) for unit, members in albums.items()}
     for item in inputs:
         key = album_of.get(item.file_id)
         if key is None:
             continue
-        disc = parse_position(item.values.get("discnumber")) if multi[key] else None
+        is_multi = multi[unit_of[item.file_id]]
+        disc = parse_position(item.values.get("discnumber")) if is_multi else None
         values = _values(item, "" if disc is None else str(disc))
         final = _render_one(pattern, item, values, lenient=False)
         if isinstance(final, _Missing):

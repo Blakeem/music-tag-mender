@@ -965,7 +965,9 @@ def detect_album_gaps(
 
     A transient MusicBrainz error is counted in ``errors`` and itemized in ``error_items``
     (``{key, message}``), never folded into ``stays_blank``. A folder whose recording lookups
-    all failed has source ``lookup_error``. Re-run to retry it.
+    all failed has source ``lookup_error``. Re-run to retry it. A blank file whose format the
+    tag writer refuses (WAV, AIFF, WMA, raw AAC) gets no proposal and is counted in
+    ``unwritable``. A folder holding only such blank files has source ``unwritable``.
 
     Recommended fix flow (the human is the diff-gate for every value): start here, expand one
     folder with ``folder="<exact folder path>"``, then per source feed the proposals'
@@ -978,8 +980,8 @@ def detect_album_gaps(
 
     Args:
         limit: Cap the number of folder groups returned. The ``total_files``/``green``/
-            ``confirm``/``review``/``stays_blank``/``errors`` counts still describe the whole
-            library.
+            ``confirm``/``review``/``stays_blank``/``errors``/``unwritable`` counts still
+            describe the whole library.
         folder: Return only the group for exactly this folder, never a subfolder. Compared as
             a path: case and ``/`` versus backslash do not matter on Windows, and a relative
             folder resolves under ``music_path``.
@@ -988,9 +990,10 @@ def detect_album_gaps(
 
     Returns:
         ``{"ok": True, groups, total_files, total_blank, green, confirm, review, stays_blank,
-        errors, error_items, summary}``, where ``green + confirm + review + stays_blank +
-        errors == total_blank``. Each group is ``{folder, blank_count, file_count, file_ids,
-        sibling_histogram, source, proposals, errors}``, where ``file_ids`` names the folder's
+        errors, error_items, unwritable, summary}``, where ``green + confirm + review +
+        stays_blank + errors + unwritable == total_blank``. Each group is ``{folder,
+        blank_count, file_count, file_ids, sibling_histogram, source, proposals, errors,
+        unwritable}``, where ``file_ids`` names the folder's
         blank-album files. Each proposal is ``{file_id, filename, proposed, confidence, reason,
         note}``. On failure, ``{"ok": False, "error": ...}`` (e.g. a corrupt genre vocabulary).
     """
@@ -2071,6 +2074,9 @@ def resolve_songs(
     on exactly one track of that release, or nothing is staged and the files come back in
     ``unassigned`` with a reason. Otherwise the whole release stamp (names, sort names, ids,
     date, numbers, release fields, ``artists`` cleared) is staged as one ``manual`` batch.
+    A release field the release leaves blank keeps the file's value when the file already
+    names that release. A real run fetches the release fresh, so the stamp carries the track
+    ids MusicBrainz lists now. A dry run reads the cache.
 
     Args:
         folder: Limit to the files directly in this folder. Compared as a path, and a

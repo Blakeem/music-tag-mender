@@ -316,7 +316,7 @@ def _release_expectations(release: MBRelease) -> dict[str, str]:
         "albumartist": release.artist_credit,
         "date": release.date,
         "releasecountry": release.country,
-        "musicbrainz_albumstatus": release.status,
+        "musicbrainz_albumstatus": release_match.album_status(release),
     }
 
 

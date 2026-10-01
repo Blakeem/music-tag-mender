@@ -890,6 +890,29 @@ def test_release_by_mbid_second_call_is_served_from_cache(db_conn: sqlite3.Conne
     assert len(calls) == 1
 
 
+def test_release_by_mbid_fresh_refetches_and_replaces_the_cached_release(
+    db_conn: sqlite3.Connection,
+) -> None:
+    renumbered = _track(1, "1", "Enemy Throttle", id="rt-1-new")
+    current = _release_body(
+        media=[
+            {"position": 1, "title": "", "format": "CD", "track-count": 1, "tracks": [renumbered]}
+        ],
+    )
+    client, calls = _client(db_conn, [_json_response(_release_body()), _json_response(current)])
+    with client:
+        cached = client.release_by_mbid("rel-1")
+        fresh = client.release_by_mbid("rel-1", fresh=True)
+        after = client.release_by_mbid("rel-1")
+
+    assert cached is not None
+    assert cached.media[0].tracks[0].release_track_mbid == "rt-1"
+    assert fresh is not None
+    assert fresh.media[0].tracks[0].release_track_mbid == "rt-1-new"
+    assert after == fresh
+    assert len(calls) == 2
+
+
 def test_release_by_mbid_caches_a_404_as_a_negative(db_conn: sqlite3.Connection) -> None:
     client, calls = _client(db_conn, [httpx.Response(404, json={"error": "Not Found"})])
     with client:

@@ -1421,9 +1421,10 @@ def test_diff_flags_the_release_stamp_an_album_change_leaves_behind(
     engine_settings: Settings,
     music_dir: Path,
 ) -> None:
+    # The ISRC names the recording, which a release change leaves as it was.
     make_track(
         music_dir / "t.mp3",
-        {"album": ["Greatest Hits"], "releasecountry": ["RU"], "media": ["CD"]},
+        {"album": ["Greatest Hits"], "releasecountry": ["RU"], "media": ["CD"], "isrc": ["X1"]},
     )
     scan_library(engine_settings)
     file_id = _file_id(engine_settings, music_dir, "t.mp3")
@@ -1432,6 +1433,21 @@ def test_diff_flags_the_release_stamp_an_album_change_leaves_behind(
 
     stale = staging.diff_tags(engine_settings)[0].stale_identity
     assert {entry["stale_field"] for entry in stale} == {"releasecountry", "media"}
+
+
+def test_diff_flags_the_isrc_a_recording_change_leaves_behind(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    make_track(music_dir / "t.mp3", {"musicbrainz_trackid": ["rec-old"], "isrc": ["X1"]})
+    scan_library(engine_settings)
+    file_id = _file_id(engine_settings, music_dir, "t.mp3")
+
+    staging.stage_tags(engine_settings, file_id=file_id, tags={"musicbrainz_trackid": ["rec-new"]})
+
+    assert staging.diff_tags(engine_settings)[0].stale_identity == [
+        {"changed": "musicbrainz_trackid", "stale_field": "isrc", "stale_value": ["X1"]},
+    ]
 
 
 def test_diff_does_not_flag_a_name_changed_with_its_id(

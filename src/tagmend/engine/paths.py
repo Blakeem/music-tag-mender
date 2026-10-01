@@ -99,10 +99,9 @@ from tagmend.engine import (
     scan,
     schema,
     store,
-    text_keys,
 )
 from tagmend.engine.detector_core import parse_position
-from tagmend.engine.path_text import clean_value, part_problems
+from tagmend.engine.path_text import part_problems
 from tagmend.log import get_logger
 
 if TYPE_CHECKING:
@@ -1156,20 +1155,25 @@ def _sidecar_step(
 
 
 def _left_behind(conn: sqlite3.Connection, music_path: Path, folders: set[Path]) -> list[str]:
-    """Return the sidecars left with no staged move in each of *folders* its audio all left."""
+    """Return the sidecars left with no staged move in each of *folders* its audio all left.
+
+    A vacated folder also lists the sidecars of a vacated folder nested in it, so each sidecar
+    is kept once, in first-seen order.
+    """
     present = set(_members_by_folder(conn))
     staged = {row.from_key for row in store.list_staged_sidecars(conn)}
     root_key = path_keys.path_key(music_path)
-    left: list[str] = []
+    left: dict[str, str] = {}
     for folder in sorted(folders):
         key = path_keys.path_key(folder)
         if key == root_key or key in present:
             continue
         for source in _sidecar_files(folder)[0]:
             relative = _relative(music_path, source)
-            if path_keys.path_key(relative) not in staged:
-                left.append(relative)
-    return left
+            relative_key = path_keys.path_key(relative)
+            if relative_key not in staged:
+                left.setdefault(relative_key, relative)
+    return list(left.values())
 
 
 def _vacated_by(conn: sqlite3.Connection, music_path: Path, commit_id: int) -> set[Path]:
@@ -1776,7 +1780,7 @@ def _slot(work: _Work) -> tuple[str, str, int | None, int] | None:
     track = parse_position(work.values.get("tracknumber"))
     if work.to_path is None or work.render is None or track is None:
         return None
-    album = text_keys.display_key(clean_value(work.values.get("album", "")).rstrip(". "))
+    album = naming.album_title_key(work.values)
     return path_keys.path_key(Path(work.to_path).parent), album, work.render.disc, track
 
 

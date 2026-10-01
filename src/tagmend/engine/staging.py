@@ -81,7 +81,9 @@ _IDENTITY_GROUPS: Final[tuple[tuple[tuple[str, ...], tuple[str, ...]], ...]] = (
         ("title", "musicbrainz_trackid", "musicbrainz_releasetrackid"),
         ("title", "musicbrainz_trackid", "musicbrainz_releasetrackid"),
     ),
-    (("album", "musicbrainz_albumid"), tuple(sorted(RELEASE_STAMP_TAGS))),
+    (("album", "musicbrainz_albumid"), tuple(sorted(RELEASE_STAMP_TAGS - {"isrc"}))),
+    # An ISRC names the recording, so only a new recording id leaves it stale, never a rebind.
+    (("musicbrainz_trackid",), ("isrc",)),
 )
 
 

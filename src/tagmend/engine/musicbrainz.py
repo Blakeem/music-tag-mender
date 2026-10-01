@@ -286,8 +286,11 @@ class MBArtistSource(Protocol):
 class MBReleaseSource(Protocol):
     """The release+tracklist lookup a repair flow depends on (so it can use a fake in tests)."""
 
-    def release_by_mbid(self, mbid: str) -> MBRelease | None:
-        """Return the release MusicBrainz holds under *mbid*, or ``None`` if it holds none."""
+    def release_by_mbid(self, mbid: str, *, fresh: bool = False) -> MBRelease | None:
+        """Return the release MusicBrainz holds under *mbid*, or ``None`` if it holds none.
+
+        *fresh* skips any cached answer and replaces it with the one fetched now.
+        """
 
 
 class MusicBrainzClient:
@@ -432,16 +435,17 @@ class MusicBrainzClient:
 
         return self._fetch_and_cache_artist(mbid, request_key)
 
-    def release_by_mbid(self, mbid: str) -> MBRelease | None:
+    def release_by_mbid(self, mbid: str, *, fresh: bool = False) -> MBRelease | None:
         """Return the release MusicBrainz holds under *mbid*, tracklist included.
 
         A direct lookup by id, like :meth:`artist_by_mbid`: the file supplies the identity.
-        Cache first (positive or negative), else one paced network query. A ``404`` is a real
-        answer and is negative-cached; any other non-2xx raises :class:`MusicBrainzError`.
+        Cache first (positive or negative), else one paced network query. *fresh* skips the
+        cache read, so the fetched answer replaces the cached one. A ``404`` is a real answer
+        and is negative-cached; any other non-2xx raises :class:`MusicBrainzError`.
         """
         request_key = _release_request_key(mbid)
 
-        cached = get_cached_mb_release(self._conn, request_key)
+        cached = None if fresh else get_cached_mb_release(self._conn, request_key)
         if cached is not None:
             found, payload = cached
             if not found or payload is None:

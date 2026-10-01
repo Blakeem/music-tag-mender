@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import sqlite3
 import sys
 from typing import TYPE_CHECKING
@@ -15,6 +16,7 @@ from tagmend.engine.schema import SCHEMA_VERSION, apply_append_only_triggers, ap
 from tagmend.engine.tags import MANAGED_SET_VERSION, TAG_READER_VERSION
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
     from pathlib import Path
 
 
@@ -116,6 +118,45 @@ def test_apply_schema_is_read_only_on_a_current_ledger(tmp_path: Path) -> None:
         reader.close()
         writer.rollback()
         writer.close()
+
+
+@pytest.fixture
+def schema_log(caplog: pytest.LogCaptureFixture) -> Iterator[pytest.LogCaptureFixture]:
+    """Capture ``tagmend`` INFO records, which never propagate to the root ``caplog`` handler."""
+    logger = logging.getLogger("tagmend")
+    logger.addHandler(caplog.handler)
+    try:
+        with caplog.at_level(logging.INFO, logger="tagmend"):
+            yield caplog
+    finally:
+        logger.removeHandler(caplog.handler)
+
+
+def test_a_new_ledger_logs_a_creation_not_an_upgrade(schema_log: pytest.LogCaptureFixture) -> None:
+    conn = sqlite3.connect(":memory:")
+    try:
+        apply_schema(conn)
+    finally:
+        conn.close()
+
+    messages = [record.getMessage() for record in schema_log.records]
+    assert f"creating ledger schema v{SCHEMA_VERSION}" in messages
+    assert not any(message.startswith("upgrading") for message in messages)
+
+
+def test_an_older_ledger_logs_an_upgrade(schema_log: pytest.LogCaptureFixture) -> None:
+    conn = sqlite3.connect(":memory:")
+    try:
+        apply_schema(conn)
+        conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION - 1}")
+        schema_log.clear()
+
+        apply_schema(conn)
+    finally:
+        conn.close()
+
+    messages = [record.getMessage() for record in schema_log.records]
+    assert f"upgrading ledger schema v{SCHEMA_VERSION - 1} to v{SCHEMA_VERSION}" in messages
 
 
 def test_apply_schema_refuses_a_newer_ledger() -> None:

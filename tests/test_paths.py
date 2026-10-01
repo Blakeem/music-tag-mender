@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import dataclasses
 import os
 import sqlite3
 import sys
@@ -21,10 +22,12 @@ import mutagen
 import pytest
 
 from conftest import make_track
+from tagmend import config
 from tagmend.engine import (
     commits,
     health,
     mismatch,
+    naming,
     path_keys,
     paths,
     staging,
@@ -139,10 +142,10 @@ def _file_count(lib: _Lib) -> int:
         return len(store.list_files(conn))
 
 
-def _external_write(path: Path) -> None:
+def _external_write(path: Path, field: str = "title", value: str = "Edited elsewhere") -> None:
     """A tagger edit: new tag bytes and a later mtime."""
     audio = mutagen.File(path, easy=True)  # type: ignore[attr-defined]
-    audio["title"] = ["Edited elsewhere"]
+    audio[field] = [value]
     audio.save()
     stat_result = path.stat()
     os.utime(path, ns=(stat_result.st_atime_ns, stat_result.st_mtime_ns + 5_000_000_000))
@@ -1013,3 +1016,275 @@ def test_the_path_modules_never_delete_or_overwrite() -> None:
         assert {name for _, name in calls} == {"unlink", "rmdir"}
         for function, name in calls:
             assert function in _ALLOWED.get(name, set()), f"{module.name}: {name} in {function}"
+
+
+# --- stage_paths and the naming settings ------------------------------------------------
+
+_ONE = Path("Artist") / "Album" / "01 One.flac"
+_TWO = Path("Artist") / "Album" / "02 Two.flac"
+_TUNE = Path("Other") / "Record" / "01 Tune.flac"
+_RENDERED_ALBUM = Path("Artist") / "(2001) Artist - Album"
+_ONE_TARGET = _RENDERED_ALBUM / "Artist - Album - 01 - One.flac"
+
+
+def _full_tags(artist: str, album: str, track: int, title: str) -> dict[str, list[str]]:
+    return {
+        "albumartist": [artist],
+        "artist": [artist],
+        "album": [album],
+        "date": ["2001"],
+        "tracknumber": [str(track)],
+        "title": [title],
+    }
+
+
+@pytest.fixture
+def loose(engine_settings: Settings, music_dir: Path) -> dict[Path, int]:
+    """A library laid out loosely: the gate is open and every file deviates from the render."""
+    make_track(music_dir / _ONE, _full_tags("Artist", "Album", 1, "One"))
+    make_track(music_dir / _TWO, _full_tags("Artist", "Album", 2, "Two"))
+    make_track(music_dir / _TUNE, _full_tags("Other", "Record", 1, "Tune"))
+    scan_library(engine_settings)
+    assert mismatch.gate_state(engine_settings).open
+    return {
+        relative: _id_at(engine_settings, music_dir / relative) for relative in (_ONE, _TWO, _TUNE)
+    }
+
+
+def _at(settings: Settings, file_id: int) -> Path:
+    with _ledger(settings) as conn:
+        row = store.get_file_by_id(conn, file_id)
+        assert row is not None
+        return Path(row.folder) / row.filename
+
+
+def _tag_history(settings: Settings, file_ids: list[int]) -> dict[int, object]:
+    with _ledger(settings) as conn:
+        return {
+            file_id: (store.get_tags(conn, file_id), store.get_revisions(conn, file_id))
+            for file_id in file_ids
+        }
+
+
+def test_a_full_stage_paths_cycle_moves_every_file_and_revert_restores_every_path(
+    engine_settings: Settings, music_dir: Path, loose: dict[Path, int]
+) -> None:
+    ids = list(loose.values())
+    tags_before = _tag_history(engine_settings, ids)
+
+    preview = paths.stage_paths(engine_settings, dry_run=True)
+    assert (preview.dry_run, preview.staged, paths.diff_paths(engine_settings)) == (True, 3, [])
+
+    staged = paths.stage_paths(engine_settings, note="tidy")
+    assert (staged.staged, staged.folders, staged.kinds) == (3, 2, {"rename": 0, "move": 3})
+    views = paths.diff_paths(engine_settings)
+    assert {(view.origin, view.state, view.stale) for view in views} == {
+        ("auto", paths.AT_SOURCE, False),
+    }
+
+    result = paths.commit_paths(engine_settings)
+    assert (result.committed, result.problems) == (3, ())
+    assert result.commit_id is not None
+    commit = commits.get_commit(engine_settings, result.commit_id)
+    assert commit is not None
+    assert commit.message == f"naming pattern {naming.DEFAULT_PATTERN}"
+    assert _at(engine_settings, loose[_ONE]) == music_dir / _ONE_TARGET
+    assert paths.stage_paths(engine_settings, dry_run=True).at_target == 3
+
+    back = versioning.revert_commit(engine_settings, result.commit_id)
+
+    assert (back.reverted, back.errors) == (3, 0)
+    for relative, file_id in loose.items():
+        assert _at(engine_settings, file_id) == music_dir / relative
+        assert (music_dir / relative).exists()
+    assert not (music_dir / _RENDERED_ALBUM).exists()
+    assert _tag_history(engine_settings, ids) == tags_before
+
+
+def test_stage_paths_refuses_while_the_gate_is_closed_except_a_dry_run(
+    engine_settings: Settings, music_dir: Path, loose: dict[Path, int]
+) -> None:
+    make_track(
+        music_dir / "Wrong" / "Album" / "01 One.flac", _full_tags("Right", "Album", 1, "One")
+    )
+    scan_library(engine_settings)
+
+    with pytest.raises(ValueError, match="gate is closed"):
+        paths.stage_paths(engine_settings)
+
+    assert paths.stage_paths(engine_settings, dry_run=True).staged == 4
+    assert paths.diff_paths(engine_settings) == []
+
+
+def test_stage_paths_replaces_its_own_auto_rows_and_never_touches_a_manual_row(
+    engine_settings: Settings, music_dir: Path, loose: dict[Path, int]
+) -> None:
+    paths.stage_paths(engine_settings)
+    kept = str(Path("Other") / "Kept" / "01 Tune.flac")
+    paths.stage_paths_batch(engine_settings, entries=[(loose[_TUNE], kept)])
+    in_place = dataclasses.replace(
+        engine_settings, naming_pattern="{albumartist}/{album}/{tracknumber:02} {title}"
+    )
+
+    again = paths.stage_paths(in_place)
+
+    assert (again.staged, again.unstaged, again.at_target, again.kept_staged) == (0, 2, 2, 1)
+    rows = {view.file_id: (view.origin, view.to_path) for view in paths.diff_paths(in_place)}
+    assert rows == {loose[_TUNE]: ("manual", kept)}
+
+
+def test_a_folder_with_a_manual_row_holds_its_other_files(
+    engine_settings: Settings, loose: dict[Path, int]
+) -> None:
+    paths.stage_paths_batch(engine_settings, entries=[(loose[_ONE], str(Path("Away") / "1.flac"))])
+
+    result = paths.stage_paths(engine_settings, path="Artist")
+
+    assert (result.matched, result.staged, result.kept_staged) == (2, 0, 1)
+    held = result.held_files[0]
+    assert (held.file_id, held.reasons[0][0]) == (loose[_TWO], paths.UNIT_MEMBER)
+    assert str(loose[_ONE]) in held.reasons[0][1]
+
+
+def test_stage_paths_never_replaces_a_landed_move_and_commit_paths_finishes_it(
+    engine_settings: Settings, music_dir: Path, loose: dict[Path, int]
+) -> None:
+    paths.stage_paths(engine_settings, path="Artist")
+    (music_dir / _ONE_TARGET).parent.mkdir(parents=True)
+    (music_dir / _ONE).rename(music_dir / _ONE_TARGET)
+    before = _staged_rows(engine_settings)
+
+    again = paths.stage_paths(engine_settings, path="Artist")
+
+    assert again.held[paths.LANDED_MOVE] == 1
+    assert "commit_paths" in again.held_files[0].reasons[0][1]
+    assert _staged_rows(engine_settings)[loose[_ONE]] == before[loose[_ONE]]
+    assert loose[_TWO] not in _staged_rows(engine_settings)
+    assert paths.commit_paths(engine_settings).committed == 1
+    assert _at(engine_settings, loose[_ONE]) == music_dir / _ONE_TARGET
+
+
+def _staged_rows(settings: Settings) -> dict[int, store.StagedPath]:
+    with _ledger(settings) as conn:
+        return {row.file_id: row for row in store.list_staged_paths(conn)}
+
+
+def test_stage_paths_restages_two_auto_rows_that_swap_targets(
+    engine_settings: Settings, music_dir: Path
+) -> None:
+    first = music_dir / "Artist" / "Album" / "01 Song.flac"
+    second = music_dir / "Artist" / "Album" / "CD1" / "01 Song.flac"
+    for path, year in ((first, "2001"), (second, "2003")):
+        tags = _full_tags("Artist", "Album", 1, "Song")
+        make_track(path, {**tags, "date": [year], "discnumber": ["1"]})
+    scan_library(engine_settings)
+    ids = (_id_at(engine_settings, first), _id_at(engine_settings, second))
+    assert paths.stage_paths(engine_settings).staged == 2
+    before = {file_id: row.to_path for file_id, row in _staged_rows(engine_settings).items()}
+    _external_write(first, "date", "2003")
+    _external_write(second, "date", "2001")
+    scan_library(engine_settings)
+    assert all(view.stale for view in paths.diff_paths(engine_settings))
+
+    again = paths.stage_paths(engine_settings)
+
+    after = {file_id: row.to_path for file_id, row in _staged_rows(engine_settings).items()}
+    assert (again.staged, again.held, again.unstaged) == (2, {}, 0)
+    assert after == {ids[0]: before[ids[1]], ids[1]: before[ids[0]]}
+    assert not any(view.stale for view in paths.diff_paths(engine_settings))
+
+
+def test_stage_paths_scopes_to_a_folder_and_counts_staged_targets_under_an_empty_one(
+    engine_settings: Settings, music_dir: Path, loose: dict[Path, int]
+) -> None:
+    scoped = paths.stage_paths(engine_settings, path=music_dir / "Other")
+    assert (scoped.matched, scoped.staged) == (1, 1)
+    paths.stage_paths(engine_settings, path="Artist")
+
+    empty = paths.stage_paths(engine_settings, path=str(_RENDERED_ALBUM), dry_run=True)
+
+    assert (empty.matched, empty.staged_targets_under_path) == (0, 2)
+
+
+def test_diff_paths_flags_an_auto_row_the_current_render_no_longer_targets(
+    engine_settings: Settings, loose: dict[Path, int]
+) -> None:
+    paths.stage_paths(engine_settings, path="Artist")
+    paths.stage_paths_batch(engine_settings, entries=[(loose[_TUNE], "Tune.flac")])
+    changed = dataclasses.replace(engine_settings, naming_pattern="{albumartist}/{title}")
+
+    stale = {view.file_id: view.stale for view in paths.diff_paths(changed)}
+
+    assert stale == {loose[_ONE]: True, loose[_TWO]: True, loose[_TUNE]: False}
+    assert not any(view.stale for view in paths.diff_paths(engine_settings))
+
+
+def test_commit_paths_keeps_an_explicit_message(
+    engine_settings: Settings, loose: dict[Path, int]
+) -> None:
+    paths.stage_paths(engine_settings)
+
+    commit_id = paths.commit_paths(engine_settings, message="mine").commit_id
+
+    assert commit_id is not None
+    commit = commits.get_commit(engine_settings, commit_id)
+    assert commit is not None
+    assert commit.message == "mine"
+
+
+def test_set_naming_pattern_saves_each_setting_it_is_given(engine_settings: Settings) -> None:
+    saved = paths.set_naming_pattern(
+        engine_settings, pattern=" {albumartist}/{title} ", container_folders=["Soundtracks"]
+    )
+
+    loaded = config.load_settings()
+    assert (loaded.naming_pattern, loaded.container_folders) == (
+        "{albumartist}/{title}",
+        ("Soundtracks",),
+    )
+    assert saved.to_dict()["pattern"] == "{albumartist}/{title}"
+
+    cleared = paths.set_naming_pattern(loaded, container_folders=[])
+
+    assert (cleared.pattern, cleared.container_folders) == ("{albumartist}/{title}", ())
+    assert config.load_settings().container_folders == ()
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({}, "pass pattern, container_folders or both"),
+        ({"pattern": ""}, "empty"),
+        ({"pattern": "{artist}/{bogus}"}, "unknown field name"),
+        ({"pattern": "{artist}/{title"}, "unbalanced"),
+        ({"pattern": "{artist}/[{album}/x]{title}"}, "inside a group"),
+        ({"container_folders": ["a;b"]}, "invalid container_folders"),
+    ],
+)
+def test_set_naming_pattern_refuses_invalid_input(
+    engine_settings: Settings, kwargs: dict[str, object], message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        paths.set_naming_pattern(engine_settings, **kwargs)  # type: ignore[arg-type]
+
+    assert config.load_settings().naming_pattern == ""
+
+
+def test_set_naming_pattern_refuses_while_a_move_is_staged(
+    engine_settings: Settings, loose: dict[Path, int]
+) -> None:
+    paths.stage_paths(engine_settings)
+
+    with pytest.raises(ValueError, match="commit_paths"):
+        paths.set_naming_pattern(engine_settings, pattern="{albumartist}/{title}")
+
+    assert config.load_settings().naming_pattern == ""
+
+
+def test_an_invalid_saved_pattern_is_named_on_use(
+    engine_settings: Settings, loose: dict[Path, int]
+) -> None:
+    broken = dataclasses.replace(engine_settings, naming_pattern="{nope}")
+
+    with pytest.raises(ValueError, match="naming_pattern setting is invalid"):
+        paths.stage_paths(broken, dry_run=True)

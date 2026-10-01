@@ -218,6 +218,15 @@ def test_container_folders_env_override(monkeypatch: pytest.MonkeyPatch) -> None
     assert config.load_settings().container_folders == ("FromEnv", "Other")
 
 
+# --- naming_pattern (the path renderer's pattern) --------------------------------------
+
+
+def test_naming_pattern_defaults_empty_and_roundtrips_stripped() -> None:
+    assert config.load_settings().naming_pattern == ""
+    config.set_setting("naming_pattern", " {albumartist}/{title} ")
+    assert config.load_settings().naming_pattern == "{albumartist}/{title}"
+
+
 # --- song-axis settings --------------------------------------------------------------
 
 

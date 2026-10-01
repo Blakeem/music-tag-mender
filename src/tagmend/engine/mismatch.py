@@ -884,17 +884,27 @@ def _parse_filename(
 def _anchored_template(
     stem: str, album_artist: str | None, album: str | None
 ) -> _ParsedName | None:
-    """Parse ``AlbumArtist - Album - NN - Title`` with the file's own tags as the prefix.
+    """Parse ``AlbumArtist - Album - [D-]NN - Title`` with the file's own tags as the prefix.
 
     The generic template splits at the first `` - NN - ``, which an album or artist may hold.
+    The prefix is tried as tagged, then as the path renderer writes it, which deletes the
+    characters a path part cannot hold.
     """
     if album_artist is None or album is None:
         return None
-    prefix = re.escape(f"{album_artist} - {album} - ")
-    match = re.match(prefix + r"(\d+) - (.+)$", stem, re.IGNORECASE)
-    if match is None:
-        return None
-    return _ParsedName(number=_track_number(match[1]), title=match[2])
+    for artist_text, album_text in (
+        (album_artist, album),
+        (clean_value(album_artist), clean_value(album)),
+    ):
+        prefix = re.escape(f"{artist_text} - {album_text} - ")
+        match = re.match(prefix + r"(?:(\d{1,2})-)?(\d+) - (.+)$", stem, re.IGNORECASE)
+        if match is None:
+            continue
+        number = _track_number(match[2])
+        if number is not None and match[1] is not None:
+            number = replace(number, disc=int(match[1]), text=f"{match[1]}-{match[2]}")
+        return _ParsedName(number=number, title=match[3])
+    return None
 
 
 def _track_number(text: str) -> _FilenameNumber | None:

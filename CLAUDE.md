@@ -108,7 +108,7 @@ compares a file's year tags with the first-release year of its album's MusicBrai
 found by the album identity (album artist else artist, album). `high` means the `originaldate` year
 differs, `medium` means the `date` year is earlier than the first release. `release_limit` (default
 200) caps the uncached lookups one call makes, and cache writes are its only ledger writes.
-44 MCP tools total. Schema is **v25** (additive: v11 adds
+47 MCP tools total. Schema is **v25** (additive: v11 adds
 `musicbrainz_recording_cache`, v12 renames `file_album_status` → `file_year_status` in place —
 dispositions preserved; v13 adds `tag_revisions.managed_set`, stamping which managed-tag set
 governed each revision so a revert can restore emptiness on the widened fields; v14 adds
@@ -136,8 +136,13 @@ path staging columns (`to_key`, the stage-time signature, `reverted_from`). A ne
 refused). The paths domain (`paths.py`) is the second `RevisionDomain`. `stage_paths_batch`,
 `unstage_paths`, `diff_paths`, `commit_paths`, `history_paths` and `revert_paths` move files with one
 `files.id` across every move, never overwrite a target, and prune emptied source folders. A move
-that landed before a crash is finished by the next `commit_paths`. The naming pattern and
-renderer are not built yet.
+that landed before a crash is finished by the next `commit_paths`. The naming pattern
+(`naming.py`, settings key `naming_pattern`, empty for the default) renders each file's path from
+its tags. `set_naming_pattern` saves it and `container_folders`. `detect_path_deviations`
+(`path_deviations.py`) reports each file against its render, and previews a candidate pattern
+unsaved. `stage_paths` stages entire folders as `auto` rows. Both read one planner,
+`paths.plan_library`, which applies every hold. `diff_paths` flags an `auto` row `stale` when the
+render moved. A rendered path never flags in `detect_mismatches`, which a round-trip test checks.
 
 **The canonical tag namespace is TagMend's, not mutagen's.** mutagen's "easy" layer is an
 incomplete normalizer, so `tags.py` owns the mapping wherever it is wrong: `EasyID3` points
@@ -222,6 +227,7 @@ verb requires an operation no existing verb covers.
 | lookup → stage | `resolve_<axis>s` |
 | axis status | `set_<axis>_status` / `reset_<axis>_status` |
 | post-commit reopen | `reopen_axes` (keyed by `commit_id`) |
+| setting write | `set_<setting>` (`set_naming_pattern`) |
 
 Rules, in order:
 
@@ -316,7 +322,7 @@ src/tagmend/
   log.py            shared logger (use everywhere)
   config.py         settings.json (platformdirs) + typed Settings
   cli.py            Typer CLI (thin)
-  mcp_server.py     FastMCP server (thin) — 44 tools
+  mcp_server.py     FastMCP server (thin) — 47 tools
   engine/
     db.py           SQLite connection (WAL)
     schema.py       all DDL + PRAGMA user_version (v25)
@@ -342,14 +348,16 @@ src/tagmend/
     songs.py        resolve_songs + set/reset_song_status: AcoustID folder consensus, anchored check, rebind report, manual release path
     years.py        resolve_years + set/reset_year_status: MusicBrainz originaldate blank-fill + file_year_status workflow
     mismatch.py     detect_mismatches + set/reset_mismatch_status + layout_of + the path gate: tags vs every path level, tiered
-    path_text.py    clean_value: the value rule a tag obeys inside one path part
+    path_text.py    clean_value and the part rules: what a tag value and a path part may hold
     track_conflicts.py  detect_track_conflicts: intra-folder (disc, track) slot collisions
     album_conflicts.py  detect_album_conflicts: intra-folder album-identity splits, tiered
     release_disagreements.py  detect_release_disagreements: tags vs the MusicBrainz release the file's album id names, tiered
     year_disagreements.py  detect_year_disagreements: year tags vs the release group's first-release year, tiered
     album_gaps.py   detect_album_gaps: blank-album files grouped by folder + tiered fill proposals
     parsing.py      pure folder/filename → (artist, album) parsing for the album-gap fills
-    paths.py        PathDomain + the explicit path tools: tracked, revertible, no-clobber moves
+    naming.py       the naming pattern: grammar, album grouper, renderer (pure)
+    path_deviations.py  detect_path_deviations: current path vs the rendered path, plus the discovery header
+    paths.py        PathDomain + the path tools + the planner (plan_library, stage_paths, set_naming_pattern): tracked, revertible, no-clobber moves
 tests/              pytest; conftest isolates config + builds temp libraries (make_track)
 ```
 

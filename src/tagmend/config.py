@@ -44,6 +44,7 @@ _KNOWN_KEYS: Final[frozenset[str]] = frozenset(
         "musicbrainz_contact",
         "year_stage_limit",
         "container_folders",
+        "naming_pattern",
         "acoustid_api_key",
         "fpcalc_path",
         "acoustid_rate_per_sec",
@@ -141,9 +142,11 @@ class Settings:
     musicbrainz_rate_per_sec: float = _MUSICBRAINZ_RATE_PER_SEC_DEFAULT
     musicbrainz_contact: str = _MUSICBRAINZ_CONTACT_DEFAULT
     year_stage_limit: int = _YEAR_STAGE_LIMIT_DEFAULT
-    # Top-level container folders whose path signal the mismatch detector suppresses; a
-    # semicolon-delimited string on disk, coerced to a tuple here.
+    # Top-level folders that collect releases rather than name an artist. A semicolon-delimited
+    # string on disk, coerced to a tuple here.
     container_folders: tuple[str, ...] = ()
+    # The path naming pattern. Empty means the built-in default the naming module defines.
+    naming_pattern: str = ""
     # Song-axis settings. The key stays out of the repr so a logged Settings never leaks it.
     acoustid_api_key: str | None = field(default=None, repr=False)
     fpcalc_path: str | None = None
@@ -210,6 +213,7 @@ def load_settings() -> Settings:
             _YEAR_STAGE_LIMIT_DEFAULT,
         ),
         container_folders=_coerce_folder_list(_resolve_raw("container_folders", raw)),
+        naming_pattern=(_resolve_raw("naming_pattern", raw) or "").strip(),
         acoustid_api_key=_resolve_raw("acoustid_api_key", raw) or None,
         fpcalc_path=_resolve_raw("fpcalc_path", raw) or None,
         acoustid_rate_per_sec=_coerce_capped_rate(

@@ -653,7 +653,7 @@ def test_error_envelope_lets_a_bug_raise(monkeypatch: pytest.MonkeyPatch) -> Non
 def test_every_tool_is_enveloped() -> None:
     tools = mcp_server.mcp._tool_manager.list_tools()
 
-    assert len(tools) == 44
+    assert len(tools) == 47
     assert [tool.name for tool in tools if not hasattr(tool.fn, "__wrapped__")] == []
 
 
@@ -724,6 +724,7 @@ _NEGATIVE_LIMIT_CALLS = [
     ("detect_release_disagreements", {"release_limit": -1}),
     ("detect_year_disagreements", {"limit": -1}),
     ("detect_year_disagreements", {"release_limit": -1}),
+    ("detect_path_deviations", {"limit": -1}),
 ]
 
 
@@ -776,6 +777,48 @@ def test_path_tools_roundtrip(music_dir: Path) -> None:
     assert mcp_server.unstage_paths(file_id=file_id) == {"ok": True, "removed": 0}
 
 
+def test_the_rendered_path_tools_roundtrip(music_dir: Path) -> None:
+    config.set_setting("music_path", str(music_dir))
+    tags = {
+        "albumartist": ["Artist"],
+        "artist": ["Artist"],
+        "album": ["Album"],
+        "tracknumber": ["1"],
+        "title": ["One"],
+    }
+    make_track(music_dir / "Artist" / "Album" / "01 One.mp3", tags)
+    mcp_server.scan_library()
+
+    saved = mcp_server.set_naming_pattern(container_folders=["Soundtracks"])
+    assert (saved["ok"], saved["container_folders"]) == (True, ["Soundtracks"])
+    preview = mcp_server.detect_path_deviations(pattern="{albumartist}/{album}/{title}")
+    assert (preview["ok"], preview["persisted"]) == (True, False)
+    report = mcp_server.detect_path_deviations()
+    target = str(Path("Artist") / "Artist - Album" / "Artist - Album - 01 - One.mp3")
+    assert report["groups"] == [
+        {
+            "folder": str(Path("Artist") / "Album"),
+            "files": 1,
+            "destinations": [str(Path("Artist") / "Artist - Album")],
+            "kind": "move",
+            "held": {},
+            "example": {"from": str(Path("Artist") / "Album" / "01 One.mp3"), "to": target},
+        },
+    ]
+
+    staged = mcp_server.stage_paths(path="Artist")
+    assert (staged["ok"], staged["staged"]) == (True, 1)
+    changes = mcp_server.diff_paths()["changes"]
+    assert isinstance(changes, list)
+    assert changes[0]["stale"] is False
+    refused = mcp_server.set_naming_pattern(pattern="{albumartist}/{title}")
+    assert refused["ok"] is False
+    assert "commit_paths" in str(refused["error"])
+    committed = mcp_server.commit_paths()
+    assert (committed["ok"], committed["committed"]) == (True, 1)
+    assert (music_dir / target).exists()
+
+
 def test_path_tools_return_the_error_envelope(music_dir: Path) -> None:
     config.set_setting("music_path", str(music_dir))
 
@@ -785,6 +828,9 @@ def test_path_tools_return_the_error_envelope(music_dir: Path) -> None:
     held = mcp_server.stage_paths_batch([{"file_id": 9999, "to_path": "a.mp3"}])
     assert held["ok"] is False
     assert "unknown_file" in str(held["error"])
+    assert mcp_server.set_naming_pattern()["ok"] is False
+    assert mcp_server.detect_path_deviations(pattern="{x}")["ok"] is False
+    assert mcp_server.stage_paths(path="..")["ok"] is False
 
 
 def _scanned_id(path: Path) -> int:

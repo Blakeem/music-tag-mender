@@ -72,16 +72,18 @@ from __future__ import annotations
 import os
 import re
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
-from tagmend.engine import clock, commits, db, mismatch, path_keys, schema, store
-from tagmend.engine.path_text import clean_value
+from tagmend import config
+from tagmend.engine import clock, commits, db, mismatch, naming, path_keys, schema, store
+from tagmend.engine.detector_core import parse_position
+from tagmend.engine.path_text import part_problems
 from tagmend.log import get_logger
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Callable, Sequence
 
     from tagmend.config import Settings
 
@@ -112,16 +114,6 @@ _FORWARD_ORIGINS: Final = frozenset({"auto", "manual"})
 _REVERT: Final = "revert"
 _BASELINE_ORIGIN: Final = "scan"
 
-_RESERVED_NAMES: Final = frozenset(
-    {
-        "CON",
-        "PRN",
-        "AUX",
-        "NUL",
-        *(f"COM{number}" for number in range(1, 10)),
-        *(f"LPT{number}" for number in range(1, 10)),
-    },
-)
 # Windows limits: NTFS caps one name at 255 UTF-16 units, and MAX_PATH leaves 259 characters.
 _MAX_PART_UNITS: Final = 255
 _MAX_PATH_CHARS: Final = 259
@@ -157,15 +149,7 @@ def check_components(relative_path: str) -> list[str]:
         if part == "..":
             problems.append("a '..' part leaves its folder")
             continue
-        if clean_value(part) != part:
-            problems.append(
-                f"part {part!r} holds a character a path part cannot hold, edge or repeated "
-                "whitespace, or a non-NFC form",
-            )
-        if part.rstrip(". ") != part:
-            problems.append(f"part {part!r} ends with a dot or a space")
-        if part.split(".")[0].rstrip(" ").upper() in _RESERVED_NAMES:
-            problems.append(f"part {part!r} is a reserved device name")
+        problems.extend(part_problems(part))
     return problems
 
 
@@ -224,17 +208,68 @@ def _signature(path: Path) -> tuple[int, int]:
     return stat_result.st_size, stat_result.st_mtime_ns
 
 
-def _existing_folder_name(parent: Path, name: str) -> str | None:
-    """Return the name of the folder in *parent* whose key equals *name*'s, or ``None``."""
-    wanted = path_keys.path_key(name)
-    try:
-        with os.scandir(parent) as entries:
-            return next(
-                (e.name for e in entries if e.is_dir() and path_keys.path_key(e.name) == wanted),
-                None,
-            )
-    except (FileNotFoundError, NotADirectoryError):
-        return None
+class _Speller:
+    """Reads folder listings once each, for a plan that probes many paths in few folders.
+
+    Rendered folders take the on-disk spelling of an existing folder with the same key, and a
+    folder not on disk yet takes the first spelling the plan gave it, so one plan never records
+    two spellings of one folder.
+    """
+
+    def __init__(self, music_path: Path) -> None:
+        self._music_path = music_path
+        self._listings: dict[str, dict[str, tuple[str, bool]] | None] = {}
+        self._chosen: dict[str, str] = {}
+        self._cues: dict[str, dict[str, list[str]]] = {}
+
+    def _listing(self, folder: Path) -> dict[str, tuple[str, bool]] | None:
+        """Return ``{entry key: (name, is_dir)}`` of *folder*, ``None`` when a file sits there."""
+        key = path_keys.path_key(folder)
+        if key not in self._listings:
+            try:
+                with os.scandir(folder) as entries:
+                    listing = {path_keys.path_key(e.name): (e.name, e.is_dir()) for e in entries}
+            except NotADirectoryError:
+                self._listings[key] = None
+                return None
+            except OSError:
+                # A missing folder, or a name too long for the volume (a bare OSError on
+                # Windows), holds no entry. The length hold then names the long one.
+                listing = {}
+            self._listings[key] = listing
+        return self._listings[key]
+
+    def respell(self, relative_path: str) -> str:
+        """Return *relative_path* with each folder spelled as on disk, or as first chosen."""
+        parts = Path(relative_path).parts
+        spelled: list[str] = []
+        parent = self._music_path
+        for part in parts[:-1]:
+            entry = (self._listing(parent) or {}).get(path_keys.path_key(part))
+            if entry is not None and entry[1]:
+                name = entry[0]
+            else:
+                name = self._chosen.setdefault(path_keys.path_key(parent / part), part)
+            spelled.append(name)
+            parent = parent / name
+        return str(Path(*spelled, parts[-1]))
+
+    def present(self, path: Path) -> bool:
+        """Whether the exact name of *path* is an entry of its folder's listing."""
+        entry = (self._listing(path.parent) or {}).get(path_keys.path_key(path.name))
+        return entry is not None and entry[0] == path.name
+
+    def holds_key(self, path: Path) -> bool:
+        """Whether any entry of *path*'s folder has *path*'s key, or a file blocks the folder."""
+        listing = self._listing(path.parent)
+        return listing is None or path_keys.path_key(path.name) in listing
+
+    def cue_sheets(self, source: Path) -> list[str]:
+        """Return the cue sheets and playlists in *source*'s folder that name *source*."""
+        folder_key = path_keys.path_key(source.parent)
+        if folder_key not in self._cues:
+            self._cues[folder_key] = _cue_index(source.parent)
+        return self._cues[folder_key].get(path_keys.path_key(source), [])
 
 
 def respell_folders(music_path: Path, relative_path: str) -> str:
@@ -244,14 +279,7 @@ def respell_folders(music_path: Path, relative_path: str) -> str:
     so a move never records a second spelling of one folder. The filename keeps the caller's
     spelling, since a filename case change is a rename the caller asked for.
     """
-    parts = Path(relative_path).parts
-    spelled: list[str] = []
-    parent = music_path
-    for part in parts[:-1]:
-        name = _existing_folder_name(parent, part) or part
-        spelled.append(name)
-        parent = parent / name
-    return str(Path(*spelled, parts[-1]))
+    return _Speller(music_path).respell(relative_path)
 
 
 def _case_blind_volume(music_path: Path) -> bool:
@@ -326,24 +354,27 @@ def _playlist_entries(sheet: Path) -> list[str]:
     return [match.group(1) or match.group(2) for match in matches if match is not None]
 
 
-def _cue_references(source: Path) -> list[str]:
-    """Return the cue sheets and playlists in *source*'s folder that name *source*."""
-    folder = source.parent
-    wanted = path_keys.path_key(source)
+def _cue_index(folder: Path) -> dict[str, list[str]]:
+    """Return ``{file key: sheet names}`` for each file the sheets in *folder* name."""
     try:
         with os.scandir(folder) as entries:
-            sheets = [
+            sheets = sorted(
                 Path(e.path)
                 for e in entries
                 if e.is_file() and Path(e.name).suffix.lower() in _PLAYLIST_SUFFIXES
-            ]
+            )
     except OSError:
-        return []
-    return sorted(
-        sheet.name
-        for sheet in sheets
-        if any(path_keys.path_key(folder / name) == wanted for name in _playlist_entries(sheet))
-    )
+        return {}
+    index: dict[str, list[str]] = {}
+    for sheet in sheets:
+        for key in {path_keys.path_key(folder / name) for name in _playlist_entries(sheet)}:
+            index.setdefault(key, []).append(sheet.name)
+    return index
+
+
+def _cue_references(source: Path) -> list[str]:
+    """Return the cue sheets and playlists in *source*'s folder that name *source*."""
+    return _cue_index(source.parent).get(path_keys.path_key(source), [])
 
 
 def _one_entry(source: Path, target: Path) -> bool:
@@ -914,6 +945,722 @@ def stage_paths_batch(
     return staged_ids
 
 
+# --- the planner: render every file, then hold what must not move ----------------------
+
+# One file's place in the plan.
+STATUS_AT_TARGET: Final = "at_target"
+STATUS_CASE_ONLY: Final = "case_only"
+STATUS_WILL_MOVE: Final = "will_move"
+STATUS_HELD: Final = "held"
+STATUS_KEPT_STAGED: Final = "kept_staged"
+PLAN_STATUSES: Final = (
+    STATUS_AT_TARGET,
+    STATUS_CASE_ONLY,
+    STATUS_WILL_MOVE,
+    STATUS_HELD,
+    STATUS_KEPT_STAGED,
+)
+
+# How a deviating file's path changes.
+KIND_RENAME: Final = "rename"
+KIND_MOVE: Final = "move"
+KIND_CASE: Final = "case"
+
+# The render holds. stage_paths applies them, and an explicit stage_paths_batch destination
+# supersedes them. A required field that renders empty holds ``missing_<name>``.
+MISSING_PREFIX: Final = "missing_"
+MISSING_YEAR: Final = "missing_year"
+MISSING_DISC: Final = "missing_disc"
+ALBUM_SPLIT: Final = "album_split"
+UNIT_MEMBER: Final = "unit_member"
+TRACK_CONFLICT: Final = "track_conflict"
+MERGE: Final = "merge"
+DUPLICATE_RENDER: Final = "duplicate_render"
+
+_AUTO: Final = "auto"
+_NAMED_IDS: Final = 5
+_HELD_CAP: Final = 50
+
+
+@dataclass(slots=True)
+class _Work:
+    """One present file while the planner decides its fate. Holds accumulate in ``reasons``."""
+
+    row: store.FileRow
+    from_path: str
+    folder_key: str
+    values: dict[str, str]
+    layout: mismatch.Layout
+    kept: bool
+    staged: store.StagedPath | None
+    render: naming.Rendered | None = None
+    to_path: str | None = None
+    status: str = STATUS_HELD
+    kind: str | None = None
+    reasons: list[tuple[str, str]] = field(default_factory=list)
+    replaces: bool = False
+
+    @property
+    def source(self) -> Path:
+        """Where the ledger records the file."""
+        return Path(self.row.folder) / self.row.filename
+
+    @property
+    def stays(self) -> bool:
+        """Whether the file stays in its folder: held, or kept by a manual or revert row."""
+        return bool(self.reasons) or self.status == STATUS_KEPT_STAGED
+
+    @property
+    def moving(self) -> bool:
+        """Whether the file is planned to move and nothing holds it yet."""
+        return self.status == STATUS_WILL_MOVE and not self.reasons
+
+    def hold(self, reason: str, detail: str) -> bool:
+        """Add *reason* unless the file already carries it. True when it was added."""
+        if self.status == STATUS_KEPT_STAGED or any(name == reason for name, _ in self.reasons):
+            return False
+        self.reasons.append((reason, detail))
+        return True
+
+
+@dataclass(frozen=True, slots=True)
+class FilePlan:
+    """One present file's place in the path plan. Paths are relative to ``music_path``.
+
+    ``status`` is ``at_target``, ``case_only`` (a folder differs only in case, which the
+    folder's on-disk spelling absorbs, so nothing stages), ``will_move``, ``held`` (``reasons``
+    says why) or ``kept_staged`` (a manual or revert move stays staged, untouched). ``kind`` is
+    ``rename`` (same folder), ``move`` or ``case``. ``to_path`` is ``None`` when the tags render
+    no path. ``rendered`` is the render before folder respelling, and ``levels`` gives each of
+    its parts' pattern component index. ``replaces`` marks an ``auto`` row that a stage of this
+    file's scope replaces.
+    """
+
+    file_id: int
+    folder_key: str
+    from_path: str
+    to_path: str | None
+    rendered: tuple[str, ...]
+    levels: tuple[int | None, ...]
+    status: str
+    kind: str | None
+    reasons: tuple[tuple[str, str], ...]
+    replaces: bool
+
+    @property
+    def source_folder(self) -> str:
+        """The folder the file sits in, relative to ``music_path``."""
+        return str(Path(self.from_path).parent)
+
+    def to_dict(self) -> dict[str, object]:
+        """JSON-serializable form for the MCP tools."""
+        return {
+            "file_id": self.file_id,
+            "from_path": self.from_path,
+            "to_path": self.to_path,
+            "status": self.status,
+            "kind": self.kind,
+            "reasons": [{"reason": reason, "detail": detail} for reason, detail in self.reasons],
+        }
+
+
+def _named(ids: Sequence[int]) -> str:
+    """Return up to :data:`_NAMED_IDS` file ids for a detail, with a count of the rest."""
+    shown = ", ".join(str(file_id) for file_id in ids[:_NAMED_IDS])
+    rest = len(ids) - _NAMED_IDS
+    return f"file_id {shown}" + (f" and {rest} more" if rest > 0 else "")
+
+
+def _load_works(
+    conn: sqlite3.Connection,
+    settings: Settings,
+    music_path: Path,
+    pattern: naming.Pattern,
+) -> list[_Work]:
+    """Read every present file under ``music_path`` with the tags and decisions it renders by."""
+    root_key = path_keys.path_key(music_path)
+    rows = [
+        row
+        for row in store.list_files(conn)
+        if not row.is_missing and path_keys.is_within(path_keys.path_key(row.folder), root_key)
+    ]
+    names = tuple(sorted({*pattern.tag_names(), *naming.BASE_TAGS}))
+    tag_values = store.load_tag_values(conn, names)
+    keeps = {
+        file_id
+        for file_id in store.load_mismatch_statuses(conn)
+        if mismatch.planner_keep(conn, file_id)
+    }
+    staged = {row.file_id: row for row in store.list_staged_paths(conn)}
+    return [
+        _Work(
+            row=row,
+            from_path=_relative(music_path, Path(row.folder) / row.filename),
+            folder_key=path_keys.path_key(row.folder),
+            values=tag_values.get(row.id, {}),
+            layout=mismatch.layout_of(settings, row.folder, row.filename),
+            kept=row.id in keeps,
+            staged=staged.get(row.id),
+        )
+        for row in rows
+    ]
+
+
+def _render_input(work: _Work) -> naming.RenderInput:
+    """Return what the renderer reads of *work*."""
+    folder_parts = Path(work.from_path).parts[:-1]
+    container = folder_parts[0] if work.layout.container and folder_parts else None
+    return naming.RenderInput(
+        file_id=work.row.id,
+        values=work.values,
+        container=container,
+        kept_folder=folder_parts if work.kept else None,
+        suffix=Path(work.row.filename).suffix,
+    )
+
+
+def _place(work: _Work, render: naming.Rendered, speller: _Speller) -> None:
+    """Set *work*'s target, status and kind from its render, plus its blank-tag holds."""
+    work.render = render
+    raw = render.relative_path
+    if raw is not None:
+        work.to_path = speller.respell(raw)
+    if work.staged is not None and work.staged.origin != _AUTO:
+        work.status = STATUS_KEPT_STAGED
+        return
+    if render.missing is not None:
+        name = render.missing
+        work.hold(f"{MISSING_PREFIX}{name}", f"the pattern needs {{{name}}}, which is blank")
+    elif work.to_path == work.from_path:
+        work.status = STATUS_AT_TARGET if raw == work.from_path else STATUS_CASE_ONLY
+        work.kind = None if raw == work.from_path else KIND_CASE
+    elif work.to_path is not None:
+        work.status = STATUS_WILL_MOVE
+        same_folder = path_keys.path_key(Path(work.to_path).parent) == path_keys.path_key(
+            Path(work.from_path).parent,
+        )
+        work.kind = KIND_RENAME if same_folder else KIND_MOVE
+    # A kept folder stays, so the path information it carries is never lost.
+    if work.kept:
+        return
+    if work.layout.release_years and not naming.year_of(work.values):
+        detail = (
+            f"its release folder {work.layout.release_folder} names a year and the file has no "
+            "date or originaldate"
+        )
+        work.hold(MISSING_YEAR, detail)
+    if work.layout.disc_folder is not None and not work.values.get("discnumber", "").strip():
+        detail = f"it sits in the disc folder {work.layout.disc_folder} and its discnumber is blank"
+        work.hold(MISSING_DISC, detail)
+
+
+def _rendered_works(
+    conn: sqlite3.Connection,
+    settings: Settings,
+    music_path: Path,
+    pattern: naming.Pattern,
+) -> tuple[list[_Work], _Speller]:
+    """Load and render every present file, its target respelled on disk."""
+    works = _load_works(conn, settings, music_path, pattern)
+    renders = naming.render_library(pattern, [_render_input(work) for work in works])
+    speller = _Speller(music_path)
+    for work in works:
+        _place(work, renders[work.row.id], speller)
+    return works, speller
+
+
+def _group[K](works: Sequence[_Work], key: Callable[[_Work], K | None]) -> dict[K, list[_Work]]:
+    """Group *works* by *key*, leaving out a work whose key is ``None``."""
+    groups: dict[K, list[_Work]] = {}
+    for work in works:
+        value = key(work)
+        if value is not None:
+            groups.setdefault(value, []).append(work)
+    return groups
+
+
+def _target_key(work: _Work) -> str | None:
+    """Return the key of *work*'s target relative to ``music_path``."""
+    return None if work.to_path is None else path_keys.path_key(work.to_path)
+
+
+def _slot(work: _Work) -> tuple[str, int | None, int] | None:
+    """Return the destination folder and ``[disc-]NN`` slot of *work*, ``None`` with no track."""
+    track = parse_position(work.values.get("tracknumber"))
+    if work.to_path is None or work.render is None or track is None:
+        return None
+    return path_keys.path_key(Path(work.to_path).parent), work.render.disc, track
+
+
+def _hold_shared_renders(works: list[_Work]) -> None:
+    """Hold ``duplicate_render``, ``track_conflict`` and ``album_split`` across the library."""
+    for members in _group(works, _target_key).values():
+        if len(members) > 1:
+            for work in members:
+                others = [m.row.id for m in members if m is not work]
+                work.hold(DUPLICATE_RENDER, f"{_named(others)} renders the same path")
+    for members in _group(works, _slot).values():
+        if len(members) > 1:
+            for work in members:
+                others = [m.row.id for m in members if m is not work]
+                work.hold(TRACK_CONFLICT, f"{_named(others)} takes the same disc and track slot")
+    rendered = [work for work in works if work.render is not None and work.to_path is not None]
+    for members in _group(rendered, lambda work: work.folder_key).values():
+        albums = {work.render.album_key for work in members if work.render is not None}
+        if len(albums) > 1:
+            detail = f"the files of this folder render to {len(albums)} album folders"
+            for work in members:
+                work.hold(ALBUM_SPLIT, detail)
+
+
+def _replaceable(
+    work: _Work,
+    music_path: Path,
+    scope_key: str | None,
+) -> tuple[bool, tuple[str, str] | None]:
+    """Return whether a stage in scope replaces *work*'s ``auto`` row, and its landed hold."""
+    staged = work.staged
+    if staged is None or staged.origin != _AUTO:
+        return False, None
+    if _locate(work.source, music_path / staged.to_path, staged) in _AT_TARGET:
+        detail = f"its staged move to {staged.to_path} already landed on disk. Run commit_paths"
+        return False, (LANDED_MOVE, detail)
+    in_scope = scope_key is None or path_keys.is_within(work.folder_key, scope_key)
+    return in_scope, None
+
+
+def _target_holds(  # noqa: PLR0913 - cohesive keyword-only target-safety inputs
+    work: _Work,
+    *,
+    music_path: Path,
+    speller: _Speller,
+    tracked: dict[str, int],
+    claims: dict[str, int],
+    staged_tags: set[int],
+) -> None:
+    """Hold one moving file by every destination-safety reason that applies to it."""
+    if work.to_path is None:  # pragma: no cover - defensive, a moving file has a target
+        return
+    if work.row.id in staged_tags:
+        work.hold(STAGED_TAG, "it has a staged tag change. Run commit_tags or unstage_tags")
+    if not speller.present(work.source):
+        work.hold(MISSING, f"{work.from_path} is not on disk. Rescan first")
+    too_long = check_length(music_path, work.to_path)
+    if too_long:
+        # A path too long to list reliably is never probed on disk.
+        work.hold(TOO_LONG, "; ".join(too_long))
+        return
+    target = music_path / work.to_path
+    target_key = path_keys.path_key(target)
+    holder = tracked.get(target_key)
+    if holder is not None and holder != work.row.id:
+        work.hold(OCCUPIED, f"file_id={holder} is tracked at {work.to_path}")
+    elif target_key != path_keys.path_key(work.source) and speller.holds_key(target):
+        work.hold(OCCUPIED, f"{work.to_path} is taken on disk")
+    claimant = claims.get(path_keys.path_key(work.to_path))
+    if claimant is not None and claimant != work.row.id:
+        work.hold(SHARED_TARGET, f"file_id={claimant} is already staged to {work.to_path}")
+    sheets = speller.cue_sheets(work.source)
+    if sheets:
+        detail = f"{', '.join(sheets)} in its folder names it. Edit or move the sheet first"
+        work.hold(CUE_REFERENCE, detail)
+
+
+def _hold_unsafe(
+    conn: sqlite3.Connection,
+    works: list[_Work],
+    *,
+    music_path: Path,
+    speller: _Speller,
+    scope_key: str | None,
+) -> None:
+    """Mark the ``auto`` rows a stage replaces, then hold every unsafe destination."""
+    for work in works:
+        work.replaces, landed = _replaceable(work, music_path, scope_key)
+        if landed is not None:
+            work.hold(*landed)
+    replacing = {work.row.id for work in works if work.replaces}
+    claims = {
+        row.to_key: row.file_id
+        for row in store.list_staged_paths(conn)
+        if row.to_key is not None and row.file_id not in replacing
+    }
+    tracked = {
+        path_keys.file_path_key(row.folder, row.filename): row.id for row in store.list_files(conn)
+    }
+    staged_tags = {row.file_id for row in store.list_staged_tags(conn)}
+    for work in works:
+        if work.moving:
+            _target_holds(
+                work,
+                music_path=music_path,
+                speller=speller,
+                tracked=tracked,
+                claims=claims,
+                staged_tags=staged_tags,
+            )
+
+
+def _close_units(works: list[_Work]) -> bool:
+    """Hold ``unit_member`` on every moving file whose folder has a file that stays."""
+    changed = False
+    for members in _group(works, lambda work: work.folder_key).values():
+        staying = sorted(work.row.id for work in members if work.stays)
+        if not staying:
+            continue
+        detail = f"{_named(staying)} in this folder stays, and a folder moves as a unit"
+        for work in members:
+            if work.moving:
+                changed |= work.hold(UNIT_MEMBER, detail)
+    return changed
+
+
+def _disc_of(work: _Work) -> int:
+    """Return the disc a file belongs to, a blank disc number counting as disc 1."""
+    return parse_position(work.values.get("discnumber")) or 1
+
+
+def _hold_merges(works: list[_Work], music_path: Path) -> bool:
+    """Hold ``merge`` on files poured into a folder another folder also feeds, disc sets shared.
+
+    A feeder is a source folder with an unheld file rendering to the destination. The
+    destination itself feeds it when it holds a file that stays.
+    """
+    changed = False
+    staying = _group([w for w in works if w.stays], lambda work: work.folder_key)
+
+    def destination(work: _Work) -> str | None:
+        if work.stays or work.to_path is None:
+            return None
+        return path_keys.path_key((music_path / work.to_path).parent)
+
+    for dest, members in _group(works, destination).items():
+        feeders: dict[str, set[int]] = {}
+        for work in [*members, *staying.get(dest, [])]:
+            feeders.setdefault(work.folder_key, set()).add(_disc_of(work))
+        discs = list(feeders.values())
+        if len(discs) == 1 or sum(map(len, discs)) == len(set().union(*discs)):
+            continue
+        folder = Path(members[0].to_path or "").parent
+        detail = (
+            f"{len(feeders)} folders feed {folder} and their disc numbers overlap. Join them "
+            "with stage_paths_batch"
+        )
+        for work in members:
+            if work.moving and work.folder_key != dest:
+                changed |= work.hold(MERGE, detail)
+    return changed
+
+
+def _freeze(work: _Work) -> FilePlan:
+    """Return the public plan of *work*, held when any reason holds it."""
+    status = work.status
+    if work.reasons and status != STATUS_KEPT_STAGED:
+        status = STATUS_HELD
+    render = work.render
+    return FilePlan(
+        file_id=work.row.id,
+        folder_key=work.folder_key,
+        from_path=work.from_path,
+        to_path=work.to_path,
+        rendered=() if render is None else render.parts,
+        levels=() if render is None else render.levels,
+        status=status,
+        kind=work.kind,
+        reasons=tuple(work.reasons),
+        replaces=work.replaces,
+    )
+
+
+def plan_library(
+    conn: sqlite3.Connection,
+    settings: Settings,
+    *,
+    pattern: naming.Pattern,
+    scope_key: str | None = None,
+) -> list[FilePlan]:
+    """Render every present file with *pattern* and decide which ones may move. Reads only.
+
+    The render holds come first (``missing_<name>``, ``missing_year``, ``missing_disc``,
+    ``duplicate_render``, ``track_conflict``, ``album_split``), then the destination-safety
+    holds of a moving file (``landed_move``, ``staged_tag``, ``missing``, ``too_long``,
+    ``occupied``, ``shared_target``, ``cue_reference``). A folder moves as a unit, so every moving
+    file of a folder with a file that stays holds ``unit_member``, and a destination fed by
+    more than one folder with shared disc numbers holds ``merge``. Those two repeat until no
+    hold is added. *scope_key* marks the ``auto`` rows a stage of that folder replaces.
+    """
+    music_path = _require_music_path(settings)
+    works, speller = _rendered_works(conn, settings, music_path, pattern)
+    _hold_shared_renders(works)
+    _hold_unsafe(conn, works, music_path=music_path, speller=speller, scope_key=scope_key)
+    changed = True
+    while changed:
+        changed = _close_units(works) | _hold_merges(works, music_path)
+    return [_freeze(work) for work in works]
+
+
+def render_targets(
+    conn: sqlite3.Connection,
+    settings: Settings,
+    pattern: naming.Pattern,
+) -> dict[int, str | None]:
+    """Return each present file's rendered target, respelled on disk, ``None`` when blank."""
+    works, _ = _rendered_works(conn, settings, _require_music_path(settings), pattern)
+    return {work.row.id: work.to_path for work in works}
+
+
+@dataclass(frozen=True, slots=True)
+class StagePathsResult:
+    """What one :func:`stage_paths` call staged, or would stage on a dry run.
+
+    ``matched`` counts the present files in scope. ``unstaged`` counts the ``auto`` rows in
+    scope the new plan dropped. ``held`` counts held files per reason, and ``held_files`` lists
+    the first :data:`_HELD_CAP` of them. ``staged_targets_under_path`` is set only when *path*
+    matched no file: the staged moves whose target lies under it.
+    """
+
+    dry_run: bool
+    pattern: str
+    matched: int
+    staged: int
+    folders: int
+    kinds: dict[str, int]
+    at_target: int
+    case_only: int
+    kept_staged: int
+    unstaged: int
+    held_count: int
+    held: dict[str, int]
+    held_files: tuple[FilePlan, ...]
+    staged_targets_under_path: int | None
+
+    def to_dict(self) -> dict[str, object]:
+        """JSON-serializable form for the MCP tool."""
+        return {
+            "dry_run": self.dry_run,
+            "pattern": self.pattern,
+            "matched": self.matched,
+            "staged": self.staged,
+            "folders": self.folders,
+            "kinds": self.kinds,
+            "at_target": self.at_target,
+            "case_only": self.case_only,
+            "kept_staged": self.kept_staged,
+            "unstaged": self.unstaged,
+            "held_count": self.held_count,
+            "held": self.held,
+            "held_files": [plan.to_dict() for plan in self.held_files],
+            "staged_targets_under_path": self.staged_targets_under_path,
+        }
+
+
+def held_counts(plans: Sequence[FilePlan]) -> dict[str, int]:
+    """Count the held files per reason, sorted by reason. A file counts once per reason."""
+    counts: dict[str, int] = {}
+    for plan in plans:
+        if plan.status == STATUS_HELD:
+            for reason, _ in plan.reasons:
+                counts[reason] = counts.get(reason, 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def _staged_targets_under(conn: sqlite3.Connection, music_path: Path, root_key: str) -> int:
+    """Count the staged moves whose target lies under the folder keyed *root_key*."""
+    return sum(
+        1
+        for row in store.list_staged_paths(conn)
+        if path_keys.is_within(path_keys.path_key(music_path / row.to_path), root_key)
+    )
+
+
+def _write_plan(
+    conn: sqlite3.Connection,
+    music_path: Path,
+    moving: list[FilePlan],
+    replaced: list[int],
+    note: str | None,
+) -> None:
+    """Delete every replaced ``auto`` row, then stage each moving file as ``auto``.
+
+    Every delete runs before any insert because two replaced rows may swap targets, and the
+    unique ``to_key`` index checks each insert on its own.
+    """
+    now = clock.utc_now()
+    for file_id in replaced:
+        store.delete_staged_path(conn, file_id)
+    for plan in moving:
+        if plan.to_path is None:  # pragma: no cover - defensive, a moving plan has a target
+            continue
+        size, mtime_ns = _signature(music_path / plan.from_path)
+        _ensure_path_baseline(conn, plan.file_id, plan.from_path, now)
+        store.upsert_staged_path(
+            conn,
+            store.StagedPath(
+                file_id=plan.file_id,
+                to_path=plan.to_path,
+                to_key=path_keys.path_key(plan.to_path),
+                origin=_AUTO,
+                note=note,
+                staged_at=now,
+                base_size_bytes=size,
+                base_mtime_ns=mtime_ns,
+                reverted_from=None,
+            ),
+        )
+
+
+def stage_paths(
+    settings: Settings,
+    *,
+    path: str | os.PathLike[str] | None = None,
+    dry_run: bool = False,
+    note: str | None = None,
+) -> StagePathsResult:
+    """Render the persisted naming pattern for every file under *path* and stage the moves.
+
+    Every present file in scope is rendered (:func:`plan_library`), and each moving file is
+    staged as an ``auto`` row. A folder moves as a unit or not at all. The call replaces its own
+    ``auto`` rows in scope and never touches a ``manual`` or ``revert`` row, whose folder holds
+    ``unit_member``. An ``auto`` row whose move already landed on disk is never replaced: the
+    file holds ``landed_move``, which names ``commit_paths``.
+
+    A path decision binds the planner. A file whose ``legit_ignore`` keep binds its current
+    folder keeps that folder, and only its filename renders. No decision keeps a filename, so a
+    filename rename the owner reverted is rendered again on the next call while the old
+    filename still agrees with the tags. Change the pattern, or leave the folder out of *path*,
+    to keep it.
+
+    Refused while ``detect_mismatches`` does not read ``gate_open: true`` and on a volume the
+    volume check refuses, except with *dry_run*, which stages nothing. *path* matches where a
+    file sits now (:func:`tagmend.engine.path_keys.folder_arg_key`). Raises
+    :class:`ValueError` on a refusal, an invalid persisted pattern or a missing ``music_path``.
+    """
+    music_path = _require_music_path(settings)
+    pattern = naming.effective_pattern(settings)
+    root_key = None if path is None else path_keys.folder_arg_key(settings, path)
+    if not dry_run:
+        _require_volume(music_path)
+        _require_open_gate(settings)
+
+    connection = db.connect(settings.db_path)
+    try:
+        schema.apply_schema(connection)
+        plans = plan_library(connection, settings, pattern=pattern, scope_key=root_key)
+        in_scope = [
+            plan
+            for plan in plans
+            if root_key is None or path_keys.is_within(plan.folder_key, root_key)
+        ]
+        moving = [plan for plan in in_scope if plan.status == STATUS_WILL_MOVE]
+        replaced = [plan for plan in in_scope if plan.replaces]
+        staged_under = None
+        if root_key is not None and not in_scope:
+            staged_under = _staged_targets_under(connection, music_path, root_key)
+        if not dry_run:
+            _write_plan(connection, music_path, moving, [p.file_id for p in replaced], note)
+            connection.commit()
+    finally:
+        connection.close()
+
+    held = [plan for plan in in_scope if plan.status == STATUS_HELD]
+    result = StagePathsResult(
+        dry_run=dry_run,
+        pattern=pattern.text,
+        matched=len(in_scope),
+        staged=len(moving),
+        folders=len({plan.folder_key for plan in moving}),
+        kinds={kind: sum(1 for p in moving if p.kind == kind) for kind in (KIND_RENAME, KIND_MOVE)},
+        at_target=sum(1 for plan in in_scope if plan.status == STATUS_AT_TARGET),
+        case_only=sum(1 for plan in in_scope if plan.status == STATUS_CASE_ONLY),
+        kept_staged=sum(1 for plan in in_scope if plan.status == STATUS_KEPT_STAGED),
+        unstaged=sum(1 for plan in replaced if plan.status != STATUS_WILL_MOVE),
+        held_count=len(held),
+        held=held_counts(held),
+        held_files=tuple(held[:_HELD_CAP]),
+        staged_targets_under_path=staged_under,
+    )
+    logger.info(
+        "stage_paths dry_run=%s matched=%d staged=%d held=%d unstaged=%d",
+        dry_run,
+        result.matched,
+        result.staged,
+        result.held_count,
+        result.unstaged,
+    )
+    return result
+
+
+@dataclass(frozen=True, slots=True)
+class NamingSettings:
+    """The naming settings :func:`set_naming_pattern` saved."""
+
+    pattern: str
+    default_pattern: str
+    container_folders: tuple[str, ...]
+    settings_path: str
+
+    def to_dict(self) -> dict[str, object]:
+        """JSON-serializable form for the MCP tool."""
+        return {
+            "pattern": self.pattern,
+            "default_pattern": self.default_pattern,
+            "container_folders": list(self.container_folders),
+            "settings_path": self.settings_path,
+        }
+
+
+def set_naming_pattern(
+    settings: Settings,
+    *,
+    pattern: str | None = None,
+    container_folders: Sequence[str] | None = None,
+) -> NamingSettings:
+    """Save the naming pattern, the container folder list, or both, to ``settings.json``.
+
+    ``None`` leaves that setting unchanged, and an empty *container_folders* clears the list.
+    Set *container_folders* before the first ``set_mismatch_status`` decision, since
+    ``detect_mismatches`` reads the same list. The pattern is validated by
+    :func:`tagmend.engine.naming.parse_pattern` and each folder by
+    :func:`tagmend.engine.naming.validate_container_folders`. Refused while any path move is
+    staged, since a staged move was rendered by the settings in force. Raises
+    :class:`ValueError` on any refusal, saving nothing.
+    """
+    if pattern is None and container_folders is None:
+        message = "pass pattern, container_folders or both. Nothing was saved"
+        raise ValueError(message)
+    updates: dict[str, str] = {}
+    saved_pattern = naming.pattern_text(settings)
+    if pattern is not None:
+        saved_pattern = naming.parse_pattern(pattern.strip()).text
+        updates["naming_pattern"] = saved_pattern
+    folders = settings.container_folders
+    if container_folders is not None:
+        folders = naming.validate_container_folders(container_folders)
+        updates["container_folders"] = naming.folder_list_setting(folders)
+
+    connection = db.connect(settings.db_path)
+    try:
+        schema.apply_schema(connection)
+        staged = len(store.list_staged_paths(connection))
+    finally:
+        connection.close()
+    if staged:
+        message = (
+            f"{staged} path move(s) are staged under the current naming settings. Run "
+            "commit_paths, or unstage_paths(path=...), first. Nothing was saved"
+        )
+        raise ValueError(message)
+
+    written = config.set_settings(updates)
+    logger.info("saved the naming settings: %s", ", ".join(sorted(updates)))
+    return NamingSettings(
+        pattern=saved_pattern,
+        default_pattern=naming.DEFAULT_PATTERN,
+        container_folders=folders,
+        settings_path=str(written),
+    )
+
+
 def _staged_in_scope(
     conn: sqlite3.Connection,
     root_key: str | None,
@@ -978,7 +1725,8 @@ def unstage_paths(
 class PathDiffView:
     """One staged move as ``diff_paths`` shows it. Both paths are relative to ``music_path``.
 
-    ``state`` is the row's disk state, one of the module docstring's six.
+    ``state`` is the row's disk state, one of the module docstring's six. ``stale`` marks an
+    ``auto`` row whose target the current tags and naming settings no longer render.
     """
 
     file_id: int
@@ -988,6 +1736,7 @@ class PathDiffView:
     note: str | None
     staged_at: str
     state: str
+    stale: bool
 
     def to_dict(self) -> dict[str, object]:
         """JSON-serializable form for the MCP tool."""
@@ -999,6 +1748,7 @@ class PathDiffView:
             "note": self.note,
             "staged_at": self.staged_at,
             "state": self.state,
+            "stale": self.stale,
         }
 
 
@@ -1009,7 +1759,9 @@ def diff_paths(
 ) -> list[PathDiffView]:
     """Return every staged move, or those under the folder *path*, with its disk state.
 
-    Read-only. ``state`` names the row's place in the module docstring's table.
+    Read-only. ``state`` names the row's place in the module docstring's table. An ``auto`` row
+    is ``stale`` when the persisted naming settings render the file elsewhere now. The commit
+    still applies the staged target, so stage again to follow the new render.
     """
     music_path = _require_music_path(settings)
     root_key = None if path is None else path_keys.folder_arg_key(settings, path)
@@ -1017,8 +1769,12 @@ def diff_paths(
     connection = db.connect(settings.db_path)
     try:
         schema.apply_schema(connection)
+        rows = _staged_in_scope(connection, root_key)
+        renders: dict[int, str | None] = {}
+        if any(row.origin == _AUTO for row in rows):
+            renders = render_targets(connection, settings, naming.effective_pattern(settings))
         views: list[PathDiffView] = []
-        for row in _staged_in_scope(connection, root_key):
+        for row in rows:
             source = _source_of(connection, row.file_id)
             views.append(
                 PathDiffView(
@@ -1029,6 +1785,7 @@ def diff_paths(
                     note=row.note,
                     staged_at=row.staged_at,
                     state=_locate(source, music_path / row.to_path, row),
+                    stale=row.origin == _AUTO and renders.get(row.file_id) != row.to_path,
                 ),
             )
         return views
@@ -1165,6 +1922,11 @@ def _refuse_flagged(
         raise ValueError(message)
 
 
+def _pattern_message(settings: Settings) -> str:
+    """Return the default commit message, which records the naming pattern in force."""
+    return f"naming pattern {naming.pattern_text(settings)}"
+
+
 def commit_paths(
     settings: Settings,
     *,
@@ -1180,8 +1942,9 @@ def commit_paths(
     refused whole. Each move then runs through
     :func:`tagmend.engine.commits.run_commit` with :class:`PathDomain`, and the folders it
     empties are pruned. A move left unfinished keeps its row, except a ``missing`` one, and is
-    listed under ``problems``. ``commit_id`` is ``None`` when nothing was staged. Raises
-    :class:`ValueError` when ``music_path`` is unset or the volume check refuses it.
+    listed under ``problems``. ``commit_id`` is ``None`` when nothing was staged. Without a
+    *message* the commit records the naming pattern in force. Raises :class:`ValueError` when
+    ``music_path`` is unset or the volume check refuses it.
     """
     music_path = _require_music_path(settings)
     _require_volume(music_path)
@@ -1202,7 +1965,7 @@ def commit_paths(
         commit_id = commits.create_commit(
             connection,
             origin=_commit_origin({row.origin for row in staged}),
-            message=message,
+            message=message if message is not None else _pattern_message(settings),
             now=clock.utc_now(),
         )
         connection.commit()  # commit row durable before any per-file work

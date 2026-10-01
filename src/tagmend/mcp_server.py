@@ -28,6 +28,7 @@ from tagmend.engine import (
     health,
     library,
     mismatch,
+    path_deviations,
     paths,
     release_disagreements,
     songs,
@@ -1139,6 +1140,142 @@ def get_commit(commit_id: int) -> dict[str, object]:
 
 @mcp.tool()
 @_error_envelope
+def detect_path_deviations(
+    pattern: str | None = None,
+    container_folders: list[str] | None = None,
+    folder: str | None = None,
+    group: bool = True,  # noqa: FBT001, FBT002 - MCP tool surface, not a Python API
+    limit: int | None = 50,
+) -> dict[str, object]:
+    """Report files whose path differs from the path the naming pattern renders from their tags.
+
+    Read-only, and allowed while the ``detect_mismatches`` gate is closed. Order: set
+    ``container_folders`` (with ``set_naming_pattern``) before the first ``set_mismatch_status``
+    decision, since both tools read that list, then bring ``detect_mismatches`` to
+    ``gate_open: true``, then pick a pattern here and stage with ``stage_paths``.
+
+    Pattern grammar: components separated by ``/``, the last the filename (the extension is
+    appended). ``{a|b}`` renders the first non-empty name, ``{tracknumber:02}`` zero-pads.
+    ``[...]`` renders only when every field inside is non-empty. A field outside ``[...]`` is
+    required, and a file where it is blank holds ``missing_<name>``. Names: any managed tag,
+    plus ``year`` (originaldate, else date), ``disc`` (the disc number on a multi-disc album
+    only) and ``container`` (the configured container folder the file sits under).
+
+    Header: ``counts`` per status (``at_target``, ``case_only`` = only a folder's case differs,
+    never staged, ``will_move``, ``held``, ``kept_staged`` = a manual or revert move is
+    staged), ``held`` per reason, ``fit`` per pattern component (exact, case, differs), the
+    top ``shapes`` of the current top folder, leaf folder and filename written with
+    ``{field}`` placeholders, ``container_candidates`` (top folders that mostly hold other
+    album artists: a container, or an artist spelling ``detect_mismatches`` owns), the
+    ``gate`` and the ``volume_refusal``. Hold reasons: ``missing_<name>``, ``missing_year``
+    (the folder names a year the tags lack), ``missing_disc`` (a disc subfolder with a blank
+    discnumber), ``album_split``, ``unit_member`` (a folder moves as a unit), ``track_conflict``,
+    ``merge``, ``duplicate_render``, ``landed_move``, ``staged_tag``, ``missing``,
+    ``too_long``, ``occupied``, ``shared_target`` and ``cue_reference``.
+
+    Args:
+        pattern: A candidate pattern to preview. Never saved. Omit for the saved pattern.
+        container_folders: A candidate container folder list to preview. Never saved.
+        folder: One exact folder to list file by file, every status included. Compared as a
+            path. Wins over ``group``.
+        group: True (default) for one group per source folder holding a deviating file, with
+            its file count, destinations, largest ``kind`` (move, rename, case), held counts
+            and one example pair. False for one row per deviating file.
+        limit: Cap on groups or rows (default 50). Counts always cover the entire library.
+
+    Returns:
+        ``{"ok": True, "pattern", "persisted", "default_pattern", "container_folders",
+        "total_files", "counts", "held", "fit", "shapes", "container_candidates", "gate",
+        "volume_refusal", "group_count", "groups", "rows"}``.
+    """
+    report = path_deviations.detect_path_deviations(
+        load_settings(),
+        pattern=pattern,
+        container_folders=container_folders,
+        folder=folder,
+        group=group,
+        limit=limit,
+    )
+    return {"ok": True, **report.to_dict()}
+
+
+@mcp.tool()
+@_error_envelope
+def set_naming_pattern(
+    pattern: str | None = None,
+    container_folders: list[str] | None = None,
+) -> dict[str, object]:
+    """Save the naming pattern, the container folder list, or both, to settings.json.
+
+    Set ``container_folders`` first, before the first ``set_mismatch_status`` decision, since
+    ``detect_mismatches`` reads the same list: a container is a top folder that collects
+    releases (``Soundtracks``) rather than naming an artist. Then preview patterns with
+    ``detect_path_deviations(pattern=...)`` and save the winner here. Leave ``pattern`` out
+    when the default fits. The grammar is in ``detect_path_deviations``.
+
+    Refused while any path move is staged: run ``commit_paths``, or
+    ``unstage_paths(path=...)``, first. Also refused, saving nothing, for an empty pattern, an
+    unknown name, an unbalanced brace or bracket, a ``/`` inside ``[...]`` and an invalid
+    folder name.
+
+    Args:
+        pattern: The pattern to save. ``None`` leaves the saved pattern unchanged.
+        container_folders: Top folder names to save. ``[]`` clears the list. ``None`` leaves
+            it unchanged.
+
+    Returns:
+        ``{"ok": True, "pattern", "default_pattern", "container_folders", "settings_path"}``.
+    """
+    saved = paths.set_naming_pattern(
+        load_settings(),
+        pattern=pattern,
+        container_folders=container_folders,
+    )
+    return {"ok": True, **saved.to_dict()}
+
+
+@mcp.tool()
+@_error_envelope
+def stage_paths(
+    path: str | None = None,
+    dry_run: bool = False,  # noqa: FBT001, FBT002 - MCP tool surface, not a Python API
+    note: str | None = None,
+) -> dict[str, object]:
+    """Stage the move of every file under a folder to the path its tags render (no disk write).
+
+    Renders the saved naming pattern for each file, holds every file ``detect_path_deviations``
+    holds, and stages the rest as ``auto`` moves. A folder moves as a unit or not at all. The call
+    replaces its own ``auto`` moves in scope and never touches a ``manual`` or ``revert`` move.
+    A move that already landed on disk holds ``landed_move``: run ``commit_paths``. Nothing
+    moves until ``commit_paths``.
+
+    A ``legit_ignore`` decision keeps the file's folder, and only its filename renders. No
+    decision keeps a filename, so a filename rename you reverted is rendered again while the
+    old filename still agrees with the tags. Change the pattern, or leave that folder out of
+    ``path``, to keep it.
+
+    Refused while ``detect_mismatches`` does not read ``gate_open: true`` and on a volume that
+    ignores case under a case-keeping OS, except with ``dry_run``.
+
+    Args:
+        path: Only files sitting at this folder or under it. Compared as a path, like
+            ``unstage_paths``. Omit for the entire library.
+        dry_run: When true, report what would stage and change nothing.
+        note: Optional free-text note stored with each eventual path revision.
+
+    Returns:
+        ``{"ok": True, "dry_run", "pattern", "matched", "staged", "folders", "kinds",
+        "at_target", "case_only", "kept_staged", "unstaged", "held_count", "held",
+        "held_files": [{file_id, from_path, to_path, status, kind, reasons}, ...],
+        "staged_targets_under_path"}``. ``held_files`` lists the first 50.
+        ``staged_targets_under_path`` is set only when ``path`` matched no file.
+    """
+    result = paths.stage_paths(load_settings(), path=path, dry_run=dry_run, note=note)
+    return {"ok": True, **result.to_dict()}
+
+
+@mcp.tool()
+@_error_envelope
 def stage_paths_batch(
     entries: list[dict[str, object]],
     note: str | None = None,
@@ -1207,7 +1344,9 @@ def diff_paths(path: str | None = None) -> dict[str, object]:
     file changed since it was staged: stage the same ``to_path`` again to confirm it),
     ``half_link`` (a cut POSIX move, ``commit_paths`` finishes it), ``target_taken`` (another
     file sits at the target: stage another ``to_path`` or unstage) and ``gone`` (neither path
-    is on disk: ``commit_paths`` flags the file missing).
+    is on disk: ``commit_paths`` flags the file missing). ``stale`` marks an ``auto`` move whose
+    file the saved naming settings now render elsewhere. The commit still applies the staged
+    target, so run ``stage_paths`` again to follow the new render.
 
     Args:
         path: When given, only moves of files sitting at this folder or under it. Compared as a
@@ -1215,7 +1354,7 @@ def diff_paths(path: str | None = None) -> dict[str, object]:
 
     Returns:
         ``{"ok": True, "changes": [{file_id, from_path, to_path, origin, note, staged_at,
-        state}, ...]}``, both paths relative to ``music_path``.
+        state, stale}, ...]}``, both paths relative to ``music_path``.
     """
     changes = paths.diff_paths(load_settings(), path=path)
     return {"ok": True, "changes": [view.to_dict() for view in changes]}
@@ -1237,7 +1376,7 @@ def commit_paths(path: str | None = None, message: str | None = None) -> dict[st
     Args:
         path: When given, only moves of files sitting at this folder or under it. Compared as a
             path, like ``unstage_paths``.
-        message: Optional commit message.
+        message: Optional commit message. Without one, the message records the naming pattern.
 
     Returns:
         ``{"ok": True, "commit_id", "committed", "noop", "missing", "changed_since_stage",

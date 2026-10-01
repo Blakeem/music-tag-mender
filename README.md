@@ -118,7 +118,7 @@ Edits apply on the next tool call; every command and MCP tool re-reads `settings
 
 ## Tools
 
-The MCP server exposes 44 tools. Tag edits and file moves are staged first and only written to disk on `commit_tags` or `commit_paths`, and everything is revertible.
+The MCP server exposes 47 tools. Tag edits and file moves are staged first and only written to disk on `commit_tags` or `commit_paths`, and everything is revertible.
 
 ### Core & Library
 
@@ -192,7 +192,7 @@ The MCP server exposes 44 tools. Tag edits and file moves are staged first and o
 
 ### Mismatch fixing
 
-Use `detect_mismatches` (above) to find files whose path disagrees with their own tags. Fix a wrong tag through the staging engine (`stage_tags_batch` → `commit_tags` → `reopen_axes`), or record a path decision for the group. `legit_ignore` keeps the folder. `misfiled_deferred` lets the tags render every level of the path. No decision keeps a filename, so write a wording you want to keep into the tag. A decision covers the names its group flags. The file flags again when a covered tag changes or a committed move changes its path. The report reads `gate_open: true` once every group is fixed or decided.
+Use `detect_mismatches` (above) to find files whose path disagrees with their own tags. Fix a wrong tag through the staging engine (`stage_tags_batch` → `commit_tags` → `reopen_axes`), or record a path decision for the group. `legit_ignore` keeps the folder. `misfiled_deferred` lets the tags render every level of the path. No decision keeps a filename, so write a wording you want to keep into the tag. A decision covers the names its group flags. The file flags again when a covered tag changes or a committed move changes its path. The report reads `gate_open: true` once every group is fixed or decided. Set the container folders with `set_naming_pattern` before the first decision, since `detect_mismatches` reads that list.
 
 | Tool | Description |
 |------|-------------|
@@ -202,10 +202,13 @@ Use `detect_mismatches` (above) to find files whose path disagrees with their ow
 
 ### File Moves
 
-A move is staged with an explicit destination and committed as one revertible commit. Staging needs `detect_mismatches` to read `gate_open: true`. Each file keeps its id across moves.
+A naming pattern renders each file's path from its tags. A move is staged from that render or with an explicit destination, and is committed as one revertible commit. Staging needs `detect_mismatches` to read `gate_open: true`. Each file keeps its id across moves.
 
 | Tool | Description |
 |------|-------------|
+| `set_naming_pattern` | Save the naming pattern and the container folder list |
+| `detect_path_deviations` | Report files whose path differs from the path their tags render. A candidate pattern is shown without being saved |
+| `stage_paths` | Stage every file under a folder to the path its tags render. A folder moves as a unit or not at all |
 | `stage_paths_batch` | Stage explicit destinations for many files in one atomic, all-or-nothing call |
 | `unstage_paths` | Drop the staged moves of one file or of every file under a folder |
 | `diff_paths` | Show the staged moves and where each file sits on disk now |

@@ -1063,12 +1063,14 @@ def revert_commit(
     commit_id: int,
     note: str | None = None,
     dry_run: bool = False,  # noqa: FBT001, FBT002 - MCP tool surface, not a Python API
+    path: str | None = None,
 ) -> dict[str, object]:
     """Undo an entire commit as a unit. Every file it changed goes back to its pre-commit state.
 
     Works on both logs. A tag commit restores each file's pre-commit tags. A path commit
-    (from ``commit_paths``) moves each file back to the path it left, and a revert of that
-    revert moves them forward again. ``get_commit`` names the log a commit changed.
+    (from ``commit_paths``) moves each file and each sidecar (cover art, cue sheet, log) back
+    to the path it left, and a revert of that revert moves them forward again. ``get_commit``
+    names the logs a commit changed.
 
     The group counterpart of ``revert_tags`` and ``revert_paths``. All reverts land under ONE
     new ``origin='revert'`` commit whose ``reverted_from`` records the undone commit, so the
@@ -1089,21 +1091,27 @@ def revert_commit(
         dry_run: When true, classify and report only, with no disk or ledger change.
             ``commit_id`` in the result is ``null``, ``status='reverted'`` means "would be
             reverted", and ``status='noop'`` means "would change nothing".
+        path: A path commit only. Reverts just the files and sidecars sitting at this folder
+            or under it now, so one album folder, or one sidecar's own path, reverts alone.
+            Compared as a path, like ``unstage_paths``.
 
     Returns:
         ``{"ok": True, "commit_id": ..., "reverted_from": ..., "dry_run": ...,
         "reverted"/"noop"/"skipped"/"missing"/"errors": counts, "outcomes": [...]}`` with
         one outcome per file (``noop`` = the file already held its pre-commit state, so
-        the audited revert revision was appended but nothing on disk moved). Returns
-        ``{"ok": False, "error": ...}`` if the commit id is unknown, the commit is still
-        ``applying``, the commit holds no change in either log, or the staging area is not
-        empty.
+        the audited revert revision was appended but nothing on disk moved). A path commit's
+        result adds ``"sidecars_reverted"`` and ``"sidecars": [{from_path, to_path, status,
+        detail}, ...]``, one per sidecar it moved. A sidecar a later move left or reached is
+        ``skipped_later_changes``. Returns ``{"ok": False, "error": ...}`` if the commit id is
+        unknown, the commit is still ``applying``, the commit holds no change in any log,
+        ``path`` is given for a tag commit, or the staging area is not empty.
     """
     result = versioning.revert_commit(
         load_settings(),
         commit_id,
         note=note,
         dry_run=dry_run,
+        path=path,
     )
     return {"ok": True, **result.to_dict()}
 
@@ -1127,9 +1135,10 @@ def get_commit(commit_id: int) -> dict[str, object]:
     """Return one commit by id, and the revision logs that hold its changes.
 
     Returns ``{"ok": True, "commit": {commit_id, created_at, origin, message, reverted_from,
-    status}, "logs": {"tag_revisions": <count>, "path_revisions": <count>}}``, where ``logs``
-    names only the logs holding rows of this commit (a tag commit or a path commit), or
-    ``{"ok": False, "error": ...}`` if the id is unknown.
+    status}, "logs": {"tag_revisions": <count>, "path_revisions": <count>, "sidecar_moves":
+    <count>}}``, where ``logs`` names only the logs holding rows of this commit (a tag commit,
+    or a path commit with its moved files and sidecars), or ``{"ok": False, "error": ...}`` if
+    the id is unknown.
     """
     settings = load_settings()
     commit = commits.get_commit(settings, commit_id)
@@ -1253,6 +1262,11 @@ def stage_paths(
     A move that already landed on disk holds ``landed_move``: run ``commit_paths``. Nothing
     moves until ``commit_paths``.
 
+    A folder whose every file moves to one other folder takes its sidecars along: every
+    non-audio file under it (cover art, hidden thumbnails, cue sheets, rip logs, a ``Scans``
+    folder), with names and relative structure unchanged. A sidecar whose target is taken
+    stays in place, and of two folders claiming one target the one with the lower file id wins.
+
     A ``legit_ignore`` decision keeps the file's folder, and only its filename renders. No
     decision keeps a filename, so a filename rename you reverted is rendered again while the
     old filename still agrees with the tags. Change the pattern, or leave that folder out of
@@ -1271,8 +1285,9 @@ def stage_paths(
         ``{"ok": True, "dry_run", "pattern", "matched", "staged", "folders", "kinds",
         "at_target", "case_only", "kept_staged", "unstaged", "held_count", "held",
         "held_files": [{file_id, from_path, to_path, status, kind, reasons}, ...],
-        "staged_targets_under_path"}``. ``held_files`` lists the first 50.
-        ``staged_targets_under_path`` is set only when ``path`` matched no file.
+        "staged_targets_under_path", "sidecars_staged", "sidecars_held": [{from_path, to_path,
+        detail}, ...]}``. ``held_files`` lists the first 50. ``staged_targets_under_path`` is
+        set only when ``path`` matched no file.
     """
     result = paths.stage_paths(load_settings(), path=path, dry_run=dry_run, note=note)
     return {"ok": True, **result.to_dict()}
@@ -1306,7 +1321,8 @@ def stage_paths_batch(
     its staged ``to_path`` again, in the same spelling, which confirms the file found there. A
     call made only of such confirmations passes while the gate is closed. Staging captures each
     file's first location as path version 0. Tag staging and path staging exclude each other
-    per file.
+    per file. A folder whose every file the call moves to one other folder takes its sidecars
+    along, as in ``stage_paths``.
 
     Args:
         entries: A list of ``{"file_id": <int>, "to_path": <str>}`` objects.
@@ -1324,18 +1340,22 @@ def stage_paths_batch(
 @mcp.tool()
 @_error_envelope
 def unstage_paths(file_id: int | None = None, path: str | None = None) -> dict[str, object]:
-    """Drop staged moves for one file, or for every file under a folder. Moves nothing.
+    """Drop staged moves for one file, or for every file and sidecar under a folder. Moves nothing.
 
     Pass exactly one of ``file_id`` and ``path``. ``path`` matches where a file sits now,
-    which is its source until its move commits. It is compared as a path: case and ``/`` versus
-    backslash do not matter on Windows, and a relative folder resolves under ``music_path``.
-    The call is refused whole, naming the files, when any matched file already sits at its
-    staged target on disk (a crash after the move): run ``commit_paths`` to finish those moves.
+    which is its source until its move commits, and a sidecar by its staged source, so the
+    path of one sidecar drops that sidecar alone. It is compared as a path: case and ``/``
+    versus backslash do not matter on Windows, and a relative folder resolves under
+    ``music_path``. A folder that loses a staged file no longer moves whole, so its sidecar
+    moves are dropped too. The call is refused whole, naming them, when any matched file or
+    sidecar already sits at its staged target on disk (a crash after the move): run
+    ``commit_paths`` to finish those moves.
 
-    Returns ``{"ok": True, "removed": <count>}``, or ``{"ok": False, "error": ...}``.
+    Returns ``{"ok": True, "removed": <count>, "sidecars_removed": <count>}``, or
+    ``{"ok": False, "error": ...}``.
     """
     removed = paths.unstage_paths(load_settings(), file_id=file_id, path=path)
-    return {"ok": True, "removed": removed}
+    return {"ok": True, **removed.to_dict()}
 
 
 @mcp.tool()
@@ -1373,9 +1393,12 @@ def commit_paths(path: str | None = None, message: str | None = None) -> dict[st
     path: a file that flags with no decision covering it refuses the whole call. Fix its tags,
     record a decision with ``set_mismatch_status``, or drop it with ``unstage_paths``. Each
     move never overwrites a file, appends a ``path_revisions`` row, and repoints the file's
-    row. Folders a move empties are removed up to ``music_path``, and a folder holding any
-    file, a hidden one included, stays. A commit left ``applying`` by a crash is marked
-    interrupted and its leftover rows, a moved file's included, are swept into this commit.
+    row. Then each staged sidecar whose folder's audio has all moved follows it, logged in
+    ``sidecar_moves``. A sidecar whose folder still holds a staged file waits for the next
+    ``commit_paths``. Folders a move empties are removed up to ``music_path``, and a folder
+    holding any file, a hidden one included, stays. A commit left ``applying`` by a crash is
+    marked interrupted and its leftover rows, a moved file's or sidecar's included, are swept
+    into this commit.
 
     Args:
         path: When given, only moves of files sitting at this folder or under it. Compared as a
@@ -1384,9 +1407,13 @@ def commit_paths(path: str | None = None, message: str | None = None) -> dict[st
 
     Returns:
         ``{"ok": True, "commit_id", "committed", "noop", "missing", "changed_since_stage",
-        "errors", "problems": [{file_id, status, to_path, detail}, ...]}``. ``commit_id`` is
-        ``null`` when nothing was staged. Each problem keeps its row, except a ``missing`` one,
-        and its ``detail`` names the next step.
+        "errors", "problems": [{file_id, status, to_path, detail}, ...], "sidecars_moved",
+        "sidecars_waiting", "sidecars_held": [<path>, ...], "folders_pruned",
+        "sidecar_problems": [{from_path, to_path, status, detail}, ...]}``. ``commit_id`` is
+        ``null`` when nothing was staged. ``sidecars_held`` lists the non-audio files left in
+        a folder whose audio all moved, because their target was taken or the folder's files
+        went to different folders. Each problem keeps its row, except a ``missing`` one, and
+        its ``detail`` names the next step.
     """
     result = paths.commit_paths(load_settings(), path=path, message=message)
     return {"ok": True, **result.to_dict()}

@@ -27,7 +27,7 @@ def test_apply_schema_stamps_current_version(db_conn: sqlite3.Connection) -> Non
     # db_conn already applied the schema; the stamp must match the constant the code ships.
     version = db_conn.execute("PRAGMA user_version").fetchone()[0]
     assert version == SCHEMA_VERSION
-    assert SCHEMA_VERSION == 25
+    assert SCHEMA_VERSION == 26
 
 
 def test_apply_schema_creates_genre_tables(db_conn: sqlite3.Connection) -> None:
@@ -389,6 +389,8 @@ _APPEND_ONLY_TRIGGERS = (
     "tag_revisions_no_delete",
     "path_revisions_no_update",
     "path_revisions_no_delete",
+    "sidecar_moves_no_update",
+    "sidecar_moves_no_delete",
 )
 _COMMIT_ID_INDEXES = ("idx_tag_revisions_commit_id", "idx_path_revisions_commit_id")
 
@@ -1501,5 +1503,79 @@ def test_v24_ledger_gains_the_path_staging_columns_in_place() -> None:
         assert row == ("New/a.mp3", "kept", None, None, None, None)
         indexes = {str(r[1]) for r in conn.execute("PRAGMA index_list(path_revisions_staged)")}
         assert "idx_path_revisions_staged_to_key" in indexes
+    finally:
+        conn.close()
+
+
+# --- v26: the sidecar tables -------------------------------------------------------------
+
+_SIDECAR_TABLES = ("sidecar_moves", "sidecar_moves_staged")
+_SIDECAR_INDEXES = (
+    "idx_sidecar_moves_commit_id",
+    "idx_sidecar_moves_from_key",
+    "idx_sidecar_moves_to_key",
+    "idx_sidecar_moves_staged_unit_key",
+)
+
+
+def _insert_sidecar_move(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        "INSERT INTO commits (created_at, origin, status) "
+        "VALUES ('2026-10-01T00:00:00+00:00', 'manual', 'applied')"
+    )
+    conn.execute(
+        """
+        INSERT INTO sidecar_moves
+          (commit_id, created_at, origin, from_path, to_path, from_key, to_key, unit_key,
+           size_bytes, mtime_ns)
+        VALUES (1, '2026-10-01T00:00:00+00:00', 'manual', 'A/Folder.jpg', 'B/Folder.jpg',
+                'a/folder.jpg', 'b/folder.jpg', 'a', 5, 7)
+        """
+    )
+
+
+def test_sidecar_moves_reject_update_and_delete(db_conn: sqlite3.Connection) -> None:
+    _insert_sidecar_move(db_conn)
+
+    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+        db_conn.execute("UPDATE sidecar_moves SET to_path = 'C/Folder.jpg'")
+    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+        db_conn.execute("DELETE FROM sidecar_moves")
+
+    assert db_conn.execute("SELECT to_path FROM sidecar_moves").fetchall() == [("B/Folder.jpg",)]
+
+
+def test_two_staged_sidecars_never_share_a_target(db_conn: sqlite3.Connection) -> None:
+    insert = (
+        "INSERT INTO sidecar_moves_staged (from_key, from_path, to_path, to_key, unit_key, "
+        "base_size_bytes, base_mtime_ns, origin, staged_at) "
+        "VALUES (?, 'x', 'B/Folder.jpg', 'b/folder.jpg', 'a', 1, 1, 'auto', '2026')"
+    )
+    db_conn.execute(insert, ("a/folder.jpg",))
+
+    with pytest.raises(sqlite3.IntegrityError, match="UNIQUE"):
+        db_conn.execute(insert, ("c/folder.jpg",))
+
+
+def test_v25_ledger_gains_the_sidecar_tables_in_place() -> None:
+    conn = sqlite3.connect(":memory:")
+    try:
+        apply_schema(conn)
+        file_id = _insert_file(conn)
+        for table in _SIDECAR_TABLES:
+            conn.execute(f"DROP TABLE {table}")
+        conn.execute("PRAGMA user_version = 25")
+        conn.commit()
+        assert not set(_SIDECAR_TABLES) & _table_names(conn)
+
+        apply_schema(conn)  # the in-place upgrade
+        conn.execute("PRAGMA user_version = 25")
+        apply_schema(conn)  # a second application must find everything in place
+
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        assert set(_SIDECAR_TABLES) <= _table_names(conn)
+        assert set(_SIDECAR_INDEXES) <= _schema_objects(conn, "index")
+        assert set(_APPEND_ONLY_TRIGGERS) <= _schema_objects(conn, "trigger")
+        assert conn.execute("SELECT id FROM files").fetchall() == [(file_id,)]
     finally:
         conn.close()

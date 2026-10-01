@@ -110,7 +110,7 @@ compares a file's year tags with the first-release year of its album's MusicBrai
 found by the album identity (album artist else artist, album). `high` means the `originaldate` year
 differs, `medium` means the `date` year is earlier than the first release. `release_limit` (default
 200) caps the uncached lookups one call makes, and cache writes are its only ledger writes.
-47 MCP tools total. Schema is **v25** (additive: v11 adds
+47 MCP tools total. Schema is **v26** (additive: v11 adds
 `musicbrainz_recording_cache`, v12 renames `file_album_status` → `file_year_status` in place —
 dispositions preserved; v13 adds `tag_revisions.managed_set`, stamping which managed-tag set
 governed each revision so a revert can restore emptiness on the widened fields; v14 adds
@@ -134,8 +134,8 @@ with a 7-day expiry on an empty answer). v23 adds `file_song_status` and
 `tag_revisions_staged.supplied_keys`, the keys the caller passed that survive a `fill_only` drop,
 which the stale-identity warning in `diff_tags` treats as confirmed. v24 rewrites each
 `file_mismatch_status` row as a JSON decision snapshot and drops `source_field`. v25 adds the
-path staging columns (`to_key`, the stage-time signature, `reverted_from`). A newer ledger is
-refused). The paths domain (`paths.py`) is the second `RevisionDomain`. `stage_paths_batch`,
+path staging columns (`to_key`, the stage-time signature, `reverted_from`). v26 adds
+`sidecar_moves` and `sidecar_moves_staged`. A newer ledger is refused). The paths domain (`paths.py`) is the second `RevisionDomain`. `stage_paths_batch`,
 `unstage_paths`, `diff_paths`, `commit_paths`, `history_paths` and `revert_paths` move files with one
 `files.id` across every move, never overwrite a target, and prune emptied source folders. A move
 that landed before a crash is finished by the next `commit_paths`. The naming pattern
@@ -145,6 +145,10 @@ its tags. `set_naming_pattern` saves it and `container_folders`. `detect_path_de
 unsaved. `stage_paths` stages entire folders as `auto` rows. Both read one planner,
 `paths.plan_library`, which applies every hold. `diff_paths` flags an `auto` row `stale` when the
 render moved. A rendered path never flags in `detect_mismatches`, which a round-trip test checks.
+When every audio file of a folder moves to one new folder, its non-audio files (cover art, `.cue`,
+`.log`, `Scans/`) move with it under their own names, logged in `sidecar_moves` and reverted by
+`revert_commit`. A sidecar waits until its album's audio has moved, a same-name collision keeps the
+lower file id's copy and reports the other in `sidecars_held`, and nothing is ever deleted.
 
 **The canonical tag namespace is TagMend's, not mutagen's.** mutagen's "easy" layer is an
 incomplete normalizer, so `tags.py` owns the mapping wherever it is wrong: `EasyID3` points
@@ -327,7 +331,7 @@ src/tagmend/
   mcp_server.py     FastMCP server (thin) — 47 tools
   engine/
     db.py           SQLite connection (WAL)
-    schema.py       all DDL + PRAGMA user_version (v25)
+    schema.py       all DDL + PRAGMA user_version (v26)
     path_keys.py    path identity keys, subtree key ranges, the folder-argument normalizer
     text_keys.py    the shared text fold keys (alnum, display, artist name, loose, title)
     scan.py         filesystem discovery + signatures

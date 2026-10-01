@@ -774,7 +774,11 @@ def test_path_tools_roundtrip(music_dir: Path) -> None:
 
     again = mcp_server.revert_paths(file_id, 1, dry_run=True)
     assert (again["ok"], again["status"], again["commit_id"]) == (True, "reverted", None)
-    assert mcp_server.unstage_paths(file_id=file_id) == {"ok": True, "removed": 0}
+    assert mcp_server.unstage_paths(file_id=file_id) == {
+        "ok": True,
+        "removed": 0,
+        "sidecars_removed": 0,
+    }
 
 
 def test_the_rendered_path_tools_roundtrip(music_dir: Path) -> None:

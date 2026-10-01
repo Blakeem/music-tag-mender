@@ -225,7 +225,7 @@ def test_unstage_paths_cell(lib: _Lib, state: str) -> None:
             paths.unstage_paths(lib.settings, file_id=lib.x)
         assert _staged(lib, lib.x) is not None
         return
-    assert paths.unstage_paths(lib.settings, file_id=lib.x) == 1
+    assert paths.unstage_paths(lib.settings, file_id=lib.x).removed == 1
     assert _staged(lib, lib.x) is None
 
 
@@ -237,7 +237,7 @@ def test_unstage_paths_by_folder_refuses_the_whole_call_for_a_landed_move(lib: _
         paths.unstage_paths(lib.settings, path=str(lib.music / "Artist"))
 
     assert _staged(lib, lib.y) is not None
-    assert paths.unstage_paths(lib.settings, file_id=lib.y) == 1
+    assert paths.unstage_paths(lib.settings, file_id=lib.y).removed == 1
 
 
 def test_unstage_paths_needs_exactly_one_argument(lib: _Lib) -> None:
@@ -744,10 +744,14 @@ def test_the_pruner_keeps_a_folder_holding_a_hidden_file(lib: _Lib) -> None:
     hidden = lib.music / "Artist" / "Album" / ".hidden"
     hidden.write_bytes(b"\x00")
     new = Path("Artist") / "New"
+    # The same name at the destination holds the sidecar, so it stays in the vacated folder.
+    (lib.music / new).mkdir()
+    (lib.music / new / ".hidden").write_bytes(b"\x01")
     _stage(lib, (lib.x, new / "01.mp3"), (lib.y, new / "02.mp3"))
 
-    paths.commit_paths(lib.settings)
+    result = paths.commit_paths(lib.settings)
 
+    assert result.sidecars_held == (str(Path("Artist") / "Album" / ".hidden"),)
     assert hidden.exists()
     assert (lib.music / new / "01.mp3").exists()
 

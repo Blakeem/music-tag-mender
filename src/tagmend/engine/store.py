@@ -1,13 +1,14 @@
 """Pure data access for the snapshot, the revision logs, and the staging areas (M1 + M3).
 
-Covers the ``files`` / ``file_tags`` snapshot, the append-only ``tag_revisions`` and
-``path_revisions`` histories, and the ``tag_revisions_staged`` and ``path_revisions_staged``
-staging areas (git's index). Every function takes an open :class:`sqlite3.Connection` and
-does one focused thing, with no scanning, tag reading or commit policy. That orchestration
-lives in :mod:`tagmend.engine.library`, :mod:`tagmend.engine.versioning`,
-:mod:`tagmend.engine.staging` and :mod:`tagmend.engine.paths`. The ``commits``-table ops and
-the shared commit loop live in :mod:`tagmend.engine.commits`. SQLite hands back ``Any``, so
-this module casts at the boundary and the rest of the engine stays strictly typed.
+Covers the ``files`` / ``file_tags`` snapshot, the append-only ``tag_revisions``,
+``path_revisions`` and ``sidecar_moves`` histories, and the ``tag_revisions_staged``,
+``path_revisions_staged`` and ``sidecar_moves_staged`` staging areas (git's index). Every
+function takes an open :class:`sqlite3.Connection` and does one focused thing, with no scanning,
+tag reading or commit policy. That orchestration lives in :mod:`tagmend.engine.library`,
+:mod:`tagmend.engine.versioning`, :mod:`tagmend.engine.staging` and :mod:`tagmend.engine.paths`.
+The ``commits``-table ops and the shared commit loop live in :mod:`tagmend.engine.commits`.
+SQLite hands back ``Any``, so this module casts at the boundary and the rest of the engine stays
+strictly typed.
 
 All SQL uses ``?`` placeholders (never string-formatted values).
 """
@@ -1057,7 +1058,7 @@ def is_staged(conn: sqlite3.Connection, file_id: int) -> bool:
 
 
 def any_staged(conn: sqlite3.Connection) -> bool:
-    """Return whether ANY file has a pending tag or path change.
+    """Return whether ANY file has a pending tag or path change, or any sidecar a pending move.
 
     The clean-staging-area guard for commit-level revert and the resolvers: rolling back with
     work still staged would interleave a revert with half-staged intent, so the revert refuses
@@ -1065,7 +1066,8 @@ def any_staged(conn: sqlite3.Connection) -> bool:
     """
     row = conn.execute(
         "SELECT EXISTS(SELECT 1 FROM tag_revisions_staged) "
-        "OR EXISTS(SELECT 1 FROM path_revisions_staged)",
+        "OR EXISTS(SELECT 1 FROM path_revisions_staged) "
+        "OR EXISTS(SELECT 1 FROM sidecar_moves_staged)",
     ).fetchone()
     return bool(row[0])
 
@@ -1383,10 +1385,15 @@ def commit_log_counts(conn: sqlite3.Connection, commit_id: int) -> dict[str, int
     """Return the rows each revision log holds for *commit_id*, naming only non-empty logs."""
     row = conn.execute(
         "SELECT (SELECT COUNT(*) FROM tag_revisions WHERE commit_id = ?), "
-        "(SELECT COUNT(*) FROM path_revisions WHERE commit_id = ?)",
-        (commit_id, commit_id),
+        "(SELECT COUNT(*) FROM path_revisions WHERE commit_id = ?), "
+        "(SELECT COUNT(*) FROM sidecar_moves WHERE commit_id = ?)",
+        (commit_id, commit_id, commit_id),
     ).fetchone()
-    counts = {"tag_revisions": db.as_int(row[0]), "path_revisions": db.as_int(row[1])}
+    counts = {
+        "tag_revisions": db.as_int(row[0]),
+        "path_revisions": db.as_int(row[1]),
+        "sidecar_moves": db.as_int(row[2]),
+    }
     return {log: count for log, count in counts.items() if count}
 
 
@@ -1558,6 +1565,205 @@ def staged_path_file_ids(conn: sqlite3.Connection, file_ids: list[int]) -> list[
         tuple(file_ids),
     )
     return [db.as_int(row[0]) for row in cursor.fetchall()]
+
+
+# --- sidecar_moves_staged and sidecar_moves (the non-audio files of a moving album) -----
+
+_SIDECAR_STAGED_FIELDS: Final = (
+    "from_key",
+    "from_path",
+    "to_path",
+    "to_key",
+    "unit_key",
+    "base_size_bytes",
+    "base_mtime_ns",
+    "origin",
+    "reverted_from",
+    "note",
+    "staged_at",
+)
+_SIDECAR_STAGED_COLUMNS: Final = ", ".join(_SIDECAR_STAGED_FIELDS)
+
+
+@dataclass(frozen=True, slots=True)
+class StagedSidecar:
+    """One pending sidecar move. Paths and keys are relative to ``music_path``.
+
+    ``unit_key`` is the key of the album folder the sidecar sits under, whose audio it follows.
+    ``base_size_bytes``/``base_mtime_ns`` are its signature when staged. ``reverted_from`` is the
+    ``sidecar_moves`` id a revert row undoes.
+    """
+
+    from_key: str
+    from_path: str
+    to_path: str
+    to_key: str
+    unit_key: str
+    base_size_bytes: int
+    base_mtime_ns: int
+    origin: str
+    reverted_from: int | None
+    note: str | None
+    staged_at: str
+
+
+def _row_to_staged_sidecar(row: tuple[object, ...]) -> StagedSidecar:
+    """Build a typed :class:`StagedSidecar` from a raw sqlite tuple."""
+    return StagedSidecar(
+        from_key=str(row[0]),
+        from_path=str(row[1]),
+        to_path=str(row[2]),
+        to_key=str(row[3]),
+        unit_key=str(row[4]),
+        base_size_bytes=db.as_int(row[5]),
+        base_mtime_ns=db.as_int(row[6]),
+        origin=str(row[7]),
+        reverted_from=None if row[8] is None else db.as_int(row[8]),
+        note=None if row[9] is None else str(row[9]),
+        staged_at=str(row[10]),
+    )
+
+
+def insert_staged_sidecar(conn: sqlite3.Connection, staged: StagedSidecar) -> None:
+    """Stage one sidecar move. A second row with the same source or target raises."""
+    placeholders = ", ".join("?" for _ in _SIDECAR_STAGED_FIELDS)
+    conn.execute(
+        f"INSERT INTO sidecar_moves_staged ({_SIDECAR_STAGED_COLUMNS}) "  # noqa: S608
+        f"VALUES ({placeholders})",
+        (
+            staged.from_key,
+            staged.from_path,
+            staged.to_path,
+            staged.to_key,
+            staged.unit_key,
+            staged.base_size_bytes,
+            staged.base_mtime_ns,
+            staged.origin,
+            staged.reverted_from,
+            staged.note,
+            staged.staged_at,
+        ),
+    )
+
+
+def list_staged_sidecars(conn: sqlite3.Connection) -> list[StagedSidecar]:
+    """Return every pending sidecar move, in source-key order."""
+    cursor = conn.execute(
+        f"SELECT {_SIDECAR_STAGED_COLUMNS} FROM sidecar_moves_staged ORDER BY from_key",  # noqa: S608
+    )
+    return [_row_to_staged_sidecar(tuple(row)) for row in cursor.fetchall()]
+
+
+def set_staged_sidecar_signature(
+    conn: sqlite3.Connection,
+    from_key: str,
+    signature: tuple[int, int],
+) -> None:
+    """Record *signature* as the staged signature of the sidecar move keyed *from_key*."""
+    conn.execute(
+        "UPDATE sidecar_moves_staged SET base_size_bytes = ?, base_mtime_ns = ? WHERE from_key = ?",
+        (*signature, from_key),
+    )
+
+
+def delete_staged_sidecar(conn: sqlite3.Connection, from_key: str) -> None:
+    """Remove the pending sidecar move keyed *from_key* (no-op if none)."""
+    conn.execute("DELETE FROM sidecar_moves_staged WHERE from_key = ?", (from_key,))
+
+
+_SIDECAR_MOVE_COLUMNS: Final = (
+    "id, commit_id, created_at, origin, reverted_from, from_path, to_path, from_key, to_key, "
+    "unit_key, size_bytes, mtime_ns, note"
+)
+
+
+@dataclass(frozen=True, slots=True)
+class SidecarMove:
+    """One ``sidecar_moves`` row. Paths and keys are relative to ``music_path``."""
+
+    id: int
+    commit_id: int
+    created_at: str
+    origin: str
+    reverted_from: int | None
+    from_path: str
+    to_path: str
+    from_key: str
+    to_key: str
+    unit_key: str
+    size_bytes: int
+    mtime_ns: int
+    note: str | None
+
+
+def _row_to_sidecar_move(row: tuple[object, ...]) -> SidecarMove:
+    """Build a typed :class:`SidecarMove` from a raw sqlite tuple."""
+    return SidecarMove(
+        id=db.as_int(row[0]),
+        commit_id=db.as_int(row[1]),
+        created_at=str(row[2]),
+        origin=str(row[3]),
+        reverted_from=None if row[4] is None else db.as_int(row[4]),
+        from_path=str(row[5]),
+        to_path=str(row[6]),
+        from_key=str(row[7]),
+        to_key=str(row[8]),
+        unit_key=str(row[9]),
+        size_bytes=db.as_int(row[10]),
+        mtime_ns=db.as_int(row[11]),
+        note=None if row[12] is None else str(row[12]),
+    )
+
+
+def insert_sidecar_move(
+    conn: sqlite3.Connection,
+    staged: StagedSidecar,
+    *,
+    commit_id: int,
+    now: str,
+) -> None:
+    """Append the log row of the staged move *staged*. The append-only triggers refuse rewrites."""
+    conn.execute(
+        """
+        INSERT INTO sidecar_moves
+          (commit_id, created_at, origin, reverted_from, from_path, to_path, from_key, to_key,
+           unit_key, size_bytes, mtime_ns, note)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            commit_id,
+            now,
+            staged.origin,
+            staged.reverted_from,
+            staged.from_path,
+            staged.to_path,
+            staged.from_key,
+            staged.to_key,
+            staged.unit_key,
+            staged.base_size_bytes,
+            staged.base_mtime_ns,
+            staged.note,
+        ),
+    )
+
+
+def sidecar_moves_for_commit(conn: sqlite3.Connection, commit_id: int) -> list[SidecarMove]:
+    """Return every ``sidecar_moves`` row *commit_id* appended, in source-key order."""
+    cursor = conn.execute(
+        f"SELECT {_SIDECAR_MOVE_COLUMNS} FROM sidecar_moves "  # noqa: S608
+        "WHERE commit_id = ? ORDER BY from_key",
+        (commit_id,),
+    )
+    return [_row_to_sidecar_move(tuple(row)) for row in cursor.fetchall()]
+
+
+def sidecar_moved_later(conn: sqlite3.Connection, move_id: int, key: str) -> bool:
+    """Whether a ``sidecar_moves`` row after *move_id* moved a sidecar from or to *key*."""
+    row = conn.execute(
+        "SELECT EXISTS(SELECT 1 FROM sidecar_moves WHERE id > ? AND (from_key = ? OR to_key = ?))",
+        (move_id, key, key),
+    ).fetchone()
+    return bool(row[0])
 
 
 def distinct_artists(conn: sqlite3.Connection) -> list[tuple[str, int]]:

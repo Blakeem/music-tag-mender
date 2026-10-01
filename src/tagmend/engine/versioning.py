@@ -47,6 +47,7 @@ from tagmend.engine.tags import (
 from tagmend.log import get_logger
 
 if TYPE_CHECKING:
+    import os
     import sqlite3
 
     from tagmend.config import Settings
@@ -534,19 +535,38 @@ def _classify_for_revert(conn: sqlite3.Connection, revision: Revision) -> str:
     return "revertable"
 
 
+def _require_tag_commit(
+    commit_id: int,
+    logs: dict[str, int],
+    path: str | os.PathLike[str] | None,
+) -> None:
+    """Refuse a commit holding no log row, and a *path* scope, which only a path commit has."""
+    if not logs:
+        message = f"commit {commit_id} holds no change in the tag or path log to revert"
+        raise ValueError(message)
+    if path is not None:
+        message = (
+            f"commit {commit_id} changed tags, and path= selects the files of a path commit "
+            "only. Revert it whole, or one file with revert_tags"
+        )
+        raise ValueError(message)
+
+
 def revert_commit(
     settings: Settings,
     commit_id: int,
     *,
     note: str | None = None,
     dry_run: bool = False,
+    path: str | os.PathLike[str] | None = None,
 ) -> commits.RevertCommitResult:
     """Undo an entire commit as a unit: revert every file it changed to its pre-commit state.
 
-    Domain-neutral: a commit whose rows sit in ``path_revisions`` is undone by
-    :func:`tagmend.engine.paths.revert_commit_moves`, which moves each file back to its source.
-    A commit with rows in no log raises :class:`ValueError`. The rest of this docstring describes
-    a tag commit.
+    Domain-neutral: a commit whose rows sit in ``path_revisions`` or ``sidecar_moves`` is undone
+    by :func:`tagmend.engine.paths.revert_commit_moves`, which moves each file and sidecar back
+    to its source. *path* applies to such a commit only and keeps the files and sidecars sitting
+    at or under it now. A commit with rows in no log raises :class:`ValueError`, and so does
+    *path* on a tag commit. The rest of this docstring describes a tag commit.
 
     The group counterpart of :func:`revert_tags` (PLAN.md §7: "reverting a whole
     ``commit_id`` undoes an entire run"). For each revision the target commit created,
@@ -599,13 +619,11 @@ def revert_commit(
         if store.any_staged(connection):
             raise ValueError(paths.STAGING_NOT_EMPTY)
         logs = store.commit_log_counts(connection, commit_id)
-        if "path_revisions" in logs:
+        if "path_revisions" in logs or "sidecar_moves" in logs:
             return paths.revert_commit_moves(
-                connection, settings, commit_id, note=note, dry_run=dry_run
+                connection, settings, commit_id, note=note, dry_run=dry_run, path=path
             )
-        if not logs:
-            message = f"commit {commit_id} holds no change in the tag or path log to revert"
-            raise ValueError(message)
+        _require_tag_commit(commit_id, logs, path)
 
         # Plan pass (read-only): classify every file the target commit changed.
         planned: list[tuple[Revision, str]] = [

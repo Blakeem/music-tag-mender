@@ -206,6 +206,16 @@ upgrades in place with every row preserved):
   which is how a commit recognises a file that already landed at its target.
 * ``reverted_from``: on a revert row, the version whose location it restores.
   :func:`_migrate_path_staging` adds the four columns as NULL on earlier rows.
+
+The sidecar pass adds two tables (schema v26, purely additive, created by its DDL with no
+migration):
+
+* ``sidecar_moves``: the append-only log of the non-audio files that move with their album
+  folder, one row per move with both paths and keys relative to ``music_path``, the signature
+  the file kept across the move and ``unit_key``, the key of the album folder the file sat
+  under. A revert reads ``unit_key`` to find the folder the album occupies after the move.
+* ``sidecar_moves_staged``: one pending sidecar move per source key, its target key unique, so
+  two sidecars never share a target.
 """
 
 from __future__ import annotations
@@ -223,7 +233,7 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
-SCHEMA_VERSION: Final = 25
+SCHEMA_VERSION: Final = 26
 
 _FILES_DDL: Final = """
 CREATE TABLE IF NOT EXISTS files (
@@ -366,6 +376,60 @@ CREATE TABLE IF NOT EXISTS path_revisions_staged (
 _PATH_REVISIONS_STAGED_TO_KEY_INDEX_DDL: Final = (
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_path_revisions_staged_to_key "
     "ON path_revisions_staged(to_key)"
+)
+
+# A sidecar has no ``files`` row, so its log is keyed by its own paths. The signature is how a
+# commit recognises a sidecar that already landed at its target.
+_SIDECAR_MOVES_DDL: Final = """
+CREATE TABLE IF NOT EXISTS sidecar_moves (
+  id            INTEGER PRIMARY KEY,
+  commit_id     INTEGER NOT NULL REFERENCES commits(id),
+  created_at    TEXT NOT NULL,
+  origin        TEXT NOT NULL,
+  reverted_from INTEGER REFERENCES sidecar_moves(id),
+  from_path     TEXT NOT NULL,
+  to_path       TEXT NOT NULL,
+  from_key      TEXT NOT NULL,
+  to_key        TEXT NOT NULL,
+  unit_key      TEXT NOT NULL,
+  size_bytes    INTEGER NOT NULL,
+  mtime_ns      INTEGER NOT NULL,
+  note          TEXT
+)
+"""
+
+_SIDECAR_MOVES_INDEX_DDL: Final = (
+    "CREATE INDEX IF NOT EXISTS idx_sidecar_moves_commit_id ON sidecar_moves(commit_id)",
+    "CREATE INDEX IF NOT EXISTS idx_sidecar_moves_from_key ON sidecar_moves(from_key)",
+    "CREATE INDEX IF NOT EXISTS idx_sidecar_moves_to_key ON sidecar_moves(to_key)",
+)
+
+_SIDECAR_MOVES_STAGED_DDL: Final = """
+CREATE TABLE IF NOT EXISTS sidecar_moves_staged (
+  from_key        TEXT NOT NULL PRIMARY KEY,
+  from_path       TEXT NOT NULL,
+  to_path         TEXT NOT NULL,
+  to_key          TEXT NOT NULL UNIQUE,
+  unit_key        TEXT NOT NULL,
+  base_size_bytes INTEGER NOT NULL,
+  base_mtime_ns   INTEGER NOT NULL,
+  origin          TEXT NOT NULL,
+  reverted_from   INTEGER REFERENCES sidecar_moves(id),
+  note            TEXT,
+  staged_at       TEXT NOT NULL
+)
+"""
+
+_SIDECAR_MOVES_STAGED_UNIT_INDEX_DDL: Final = (
+    "CREATE INDEX IF NOT EXISTS idx_sidecar_moves_staged_unit_key ON sidecar_moves_staged(unit_key)"
+)
+
+# Each table precedes its indexes.
+_SIDECAR_DDL: Final = (
+    _SIDECAR_MOVES_DDL,
+    *_SIDECAR_MOVES_INDEX_DDL,
+    _SIDECAR_MOVES_STAGED_DDL,
+    _SIDECAR_MOVES_STAGED_UNIT_INDEX_DDL,
 )
 
 # Persistent cache of parsed Last.fm top-tag lists only, keyed by a request hash (so it
@@ -562,7 +626,7 @@ _REVISIONS_COMMIT_INDEX_DDL: Final = (
     "CREATE INDEX IF NOT EXISTS idx_path_revisions_commit_id ON path_revisions(commit_id)",
 )
 
-_APPEND_ONLY_LOGS: Final = ("tag_revisions", "path_revisions")
+_APPEND_ONLY_LOGS: Final = ("tag_revisions", "path_revisions", "sidecar_moves")
 
 # Revert reads an omitted tag by the revision's managed set, so a NULL would silently change
 # what a revert deletes. SQLite cannot add NOT NULL to an existing column, so a trigger does.
@@ -574,7 +638,7 @@ _MANAGED_SET_REQUIRED_TRIGGER_DDL: Final = (
 
 
 def apply_append_only_triggers(connection: sqlite3.Connection) -> None:
-    """Create the triggers that abort any ``UPDATE`` or ``DELETE`` on the two revision logs.
+    """Create the triggers that abort any ``UPDATE`` or ``DELETE`` on the three append-only logs.
 
     A BEFORE DELETE trigger also blocks the ``ON DELETE CASCADE`` from ``files``, so deleting a
     file row can never erase its history. One more trigger aborts a ``tag_revisions`` insert
@@ -1213,10 +1277,10 @@ def apply_schema(connection: sqlite3.Connection) -> None:
     changed fields (:func:`_migrate_staged_changed_fields`), v23 adds the staged supplied
     keys (:func:`_migrate_staged_supplied_keys`), v24 rewrites the mismatch rows as covers
     snapshots (:func:`_migrate_mismatch_covers`) and v25 adds the path staging columns
-    (:func:`_migrate_path_staging`). v15, v16 and v22 add cache tables only, and
-    v23 adds ``file_song_status``, which the DDL creates, so they need no migration step. The
-    triggers come after every migration, so a migration that updates a log runs before they
-    exist.
+    (:func:`_migrate_path_staging`). v15, v16 and v22 add cache tables only, v23 adds
+    ``file_song_status`` and v26 adds the two sidecar tables, which the DDL creates, so they
+    need no migration step. The triggers come after every migration, so a migration that
+    updates a log runs before they exist.
 
     ``commits`` is created before the revision/staging tables that reference it.
     """
@@ -1271,7 +1335,7 @@ def apply_schema(connection: sqlite3.Connection) -> None:
     connection.execute(_FILE_MISMATCH_STATUS_DDL)
     connection.execute(_FINGERPRINT_CACHE_DDL)
     connection.execute(_ACOUSTID_CACHE_DDL)
-    for index_ddl in _REVISIONS_COMMIT_INDEX_DDL:
-        connection.execute(index_ddl)
+    for ddl in (*_SIDECAR_DDL, *_REVISIONS_COMMIT_INDEX_DDL):
+        connection.execute(ddl)
     apply_append_only_triggers(connection)
     connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")

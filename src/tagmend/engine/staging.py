@@ -31,13 +31,12 @@ from __future__ import annotations
 
 import unicodedata
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, cast
 
 import mutagen
 
-from tagmend.engine import axis, commits, db, path_keys, schema, store, versioning
+from tagmend.engine import axis, clock, commits, db, path_keys, schema, store, versioning
 from tagmend.engine.tags import (
     MANAGED_TAGS,
     RELEASE_STAMP_TAGS,
@@ -83,11 +82,6 @@ _IDENTITY_GROUPS: Final[tuple[tuple[tuple[str, ...], tuple[str, ...]], ...]] = (
 
 # A NUL splits a value inside TagLib, and ID3v2.4 forbids line breaks in a text frame.
 _FORBIDDEN_CHARACTERS: Final = ("\x00", "\r", "\n")
-
-
-def _utc_now() -> str:
-    """Return the current time as an ISO-8601 UTC string."""
-    return datetime.now(UTC).isoformat()
 
 
 def _clean_values(file_id: int, managed_tags: dict[str, list[str]]) -> dict[str, list[str]]:
@@ -267,7 +261,7 @@ class TagDomain:
 
     def flag_and_drop_missing(self, conn: sqlite3.Connection, file_id: int) -> None:
         """Flag the file missing and drop its staged row (it vanished from disk)."""
-        store.flag_missing(conn, file_id, _utc_now())
+        store.flag_missing(conn, file_id, clock.utc_now())
         store.delete_staged_tag(conn, file_id)
 
     def post_commit_file(self, conn: sqlite3.Connection, file_id: int) -> None:
@@ -386,7 +380,7 @@ def stage_tags(  # noqa: PLR0913 - cohesive keyword-only staging payload
 
     Validates *origin* (``auto``/``manual``) then, via the shared :func:`_stage_one` core,
     that every key is a managed tag and the file is known and not flagged missing. Also
-    captures the version-0 baseline now (from the current snapshot) if the file has none,
+    captures the version-0 baseline now (read from the file on disk) if the file has none,
     so a later crash-then-rescan can never record the wrong original. Nothing on disk
     changes and no further history is recorded until :func:`commit_tags`. Owns its
     transaction.
@@ -420,7 +414,7 @@ def stage_tags(  # noqa: PLR0913 - cohesive keyword-only staging payload
             tags=tags,
             origin=origin,
             note=note,
-            now=_utc_now(),
+            now=clock.utc_now(),
             fill_only=fill_only,
         )
         connection.commit()
@@ -509,7 +503,7 @@ def stage_tags_batch(
     connection = db.connect(settings.db_path)
     try:
         schema.apply_schema(connection)
-        now = _utc_now()
+        now = clock.utc_now()
         for file_id, managed_tags in validated:
             _stage_one(
                 connection,
@@ -603,9 +597,9 @@ def _stale_identity(
 def diff_tags(settings: Settings, *, path: Path | None = None) -> list[TagDiffView]:
     """Return staged-but-uncommitted tag changes enriched with the current→target diff.
 
-    This is ``git diff --staged`` (staged-vs-snapshot), **not** working-tree: ``current``
-    is the last committed/scanned managed-tag snapshot for the file and may lag the actual
-    disk state after an interrupted commit. ``target`` is the staged managed tags and
+    This is ``git diff --staged``. ``current`` is read from the file on disk, the same source
+    staging merges onto, so ``diff`` is what the commit will write. The snapshot mirror is the
+    fallback only for a file that is gone or unreadable. ``target`` is the staged managed tags and
     ``diff`` is :func:`tagmend.engine.versioning.compute_diff` between them (a no-op stage
     yields ``diff == {}`` but the row still appears). Optionally limited to files in the
     folder *path* or nested under it, resolved by
@@ -693,9 +687,9 @@ def commit_tags(
         )
         if not file_ids:
             connection.commit()
-            return commits._summarize(commit_id=None, applied=[])  # noqa: SLF001
+            return commits.summarize(commit_id=None, applied=[])
 
-        now = _utc_now()
+        now = clock.utc_now()
         origin = _commit_origin(store.staged_origins(connection, file_ids))
         commit_id = commits.create_commit(connection, origin=origin, message=message, now=now)
         connection.commit()  # commit row durable before any per-file work
@@ -712,7 +706,7 @@ def commit_tags(
     finally:
         connection.close()
 
-    result = commits._summarize(commit_id=commit_id, applied=applied)  # noqa: SLF001
+    result = commits.summarize(commit_id=commit_id, applied=applied)
     logger.info(
         "commit %d: committed=%d noop=%d missing=%d changed_since_stage=%d errors=%d",
         commit_id,
@@ -752,8 +746,9 @@ def reopen_axes(settings: Settings, *, commit_id: int) -> ReopenResult:
 
     * voids the derived-axis fields (:data:`tagmend.engine.axis.GENRE_AXIS.fields` +
       :data:`~tagmend.engine.axis.YEAR_AXIS.fields`) via
-      :func:`tagmend.engine.store.void_auto_changes`, so ``derived_genre_status`` /
-      ``derived_year_status`` flip ``done`` → ``pending`` and the axes re-open (a LATER fresh
+      :func:`tagmend.engine.store.void_auto_changes`, so
+      :func:`tagmend.engine.store.derived_status` on the genre and year axes flips ``done`` →
+      ``pending`` and the axes re-open (a LATER fresh
       auto commit reads ``done`` again — the Run-1 watermark semantics); and
     * deletes any :func:`tagmend.engine.store.delete_artist_status` row.
 

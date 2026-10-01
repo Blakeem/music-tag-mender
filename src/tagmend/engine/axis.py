@@ -1,29 +1,31 @@
-"""The metadata-axis abstraction: ONE parameterized status machinery for genre/artist.
+"""The metadata-axis abstraction: ONE status machinery for genre, artist, year and mismatch.
 
-Genre and artist (and the year/song axes to come) each carry a per-file *workflow
-status* — ``pending`` / ``staged`` / ``done`` / ``manual`` / ``no_identity`` (and
-``no_match`` on the genre and year axes). Their machinery is identical bar a handful of
-values, so it lives here ONCE as a
-parameterized :class:`Axis`: the name, the managed-tag *fields* its field-aware
-``staged``/``done`` derivation keys on, its ``file_<name>_status`` side table and that
-table's source-identity columns, its valid workflow-status set, and the staleness rule
-that decides whether a *stored* decision still blocks reprocessing.
+Each axis carries a per-file workflow status. Genre and year have ``pending``, ``staged``,
+``done``, ``manual``, ``no_match`` and ``no_identity``. Artist has the same set without
+``no_match``. Mismatch has ``pending``, ``legit_ignore`` and ``misfiled_deferred`` only. The
+machinery is identical bar a handful of values, so it lives here ONCE as a parameterized
+:class:`Axis`: the name, the managed-tag *fields* its field-aware ``staged``/``done``
+derivation keys on, its ``file_<name>_status`` side table and that table's source-identity
+columns, its valid workflow-status set, and the staleness rule that decides whether a
+*stored* decision still blocks reprocessing.
 
-The two asymmetries the abstraction must preserve (NOT flatten):
+The differences the abstraction must preserve (NOT flatten):
 
-* **genre has a ``no_match`` state; artist does not.** A stored genre ``no_match`` goes
-  *stale* when the file's lookup identity changes, which re-opens it for processing; a
-  stored artist ``manual`` is *sticky* (never goes stale). Both are encoded in each axis's
-  :attr:`Axis.decision_blocks` predicate, so the skip path
-  (:mod:`tagmend.engine.genres` / :mod:`tagmend.engine.artists`) and the user-facing
-  derivation (:func:`derived_status`) share one source of truth and can never drift.
-* **the source-identity columns differ:** ``file_genre_status`` records
-  ``(source_artist, source_album)``; ``file_artist_status`` records
-  ``(source_artist, source_albumartist)``. Each axis names its two columns in
-  :attr:`Axis.source_columns`; the generic SQL is built from those names.
+* **A genre or year ``no_match`` goes stale when the lookup identity changes, while an artist
+  ``manual`` is sticky.** The stale ``no_match`` re-opens the file for processing. The artist
+  ``manual`` never goes stale.
+* **A mismatch disposition blocks while its snapshotted tag value is unchanged.** Any change
+  to that tag, its removal included, makes the disposition stale and the file re-surfaces.
+* **The mismatch axis has no ``staged``/``done`` derivation.** Its status is stored or
+  ``pending`` (:func:`tagmend.engine.store.derived_mismatch_status`).
 
-Like the rest of :mod:`tagmend.engine.store`, the helpers here never commit — the
-conn-owning layer (genres/artists/library) owns the transaction.
+Each rule is one axis's :attr:`Axis.decision_blocks` predicate, so the skip path and the
+user-facing derivation (:func:`tagmend.engine.store.derived_status`) share one source of truth
+and can never drift. Each axis names its two source-identity columns in
+:attr:`Axis.source_columns`, and the generic SQL is built from those names.
+
+Like the rest of :mod:`tagmend.engine.store`, the helpers here never commit. The conn-owning
+layer (genres/artists/library) owns the transaction.
 """
 
 from __future__ import annotations
@@ -68,9 +70,9 @@ class Identity:
 
 @dataclass(frozen=True, slots=True)
 class Axis:
-    """Everything that differs between the genre, artist (and future) metadata axes.
+    """Everything that differs between the metadata axes.
 
-    A new axis slots in as one of these values plus a resolver — never a copied module.
+    A new axis slots in as one of these values plus a resolver, never a copied module.
     """
 
     name: str
@@ -98,12 +100,14 @@ class Axis:
     decision_blocks: Callable[[StatusRow, Identity], bool]
     """Whether a STORED decision still blocks reprocessing for the given current identity.
 
-    The single source of truth shared by the skip path and the derived-status report:
-    genre's ``no_match`` blocks only while NOT stale (identity unchanged), ``manual`` always
-    blocks; artist's ``manual`` always blocks (sticky, no staleness re-check)."""
+    The single source of truth shared by the skip path and the derived-status report.
+    Genre's ``manual`` always blocks, and its ``no_match`` blocks only while the lookup
+    identity is unchanged. Year follows the same rule as genre. Artist's ``manual`` always
+    blocks, with no staleness re-check. A mismatch disposition blocks only while its
+    snapshotted value equals the current value of its own tag."""
 
 
-# --- genre / artist staleness rules --------------------------------------------------
+# --- per-axis staleness rules --------------------------------------------------------
 
 
 def _identity_decision_blocks(decision: StatusRow, identity: Identity) -> bool:
@@ -151,7 +155,7 @@ def _mismatch_decision_blocks(decision: StatusRow, identity: Identity) -> bool:
     return decision.source_secondary == current
 
 
-# --- the two axes --------------------------------------------------------------------
+# --- the four axes -------------------------------------------------------------------
 
 GENRE_AXIS: Final = Axis(
     name="genre",
@@ -266,3 +270,46 @@ def delete_status(conn: sqlite3.Connection, axis: Axis, file_id: int) -> None:
         f"DELETE FROM {axis.status_table} WHERE file_id = ?",  # noqa: S608 - table from trusted Axis
         (file_id,),
     )
+
+
+# --- lookup identity -----------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class LookupIdentity:
+    """The ``(artist, album)`` a file is looked up / classified against."""
+
+    artist: str | None
+    album: str | None
+
+
+def first_nonblank(values: list[str] | None) -> str | None:
+    """Return the first value that is non-blank after ``str.strip()``, else ``None``.
+
+    Whitespace-only tag values (spaces, tabs, newlines) count as absent. This is the Python
+    twin of :func:`tagmend.engine.store.has_identity`'s blankness rule, so the resolvers'
+    ``identity.artist is None`` gate buckets such files as ``skipped_no_identity`` (rather
+    than looking up ``" "`` junk) and the derived ``no_identity`` status agrees. The value
+    is returned verbatim (unstripped), preserving the exact lookup string for non-blank tags.
+    """
+    if not values:
+        return None
+    for value in values:
+        if value.strip():
+            return value
+    return None
+
+
+def lookup_identity(tags: dict[str, list[str]]) -> LookupIdentity:
+    """Derive the lookup identity for a file's tags.
+
+    Lookup artist is the first non-blank ``albumartist`` value when one exists (better
+    identity for compilations), else the first non-blank ``artist`` value, or ``None`` when
+    neither has a non-blank value. Album is the first non-blank ``album`` value, or ``None``.
+    Whitespace-only values are treated as absent (see :func:`first_nonblank`).
+    """
+    lookup_artist = first_nonblank(tags.get("albumartist")) or first_nonblank(
+        tags.get("artist"),
+    )
+    lookup_album = first_nonblank(tags.get("album"))
+    return LookupIdentity(artist=lookup_artist, album=lookup_album)

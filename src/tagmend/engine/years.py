@@ -29,10 +29,9 @@ commit; the building blocks in :mod:`tagmend.engine.store` never commit.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
-from tagmend.engine import axis, db, genres, schema, staging, store
+from tagmend.engine import axis, clock, db, lookup_clients, schema, staging, store
 from tagmend.engine.musicbrainz import MusicBrainzClient, MusicBrainzError
 from tagmend.engine.validation import check_limit, require_choice
 from tagmend.log import get_logger
@@ -41,7 +40,6 @@ if TYPE_CHECKING:
     import sqlite3
 
     from tagmend.config import Settings
-    from tagmend.engine.genres import _Identity
     from tagmend.engine.musicbrainz import MBReleaseGroupSource
 
 logger = get_logger(__name__)
@@ -52,11 +50,6 @@ _YEAR_FIELD = "originaldate"
 # The two states ``set_year_status`` is allowed to drive: ``manual`` writes a sticky
 # exclusion row; ``pending`` deletes it (re-queue). ``no_match`` is engine-owned.
 _USER_STATUSES = frozenset({"manual", "pending"})
-
-
-def _utc_now() -> str:
-    """Return the current time as an ISO-8601 UTC string (the engine's timestamp form)."""
-    return datetime.now(UTC).isoformat()
 
 
 # --- result types --------------------------------------------------------------------
@@ -128,7 +121,7 @@ class _Candidate:
     """A processable file plus the album identity it will be looked up against."""
 
     file_id: int
-    identity: _Identity
+    identity: axis.LookupIdentity
 
 
 # --- public entry --------------------------------------------------------------------
@@ -155,8 +148,9 @@ def resolve_years(  # noqa: PLR0913 - cohesive keyword-only scope + injection pa
 
     *limit* caps the number of groups processed per call; the remainder is reported via
     ``pending_remaining`` / ``more``. A file the last scan flagged missing is counted under
-    ``skipped_missing``. *dry_run* returns the proposed mappings + would-stage count, stages
-    nothing, and works from cache (no precondition). A non-dry-run raises
+    ``skipped_missing``. *dry_run* returns the proposed mappings + would-stage count and
+    stages nothing. Lookups still run. A cached answer costs nothing and a cache miss makes a
+    live request. A dry run skips the empty-staging precondition. A non-dry-run raises
     :class:`ValueError` if anything is already staged, and any run raises it for a negative
     *limit*. *client* lets callers inject an
     :class:`tagmend.engine.musicbrainz.MBReleaseGroupSource`, such as a fake in tests. When
@@ -237,7 +231,7 @@ def _select(
     processable: list[_Candidate] = []
     for fid in candidate_ids:
         tags = store.get_tags(conn, fid)
-        identity = genres._identity(tags)  # noqa: SLF001 - shared identity shape
+        identity = axis.lookup_identity(tags)
 
         if identity.artist is None:
             tally.skipped_no_identity += 1
@@ -271,12 +265,12 @@ def _select(
     return processable
 
 
-def _decision_blocks(decision: store.YearStatusRow, identity: _Identity) -> bool:
+def _decision_blocks(decision: store.YearStatusRow, identity: axis.LookupIdentity) -> bool:
     """Whether a stored year decision still blocks processing for the current identity.
 
     The shared year staleness/sticky rule (``manual`` always blocks; ``no_match`` blocks
     only while NOT stale) lives on the axis, so this skip path and the user-facing
-    :func:`tagmend.engine.store.derived_year_status` can never drift.
+    :func:`tagmend.engine.store.derived_status` on ``axis.YEAR_AXIS`` can never drift.
     """
     return axis.YEAR_AXIS.decision_blocks(
         axis.StatusRow(
@@ -288,9 +282,9 @@ def _decision_blocks(decision: store.YearStatusRow, identity: _Identity) -> bool
     )
 
 
-def _group_by_identity(candidates: list[_Candidate]) -> dict[_Identity, list[int]]:
+def _group_by_identity(candidates: list[_Candidate]) -> dict[axis.LookupIdentity, list[int]]:
     """Group file ids by their album identity, preserving first-seen group order."""
-    groups: dict[_Identity, list[int]] = {}
+    groups: dict[axis.LookupIdentity, list[int]] = {}
     for candidate in candidates:
         groups.setdefault(candidate.identity, []).append(candidate.file_id)
     return groups
@@ -302,39 +296,25 @@ def _group_by_identity(candidates: list[_Candidate]) -> dict[_Identity, list[int
 def _process_groups(  # noqa: PLR0913 - cohesive orchestration inputs
     settings: Settings,
     conn: sqlite3.Connection,
-    groups: list[tuple[_Identity, list[int]]],
+    groups: list[tuple[axis.LookupIdentity, list[int]]],
     client: MBReleaseGroupSource | None,
     tally: _Tally,
     *,
     dry_run: bool,
 ) -> None:
     """Resolve each group via *client* (built if None) and stage / mark its files."""
-    if client is not None:
+    with lookup_clients.injected_or_owned(
+        client,
+        lambda: MusicBrainzClient.from_settings(settings, conn),
+    ) as source:
         for identity, fids in groups:
-            _process_one_group(settings, conn, identity, fids, client, tally, dry_run=dry_run)
-        return
-
-    with MusicBrainzClient(
-        settings.musicbrainz_user_agent,
-        conn,
-        rate_per_sec=settings.musicbrainz_rate_per_sec,
-    ) as owned_client:
-        for identity, fids in groups:
-            _process_one_group(
-                settings,
-                conn,
-                identity,
-                fids,
-                owned_client,
-                tally,
-                dry_run=dry_run,
-            )
+            _process_one_group(settings, conn, identity, fids, source, tally, dry_run=dry_run)
 
 
 def _process_one_group(  # noqa: PLR0913 - cohesive per-group inputs
     settings: Settings,
     conn: sqlite3.Connection,
-    identity: _Identity,
+    identity: axis.LookupIdentity,
     file_ids: list[int],
     client: MBReleaseGroupSource,
     tally: _Tally,
@@ -380,7 +360,7 @@ def _process_one_group(  # noqa: PLR0913 - cohesive per-group inputs
     tally.no_match += len(file_ids)
     if dry_run:
         return
-    now = _utc_now()
+    now = clock.utc_now()
     for fid in file_ids:
         store.set_year_status(
             conn,
@@ -534,10 +514,10 @@ def set_year_status(
     try:
         schema.apply_schema(connection)
         scoped = _year_scope(connection, file_ids=file_ids, value=value)
-        now = _utc_now()
+        now = clock.utc_now()
         for fid in scoped:
             if status == "manual":
-                identity = genres._identity(store.get_tags(connection, fid))  # noqa: SLF001
+                identity = axis.lookup_identity(store.get_tags(connection, fid))
                 store.set_year_status(
                     connection,
                     file_id=fid,

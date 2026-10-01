@@ -531,7 +531,7 @@ def test_later_ordinal_album_is_not_blank_via_gather(
             mtime_ns=None,
             now=_NOW,
         )
-        # ordinal 0 blank, ordinal 1 a real album -> _first_nonblank -> "Real Album".
+        # ordinal 0 blank, ordinal 1 a real album -> axis.first_nonblank -> "Real Album".
         store.replace_tags(conn, late_id, {"album": ["", "Real Album"]}, _NOW)
         conn.commit()
     finally:

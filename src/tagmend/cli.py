@@ -44,7 +44,7 @@ def _main(
         typer.Option("--verbose", "-v", help="Enable debug logging."),
     ] = False,
 ) -> None:
-    """TagMend — genre & artist-name cleanup with full revertible history."""
+    """TagMend: music tag cleanup with a fully revertible history."""
     if verbose:
         set_level("DEBUG")
 
@@ -182,7 +182,7 @@ def config_set(
     key: Annotated[str, typer.Argument(help="Setting name (e.g. music_path).")],
     value: Annotated[str, typer.Argument(help="New value.")],
 ) -> None:
-    """Set a value in settings.json (music_path, lastfm_api_key, db_path)."""
+    """Set one value in settings.json. An unknown key fails and lists the known keys."""
     try:
         path = config.set_setting(key, value)
     except ValueError as exc:

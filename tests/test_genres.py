@@ -20,7 +20,7 @@ import mutagen
 import pytest
 
 from conftest import make_track
-from tagmend.engine import genres, staging, store, versioning
+from tagmend.engine import axis, genres, staging, store, versioning
 from tagmend.engine.db import connect
 from tagmend.engine.lastfm import LastfmError, Tag
 from tagmend.engine.library import ScanMode, list_files, scan_library
@@ -255,7 +255,7 @@ def test_already_staged_file_refuses_a_second_run_and_reads_staged(
     conn = connect(engine_settings.db_path)
     try:
         apply_schema(conn)
-        assert store.derived_genre_status(conn, file_id) == "staged"
+        assert store.derived_status(conn, axis.GENRE_AXIS, file_id) == "staged"
     finally:
         conn.close()
 
@@ -295,8 +295,8 @@ def test_genre_pipeline_is_field_aware_artist_only_change_stays_processable(
 
     Regression for the field-awareness fix in ``genres._select``: a committed
     ``origin='auto'`` revision that changed only ``artist`` (or a staged change that
-    touches only ``artist``) must leave the file genre-processable — not bucketed into
-    ``skipped['done']`` — and must agree with ``derived_genre_status == 'pending'`` so the
+    touches only ``artist``) must leave the file genre-processable, not bucketed into
+    ``skipped['done']``. It must also agree with the genre axis's derived ``pending``, so the
     status view and ``resolve_genres`` can no longer disagree.
     """
     make_track(music_dir / "committed.mp3", {"artist": ["Daft Punk"], "genre": ["Old"]})
@@ -331,8 +331,8 @@ def test_genre_pipeline_is_field_aware_artist_only_change_stays_processable(
         conn.commit()
 
         # The status view agrees: an artist-only change is genre-PENDING, not done.
-        assert store.derived_genre_status(conn, committed_id) == "pending"
-        assert store.derived_genre_status(conn, staged_id) == "pending"
+        assert store.derived_status(conn, axis.GENRE_AXIS, committed_id) == "pending"
+        assert store.derived_status(conn, axis.GENRE_AXIS, staged_id) == "pending"
 
         # resolve_genres refuses while anything is staged, so the staged half is checked at
         # the selection itself: an artist-only staged row leaves the file processable.

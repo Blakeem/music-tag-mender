@@ -37,7 +37,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Final
 
-from tagmend.engine import db, path_keys, schema, store
+from tagmend.engine import db, lookup_clients, path_keys, schema, store
 from tagmend.engine.detector_core import (
     TIER_RANK,
     Tier,
@@ -793,15 +793,11 @@ def detect_disagreements(  # noqa: PLR0913 - cohesive keyword-only scope + injec
             ]
 
         effective_limit = _DEFAULT_RELEASE_LIMIT if release_limit is None else release_limit
-        if client is not None:
-            report = _classify(files, client, release_limit=effective_limit)
-        else:
-            with MusicBrainzClient(
-                settings.musicbrainz_user_agent,
-                connection,
-                rate_per_sec=settings.musicbrainz_rate_per_sec,
-            ) as owned:
-                report = _classify(files, owned, release_limit=effective_limit)
+        with lookup_clients.injected_or_owned(
+            client,
+            lambda: MusicBrainzClient.from_settings(settings, connection),
+        ) as source:
+            report = _classify(files, source, release_limit=effective_limit)
     finally:
         connection.close()
 

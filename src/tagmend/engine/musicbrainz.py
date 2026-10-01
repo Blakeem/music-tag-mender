@@ -3,7 +3,7 @@
 The year-axis authority (mirrors :mod:`tagmend.engine.lastfm`'s shape). Last.fm cannot
 supply an album's year and has no album correction; MusicBrainz can — a *release-group*'s
 ``first-release-date`` is the original year (e.g. *Paranoid* = 1970), distinct from a
-reissue *release* ``date`` (the edition year). One endpoint is used:
+reissue *release* ``date`` (the edition year). Four endpoints are used:
 
 * ``/ws/2/release-group/`` (Lucene query ``artist:"…" AND releasegroup:"…"``) — ranked
   candidate release groups; we keep only ``primary-type == "Album"`` groups that carry no
@@ -14,13 +14,18 @@ reissue *release* ``date`` (the edition year). One endpoint is used:
   candidate recordings; we keep only the highest-scoring recording that has a release whose
   release group is a usable Album (same ``primary-type``/secondary-type gate) and return that
   release group's title (+ recording MBID + release-group MBID).
+* ``/ws/2/artist/<mbid>?inc=aliases``: a direct lookup by the MBID a file carries, feeding
+  ``resolve_artists``' MusicBrainz tier.
+* ``/ws/2/release/<mbid>?inc=recordings+artist-credits``: a direct release and tracklist
+  lookup, feeding ``detect_disagreements``.
 
-Each release-group lookup's parsed result is cached persistently in
-``musicbrainz_release_group_cache`` and each recording lookup's in
-``musicbrainz_recording_cache`` so every unique album/recording is queried at most once. Both
-cache keys carry a selection-rule version, so tightening those rules re-fetches instead of
-replaying a pick made under the old ones. A no-match (no usable Album release group) is
-negative-cached too.
+Each lookup's parsed result is cached persistently, so every unique entity is queried at most
+once. Release groups live in ``musicbrainz_release_group_cache``, recordings in
+``musicbrainz_recording_cache``, artists in ``musicbrainz_artist_cache`` and releases in
+``musicbrainz_release_cache``. Each cache is keyed by a request hash carrying its own version
+token, so tightening the selection or parse rules re-fetches instead of replaying an answer
+made under the old ones. A no-match (no usable Album release group, or a 404 on a lookup by
+id) is negative-cached too.
 Transient/HTTP failures raise :class:`MusicBrainzError` and are **never** cached, so a re-run
 retries them (the caller leaves the group pending, like the genre path).
 
@@ -37,11 +42,11 @@ import json
 import re
 import time
 from dataclasses import dataclass
-from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Final, Protocol, Self, cast
+from typing import TYPE_CHECKING, Final, Literal, Protocol, Self, cast, overload
 
 import httpx
 
+from tagmend.engine import clock
 from tagmend.engine.store import (
     get_cached_mb_artist,
     get_cached_mb_recording,
@@ -59,6 +64,8 @@ if TYPE_CHECKING:
     import sqlite3
     from collections.abc import Callable
     from types import TracebackType
+
+    from tagmend.config import Settings
 
 logger = get_logger(__name__)
 
@@ -206,11 +213,6 @@ class MBRelease:
     barcode: str
     media: tuple[MBMedium, ...]
 
-    @property
-    def total_tracks(self) -> int:
-        """Return the number of tracks across every medium."""
-        return sum(len(medium.tracks) for medium in self.media)
-
     def track_by_release_track_mbid(self, mbid: str) -> MBTrack | None:
         """Return the track carrying *mbid* as its release-track id, or ``None``."""
         return next(
@@ -276,10 +278,10 @@ class MBReleaseSource(Protocol):
 
 
 class MusicBrainzClient:
-    """Cached, paced MusicBrainz client for the album + recording endpoints.
+    """Cached, paced MusicBrainz client for release-group, recording, artist and release lookups.
 
-    Implements both :class:`MBReleaseGroupSource` (release-group year lookups) and
-    :class:`MBRecordingSource` (``(artist, title)`` → album, the album-gaps review tier).
+    Implements :class:`MBReleaseGroupSource`, :class:`MBRecordingSource`,
+    :class:`MBArtistSource` and :class:`MBReleaseSource`.
 
     Owns one :class:`httpx.Client` for its lifetime via the context-manager protocol; use it
     as ``with MusicBrainzClient(...) as client:``. The cache connection is supplied by the
@@ -310,6 +312,15 @@ class MusicBrainzClient:
         self._max_attempts = max(1, max_attempts)
         self._last_request_at: float | None = None
         self._client: httpx.Client | None = None
+
+    @classmethod
+    def from_settings(cls, settings: Settings, conn: sqlite3.Connection) -> Self:
+        """Build a client with the configured User-Agent and request rate."""
+        return cls(
+            settings.musicbrainz_user_agent,
+            conn,
+            rate_per_sec=settings.musicbrainz_rate_per_sec,
+        )
 
     # --- context manager: own one httpx.Client for the client's lifetime -------------
 
@@ -434,55 +445,43 @@ class MusicBrainzClient:
 
         # Output: cache the result eagerly, then return it.
         if resolved is None:
-            self._store_negative(request_key)
+            self._write_cache(
+                lambda now: put_cached_mb_release_group(
+                    self._conn,
+                    request_key=request_key,
+                    found=False,
+                    album_title=None,
+                    original_date=None,
+                    release_mbid=None,
+                    release_group_mbid=None,
+                    now=now,
+                ),
+            )
             return None
-        self._store_positive(request_key, resolved)
+        self._write_cache(
+            lambda now: put_cached_mb_release_group(
+                self._conn,
+                request_key=request_key,
+                found=True,
+                album_title=resolved.album_title,
+                original_date=resolved.original_date,
+                release_mbid=resolved.release_mbid,
+                release_group_mbid=resolved.release_group_mbid,
+                now=now,
+            ),
+        )
         return resolved
 
     def _request(self, artist: str, album: str) -> dict[str, object]:
-        """Pace, then perform one MusicBrainz GET, returning the decoded JSON object.
-
-        Raises :class:`MusicBrainzError` on an HTTP non-2xx status (transient).
-        """
-        if self._client is None:  # pragma: no cover - guard against misuse outside `with`
-            message = "MusicBrainzClient must be used as a context manager"
-            raise RuntimeError(message)
-
+        """Pace, then GET one release-group query, returning the decoded JSON object."""
         query = f'artist:"{_escape(artist)}" AND releasegroup:"{_escape(album)}"'
         logger.debug("musicbrainz request artist=%r album=%r", artist, album)
-        response = self._get_with_backoff(_API_URL, {"query": query, "fmt": "json"})
-        if response.is_error:
-            message = f"MusicBrainz HTTP {response.status_code} for release-group query"
-            raise MusicBrainzError(message)
-        return _decode_object(response, "release-group query")
-
-    def _store_negative(self, request_key: str) -> None:
-        """Negative-cache a no-match and commit immediately."""
-        put_cached_mb_release_group(
-            self._conn,
-            request_key=request_key,
-            found=False,
-            album_title=None,
-            original_date=None,
-            release_mbid=None,
-            release_group_mbid=None,
-            now=_utc_now(),
+        return self._get_json(
+            _API_URL,
+            {"query": query, "fmt": "json"},
+            not_found_ok=False,
+            what="release-group query",
         )
-        self._conn.commit()
-
-    def _store_positive(self, request_key: str, album: MBReleaseGroup) -> None:
-        """Positive-cache a resolved album and commit immediately."""
-        put_cached_mb_release_group(
-            self._conn,
-            request_key=request_key,
-            found=True,
-            album_title=album.album_title,
-            original_date=album.original_date,
-            release_mbid=album.release_mbid,
-            release_group_mbid=album.release_group_mbid,
-            now=_utc_now(),
-        )
-        self._conn.commit()
 
     def _fetch_and_cache_recording(
         self,
@@ -499,53 +498,41 @@ class MusicBrainzClient:
 
         # Output: cache the result eagerly, then return it.
         if resolved is None:
-            self._store_negative_recording(request_key)
+            self._write_cache(
+                lambda now: put_cached_mb_recording(
+                    self._conn,
+                    request_key=request_key,
+                    found=False,
+                    album_title=None,
+                    release_group_mbid=None,
+                    recording_mbid=None,
+                    now=now,
+                ),
+            )
             return None
-        self._store_positive_recording(request_key, resolved)
+        self._write_cache(
+            lambda now: put_cached_mb_recording(
+                self._conn,
+                request_key=request_key,
+                found=True,
+                album_title=resolved.album_title,
+                release_group_mbid=resolved.release_group_mbid,
+                recording_mbid=resolved.recording_mbid,
+                now=now,
+            ),
+        )
         return resolved
 
     def _request_recording(self, artist: str, title: str) -> dict[str, object]:
-        """Pace, then perform one MusicBrainz recording GET, returning the decoded JSON.
-
-        Raises :class:`MusicBrainzError` on an HTTP non-2xx status (transient).
-        """
-        if self._client is None:  # pragma: no cover - guard against misuse outside `with`
-            message = "MusicBrainzClient must be used as a context manager"
-            raise RuntimeError(message)
-
+        """Pace, then GET one recording query, returning the decoded JSON object."""
         query = f'artist:"{_escape(artist)}" AND recording:"{_escape(title)}"'
         logger.debug("musicbrainz recording request artist=%r title=%r", artist, title)
-        response = self._get_with_backoff(_RECORDING_API_URL, {"query": query, "fmt": "json"})
-        if response.is_error:
-            message = f"MusicBrainz HTTP {response.status_code} for recording query"
-            raise MusicBrainzError(message)
-        return _decode_object(response, "recording query")
-
-    def _store_negative_recording(self, request_key: str) -> None:
-        """Negative-cache a recording no-match and commit immediately."""
-        put_cached_mb_recording(
-            self._conn,
-            request_key=request_key,
-            found=False,
-            album_title=None,
-            release_group_mbid=None,
-            recording_mbid=None,
-            now=_utc_now(),
+        return self._get_json(
+            _RECORDING_API_URL,
+            {"query": query, "fmt": "json"},
+            not_found_ok=False,
+            what="recording query",
         )
-        self._conn.commit()
-
-    def _store_positive_recording(self, request_key: str, recording: MBRecording) -> None:
-        """Positive-cache a resolved recording and commit immediately."""
-        put_cached_mb_recording(
-            self._conn,
-            request_key=request_key,
-            found=True,
-            album_title=recording.album_title,
-            release_group_mbid=recording.release_group_mbid,
-            recording_mbid=recording.recording_mbid,
-            now=_utc_now(),
-        )
-        self._conn.commit()
 
     def _fetch_and_cache_artist(self, mbid: str, request_key: str) -> MBArtist | None:
         """Fetch one artist lookup over the network (paced), then cache eagerly."""
@@ -557,56 +544,42 @@ class MusicBrainzClient:
 
         # Output: cache the result eagerly, then return it.
         if resolved is None:
-            self._store_negative_artist(request_key)
+            self._write_cache(
+                lambda now: put_cached_mb_artist(
+                    self._conn,
+                    request_key=request_key,
+                    found=False,
+                    name=None,
+                    sort_name=None,
+                    disambiguation=None,
+                    aliases=(),
+                    now=now,
+                ),
+            )
             return None
-        self._store_positive_artist(request_key, resolved)
+        self._write_cache(
+            lambda now: put_cached_mb_artist(
+                self._conn,
+                request_key=request_key,
+                found=True,
+                name=resolved.name,
+                sort_name=resolved.sort_name,
+                disambiguation=resolved.disambiguation,
+                aliases=resolved.aliases,
+                now=now,
+            ),
+        )
         return resolved
 
     def _request_artist(self, mbid: str) -> dict[str, object] | None:
         """Pace, then GET one artist by id; ``None`` on a 404 (a real "no such artist")."""
-        if self._client is None:  # pragma: no cover - guard against misuse outside `with`
-            message = "MusicBrainzClient must be used as a context manager"
-            raise RuntimeError(message)
-
         logger.debug("musicbrainz artist request mbid=%r", mbid)
-        response = self._get_with_backoff(
+        return self._get_json(
             f"{_ARTIST_API_URL}{mbid}",
             {"inc": "aliases", "fmt": "json"},
+            not_found_ok=True,
+            what="artist lookup",
         )
-        if response.status_code == _HTTP_NOT_FOUND:
-            return None
-        if response.is_error:
-            message = f"MusicBrainz HTTP {response.status_code} for artist lookup"
-            raise MusicBrainzError(message)
-        return _decode_object(response, "artist lookup")
-
-    def _store_negative_artist(self, request_key: str) -> None:
-        """Negative-cache an MBID MusicBrainz does not know, and commit immediately."""
-        put_cached_mb_artist(
-            self._conn,
-            request_key=request_key,
-            found=False,
-            name=None,
-            sort_name=None,
-            disambiguation=None,
-            aliases=(),
-            now=_utc_now(),
-        )
-        self._conn.commit()
-
-    def _store_positive_artist(self, request_key: str, artist: MBArtist) -> None:
-        """Cache a resolved artist lookup and commit immediately."""
-        put_cached_mb_artist(
-            self._conn,
-            request_key=request_key,
-            found=True,
-            name=artist.name,
-            sort_name=artist.sort_name,
-            disambiguation=artist.disambiguation,
-            aliases=artist.aliases,
-            now=_utc_now(),
-        )
-        self._conn.commit()
 
     def _fetch_and_cache_release(self, mbid: str, request_key: str) -> MBRelease | None:
         """Fetch one release lookup over the network (paced), then cache eagerly."""
@@ -618,42 +591,84 @@ class MusicBrainzClient:
 
         # Output: cache the result eagerly, then return it.
         if resolved is None:
-            put_cached_mb_release(
+            self._write_cache(
+                lambda now: put_cached_mb_release(
+                    self._conn,
+                    request_key=request_key,
+                    found=False,
+                    payload=None,
+                    now=now,
+                ),
+            )
+            return None
+        payload = _release_to_json(resolved)
+        self._write_cache(
+            lambda now: put_cached_mb_release(
                 self._conn,
                 request_key=request_key,
-                found=False,
-                payload=None,
-                now=_utc_now(),
-            )
-            self._conn.commit()
-            return None
-        put_cached_mb_release(
-            self._conn,
-            request_key=request_key,
-            found=True,
-            payload=_release_to_json(resolved),
-            now=_utc_now(),
+                found=True,
+                payload=payload,
+                now=now,
+            ),
         )
-        self._conn.commit()
         return resolved
 
     def _request_release(self, mbid: str) -> dict[str, object] | None:
         """Pace, then GET one release by id; ``None`` on a 404 (a real "no such release")."""
-        if self._client is None:  # pragma: no cover - guard against misuse outside `with`
-            message = "MusicBrainzClient must be used as a context manager"
-            raise RuntimeError(message)
-
         logger.debug("musicbrainz release request mbid=%r", mbid)
-        response = self._get_with_backoff(
+        return self._get_json(
             f"{_RELEASE_API_URL}{mbid}",
             {"inc": "recordings+artist-credits", "fmt": "json"},
+            not_found_ok=True,
+            what="release lookup",
         )
-        if response.status_code == _HTTP_NOT_FOUND:
+
+    def _write_cache(self, write: Callable[[str], None]) -> None:
+        """Run one cache write stamped with the current UTC time, then commit it."""
+        # Committing each write eagerly keeps prior cache work when a later lookup fails.
+        write(clock.utc_now())
+        self._conn.commit()
+
+    @overload
+    def _get_json(
+        self,
+        url: str,
+        params: dict[str, str],
+        *,
+        not_found_ok: Literal[False],
+        what: str,
+    ) -> dict[str, object]: ...
+
+    @overload
+    def _get_json(
+        self,
+        url: str,
+        params: dict[str, str],
+        *,
+        not_found_ok: Literal[True],
+        what: str,
+    ) -> dict[str, object] | None: ...
+
+    def _get_json(
+        self,
+        url: str,
+        params: dict[str, str],
+        *,
+        not_found_ok: bool,
+        what: str,
+    ) -> dict[str, object] | None:
+        """GET *url* and decode its JSON object body, or raise :class:`MusicBrainzError`.
+
+        A 404 returns ``None`` only when *not_found_ok*, because a lookup by id treats it as
+        the real answer "no such entity" while a search never answers 404.
+        """
+        response = self._get_with_backoff(url, params)
+        if not_found_ok and response.status_code == _HTTP_NOT_FOUND:
             return None
         if response.is_error:
-            message = f"MusicBrainz HTTP {response.status_code} for release lookup"
+            message = f"MusicBrainz HTTP {response.status_code} for {what}"
             raise MusicBrainzError(message)
-        return _decode_object(response, "release lookup")
+        return _decode_object(response, what)
 
     def _get_with_backoff(self, url: str, params: dict[str, str]) -> httpx.Response:
         """Pace, then GET *url*, retrying only while MusicBrainz answers with its throttle code.
@@ -1163,8 +1178,3 @@ def _first_release_mbid(entry: dict[str, object]) -> str | None:
         if isinstance(rid, str) and rid:
             return rid
     return None
-
-
-def _utc_now() -> str:
-    """Return the current time as an ISO-8601 UTC string (the engine's timestamp form)."""
-    return datetime.now(UTC).isoformat()

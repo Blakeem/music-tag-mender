@@ -44,11 +44,10 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field, replace
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
-from tagmend.engine import axis, db, path_keys, schema, store
+from tagmend.engine import axis, clock, db, path_keys, schema, store
 from tagmend.engine.detector_core import (
     TIER_RANK,
     Tier,
@@ -74,11 +73,6 @@ _DETECT_FIELDS: Final = ("albumartist", "artist")
 # The dispositions :func:`set_mismatch_status` may write. ``pending`` deletes the row
 # (re-queue). There is no ``staged``/``done`` on this axis — an accepted fix needs no row.
 _USER_MISMATCH_STATUSES: Final = frozenset({"legit_ignore", "misfiled_deferred", "pending"})
-
-
-def _utc_now() -> str:
-    """Return the current time as an ISO-8601 UTC string (the engine's timestamp form)."""
-    return datetime.now(UTC).isoformat()
 
 
 # Library-wide path-disagreement rate above which the path signal is deemed unreliable
@@ -955,7 +949,7 @@ def set_mismatch_status(
     try:
         schema.apply_schema(connection)
         scoped = _mismatch_scope(connection, file_ids=file_ids, value=value)
-        now = _utc_now()
+        now = clock.utc_now()
         for fid in scoped:
             if status == "pending":
                 store.delete_mismatch_status(connection, fid)

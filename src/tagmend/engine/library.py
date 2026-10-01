@@ -18,14 +18,13 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
 import mutagen
 
-from tagmend.engine import axis, db, genres, path_keys, scan, schema, store, versioning
+from tagmend.engine import axis, clock, db, path_keys, scan, schema, store, versioning
 from tagmend.engine.tags import TAG_READER_VERSION, read_tags
 from tagmend.engine.validation import check_limit, require_choice
 from tagmend.log import get_logger
@@ -91,20 +90,19 @@ class FileView:
 def _to_view(conn: sqlite3.Connection, row: store.FileRow) -> FileView:
     """Build a :class:`FileView` from a file row, reading its managed-tag subset.
 
-    Also resolves the file's genre and artist workflow statuses (each FIELD-AWARE on its
-    own tag). For a stored ``no_match``/``manual`` decision the source values it was
-    recorded against ride along so a reviewer can compare them with the current
-    ``managed_tags`` and judge staleness.
+    Also resolves the file's genre, artist, year and mismatch statuses. For a stored decision
+    the source values it was recorded against ride along so a reviewer can compare them with
+    the current ``managed_tags`` and judge staleness.
     """
-    genre_status = store.derived_genre_status(conn, row.id)
+    genre_status = store.derived_status(conn, axis.GENRE_AXIS, row.id)
     genre_decision = store.get_genre_status(conn, row.id)
     has_stored_genre = genre_decision is not None and genre_status == genre_decision.status
 
-    artist_status = store.derived_artist_status(conn, row.id)
+    artist_status = store.derived_status(conn, axis.ARTIST_AXIS, row.id)
     artist_decision = store.get_artist_status(conn, row.id)
     has_stored_artist = artist_decision is not None and artist_status == artist_decision.status
 
-    year_status = store.derived_year_status(conn, row.id)
+    year_status = store.derived_status(conn, axis.YEAR_AXIS, row.id)
     year_decision = store.get_year_status(conn, row.id)
     has_stored_year = year_decision is not None and year_status == year_decision.status
 
@@ -163,11 +161,20 @@ def _row_matches_status(  # noqa: PLR0913 - cohesive keyword-only status filters
     Each non-``None`` filter must match the file's derived status on that axis (the axes are
     independent and field-aware); a ``None`` filter is ignored.
     """
-    if genre_status is not None and store.derived_genre_status(conn, file_id) != genre_status:
+    if (
+        genre_status is not None
+        and store.derived_status(conn, axis.GENRE_AXIS, file_id) != genre_status
+    ):
         return False
-    if artist_status is not None and store.derived_artist_status(conn, file_id) != artist_status:
+    if (
+        artist_status is not None
+        and store.derived_status(conn, axis.ARTIST_AXIS, file_id) != artist_status
+    ):
         return False
-    if year_status is not None and store.derived_year_status(conn, file_id) != year_status:
+    if (
+        year_status is not None
+        and store.derived_status(conn, axis.YEAR_AXIS, file_id) != year_status
+    ):
         return False
     return not (
         mismatch_status is not None
@@ -345,7 +352,7 @@ def list_albums(
         blanks: dict[tuple[str | None, str], int] = {}
         for fid in store.files_in_scope(connection):
             tags = store.get_tags(connection, fid)
-            identity = genres._identity(tags)  # noqa: SLF001
+            identity = axis.lookup_identity(tags)
             if identity.album is None:
                 continue
             key = (identity.artist, identity.album)
@@ -358,7 +365,7 @@ def list_albums(
                 artist=artist,
                 album=album,
                 file_count=len(fids),
-                year_status=store.derived_year_status(connection, fids[0]),
+                year_status=store.derived_status(connection, axis.YEAR_AXIS, fids[0]),
                 blank_originaldate=blanks.get((artist, album), 0),
             )
             for (artist, album), fids in groups.items()
@@ -441,11 +448,6 @@ class _Counters:
             errors=self.errors,
             respelled=self.respelled,
         )
-
-
-def _utc_now() -> str:
-    """Return the current time as an ISO-8601 UTC string."""
-    return datetime.now(UTC).isoformat()
 
 
 def scan_library(
@@ -564,7 +566,9 @@ def _process_file(
         _process_new_file(conn, path, mode, counters, folder, filename, ext, size_bytes, mtime_ns)
         return
     if (existing.folder, existing.filename) != (folder, filename):
-        store.update_location(conn, existing.id, folder=folder, filename=filename, now=_utc_now())
+        store.update_location(
+            conn, existing.id, folder=folder, filename=filename, now=clock.utc_now()
+        )
         counters.respelled += 1
     _process_existing_file(conn, path, mode, counters, existing, size_bytes, mtime_ns)
 
@@ -581,7 +585,7 @@ def _process_new_file(  # noqa: PLR0913 - cohesive insert payload, all required
     mtime_ns: int,
 ) -> None:
     """Insert a never-seen file and, unless in PRESENCE mode, read its tags."""
-    now = _utc_now()
+    now = clock.utc_now()
     file_id = store.insert_file(
         conn,
         folder=folder,
@@ -610,7 +614,7 @@ def _process_existing_file(  # noqa: PLR0913 - cohesive reconcile inputs, all re
 ) -> None:
     """Reconcile a previously-seen file: restore, update signature, maybe re-read tags."""
     counters.seen_ids.add(existing.id)
-    now = _utc_now()
+    now = clock.utc_now()
 
     if existing.is_missing:
         store.clear_missing(conn, existing.id, now)
@@ -683,7 +687,7 @@ def _try_read_and_store(
     store.stamp_reader_version(conn, file_id)
     if new_tags == current:
         return
-    store.replace_tags(conn, file_id, new_tags, _utc_now())
+    store.replace_tags(conn, file_id, new_tags, clock.utc_now())
     # tags_read counts files whose tags were re-read AND actually differed from the
     # stored snapshot (i.e. re-persisted this run); an identical re-read is an honest
     # no-op and is not tallied (see test_full_mode_honest_noop_then_reread). This is
@@ -693,7 +697,7 @@ def _try_read_and_store(
 
 def _reconcile_missing(conn: sqlite3.Connection, root: Path, counters: _Counters) -> None:
     """Flag tracked files under *root* that were not seen on this pass."""
-    now = _utc_now()
+    now = clock.utc_now()
     for row in store.tracked_files_under(conn, path_keys.path_key(root)):
         if row.id in counters.seen_ids or row.is_missing:
             continue

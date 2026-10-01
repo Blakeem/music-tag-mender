@@ -26,8 +26,8 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
-# Well-known ping targets — fixed, uncontroversial entities that exercise each authority's
-# only read endpoint. The result is discarded; we only care that the round-trip succeeded.
+# Fixed, uncontroversial entities for one live round-trip per authority. The result is
+# discarded.
 _LASTFM_PING_ARTIST: Final = "Radiohead"
 _MB_PING_ARTIST: Final = "Black Sabbath"
 _MB_PING_ALBUM: Final = "Paranoid"

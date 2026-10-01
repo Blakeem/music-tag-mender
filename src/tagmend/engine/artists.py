@@ -1,19 +1,29 @@
-"""Artist-name normalization: select → Last.fm getCorrection → cascade-stage (M4 phase 1).
+"""Artist-name normalization: select, MusicBrainz by MBID, Last.fm getCorrection, cascade-stage.
 
-The artist-side mirror of :mod:`tagmend.engine.genres`. It ties the read path, the cached
-Last.fm correction client, and the revertible staging engine together: for each distinct
-``artist``/``albumartist`` value in scope it looks up the canonical name via
-:meth:`tagmend.engine.lastfm.LastfmClient.artist_correction`, and where the canonical form
-differs it cascade-stages the corrected name across every file carrying that value
-(rewriting ``artist`` and/or ``albumartist``, exact-match only) plus the correction's
-``musicbrainz_artistid`` — through the existing ``origin='auto'`` commit engine.
+The artist-side mirror of :mod:`tagmend.engine.genres`. Where a value's canonical form
+differs, it cascade-stages the corrected name across every file carrying that value
+(rewriting ``artist`` and/or ``albumartist``, exact-match only) through the ``origin='auto'``
+commit engine. Two lookup tiers decide the canonical form, in order.
+
+The MusicBrainz name tier handles every value whose files carry ``musicbrainz_artistid`` (or
+``musicbrainz_albumartistid`` for ``albumartist``) and looks the artist up by that id through
+:meth:`tagmend.engine.musicbrainz.MusicBrainzClient.artist_by_mbid` (cached in
+``musicbrainz_artist_cache``). It accepts a spelling that folds to the canonical name
+(``source: musicbrainz``) or to a registered alias (``source: musicbrainz_alias``).
+
+The Last.fm tier sees only the values left over. It asks
+:meth:`tagmend.engine.lastfm.LastfmClient.artist_correction` for each one (cached in
+``lastfm_correction_cache``).
 
 Design notes (the spec):
 
-* **No accidental deletion (P0):** the resolver stages only the fields it decides (the
-  name fields plus each one's own id and sort field), and
+* **No accidental deletion (P0):** the resolver stages only the fields it decides, and
   :func:`tagmend.engine.staging._stage_one` merges them onto the tags read from disk, so the
-  commit's delete-on-absent write can never drop ``genre`` or any other managed tag.
+  commit's delete-on-absent write can never drop ``genre`` or any other managed tag. Each
+  corrected field writes its own id field, and on the MusicBrainz tier its own sort field
+  (``artist`` with ``musicbrainz_artistid`` and ``artistsort``, ``albumartist`` with
+  ``musicbrainz_albumartistid`` and ``albumartistsort``). Last.fm publishes no sort name, so
+  its tier leaves the sort field untouched.
 * **Per-file accumulation:** a file whose ``artist`` and ``albumartist`` both need
   correction is staged once with both fields set (not two passes clobbering each other).
 * **Guards (skip + report, never rewrite):** the ``feat``/``ft``/``featuring`` family,
@@ -26,9 +36,12 @@ Design notes (the spec):
   regardless of MBID — the ``&``/``with``/``vs`` family the pre-lookup ``feat`` guard cannot
   see. A correction MusicBrainz does not corroborate (no MBID) is held for review. Held
   values are reported, never written.
-* **"Done" is derived**, never stored — re-running after commit is a no-op because an
-  already-canonical value yields no change. getCorrection results live in
-  ``lastfm_correction_cache``.
+* **Name/id disagreement (held, not staged):** a name MusicBrainz records under neither its
+  canonical form nor an alias for the file's own id, or a value the library pairs with two
+  different ids, lands in ``name_id_disagreement`` for review.
+* **"Done" is derived**, never stored. Re-running after commit is a no-op because an
+  already-canonical value yields no change. MusicBrainz results live in
+  ``musicbrainz_artist_cache`` and getCorrection results in ``lastfm_correction_cache``.
 
 Like the rest of the conn-owning layer, the public function here owns its connection and
 commits; the building blocks in :mod:`tagmend.engine.store` never commit.
@@ -38,10 +51,9 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Final
 
-from tagmend.engine import axis, db, schema, staging, store
+from tagmend.engine import axis, clock, db, lookup_clients, schema, staging, store
 from tagmend.engine.lastfm import LastfmClient, LastfmError
 from tagmend.engine.musicbrainz import MusicBrainzClient, MusicBrainzError
 from tagmend.engine.text_keys import artist_name_key
@@ -105,11 +117,6 @@ _SORT_FIELDS: Final[Mapping[str, str]] = {
 _SOURCE_MB: Final = "musicbrainz"
 _SOURCE_MB_ALIAS: Final = "musicbrainz_alias"
 _SOURCE_LASTFM: Final = "lastfm"
-
-
-def _utc_now() -> str:
-    """Return the current time as an ISO-8601 UTC string (the engine's timestamp form)."""
-    return datetime.now(UTC).isoformat()
 
 
 def _is_feat(value: str) -> bool:
@@ -266,28 +273,34 @@ def resolve_artists(  # noqa: PLR0913 - cohesive keyword-only scope + injection 
 ) -> ResolveArtistsResult:
     """Normalize artist names: look up canonical forms and cascade-stage the changes.
 
-    Gathers the distinct ``artist`` + ``albumartist`` values in scope, drops the guarded
-    ones (empty / ``feat.`` / compilation sentinels), looks up each remaining value's
-    canonical name via *client* (cached/paced), and builds a ``value → correction`` map of
-    those that actually change. Then per file in scope it skips + reports any file whose
-    ``artist``/``albumartist`` is multi-value, and otherwise stages the corrected name(s)
-    plus the correction's MBID as an ``origin='auto'`` change (only ``artist`` /
-    ``albumartist`` / ``musicbrainz_artistid`` touched — every other managed tag preserved).
+    Gathers the distinct ``artist`` + ``albumartist`` values in scope and drops the guarded
+    ones (empty / ``feat.`` / compilation sentinels). A value whose files carry its own MBID
+    is looked up by that id on MusicBrainz via *mb_client* first. Every value left over is
+    looked up on Last.fm getCorrection via *client*. Both tiers are cached and paced, and
+    together they build a ``value → correction`` map of the values that actually change. Then
+    per file in scope it skips + reports any file whose ``artist``/``albumartist`` is
+    multi-value, and otherwise stages the corrected name(s) as an ``origin='auto'`` change.
+    Each corrected field writes its own id field, and on the MusicBrainz tier its own sort
+    field. Every other managed tag is preserved.
 
     *limit* caps the number of distinct values processed per call and the remainder is
     reported via ``pending_remaining`` / ``more``. It is a cap, not a cursor: a value that
     needs no change leaves no trace, so an identical repeat call re-processes the same
     values. Raise *limit*, or narrow with *artist* / *file_ids*, to reach the rest. A
     negative *limit* raises :class:`ValueError`. A file the last scan flagged missing is
-    counted under ``skipped_missing``. A transient Last.fm error leaves that value pending
-    (not cached) and is reported, never aborting.
+    counted under ``skipped_missing``. A transient lookup error on either tier leaves that
+    value pending (not cached) and is reported, never aborting.
 
     *dry_run* returns the proposed ``value → canonical`` mappings and the would-stage file
-    count, stages nothing, and works from cache (no precondition). A non-dry-run raises
-    :class:`ValueError` if anything is already staged ("commit or unstage pending changes
-    first"). *client* lets callers inject a :class:`tagmend.engine.lastfm.CorrectionSource`
-    (a fake in tests); when ``None`` a real :class:`LastfmClient` is built and requires
-    ``settings.lastfm_api_key``. Owns its connection; ``stage_tags`` opens its own.
+    count and stages nothing. Lookups still run. A cached answer costs nothing and a cache
+    miss makes a live request. A dry run skips the empty-staging precondition. A non-dry-run
+    raises :class:`ValueError` if anything is already staged ("commit or unstage pending
+    changes first"). *client* lets callers inject a
+    :class:`tagmend.engine.lastfm.CorrectionSource` (a fake in tests). When ``None`` a real
+    :class:`LastfmClient` is built and requires ``settings.lastfm_api_key``. *mb_client*
+    injects an :class:`tagmend.engine.musicbrainz.MBArtistSource` the same way, and when
+    ``None`` a real :class:`MusicBrainzClient` is built. Owns its connection, and
+    ``stage_tags`` opens its own.
     """
     check_limit(limit)
     connection = db.connect(settings.db_path)
@@ -349,8 +362,8 @@ def _drop_manual_excluded(
     """Drop sticky ``manual`` files from scope, recording them in *tally*.
 
     A ``manual`` file is ALWAYS skipped (no staleness re-check): its values are neither
-    looked up nor staged. The mirror of the user-facing
-    :func:`tagmend.engine.store.derived_artist_status` ``manual`` state.
+    looked up nor staged. The mirror of the user-facing ``manual`` state that
+    :func:`tagmend.engine.store.derived_status` derives on ``axis.ARTIST_AXIS``.
     """
     kept: list[int] = []
     for fid in candidate_ids:
@@ -367,7 +380,8 @@ def _decision_blocks(decision: store.ArtistStatusRow) -> bool:
     """Whether a stored artist decision still blocks processing (sticky ``manual``).
 
     The shared sticky rule lives on the axis, so this skip path and the user-facing
-    :func:`tagmend.engine.store.derived_artist_status` can never drift. The artist axis has
+    :func:`tagmend.engine.store.derived_status` on ``axis.ARTIST_AXIS`` can never drift. The
+    artist axis has
     no staleness re-check, so the current identity is irrelevant.
     """
     return axis.ARTIST_AXIS.decision_blocks(
@@ -472,15 +486,11 @@ def _resolve_by_mbid(  # noqa: PLR0913 - cohesive scope + injection params, mirr
     settled = set(ambiguous)
     lookups = [value for value in with_ids if len(pairing[value]) == 1]
     if lookups:
-        if client is not None:
-            settled |= _lookup_each(lookups, pairing, client, tally)
-        else:
-            with MusicBrainzClient(
-                settings.musicbrainz_user_agent,
-                conn,
-                rate_per_sec=settings.musicbrainz_rate_per_sec,
-            ) as owned:
-                settled |= _lookup_each(lookups, pairing, owned, tally)
+        with lookup_clients.injected_or_owned(
+            client,
+            lambda: MusicBrainzClient.from_settings(settings, conn),
+        ) as source:
+            settled |= _lookup_each(lookups, pairing, source, tally)
 
     return [value for value in values if value not in settled]
 
@@ -567,21 +577,12 @@ def _resolve_values(
     tally: _Tally,
 ) -> None:
     """Look up each value's correction via *client* (built if None); fill ``tally.corrections``."""
-    if client is not None:
+    with lookup_clients.injected_or_owned(
+        client,
+        lambda: LastfmClient.from_settings(settings, conn),
+    ) as source:
         for value in values:
-            _resolve_one_value(value, client, tally)
-        return
-
-    if not settings.lastfm_api_key:
-        message = "no Last.fm API key configured — run `tagmend config-set lastfm_api_key <key>`"
-        raise ValueError(message)
-    with LastfmClient(
-        settings.lastfm_api_key,
-        conn,
-        rate_per_sec=settings.lastfm_rate_per_sec,
-    ) as owned_client:
-        for value in values:
-            _resolve_one_value(value, owned_client, tally)
+            _resolve_one_value(value, source, tally)
 
 
 def _resolve_one_value(
@@ -862,7 +863,7 @@ def set_artist_status(
     try:
         schema.apply_schema(connection)
         scoped = _artist_scope(connection, file_ids=file_ids, value=value)
-        now = _utc_now()
+        now = clock.utc_now()
         for fid in scoped:
             if status == "manual":
                 tags = store.get_tags(connection, fid)

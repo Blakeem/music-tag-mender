@@ -15,10 +15,9 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Final, cast
 
-from tagmend.engine import axis, db, path_keys
+from tagmend.engine import axis, clock, db, path_keys
 from tagmend.engine.tags import MANAGED_SET_VERSION, TAG_READER_VERSION
 from tagmend.log import get_logger
 
@@ -293,9 +292,9 @@ def compute_stats(conn: sqlite3.Connection) -> dict[str, object]:
         "unprocessed": unprocessed,
         "total_tag_values": total_tag_values,
         "by_ext": by_ext,
-        "genre": genre_status_counts(conn),
-        "artist": artist_status_counts(conn),
-        "year": year_status_counts(conn),
+        "genre": status_counts(conn, axis.GENRE_AXIS),
+        "artist": status_counts(conn, axis.ARTIST_AXIS),
+        "year": status_counts(conn, axis.YEAR_AXIS),
         "mismatch": mismatch_status_counts(conn),
     }
 
@@ -994,11 +993,9 @@ def put_cached_mb_release(
 
 # --- file_<axis>_status (per-file workflow decisions; PLAN — Status model) -----------
 #
-# The genre/artist status machinery is ONE parameterized concept; the per-axis config and
-# the status-row CRUD live in :mod:`tagmend.engine.axis`. The named wrappers below keep the
-# historic ``*_genre_status`` / ``*_artist_status`` call sites and their row types
-# (``GenreStatusRow`` / ``ArtistStatusRow``, each surfacing its own source-column names) so
-# the rest of the engine, the MCP layer, and the tests are unchanged.
+# The per-axis status machinery is ONE parameterized concept in :mod:`tagmend.engine.axis`.
+# The row wrappers below serve the genre, artist, year and mismatch axes, and each row type
+# surfaces its own source-column names.
 
 
 @dataclass(frozen=True, slots=True)
@@ -1078,15 +1075,6 @@ def any_staged(conn: sqlite3.Connection) -> bool:
     return bool(row[0])
 
 
-def has_auto_revision(conn: sqlite3.Connection, file_id: int) -> bool:
-    """Return whether *file_id* has a committed ``origin='auto'`` revision."""
-    row = conn.execute(
-        "SELECT EXISTS(SELECT 1 FROM tag_revisions WHERE file_id = ? AND origin = 'auto')",
-        (file_id,),
-    ).fetchone()
-    return bool(row[0])
-
-
 def has_auto_change_for(
     conn: sqlite3.Connection,
     file_id: int,
@@ -1149,7 +1137,7 @@ def void_auto_changes(
     current = max_version(conn, file_id)
     if current is None:
         return
-    now = datetime.now(UTC).isoformat()
+    now = clock.utc_now()
     conn.executemany(
         """
         INSERT OR REPLACE INTO voided_auto
@@ -1163,10 +1151,10 @@ def void_auto_changes(
 def has_identity(conn: sqlite3.Connection, file_id: int) -> bool:
     """Return whether *file_id* carries any non-blank ``artist`` or ``albumartist`` value.
 
-    The store-side twin of :func:`tagmend.engine.genres._identity`'s blankness rule, kept
+    The store-side twin of :func:`tagmend.engine.axis.lookup_identity`'s blankness rule, kept
     PROVABLY identical: both treat a file as having identity exactly when at least one
-    ``artist`` or ``albumartist`` value is non-blank at ANY ordinal (``_identity`` returns a
-    non-``None`` artist iff its ``_first_nonblank`` scan finds one, so a real value at a later
+    ``artist`` or ``albumartist`` value is non-blank at ANY ordinal (``lookup_identity`` returns
+    a non-``None`` artist iff its ``first_nonblank`` scan finds one, so a real value at a later
     ordinal counts even when ordinal 0 is blank — the file is looked up and processed, hence
     is NOT a no-identity orphan). It fetches every ``artist``/``albumartist`` value in ONE
     indexed query (the ``file_tags`` PK covers the ``file_id``/``name`` prefix) and decides
@@ -1234,23 +1222,6 @@ def derived_status(conn: sqlite3.Connection, axis_: axis.Axis, file_id: int) -> 
     if not has_identity(conn, file_id):
         return "no_identity"
     return "pending"
-
-
-def derived_genre_status(conn: sqlite3.Connection, file_id: int) -> str:
-    """Return *file_id*'s genre workflow status: staged | done | no_match | manual | pending.
-
-    Thin wrapper over :func:`derived_status` for the genre axis. See it for the full rule.
-    """
-    return derived_status(conn, axis.GENRE_AXIS, file_id)
-
-
-def genre_status_counts(conn: sqlite3.Connection) -> dict[str, int]:
-    """Return file counts per genre workflow status, every axis key always present.
-
-    One pass over every tracked file via :func:`derived_genre_status` (the single source
-    of truth), so the counts and the per-file status can never drift.
-    """
-    return status_counts(conn, axis.GENRE_AXIS)
 
 
 def status_counts(conn: sqlite3.Connection, axis_: axis.Axis) -> dict[str, int]:
@@ -1329,25 +1300,6 @@ def delete_artist_status(conn: sqlite3.Connection, file_id: int) -> None:
     axis.delete_status(conn, axis.ARTIST_AXIS, file_id)
 
 
-def derived_artist_status(conn: sqlite3.Connection, file_id: int) -> str:
-    """Return *file_id*'s artist workflow status: staged | done | manual | pending.
-
-    Thin wrapper over :func:`derived_status` for the artist axis. There is no ``no_match``
-    state on this axis; ``manual`` is sticky (always skipped by ``resolve_artists``) but
-    ranks below an actual staged/committed name change.
-    """
-    return derived_status(conn, axis.ARTIST_AXIS, file_id)
-
-
-def artist_status_counts(conn: sqlite3.Connection) -> dict[str, int]:
-    """Return file counts per artist workflow status, every axis key always present.
-
-    One pass over every tracked file via :func:`derived_artist_status` (the single source
-    of truth), so the counts and the per-file status can never drift.
-    """
-    return status_counts(conn, axis.ARTIST_AXIS)
-
-
 # --- file_year_status (terminal year decisions; year-axis twin of genre) -------------
 
 # The year workflow states (re-exported from the year axis). Two are stored
@@ -1411,23 +1363,6 @@ def set_year_status(  # noqa: PLR0913 - cohesive keyword-only status payload
 def delete_year_status(conn: sqlite3.Connection, file_id: int) -> None:
     """Remove *file_id*'s terminal year decision (no-op if none)."""
     axis.delete_status(conn, axis.YEAR_AXIS, file_id)
-
-
-def derived_year_status(conn: sqlite3.Connection, file_id: int) -> str:
-    """Return *file_id*'s year workflow status: staged | done | no_match | manual | pending.
-
-    Thin wrapper over :func:`derived_status` for the year axis (keyed on ``originaldate``).
-    """
-    return derived_status(conn, axis.YEAR_AXIS, file_id)
-
-
-def year_status_counts(conn: sqlite3.Connection) -> dict[str, int]:
-    """Return file counts per year workflow status, every axis key always present.
-
-    One pass over every tracked file via :func:`derived_year_status` (the single source
-    of truth), so the counts and the per-file status can never drift.
-    """
-    return status_counts(conn, axis.YEAR_AXIS)
 
 
 # --- file_mismatch_status (per-file mismatch dispositions; mismatch-axis twin) --------
@@ -1561,20 +1496,6 @@ def distinct_artists(conn: sqlite3.Connection) -> list[tuple[str, int]]:
     return [(str(row[0]), db.as_int(row[1])) for row in cursor.fetchall()]
 
 
-def distinct_albumartists(conn: sqlite3.Connection) -> list[tuple[str, int]]:
-    """Return each distinct ``albumartist`` tag value with its file count, ordered by value."""
-    cursor = conn.execute(
-        """
-        SELECT value, COUNT(DISTINCT file_id)
-        FROM file_tags
-        WHERE name = 'albumartist'
-        GROUP BY value
-        ORDER BY value
-        """,
-    )
-    return [(str(row[0]), db.as_int(row[1])) for row in cursor.fetchall()]
-
-
 def load_tag_values(
     conn: sqlite3.Connection,
     names: tuple[str, ...],
@@ -1585,7 +1506,7 @@ def load_tag_values(
     primary value), so a caller needing a few scalar fields across the whole library avoids
     the N+1 :func:`get_tags` loop. A file missing every requested tag is simply absent from
     the result; a file with only some carries only those. Mirrors the read-only, aggregate
-    style of :func:`distinct_albumartists`.
+    style of :func:`distinct_artists`.
     """
     if not names:
         return {}

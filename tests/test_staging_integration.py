@@ -22,7 +22,7 @@ from mutagen.id3 import ID3, TYER, MakeID3v1  # type: ignore[attr-defined]
 from conftest import make_track
 from tagmend import mcp_server
 from tagmend.config import load_settings
-from tagmend.engine import artists, commits, staging, store, tags, versioning
+from tagmend.engine import artists, axis, commits, staging, store, tags, versioning
 from tagmend.engine.db import connect
 from tagmend.engine.library import ScanMode, scan_library
 from tagmend.engine.schema import apply_schema
@@ -925,8 +925,8 @@ def _derived(engine_settings: Settings, file_id: int) -> tuple[str, str]:
     conn = connect(engine_settings.db_path)
     try:
         return (
-            store.derived_genre_status(conn, file_id),
-            store.derived_year_status(conn, file_id),
+            store.derived_status(conn, axis.GENRE_AXIS, file_id),
+            store.derived_status(conn, axis.YEAR_AXIS, file_id),
         )
     finally:
         conn.close()

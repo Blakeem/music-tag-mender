@@ -12,7 +12,7 @@ import functools
 import os
 import sqlite3
 from pathlib import Path
-from typing import TYPE_CHECKING, Final, Literal, cast
+from typing import TYPE_CHECKING, Final, Literal
 
 import mutagen
 from mcp.server.fastmcp import FastMCP
@@ -164,9 +164,14 @@ def stage_tags(
     """Stage a managed-tag change for one file (the git "index"). Writes nothing to disk.
 
     Records *tags* for *file_id*, replacing any pending change for that file. Only managed
-    tags are allowed — the closed ``tags.MANAGED_TAGS`` set (the genre/artist names plus
-    the full title/album/date/track/disc + MusicBrainz-id identity "stamp"); any other key
-    is rejected. The music file is not touched and no history is recorded until you call
+    tags are allowed. The closed ``tags.MANAGED_TAGS`` set holds 25 keys: ``genre``, ``artist``,
+    ``albumartist``, ``artistsort``, ``albumartistsort``, ``title``, ``album``, ``date``,
+    ``originaldate``, ``tracknumber``, ``discnumber``, the six MusicBrainz ids
+    (``musicbrainz_artistid``, ``musicbrainz_albumartistid``, ``musicbrainz_albumid``,
+    ``musicbrainz_releasegroupid``, ``musicbrainz_trackid``, ``musicbrainz_releasetrackid``),
+    ``musicbrainz_albumtype``, and the release stamp (``musicbrainz_albumstatus``, ``media``,
+    ``releasecountry``, ``barcode``, ``catalognumber``, ``isrc``, ``asin``). Any other key is
+    rejected. The music file is not touched and no history is recorded until you call
     ``commit_tags``.
 
     *tags* is merged **onto** the file's current managed tags: keys you omit are left
@@ -194,34 +199,6 @@ def stage_tags(
         note=note,
     )
     return {"ok": True}
-
-
-def _parse_batch_entries(
-    entries: list[dict[str, object]],
-) -> list[tuple[int, dict[str, list[str]]]]:
-    """Marshal MCP ``[{file_id, tags}, ...]`` into the engine's ``(file_id, tags)`` list.
-
-    Raises :class:`ValueError` (named by position) on a malformed entry, so the tool can turn
-    it into an ``{"ok": False, "error": ...}`` envelope like the rest of the surface.
-    """
-    parsed: list[tuple[int, dict[str, list[str]]]] = []
-    for index, entry in enumerate(entries):
-        file_id = entry.get("file_id")
-        tags = entry.get("tags")
-        if not isinstance(file_id, int) or isinstance(file_id, bool):
-            message = f"entry {index}: file_id must be an integer"
-            raise ValueError(message)  # noqa: TRY004 - ValueError feeds the {"ok": False} envelope
-        if not isinstance(tags, dict):
-            message = f"entry {index} (file_id={file_id}): tags must be an object"
-            raise ValueError(message)  # noqa: TRY004 - ValueError feeds the {"ok": False} envelope
-        for name, raw_values in tags.items():
-            if not isinstance(raw_values, list) or not all(isinstance(v, str) for v in raw_values):
-                message = (
-                    f"entry {index} (file_id={file_id}): tags[{name!r}] must be a list of strings"
-                )
-                raise ValueError(message)
-        parsed.append((file_id, cast("dict[str, list[str]]", tags)))
-    return parsed
 
 
 @mcp.tool()
@@ -255,8 +232,8 @@ def stage_tags_batch(
         ``{"ok": True, "staged": <count>, "file_ids": [...]}`` on success, or
         ``{"ok": False, "error": ...}`` on a bad request (nothing staged).
     """
-    parsed = _parse_batch_entries(entries)
-    staged = staging.stage_tags_batch(load_settings(), entries=parsed, note=note)
+    pairs = [(entry.get("file_id"), entry.get("tags")) for entry in entries]
+    staged = staging.stage_tags_batch(load_settings(), entries=pairs, note=note)
     return {"ok": True, "staged": len(staged), "file_ids": staged}
 
 
@@ -394,9 +371,8 @@ def list_files(  # noqa: PLR0913 - cohesive MCP discovery filters
     """List tracked files with their current managed tags (to discover file ids).
 
     Each entry carries the stable ``file_id`` you pass to ``stage_tags`` / ``history_tags``
-    / ``revert_tags``, plus the file's folder/filename, current managed tags (the closed
-    ``tags.MANAGED_TAGS`` set — genre/artist names + the title/album/date/track/disc +
-    MusicBrainz-id identity "stamp"), and its genre workflow ``genre_status``. Run
+    / ``revert_tags``, plus the file's folder/filename, current managed tags (the
+    ``MANAGED_TAGS`` set listed under ``stage_tags``), and its genre workflow ``genre_status``. Run
     ``scan_library`` first to populate the snapshot.
 
     ``genre_status="no_match"`` is the **fix-by-hand worklist**: files Last.fm had nothing
@@ -413,8 +389,8 @@ def list_files(  # noqa: PLR0913 - cohesive MCP discovery filters
         path: When given, only files at this folder or nested under it are returned.
             Compared as a path: case and ``/`` versus backslash do not matter on Windows, and a
             relative folder resolves under ``music_path``.
-        limit: Cap the number of files returned. With ``genre_status`` the cap counts
-            *matching* files; without it, it is applied before reading tags.
+        limit: Cap the number of files returned. With any status filter the cap counts
+            matching files. Without one it is applied before reading tags.
         genre_status: Return only files in this genre workflow state
             (``pending`` | ``no_identity`` | ``no_match`` | ``manual`` | ``staged`` | ``done``).
         artist_status: Return only files in this artist workflow state
@@ -788,7 +764,8 @@ def detect_album_conflicts(
             only when it holds a file of that tier and its ``flagged``, ``file_ids`` and tier
             counts describe only those files. The report-level counts still describe the whole
             library.
-        limit: Cap the rows returned, or the groups with ``group=true``.
+        limit: Cap the rows returned, or the groups with ``group=true``. Counts are
+            unaffected.
         group: Return one compact line per folder instead of flat rows.
         folder: Expand exactly this folder's rows, never a subfolder. Takes precedence over
             ``group``. Compared as a path: case and ``/`` versus backslash do not matter on
@@ -1031,7 +1008,8 @@ def resolve_genres(
     ``artist``) and optionally album on Last.fm, classifies the community tags against the
     controlled genre vocabulary, and stages the resolved genres as an ``auto`` change
     (replacing ONLY ``genre`` — other managed tags are preserved). Review with
-    ``diff_tags`` and apply with ``commit_tags``; ``revert_tags`` undoes it.
+    ``diff_tags`` and apply with ``commit_tags``. ``revert_commit`` undoes the whole commit
+    and ``revert_tags`` undoes one file.
 
     A real run is refused while anything is staged, since staging would replace that pending
     change. Commit or unstage it first. It deliberately **skips** files that are already done
@@ -1136,7 +1114,8 @@ def resolve_artists(
             ``file_ids``, to reach the values reported under ``pending_remaining`` /
             ``more``.
         dry_run: Preview the ``value → canonical`` mappings + would-stage count without
-            staging anything (works from cache, no precondition).
+            staging anything. Lookups still run. A cached answer costs nothing and a cache miss
+            makes a live request. A dry run skips the empty-staging precondition.
 
     Returns:
         ``{"ok": True, processed, processed_unit, staged_files, corrected_values,
@@ -1162,7 +1141,9 @@ def resolve_artists(
 @mcp.tool()
 @_error_envelope
 def list_artists(limit: int | None = None) -> dict[str, object]:
-    """List distinct ``artist`` tag values with file counts (to scope ``resolve_genres``).
+    """List distinct ``artist`` tag values with file counts.
+
+    Use a value to scope ``resolve_genres`` or ``resolve_artists`` by ``artist``.
 
     Returns ``{"ok": True, "artists": [{artist, file_count}, ...]}`` in artist-value order.
     Run ``scan_library`` first to populate the snapshot.
@@ -1398,7 +1379,8 @@ def resolve_years(
         limit: Max album groups to process this call (default ``year_stage_limit``).
             Remaining groups are reported via ``pending_remaining`` / ``more``.
         dry_run: Preview the album → original-year mappings + would-stage count without
-            staging anything (works from cache, no precondition).
+            staging anything. Lookups still run. A cached answer costs nothing and a cache miss
+            makes a live request. A dry run skips the empty-staging precondition.
 
     Returns:
         ``{"ok": True, processed, processed_unit, staged_files, no_match, skipped_present,
@@ -1464,7 +1446,7 @@ def set_year_status(
     file_ids: list[int] | None = None,
     value: str | None = None,
 ) -> dict[str, object]:
-    """Exclude files from the year fill (``manual``) or re-queue them (``pending``).
+    """Exclude files from the original-year fill (``manual``) or re-queue them (``pending``).
 
     ``manual`` marks the in-scope files as a deliberate human/LLM choice: ``resolve_years``
     skips them until you reset. ``pending`` removes any status row, re-queuing them.

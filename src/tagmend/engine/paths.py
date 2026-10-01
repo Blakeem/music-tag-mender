@@ -10,8 +10,8 @@ Planned public API (the paths twin of the tags spine ``stage_tags`` → ``commit
 
     stage_paths(root: Path, *, template, folder_template) -> PathPlan   # dry-run
     commit_paths(plan: PathPlan) -> None                                # atomic
-    revert_paths(file_id: str, version: int) -> int
-    history_paths(file_id: str) -> list[PathRevision]
+    revert_paths(file_id: int, version: int) -> int
+    history_paths(file_id: int) -> list[PathRevision]
 
 Not yet implemented — see PLAN.md §18.
 

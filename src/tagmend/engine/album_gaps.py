@@ -21,7 +21,7 @@ the first pass is network-free.
 **Binding safety constraint (decision-r2 non-negotiable #1):** the ``stage_tags_batch``
 merge does not guard against overwriting a present ``album`` — so a proposal is *only ever*
 emitted for a file whose ``album`` is blank across every ordinal. That blank predicate
-scans all ordinals via :func:`tagmend.engine.genres._first_nonblank` over
+scans all ordinals via :func:`tagmend.engine.axis.first_nonblank` over
 :func:`tagmend.engine.store.get_tags` (NOT the ordinal-0-only ``load_tag_values``), exactly
 mirroring ``resolve_years``' ``skipped_no_album`` gate, so a file carrying a non-blank
 album at any ordinal can never appear in a proposal.
@@ -39,7 +39,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
-from tagmend.engine import classify, db, genres, parsing, path_keys, schema, store
+from tagmend.engine import axis, classify, db, lookup_clients, parsing, path_keys, schema, store
 from tagmend.engine.detector_core import group_by_folder
 from tagmend.engine.musicbrainz import MusicBrainzClient, MusicBrainzError
 from tagmend.engine.text_keys import alnum_key
@@ -125,8 +125,8 @@ class AlbumGapProposal:
     file_id: int
     filename: str
     proposed: str
-    confidence: str  # _CONF_GREEN | _CONF_CONFIRM
-    reason: str | None  # None when green; else the confirm reason
+    confidence: str  # _CONF_GREEN | _CONF_CONFIRM | _CONF_REVIEW
+    reason: str | None  # None when green, else the confirm or review reason
     note: str  # pre-formatted for stage_tags_batch (e.g. "sibling: unanimous n=11")
 
     def to_dict(self) -> dict[str, object]:
@@ -522,7 +522,7 @@ def _gather_inputs(conn: sqlite3.Connection) -> list[_FileInput]:
     """Read every non-missing tracked file into a :class:`_FileInput` (album/artist/title).
 
     ``album``/``artist`` come from the shared ``resolve_years`` identity
-    (:func:`tagmend.engine.genres._identity`: ``albumartist``-else-``artist``, first non-blank
+    (:func:`tagmend.engine.axis.lookup_identity`: ``albumartist``-else-``artist``, first non-blank
     album at ANY ordinal), so the binding blank-only guarantee cannot drift. ``title`` is the
     file's first non-blank ``title``. The two carry the ``(artist, title)`` the review source
     looks a blank file up against.
@@ -532,8 +532,8 @@ def _gather_inputs(conn: sqlite3.Connection) -> list[_FileInput]:
         if row.is_missing:
             continue
         tags = store.get_tags(conn, row.id)
-        identity = genres._identity(tags)  # noqa: SLF001 - shared identity shape
-        title = genres._first_nonblank(tags.get("title"))  # noqa: SLF001 - shared strip rule
+        identity = axis.lookup_identity(tags)
+        title = axis.first_nonblank(tags.get("title"))
         files.append(
             _FileInput(
                 file_id=row.id,
@@ -578,14 +578,11 @@ def _resolve_recording_source(
     itself. A fake injected via *client* bypasses both. Re-running the two pure sources is cheap
     and keeps the source ordering in one place.
     """
-    if client is not None:
-        return _classify(files, vocab, client=client)
-    with MusicBrainzClient(
-        settings.musicbrainz_user_agent,
-        conn,
-        rate_per_sec=settings.musicbrainz_rate_per_sec,
-    ) as owned_client:
-        return _classify(files, vocab, client=owned_client)
+    with lookup_clients.injected_or_owned(
+        client,
+        lambda: MusicBrainzClient.from_settings(settings, conn),
+    ) as source:
+        return _classify(files, vocab, client=source)
 
 
 def detect_album_gaps(

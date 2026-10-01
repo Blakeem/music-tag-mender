@@ -1,7 +1,7 @@
 """Unit tests for :mod:`tagmend.engine.axis` — the parameterised status abstraction.
 
 This module is covered only indirectly by the genre/artist pipeline tests; these
-tests pin the public API and the two asymmetries documented in the module docstring
+tests pin the public API and the differences documented in the module docstring
 directly, so a refactor cannot silently change semantics.
 
 These are pure-unit tests on frozen dataclasses and module-level constants: no DB,
@@ -16,7 +16,9 @@ from tagmend.engine.axis import (
     MISMATCH_AXIS,
     YEAR_AXIS,
     Identity,
+    LookupIdentity,
     StatusRow,
+    lookup_identity,
 )
 
 # ---------------------------------------------------------------------------
@@ -449,3 +451,24 @@ def test_mismatch_none_value_on_albumartist_field() -> None:
     decision = StatusRow(status="legit_ignore", source_primary="albumartist", source_secondary=None)
     assert MISMATCH_AXIS.decision_blocks(decision, Identity(primary=None, secondary="X")) is True
     assert MISMATCH_AXIS.decision_blocks(decision, Identity(primary="V", secondary="X")) is False
+
+
+# ---------------------------------------------------------------------------
+# Lookup identity
+# ---------------------------------------------------------------------------
+
+
+def test_lookup_identity_prefers_first_nonblank_albumartist_over_artist() -> None:
+    tags = {"albumartist": ["", "Various Artists"], "artist": ["Track Artist"], "album": ["A"]}
+    assert lookup_identity(tags) == LookupIdentity(artist="Various Artists", album="A")
+
+
+def test_lookup_identity_treats_whitespace_only_as_absent() -> None:
+    tags = {"albumartist": [" \t"], "artist": ["\n", "Real Artist"], "album": ["  "]}
+    assert lookup_identity(tags) == LookupIdentity(artist="Real Artist", album=None)
+    assert lookup_identity({"artist": ["   "]}) == LookupIdentity(artist=None, album=None)
+
+
+def test_lookup_identity_takes_first_nonblank_album_at_any_ordinal() -> None:
+    tags = {"artist": ["Band"], "album": ["", " ", "Third Ordinal"]}
+    assert lookup_identity(tags) == LookupIdentity(artist="Band", album="Third Ordinal")

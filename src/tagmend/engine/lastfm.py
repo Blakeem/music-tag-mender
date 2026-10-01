@@ -2,10 +2,12 @@
 
 Free API key only; ``ws.audioscrobbler.com/2.0/``. This module sources the *genre tags*
 the classifier later filters against the controlled vocabulary (see
-``docs/genre-tagging-spec.md`` §2). Two endpoints are used:
+``docs/genre-tagging-spec.md`` §2). Three endpoints are used:
 
 * ``artist.getTopTags`` — ranked community tags for an artist (by name **or** MBID).
 * ``album.getTopTags``  — ranked community tags for one album (by artist + album).
+* ``artist.getCorrection``: the canonical artist name plus MBID, feeding ``resolve_artists``'
+  Last.fm tier.
 
 Each response's parsed ``(name, weight)`` list is cached persistently in ``lastfm_cache``
 so every unique entity is queried at most once ever and re-runs are free. Each
@@ -28,11 +30,11 @@ from __future__ import annotations
 import hashlib
 import time
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Final, Protocol, Self, cast
 
 import httpx
 
+from tagmend.engine import clock
 from tagmend.engine.store import (
     get_cached_correction,
     get_cached_tags,
@@ -45,6 +47,8 @@ if TYPE_CHECKING:
     import sqlite3
     from collections.abc import Callable, Mapping
     from types import TracebackType
+
+    from tagmend.config import Settings
 
 logger = get_logger(__name__)
 
@@ -127,7 +131,7 @@ class CorrectionSource(Protocol):
 
 
 class LastfmClient:
-    """Cached, paced Last.fm top-tags client (implements :class:`TagSource`).
+    """Cached, paced Last.fm client (implements :class:`TagSource` and :class:`CorrectionSource`).
 
     Owns one :class:`httpx.Client` for its lifetime via the context-manager protocol;
     use it as ``with LastfmClient(...) as client:``. The cache connection is supplied by
@@ -158,6 +162,19 @@ class LastfmClient:
         self._max_attempts = max(1, max_attempts)
         self._last_request_at: float | None = None
         self._client: httpx.Client | None = None
+
+    @classmethod
+    def from_settings(cls, settings: Settings, conn: sqlite3.Connection) -> Self:
+        """Build a client with the configured API key and request rate.
+
+        Raises :class:`ValueError` when no API key is configured.
+        """
+        if not settings.lastfm_api_key:
+            message = (
+                "no Last.fm API key configured. Run `tagmend config-set lastfm_api_key <key>`."
+            )
+            raise ValueError(message)
+        return cls(settings.lastfm_api_key, conn, rate_per_sec=settings.lastfm_rate_per_sec)
 
     # --- context manager: own one httpx.Client for the client's lifetime -------------
 
@@ -347,7 +364,7 @@ class LastfmClient:
             request_key=request_key,
             found=found,
             tags=tags,
-            now=_utc_now(),
+            now=clock.utc_now(),
         )
         self._conn.commit()
 
@@ -359,7 +376,7 @@ class LastfmClient:
             found=correction is not None,
             name=None if correction is None else correction.name,
             mbid=None if correction is None else correction.mbid,
-            now=_utc_now(),
+            now=clock.utc_now(),
         )
         self._conn.commit()
 
@@ -473,8 +490,3 @@ def _parse_correction(body: dict[str, object]) -> ArtistCorrection | None:
     raw_mbid = artist.get("mbid")
     mbid = raw_mbid if isinstance(raw_mbid, str) and raw_mbid else None
     return ArtistCorrection(name=raw_name, mbid=mbid)
-
-
-def _utc_now() -> str:
-    """Return the current time as an ISO-8601 UTC string (the engine's timestamp form)."""
-    return datetime.now(UTC).isoformat()

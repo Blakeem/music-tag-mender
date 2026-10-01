@@ -22,6 +22,7 @@ from tagmend.engine.musicbrainz import (
     _request_key,
 )
 from tagmend.engine.store import (
+    get_cached_mb_artist,
     get_cached_mb_recording,
     get_cached_mb_release,
     get_cached_mb_release_group,
@@ -339,6 +340,24 @@ def test_non_json_body_raises_musicbrainz_error(db_conn: sqlite3.Connection) -> 
     assert len(calls) == 2
     assert get_cached_mb_release_group(db_conn, _request_key("Artist", "Album")) is None
     assert get_cached_mb_release(db_conn, _release_request_key("rel-1")) is None
+
+
+def test_non_json_body_raises_for_recording_and_artist_lookups(
+    db_conn: sqlite3.Connection,
+) -> None:
+    client, calls = _client(
+        db_conn,
+        [httpx.Response(200, content=b"<html>"), httpx.Response(200, content=b"<html>")],
+    )
+    with client:
+        with pytest.raises(MusicBrainzError, match="non-JSON body for recording query"):
+            client.recording_search("Artist", "Title")
+        with pytest.raises(MusicBrainzError, match="non-JSON body for artist lookup"):
+            client.artist_by_mbid("art-1")
+
+    assert len(calls) == 2
+    assert get_cached_mb_recording(db_conn, _recording_request_key("Artist", "Title")) is None
+    assert get_cached_mb_artist(db_conn, _artist_request_key("art-1")) is None
 
 
 def test_json_body_that_is_not_an_object_raises_musicbrainz_error(
@@ -888,10 +907,9 @@ def test_release_by_mbid_tolerates_a_release_with_no_media(db_conn: sqlite3.Conn
 
     assert release is not None
     assert release.media == ()
-    assert release.total_tracks == 0
 
 
-def test_release_total_tracks_sums_every_medium(db_conn: sqlite3.Connection) -> None:
+def test_release_by_mbid_parses_every_medium(db_conn: sqlite3.Connection) -> None:
     body = _release_body()
     media = body["media"]
     assert isinstance(media, list)
@@ -909,7 +927,8 @@ def test_release_total_tracks_sums_every_medium(db_conn: sqlite3.Connection) -> 
         release = client.release_by_mbid("rel-1")
 
     assert release is not None
-    assert release.total_tracks == 3
+    assert len(release.media) == 2
+    assert len(release.media[1].tracks) == 1
     assert release.media[1].title == "Bonus"
 
 

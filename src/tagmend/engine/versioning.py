@@ -17,8 +17,8 @@ Why version 0 is captured lazily (:func:`ensure_baseline` on first write, not at
 files that are never edited get no revision rows, so the log stays proportional to
 *changes*, not to library size.
 
-Transaction ownership mirrors the rest of the engine: :func:`ensure_baseline`,
-:func:`append_revision`, and :func:`history` take an open connection and never commit
+Transaction ownership mirrors the rest of the engine: :func:`ensure_baseline` and
+:func:`append_revision` take an open connection and never commit
 (building blocks a future cascade can batch inside one transaction). :func:`revert_tags`
 owns its own connection/commit — like :func:`tagmend.engine.library.scan_library` —
 because it pairs a disk write with DB writes as one atomic user-facing action.
@@ -29,13 +29,12 @@ See PLAN.md §7 (versioning/undo semantics) and §11 (safety model).
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
 import mutagen
 
-from tagmend.engine import commits, db, schema, store
+from tagmend.engine import clock, commits, db, schema, store
 from tagmend.engine.tags import (
     MANAGED_SETS,
     MANAGED_TAGS,
@@ -52,11 +51,6 @@ if TYPE_CHECKING:
     from tagmend.engine.store import Revision
 
 logger = get_logger(__name__)
-
-
-def _utc_now() -> str:
-    """Return the current time as an ISO-8601 UTC string."""
-    return datetime.now(UTC).isoformat()
 
 
 def managed_subset(tags: dict[str, list[str]]) -> dict[str, list[str]]:
@@ -251,7 +245,7 @@ def _revert_file(
         write_managed_tags(path, planned)
 
     # Refresh the live snapshot so file_tags reflects the actual on-disk state.
-    now = _utc_now()
+    now = clock.utc_now()
     reverted_tags = read_tags(path).tags
     store.replace_tags(conn, file_id, reverted_tags, now)
     # Re-sync the files-row signature to the just-written bytes (same fields the scanner
@@ -369,7 +363,7 @@ def revert_tags(
                 connection,
                 origin="revert",
                 message=note,
-                now=_utc_now(),
+                now=clock.utc_now(),
             )
             new_version, changed = _revert_file(
                 connection,
@@ -622,7 +616,7 @@ def revert_commit(
             connection,
             origin="revert",
             message=note,
-            now=_utc_now(),
+            now=clock.utc_now(),
             reverted_from=commit_id,
         )
         connection.commit()  # commit row durable before any per-file work
@@ -699,13 +693,8 @@ def revert_commit(
     return result
 
 
-def history(conn: sqlite3.Connection, file_id: int) -> list[Revision]:
-    """Return *file_id*'s full revision log, oldest (version 0) first. Read-only."""
-    return store.get_revisions(conn, file_id)
-
-
 def history_tags(settings: Settings, file_id: int) -> list[Revision]:
-    """Conn-owning :func:`history`: open the ledger and return *file_id*'s log. Read-only.
+    """Return *file_id*'s full revision log, oldest (version 0) first. Read-only.
 
     Raises :class:`ValueError` for an unknown *file_id*, so a typo does not read as a file
     with no history.
@@ -716,6 +705,6 @@ def history_tags(settings: Settings, file_id: int) -> list[Revision]:
         if store.get_file_by_id(connection, file_id) is None:
             message = f"unknown file_id={file_id}"
             raise ValueError(message)
-        return history(connection, file_id)
+        return store.get_revisions(connection, file_id)
     finally:
         connection.close()

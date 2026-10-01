@@ -20,7 +20,7 @@ tool + the `file_genre_status` workflow: `no_match`/`manual`/pending-by-absence)
 too: `revert_commit` group undo (skip+report, empty-staging guard, dry-run; every
 revert — even per-file `revert_tags` — is now its own `origin='revert'` commit) and
 genre-status visibility (`list_files(genre_status=...)` filter + `get_library_stats`
-genre counts via `store.derived_genre_status`, the mirror of `genres._select`).
+genre counts via `store.derived_status(conn, GENRE_AXIS, file_id)`, the mirror of `genres._select`).
 M4 phase 1 shipped too: `artists.py` (`resolve_artists` — cascade-stages the
 `artist.getCorrection` canonical name + MBID across `artist`/`albumartist`, with
 feat/sentinel/empty + per-file multi-value guards, dry-run, and the empty-staging

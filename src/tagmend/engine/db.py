@@ -1,8 +1,7 @@
 """SQLite ledger access.
 
-For M0 this only establishes a connection (WAL mode, foreign keys on) and ensures
-the file exists — there are no tables yet. Each feature milestone adds its own schema
-(see PLAN.md §7 for tags/versioning and §18 for the path/move log).
+Opens the ledger in WAL mode with foreign keys on and creates its parent folder. It creates
+no tables, because :func:`tagmend.engine.schema.apply_schema` owns every table.
 """
 
 from __future__ import annotations

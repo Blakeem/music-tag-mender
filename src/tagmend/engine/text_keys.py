@@ -33,45 +33,17 @@ _LIGATURES: Final = {
 }
 _LIGATURE_TABLE: Final = str.maketrans(_LIGATURES)
 
-# Typographic characters a server folds to ASCII before grouping. Deliberately NOT
-# :func:`alnum_ascii_key`, which strips every non-alphanumeric character: that would erase
-# ``The Crow: City of Angels`` against ``The Crow- City Of Angels``, which really are two
-# albums downstream and are exactly what the album-conflict detector exists to find. Case
-# and surrounding or repeated whitespace are cosmetic. Punctuation is not.
-DISPLAY_TYPOGRAPHY: Final[Mapping[str, str]] = {
+# Typographic characters a server folds to ASCII before grouping. Punctuation outside this
+# table is never folded, because it really does separate two albums downstream.
+TYPOGRAPHIC: Final[Mapping[str, str]] = {
     chr(codepoint): plain
     for codepoints, plain in (
         ((0x2010, 0x2011, 0x2012, 0x2013, 0x2014, 0x2212), "-"),
-        ((0x2018, 0x2019), "'"),
+        ((0x2018, 0x2019, 0x201A), "'"),
         ((0x201C, 0x201D), '"'),
         ((0x00A0, 0x2009, 0x202F), " "),
     )
     for codepoint in codepoints
-}
-
-# Characters that separate the same name into different spellings. MusicBrainz writes real
-# typography (``Static\u2010X`` carries U+2010, not a hyphen-minus) while taggers and
-# filesystems substitute ASCII, and a word break is written as a dash by one source and a
-# space by another (``Mindless Self\u2010Indulgence`` against MusicBrainz's spaced
-# spelling). Folding decides SAMENESS only, and only against names MusicBrainz records for
-# the id the file already carries, so it can never merge two different artists. The staged
-# value is always MusicBrainz's own spelling.
-ARTIST_NAME_TYPOGRAPHY: Final[Mapping[str, str]] = {
-    "-": " ",
-    "\u2010": " ",
-    "\u2011": " ",
-    "\u2012": " ",
-    "\u2013": " ",
-    "\u2014": " ",
-    "\u2212": " ",
-    "\u2018": "'",
-    "\u2019": "'",
-    "\u201a": "'",
-    "\u201c": '"',
-    "\u201d": '"',
-    "\u00a0": " ",
-    "\u2009": " ",
-    "\u202f": " ",
 }
 
 
@@ -109,7 +81,7 @@ def display_key(value: str) -> str:
     # NFC first, so the two byte-forms of one accented string compare equal. Deliberately not
     # NFKD-with-marks-stripped like :func:`alnum_ascii_key`: that folds an accent away, and
     # an accent really does separate two albums for anything reading these tags.
-    folded = "".join(DISPLAY_TYPOGRAPHY.get(ch, ch) for ch in unicodedata.normalize("NFC", value))
+    folded = "".join(TYPOGRAPHIC.get(ch, ch) for ch in unicodedata.normalize("NFC", value))
     return " ".join(folded.casefold().split())
 
 
@@ -118,7 +90,10 @@ def artist_name_key(value: str) -> str:
 
     Used only to decide whether two spellings are the same name. Never used as a value.
     """
-    folded = "".join(ARTIST_NAME_TYPOGRAPHY.get(ch, ch) for ch in value)
+    # MusicBrainz writes a word break as a dash where taggers write a space. The key is compared
+    # only against names recorded for the file's own MBID, so it never merges two artists.
+    typographic = "".join(TYPOGRAPHIC.get(ch, ch) for ch in value)
+    folded = typographic.replace("-", " ")
     return " ".join(folded.casefold().split())
 
 

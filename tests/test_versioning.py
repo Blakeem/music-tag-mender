@@ -79,7 +79,7 @@ def test_ensure_baseline_is_idempotent(db_conn: sqlite3.Connection) -> None:
         is False
     )
 
-    revisions = versioning.history(db_conn, file_id)
+    revisions = store.get_revisions(db_conn, file_id)
     assert len(revisions) == 1
     assert revisions[0].managed_tags == {"genre": ["A"]}
 
@@ -118,7 +118,7 @@ def test_append_revision_no_managed_change_returns_none(db_conn: sqlite3.Connect
     )
 
     assert result is None
-    assert len(versioning.history(db_conn, file_id)) == 1
+    assert len(store.get_revisions(db_conn, file_id)) == 1
 
 
 def test_append_revision_without_baseline_raises(db_conn: sqlite3.Connection) -> None:
@@ -185,4 +185,4 @@ def test_history_is_ordered_oldest_first(db_conn: sqlite3.Connection) -> None:
         now=_LATER,
     )
 
-    assert [r.version for r in versioning.history(db_conn, file_id)] == [0, 1]
+    assert [r.version for r in store.get_revisions(db_conn, file_id)] == [0, 1]

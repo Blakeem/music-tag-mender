@@ -7,9 +7,10 @@ classification, and the disk writes are delegated to the modules built in chunks
 
 Design notes (the spec):
 
-* **"Done" is derived**, never stored — a file is done when it has a staged genre row
-  or a committed ``origin='auto'`` revision. Only the two negative outcomes (``no_match``
-  / ``manual``) live in ``file_genre_status``.
+* **"Done" is derived**, never stored. A file is done when it has a staged change to
+  ``genre``, or a committed ``origin='auto'`` revision whose diff changed ``genre`` above that
+  field's ``voided_auto`` watermark. Only the two negative outcomes (``no_match`` /
+  ``manual``) live in ``file_genre_status``.
 * **Lookup identity** is ``albumartist`` when present (better for compilations), else
   ``artist``; ``album`` is used only when ``genre_use_album_tags`` is on.
 * **No accidental deletion (P0):** the resolver stages only ``genre``, the one field it
@@ -27,10 +28,9 @@ and commit; the building blocks in :mod:`tagmend.engine.store` never commit.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Final
 
-from tagmend.engine import axis, classify, db, schema, staging, store
+from tagmend.engine import axis, classify, clock, db, lookup_clients, schema, staging, store
 from tagmend.engine.lastfm import LastfmClient, LastfmError
 from tagmend.engine.validation import check_limit, require_choice
 from tagmend.log import get_logger
@@ -48,54 +48,6 @@ logger = get_logger(__name__)
 # a file, but never set engine-owned outcomes like ``no_match``). ``manual`` writes a
 # sticky status row; ``pending`` deletes it (re-queue).
 _USER_STATUSES: Final = frozenset({"manual", "pending"})
-
-
-def _utc_now() -> str:
-    """Return the current time as an ISO-8601 UTC string (the engine's timestamp form)."""
-    return datetime.now(UTC).isoformat()
-
-
-# --- lookup identity -----------------------------------------------------------------
-
-
-@dataclass(frozen=True, slots=True)
-class _Identity:
-    """The ``(artist, album)`` a file is looked up / classified against."""
-
-    artist: str | None
-    album: str | None
-
-
-def _first_nonblank(values: list[str] | None) -> str | None:
-    """Return the first value that is non-blank after ``str.strip()``, else ``None``.
-
-    Whitespace-only tag values (spaces, tabs, newlines) count as absent. This is the Python
-    twin of :func:`tagmend.engine.store.has_identity`'s blankness rule, so ``_select``'s
-    ``identity.artist is None`` gate buckets such files as ``skipped_no_identity`` (rather
-    than looking up ``" "`` junk) and the derived ``no_identity`` status agrees. The value
-    is returned verbatim (unstripped), preserving the exact lookup string for non-blank tags.
-    """
-    if not values:
-        return None
-    for value in values:
-        if value.strip():
-            return value
-    return None
-
-
-def _identity(tags: dict[str, list[str]]) -> _Identity:
-    """Derive the lookup identity for a file's tags.
-
-    Lookup artist is the first non-blank ``albumartist`` value when one exists (better
-    identity for compilations), else the first non-blank ``artist`` value; ``None`` when
-    neither has a non-blank value. Album is the first non-blank ``album`` value, or ``None``.
-    Whitespace-only values are treated as absent (see :func:`_first_nonblank`).
-    """
-    lookup_artist = _first_nonblank(tags.get("albumartist")) or _first_nonblank(
-        tags.get("artist"),
-    )
-    lookup_album = _first_nonblank(tags.get("album"))
-    return _Identity(artist=lookup_artist, album=lookup_album)
 
 
 # --- result types --------------------------------------------------------------------
@@ -154,7 +106,7 @@ class _Candidate:
     """A processable file plus the identity it will be looked up against."""
 
     file_id: int
-    identity: _Identity
+    identity: axis.LookupIdentity
 
 
 # --- selection -----------------------------------------------------------------------
@@ -172,13 +124,13 @@ def _select(
     non-stale ``no_match`` for its current identity.
 
     The user-facing mirror of this classification is
-    :func:`tagmend.engine.store.derived_genre_status` (the ``list_files`` filter and the
-    stats counts) — keep the two in sync when the predicates change.
+    :func:`tagmend.engine.store.derived_status` on ``axis.GENRE_AXIS`` (the ``list_files``
+    filter and the stats counts). Keep the two in sync when the predicates change.
     """
     genre_fields = axis.GENRE_AXIS.fields
     processable: list[_Candidate] = []
     for fid in candidate_ids:
-        identity = _identity(store.get_tags(conn, fid))
+        identity = axis.lookup_identity(store.get_tags(conn, fid))
 
         if identity.artist is None:
             tally.skipped_no_identity += 1
@@ -205,12 +157,12 @@ def _select(
     return processable
 
 
-def _decision_blocks(decision: store.GenreStatusRow, identity: _Identity) -> bool:
+def _decision_blocks(decision: store.GenreStatusRow, identity: axis.LookupIdentity) -> bool:
     """Whether a stored genre decision still blocks processing for the current identity.
 
     The shared genre staleness/sticky rule (``manual`` always blocks; ``no_match`` blocks
     only while NOT stale) lives on the axis, so this skip path and the user-facing
-    :func:`tagmend.engine.store.derived_genre_status` can never drift.
+    :func:`tagmend.engine.store.derived_status` on ``axis.GENRE_AXIS`` can never drift.
     """
     return axis.GENRE_AXIS.decision_blocks(
         axis.StatusRow(
@@ -319,7 +271,10 @@ def _process_groups(  # noqa: PLR0913 - cohesive orchestration inputs
     """Group *candidates* by identity and resolve each group via *client* (built if None)."""
     groups = _group_by_identity(candidates)
 
-    if client is not None:
+    with lookup_clients.injected_or_owned(
+        client,
+        lambda: LastfmClient.from_settings(settings, conn),
+    ) as source:
         for identity, fids in groups.items():
             _process_one_group(
                 settings,
@@ -327,36 +282,15 @@ def _process_groups(  # noqa: PLR0913 - cohesive orchestration inputs
                 identity,
                 fids,
                 vocab,
-                client,
-                tally,
-                dry_run=dry_run,
-            )
-        return
-
-    if not settings.lastfm_api_key:
-        message = "no Last.fm API key configured — run `tagmend config-set lastfm_api_key <key>`"
-        raise ValueError(message)
-    with LastfmClient(
-        settings.lastfm_api_key,
-        conn,
-        rate_per_sec=settings.lastfm_rate_per_sec,
-    ) as owned_client:
-        for identity, fids in groups.items():
-            _process_one_group(
-                settings,
-                conn,
-                identity,
-                fids,
-                vocab,
-                owned_client,
+                source,
                 tally,
                 dry_run=dry_run,
             )
 
 
-def _group_by_identity(candidates: list[_Candidate]) -> dict[_Identity, list[int]]:
+def _group_by_identity(candidates: list[_Candidate]) -> dict[axis.LookupIdentity, list[int]]:
     """Group file ids by their lookup identity, preserving first-seen group order."""
-    groups: dict[_Identity, list[int]] = {}
+    groups: dict[axis.LookupIdentity, list[int]] = {}
     for candidate in candidates:
         groups.setdefault(candidate.identity, []).append(candidate.file_id)
     return groups
@@ -365,7 +299,7 @@ def _group_by_identity(candidates: list[_Candidate]) -> dict[_Identity, list[int
 def _process_one_group(  # noqa: PLR0913 - cohesive per-group inputs
     settings: Settings,
     conn: sqlite3.Connection,
-    identity: _Identity,
+    identity: axis.LookupIdentity,
     file_ids: list[int],
     vocab: Vocabulary,
     client: TagSource,
@@ -403,7 +337,7 @@ def _process_one_group(  # noqa: PLR0913 - cohesive per-group inputs
         tally.no_match += len(file_ids)
         tally.no_match_artists.add(lookup_artist)
         return
-    now = _utc_now()
+    now = clock.utc_now()
     for fid in file_ids:
         store.set_genre_status(
             conn,
@@ -420,7 +354,7 @@ def _process_one_group(  # noqa: PLR0913 - cohesive per-group inputs
 
 def _resolve_group(
     settings: Settings,
-    identity: _Identity,
+    identity: axis.LookupIdentity,
     vocab: Vocabulary,
     client: TagSource,
 ) -> list[str]:
@@ -575,10 +509,10 @@ def set_genre_status(
     try:
         schema.apply_schema(connection)
         scoped = _genre_scope(connection, file_ids=file_ids, artist=artist)
-        now = _utc_now()
+        now = clock.utc_now()
         for fid in scoped:
             if status == "manual":
-                identity = _identity(store.get_tags(connection, fid))
+                identity = axis.lookup_identity(store.get_tags(connection, fid))
                 store.set_genre_status(
                     connection,
                     file_id=fid,

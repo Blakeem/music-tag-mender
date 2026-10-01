@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import sqlite3
 
-from tagmend.engine import store
+from tagmend.engine import axis, store
 
 _NOW = "2026-07-04T00:00:00+00:00"
 _LATER = "2026-07-04T01:00:00+00:00"
@@ -168,7 +168,7 @@ def test_derived_mismatch_status_ignores_staged_and_auto_changes(
         now=_NOW,
     )
     # Artist axis sees staged/done; mismatch axis stays pending (no disposition row).
-    assert store.derived_artist_status(db_conn, file_id) == "staged"
+    assert store.derived_status(db_conn, axis.ARTIST_AXIS, file_id) == "staged"
     assert store.derived_mismatch_status(db_conn, file_id) == "pending"
 
 

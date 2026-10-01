@@ -117,6 +117,19 @@ place with every row preserved):
   pre-existing rows to 0, below any real reader version, so the next incremental scan
   re-reads each of them exactly once.
 
+The artist-by-MBID lookup adds one cache (schema v15, purely additive, created by its DDL with
+no migration):
+
+* ``musicbrainz_artist_cache`` holds the canonical name, sort name, disambiguation and alias
+  set per artist MBID. ``found`` is the negative-cache sentinel. Feeds ``resolve_artists``'
+  MusicBrainz tier.
+
+The release-by-MBID lookup adds one cache (schema v16, purely additive, created by its DDL with
+no migration):
+
+* ``musicbrainz_release_cache`` holds the parsed release and tracklist as one JSON
+  ``payload``, because nothing queries inside it. Feeds ``detect_disagreements``.
+
 The data-safety pass adds two columns, two indexes and four triggers (schema v17, no new
 tables. A v16 ledger upgrades in place with every row preserved):
 
@@ -920,7 +933,8 @@ def apply_schema(connection: sqlite3.Connection) -> None:
     (:func:`_migrate_commit_origin`) and v20 renames, moves and drops in place
     (:func:`_migrate_reverted_to_version`, :func:`_migrate_managed_set_required`,
     :func:`_migrate_release_group_cache_name`, :func:`_migrate_mbid_columns`,
-    :func:`_migrate_drop_files_status`, :func:`_migrate_lastfm_correction_cache`). The
+    :func:`_migrate_drop_files_status`, :func:`_migrate_lastfm_correction_cache`). v15 and
+    v16 add cache tables only, which the DDL creates, so they need no migration step. The
     triggers come after every migration, so a migration that updates a log runs before they
     exist.
 

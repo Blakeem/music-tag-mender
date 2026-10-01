@@ -139,7 +139,7 @@ def _revisions(settings: Settings, file_id: int) -> list[store.Revision]:
     conn = connect(settings.db_path)
     try:
         apply_schema(conn)
-        return versioning.history(conn, file_id)
+        return store.get_revisions(conn, file_id)
     finally:
         conn.close()
 

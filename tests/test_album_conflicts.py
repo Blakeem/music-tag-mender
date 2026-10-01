@@ -223,6 +223,14 @@ def test_album_names_differing_only_in_case_and_spacing_agree() -> None:
     assert report.flagged == 0
 
 
+def test_a_low_single_quote_folds_to_an_ascii_apostrophe() -> None:
+    report = _classify(
+        [_f(1, album="Rock \u201an\u2019 Roll"), _f(2, filename="b.mp3", album="Rock 'n' Roll")],
+    )
+
+    assert report.flagged == 0
+
+
 # --- low: a titled multi-disc medium -------------------------------------------------
 
 

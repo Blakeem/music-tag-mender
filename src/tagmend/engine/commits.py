@@ -22,10 +22,9 @@ the crash invariant lives in exactly where those commits fall.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Final, Protocol
 
-from tagmend.engine import db, schema
+from tagmend.engine import clock, db, schema
 from tagmend.engine.validation import check_limit
 from tagmend.log import get_logger
 
@@ -36,11 +35,6 @@ if TYPE_CHECKING:
     from tagmend.config import Settings
 
 logger = get_logger(__name__)
-
-
-def _utc_now() -> str:
-    """Return the current time as an ISO-8601 UTC string."""
-    return datetime.now(UTC).isoformat()
 
 
 # --- commits table ------------------------------------------------------------------
@@ -250,7 +244,7 @@ class _Applied:
     missing: MissingFile | None
 
 
-def _summarize(*, commit_id: int | None, applied: list[_Applied]) -> CommitResult:
+def summarize(*, commit_id: int | None, applied: list[_Applied]) -> CommitResult:
     """Fold per-file results into the public :class:`CommitResult`."""
     committed = sum(1 for a in applied if a.outcome.status == "committed")
     noop = sum(1 for a in applied if a.outcome.status == "noop")
@@ -418,7 +412,9 @@ def _commit_one(
                 status="changed_since_stage",
                 detail=_CHANGED_SINCE_STAGE_DETAIL,
             )
-        version = domain.apply_to_disk(conn, file_id, path, commit_id=commit_id, now=_utc_now())
+        version = domain.apply_to_disk(
+            conn, file_id, path, commit_id=commit_id, now=clock.utc_now()
+        )
         conn.commit()  # disk already done inside, so append + delete are now durable
     except domain.per_file_errors as exc:
         # Undoes only this file's uncommitted writes, so its staged row stays for a retry.

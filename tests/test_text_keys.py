@@ -31,4 +31,6 @@ def test_keys_disagree_where_documented() -> None:
         "The Crow- City"
     )
     assert text_keys.artist_name_key("Static\u2010X") == text_keys.artist_name_key("Static X")
+    assert text_keys.artist_name_key("Static\u2010X") == text_keys.artist_name_key("static x")
+    assert text_keys.artist_name_key("It\u201as") == text_keys.artist_name_key("It's")
     assert text_keys.title_key("東京事変") != ""

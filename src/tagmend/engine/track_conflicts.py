@@ -313,7 +313,9 @@ def _summarize(  # noqa: PLR0913 - one keyword per reported count, cohesive by d
     context: int,
 ) -> str:
     """Build a short, plain human summary of the run."""
-    note = f", {context} review-context row(s) in multi-album folders" if context else ""
+    note = (
+        f", {context} review-context row(s) in multi-album or non-album folders" if context else ""
+    )
     return (
         f"Flagged {flagged} of {total_files} file(s) sharing a track slot with a sibling: "
         f"{high} high, {medium} medium, {low} low{note}."

@@ -19,7 +19,7 @@ from conftest import FOLDER_SPELLINGS, make_track, spell_folder
 from tagmend import config, mcp_server
 from tagmend.cli import app
 from tagmend.config import Settings
-from tagmend.engine import artists, mismatch, path_keys, staging, store, text_keys, versioning
+from tagmend.engine import artists, axis, mismatch, path_keys, staging, store, text_keys, versioning
 from tagmend.engine.db import connect
 from tagmend.engine.library import scan_library
 from tagmend.engine.mismatch import detect_mismatches
@@ -904,9 +904,9 @@ def _derived(settings: Settings, file_id: int) -> tuple[str, str, str]:
     conn = connect(settings.db_path)
     try:
         return (
-            store.derived_genre_status(conn, file_id),
-            store.derived_year_status(conn, file_id),
-            store.derived_artist_status(conn, file_id),
+            store.derived_status(conn, axis.GENRE_AXIS, file_id),
+            store.derived_status(conn, axis.YEAR_AXIS, file_id),
+            store.derived_status(conn, axis.ARTIST_AXIS, file_id),
         )
     finally:
         conn.close()
@@ -1038,6 +1038,34 @@ def test_mcp_stage_tags_batch_rejects_bare_string_value(music_dir: Path) -> None
     assert payload["ok"] is False
     assert "must be a list of strings" in str(payload["error"])
     # Nothing was staged: a follow-up commit has nothing to write.
+    assert mcp_server.commit_tags()["committed"] == 0
+
+
+def test_mcp_stage_tags_batch_rejects_missing_file_id(music_dir: Path) -> None:
+    config.set_setting("music_path", str(music_dir))
+    make_track(music_dir / "a.mp3", {"genre": ["Pop"]})
+    mcp_server.scan_library(path=str(music_dir))
+
+    payload = mcp_server.stage_tags_batch([{"tags": {"genre": ["Rock"]}}])
+
+    assert payload["ok"] is False
+    assert "entry 0: file_id must be an integer" in str(payload["error"])
+
+
+def test_mcp_stage_tags_batch_rejects_non_dict_tags(music_dir: Path) -> None:
+    config.set_setting("music_path", str(music_dir))
+    a = make_track(music_dir / "a.mp3", {"genre": ["Pop"]})
+    mcp_server.scan_library(path=str(music_dir))
+    conn = connect(config.load_settings().db_path)
+    try:
+        a_id = store.get_file(conn, str(music_dir), a.name).id  # type: ignore[union-attr]
+    finally:
+        conn.close()
+
+    payload = mcp_server.stage_tags_batch([{"file_id": a_id, "tags": "x"}])
+
+    assert payload["ok"] is False
+    assert "tags must be a dict" in str(payload["error"])
     assert mcp_server.commit_tags()["committed"] == 0
 
 

@@ -1,15 +1,16 @@
-"""Tests for mislabeled-file detection (:mod:`tagmend.engine.mismatch`).
+"""Tests for path coherence detection (:mod:`tagmend.engine.mismatch`).
 
-Pure-function tests for ``_top_artist`` / ``_primary_artist`` / ``_disagrees``
-and the pure ``_classify`` core over constructed inputs covering every labeled class
-(HIGH/MEDIUM/LOW, the diacritic/alias/VA/non-album false-positive classes, the reliability
-guard, the artist fallback, and a library-root file that must not crash), plus an
-integration test through ``scan_library`` on real audio and CLI/MCP wiring smoke checks.
+Pure tests run the ``_classify`` core over constructed inputs, one per path layout and
+comparison, flagged and clean. Integration tests scan generated audio, then detect, and cover
+the dispositions, the CLI and the MCP wiring.
 """
 
 from __future__ import annotations
 
 import asyncio
+import functools
+import unicodedata
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -19,23 +20,825 @@ from conftest import FOLDER_SPELLINGS, make_track, spell_folder
 from tagmend import config, mcp_server
 from tagmend.cli import app
 from tagmend.config import Settings
-from tagmend.engine import artists, axis, mismatch, path_keys, staging, store, text_keys, versioning
+from tagmend.engine import artists, axis, mismatch, path_keys, staging, store, versioning
 from tagmend.engine.db import connect
+from tagmend.engine.detector_core import parse_position
 from tagmend.engine.library import scan_library
-from tagmend.engine.mismatch import detect_mismatches
+from tagmend.engine.mismatch import (
+    DISC_FOLDER_NUMBER,
+    FILENAME_TITLE,
+    FILENAME_TRACK,
+    RELEASE_FOLDER_ALBUM,
+    RELEASE_FOLDER_YEAR,
+    TOP_FOLDER_ARTIST,
+    detect_mismatches,
+)
+from tagmend.engine.path_text import clean_value
 
 _MUSIC = Path("/library/music")
+_SOUNDTRACKS = frozenset({"soundtracks"})
 runner = CliRunner()
 
 
-def _make_mislabeled_library(music_dir: Path) -> Path:
-    """Create clean, agreeing tracks + a Jem-mislabeled Ozzy folder; return the Ozzy folder.
+def _mk(file_id: int, rel: str, filename: str, **tags: str) -> mismatch._FileInput:
+    return mismatch._FileInput(
+        file_id=file_id,
+        folder=str(_MUSIC / rel),
+        filename=filename,
+        tags=tags,
+    )
 
-    The four clean folders keep the library-wide disagreement rate under the reliability
-    floor, so the mislabeled ``Jem`` file surfaces as HIGH (mixed-albumartist folder).
+
+def _padding(count: int = 20) -> list[mismatch._FileInput]:
+    """Clean files that keep the top-folder difference rate under the reliability floor."""
+    return [
+        _mk(1000 + i, f"Clean{i}/Album", "x.mp3", albumartist=f"Clean{i}") for i in range(count)
+    ]
+
+
+def _flags(
+    files: list[mismatch._FileInput],
+    *,
+    container: frozenset[str] = frozenset(),
+) -> dict[int, set[str]]:
+    report = mismatch._classify(files, _MUSIC, container_keys=container)
+    return {r.file_id: {d.comparison for d in r.differences} for r in report.rows}
+
+
+def _find(report: mismatch.MismatchesReport, file_id: int) -> mismatch.MismatchRow | None:
+    return next((r for r in report.rows if r.file_id == file_id), None)
+
+
+def _view(report: mismatch.MismatchesReport, **kwargs: object) -> mismatch.MismatchesReport:
+    options: dict[str, object] = {
+        "tier": None,
+        "comparison": None,
+        "folder_key": None,
+        "limit": None,
+        "group": False,
+    }
+    options.update(kwargs)
+    return mismatch._narrow(report, **options)  # type: ignore[arg-type]
+
+
+# --- top_folder_artist ---------------------------------------------------------------
+
+
+def test_top_folder_artist_flags_another_artist_and_tolerates_formatting() -> None:
+    files = [
+        _mk(1, "Ozzy Osbourne/Down To Earth", "a.mp3", albumartist="Jem"),
+        _mk(2, "Ozzy Osbourne/Down To Earth", "b.mp3", albumartist="ozzy osbourne"),
+        _mk(3, "Royksopp/Melody AM", "a.mp3", albumartist="Röyksopp"),
+        _mk(4, "Roeyksopp/Melody AM", "a.mp3", albumartist="Röyksopp"),
+        _mk(5, "Doors, The/LA Woman", "a.mp3", albumartist="The Doors"),
+        _mk(6, "Simon & Garfunkel/Bookends", "a.mp3", albumartist="Simon and Garfunkel"),
+        _mk(7, "Neon Hitch/Single", "a.mp3", artist="Neon Hitch feat. Someone"),
+        _mk(8, "!!!/Myth Takes", "a.mp3", albumartist="!!!"),
+        # Equality, not containment: a collab extension of the folder's artist is a difference.
+        _mk(9, "Lusine/Serial", "a.mp3", albumartist="Lusine ICL"),
+        *_padding(),
+    ]
+
+    assert _flags(files) == {1: {TOP_FOLDER_ARTIST}, 9: {TOP_FOLDER_ARTIST}}
+
+
+def test_top_folder_artist_reads_wrappers_containers_root_albums_and_curated_folders() -> None:
+    files = [
+        _mk(1, "Tool [Discography]/(1993) Undertow", "a.mp3", albumartist="Tool"),
+        _mk(
+            2,
+            "Metallica - Discography 1983-2008/(1991) Metallica",
+            "a.mp3",
+            albumartist="Metallica",
+        ),
+        _mk(3, "Pink Floyd (1967-2014) FLAC/(1973) Dark Side", "a.mp3", albumartist="Pink Floyd"),
+        _mk(4, "Soundtracks/Movie OST", "a.mp3", albumartist="Hans Zimmer"),
+        # A root album folder has no top-folder signal.
+        _mk(5, "The Doors", "a.mp3", albumartist="Someone Else"),
+        # A curated file keeps the top-folder comparison.
+        _mk(6, "Blue Stahli/Singles", "remix.mp3", albumartist="Celldweller"),
+        *_padding(),
+    ]
+
+    report = mismatch._classify(files, _MUSIC, container_keys=_SOUNDTRACKS)
+
+    assert {r.file_id: {d.comparison for d in r.differences} for r in report.rows} == {
+        6: {TOP_FOLDER_ARTIST},
+    }
+    assert report.container_suppressed == {"Soundtracks": 1}
+
+
+# --- release_folder_album ------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "release",
+    [
+        "(1999) Artist - Album Name",
+        "1999 - Album Name",
+        "Artist - 1999 - Album Name",
+        "Album Name (1999)",
+        "Album Name [FLAC] {Scene}",
+        "(1999) Album Name (Deluxe Edition)",
+        "(1999) ARTIST - ALBUM-NAME",
+    ],
+)
+def test_release_folder_album_tolerates_each_release_layout(release: str) -> None:
+    files = [
+        _mk(1, f"Artist/{release}", "01 Song.mp3", albumartist="Artist", album="Album Name"),
+        _mk(2, f"Artist/{release}/Cd1", "01 Song.mp3", albumartist="Artist", album="Album Name"),
+    ]
+
+    assert _flags(files) == {}
+
+
+@pytest.mark.parametrize(
+    ("release", "album"),
+    [
+        ("Limited Edition", "Limited Edition"),
+        ("Disc 1", "Disc 1"),
+        ("(2005) Artist - Bonus Tracks EP", "Bonus Tracks EP"),
+        ("(2001) Artist - Limited Edition", "Limited Edition (Bonus CD)"),
+        ("Limited Edition/CD 2", "Limited Edition (Disc 2)"),
+    ],
+)
+def test_release_folder_album_tolerates_an_album_made_of_markers(release: str, album: str) -> None:
+    files = [_mk(1, f"Artist/{release}", "01 Song.mp3", albumartist="Artist", album=album)]
+
+    assert _flags(files) == {}
+
+
+def test_release_folder_album_flags_an_album_made_of_markers_against_another_name() -> None:
+    files = [
+        _mk(1, "Artist/(2001) Artist - Other Thing", "a.mp3", albumartist="Artist", album="Disc 1"),
+        _mk(2, "Artist/Real Album/CD 2", "a.mp3", albumartist="Artist", album="CD 2"),
+        _mk(
+            3,
+            "Artist/(2001) Artist - Deluxe Edition",
+            "a.mp3",
+            albumartist="Artist",
+            album="Limited Edition",
+        ),
+        *_padding(),
+    ]
+
+    report = mismatch._classify(files, _MUSIC)
+
+    assert {r.file_id: _tier(report, r.file_id) for r in report.rows} == {
+        1: "high",
+        2: "high",
+        3: "medium",
+    }
+
+
+def test_release_folder_album_flags_another_album_and_skips_curated_and_artist_roots() -> None:
+    files = [
+        _mk(1, "Artist/(1999) Artist - Other Record", "a.mp3", albumartist="Artist", album="Album"),
+        # The disc subfolder is peeled off, and its parent is compared.
+        _mk(2, "Artist/Other Record/CD 2", "a.mp3", albumartist="Artist", album="Album (Disc 2)"),
+        _mk(3, "Artist/Album/CD 2", "a.mp3", albumartist="Artist", album="Album (Disc 2)"),
+        _mk(4, "Artist/Singles", "a.mp3", albumartist="Artist", album="Some Single"),
+        _mk(5, "The Doors", "a.mp3", albumartist="The Doors", album="L.A. Woman"),
+        _mk(7, "Doors (1971)", "a.mp3", albumartist="The Doors", album="L.A. Woman"),
+        _mk(6, "Some Record (1999)", "a.mp3", albumartist="Band", album="Other Record"),
+    ]
+
+    assert _flags(files) == {
+        1: {RELEASE_FOLDER_ALBUM},
+        2: {RELEASE_FOLDER_ALBUM},
+        6: {RELEASE_FOLDER_ALBUM},
+    }
+
+
+# --- release_folder_year -------------------------------------------------------------
+
+
+def test_release_folder_year_needs_one_tag_year_among_the_folder_tokens() -> None:
+    files = [
+        _mk(1, "A/(2001) A - Album", "a.mp3", albumartist="A", album="Album", date="1999"),
+        # Either the release date or the original date agrees.
+        _mk(2, "B/(1999) B - Album", "a.mp3", albumartist="B", date="2005", originaldate="1999"),
+        _mk(3, "C/C - 1999 - Album", "a.mp3", albumartist="C", date="1999-04-01"),
+        _mk(4, "D/Album (1999)", "a.mp3", albumartist="D", date="1999"),
+        # A year inside the album title is not the release year.
+        _mk(5, "E/(2014) E - 1989", "a.mp3", albumartist="E", album="1989", date="2014"),
+        _mk(6, "F/(1995) F - Astro-Creep 2000", "a.mp3", albumartist="F", date="1995"),
+        # No year token, or no tag year, gives no signal.
+        _mk(7, "G/Album", "a.mp3", albumartist="G", date="1999"),
+        _mk(8, "H/(2001) Album", "a.mp3", albumartist="H"),
+        # A curated folder skips the year.
+        _mk(9, "I/Singles/2001 Single", "a.mp3", albumartist="I", date="1999"),
+    ]
+
+    assert _flags(files) == {1: {RELEASE_FOLDER_YEAR}}
+
+
+# --- disc_folder_number --------------------------------------------------------------
+
+
+def test_disc_folder_number_compares_numbered_disc_subfolders_only() -> None:
+    files = [
+        _mk(1, "A/Album/Cd1", "a.mp3", albumartist="A", discnumber="2"),
+        _mk(2, "A/Album/[DISC.02]", "a.mp3", albumartist="A", discnumber="2/2"),
+        _mk(3, "A/Album/1", "a.mp3", albumartist="A", discnumber="1"),
+        _mk(4, "A/Album/Disc 3 Bonus", "a.mp3", albumartist="A", discnumber="03"),
+        # Bonus CD and track-range folders name no disc number.
+        _mk(5, "A/Album/Bonus CD", "a.mp3", albumartist="A", discnumber="5"),
+        _mk(6, "A/Album/01-04 Songs", "a.mp3", albumartist="A", discnumber="3"),
+        # A blank disc tag gives no signal.
+        _mk(7, "A/Album/Cd2", "a.mp3", albumartist="A"),
+    ]
+
+    assert _flags(files) == {1: {DISC_FOLDER_NUMBER}}
+
+
+# --- filename_track ------------------------------------------------------------------
+
+
+def test_filename_track_reads_each_numbering_shape() -> None:
+    files = [
+        _mk(1, "A/Album", "A - Album - 05 - Song.mp3", albumartist="A", tracknumber="5"),
+        _mk(2, "A/Album", "A - Album - 06 - Song.mp3", albumartist="A", tracknumber="7"),
+        _mk(3, "B/Album", "B - 05 - Song.mp3", albumartist="B", tracknumber="5/12"),
+        _mk(4, "C/Album", "1-05 Song.mp3", albumartist="C", tracknumber="5", discnumber="1"),
+        _mk(5, "D/Album", "2-05 Song.mp3", albumartist="D", tracknumber="5", discnumber="1"),
+        _mk(6, "E/Album", "105 Song.mp3", albumartist="E", tracknumber="5", discnumber="1"),
+        _mk(7, "F/Album", "05. Song.mp3", albumartist="F", tracknumber="005"),
+        # 00 is a placeholder for no number.
+        _mk(8, "G/Album", "00 Intro.mp3", albumartist="G", tracknumber="3"),
+        # A leading artist number is never read first.
+        _mk(9, "311/Album", "311 - Album - 04 - Amber.mp3", albumartist="311", tracknumber="4"),
+        # A blank track tag gives no signal.
+        _mk(10, "H/Album", "09 Song.mp3", albumartist="H"),
+    ]
+
+    assert _flags(files) == {2: {FILENAME_TRACK}, 5: {FILENAME_TRACK}}
+
+
+def test_filename_track_accepts_a_continuous_count_only_across_discs() -> None:
+    multi = [
+        _mk(1, "A/Album", "01 a.mp3", albumartist="A", discnumber="1", tracknumber="1"),
+        _mk(2, "A/Album", "02 b.mp3", albumartist="A", discnumber="1", tracknumber="2"),
+        _mk(3, "A/Album", "03 c.mp3", albumartist="A", discnumber="2", tracknumber="1"),
+        _mk(4, "A/Album", "04 d.mp3", albumartist="A", discnumber="2", tracknumber="2"),
+    ]
+    single = [
+        _mk(5, "B/Album", "01 a.mp3", albumartist="B", tracknumber="2"),
+        _mk(6, "B/Album", "02 b.mp3", albumartist="B", tracknumber="3"),
+    ]
+
+    assert _flags([*multi, *single]) == {5: {FILENAME_TRACK}, 6: {FILENAME_TRACK}}
+
+
+# --- filename_title ------------------------------------------------------------------
+
+
+def test_filename_title_compares_the_title_text() -> None:
+    files = [
+        _mk(1, "A/Album", "05 Iron Gland.mp3", albumartist="A", title="Angry Chair"),
+        _mk(2, "A/Album", "06 The Song.mp3", albumartist="A", title="Song"),
+        _mk(3, "A/Album", "07 Song (Live).mp3", albumartist="A", title="Song"),
+        _mk(4, "A/Album", "08 Song (Remastered).mp3", albumartist="A", title="Song (feat. X)"),
+        _mk(5, "A/Album", "A - Other.mp3", albumartist="A", artist="A", title="Other"),
+        _mk(
+            6,
+            "A/Album",
+            "A - Album - 09 - Waking City, The.mp3",
+            albumartist="A",
+            title="The Waking City",
+        ),
+        # A filename with no title text gives no signal.
+        _mk(7, "A/Album", "10.mp3", albumartist="A", title="Anything"),
+        _mk(8, "A/Album", "11 - 1999.mp3", albumartist="A", title="Anything"),
+    ]
+
+    assert _flags(files) == {1: {FILENAME_TITLE}}
+
+
+# --- formatting, blanks and the shared value rule ------------------------------------
+
+
+def test_formatting_alone_never_flags() -> None:
+    files = [
+        _mk(
+            1,
+            "ac-dc/(1980) AC-DC - BACK IN BLACK",
+            "01 - hells bells.mp3",
+            albumartist="AC/DC",
+            album="Back in Black",
+            date="1980",
+            tracknumber="1",
+            title="Hell's Bells",
+        ),
+        _mk(
+            2,
+            "Royksopp/Melodie A.M. (2001)",
+            "2 So Easy.mp3",
+            albumartist="Röyksopp",
+            album="Mélodie A.M.",
+            date="2001-09-03",
+            tracknumber="02",
+            title="So Easy",
+        ),
+        _mk(
+            3,
+            "Artist/2003 - Album/CD 2",
+            "205 Song.mp3",
+            albumartist="Artist",
+            album="Album",
+            date="2003",
+            tracknumber="5",
+            discnumber="2/2",
+            title="Song",
+        ),
+        _mk(
+            4,
+            "Artist/Artist - 1999 - Hits Volume II",
+            "Artist - Hits Vol. 2 - 007 - Rock and Roll.mp3",
+            albumartist="Artist",
+            album="Hits Vol. 2",
+            date="1999",
+            tracknumber="7",
+            title="Rock & Roll",
+        ),
+        # A disc count marker never eats the last digit of a number before it.
+        _mk(
+            5,
+            "Depeche Mode/(1998) Depeche Mode - The Singles 86 - 98 CD 1",
+            "01 Song.mp3",
+            albumartist="Depeche Mode",
+            album="The Singles 86>98 (disc 1)",
+            date="1998",
+        ),
+        # A contraction or an initialism is one word, whatever its apostrophes, dots or spaces.
+        _mk(
+            6,
+            "Artist/(2004) Artist - I'm the Supervisor",
+            "01 Im Alive.mp3",
+            albumartist="Artist",
+            album="IM the Supervisor",
+            date="2004",
+            tracknumber="1",
+            title="I\u2019m Alive",
+        ),
+        _mk(
+            7,
+            "Artist/(2005) Artist - Ive Got It",
+            "02 Ill Be There.mp3",
+            albumartist="Artist",
+            album="I've Got It",
+            date="2005",
+            tracknumber="2",
+            title="I'll Be There",
+        ),
+        _mk(
+            8,
+            "Artist/(2006) Artist - IV",
+            "03 i._e._d.mp3",
+            albumartist="Artist",
+            album="I.V.",
+            date="2006",
+            tracknumber="3",
+            title="I.E.D.",
+        ),
+    ]
+
+    assert _flags(files) == {}
+
+
+def test_a_blank_tag_never_flags() -> None:
+    files = [
+        _mk(1, "Artist/(1999) Artist - Album/Cd1", "05 Song.mp3"),
+        _mk(
+            2,
+            "Artist/(1999) Artist - Album/Cd2",
+            "06 Song.mp3",
+            albumartist=" ",
+            album="",
+            date=" ",
+            discnumber="",
+            tracknumber=" ",
+            title="?",
+        ),
+    ]
+
+    report = mismatch._classify(files, _MUSIC)
+
+    assert report.rows == []
+    assert report.exception_rows == []
+
+
+def test_a_path_rendered_from_the_tags_never_flags() -> None:
+    nfd = functools.partial(unicodedata.normalize, "NFD")
+    tag_sets = [
+        {
+            "albumartist": "AC/DC",
+            "album": "Live: 1999 - 2009?",
+            "date": "2001-05-01",
+            "tracknumber": "3/12",
+            "discnumber": "1",
+            "title": "What*Ever...",
+        },
+        {
+            "albumartist": nfd("Röyksopp"),
+            "album": nfd("Mélodie A.M..."),
+            "date": "2002",
+            "tracknumber": "7",
+            "title": nfd("Café: Noir / Blanc"),
+        },
+        {
+            "albumartist": "Sublime - Sinsemilla",
+            "album": "Vol. 12 - 13 - Best*",
+            "date": "1999",
+            "originaldate": "1995",
+            "tracknumber": "12",
+            "title": "Track - 3 - <x>",
+        },
+        {
+            "albumartist": "The Band",
+            "album": '2001: A "Space" Odyssey',
+            "date": "1968",
+            "tracknumber": "1",
+            "title": "1999|2000",
+        },
+        {
+            "albumartist": "The Dreaming",
+            "album": "Bonus Tracks EP",
+            "date": "2005",
+            "tracknumber": "2",
+            "title": "Limited Edition",
+        },
+    ]
+    files: list[mismatch._FileInput] = []
+    for file_id, tags in enumerate(tag_sets, 1):
+        artist, album, title = (
+            clean_value(tags[name]) for name in ("albumartist", "album", "title")
+        )
+        number = f"{parse_position(tags['tracknumber']):02d}"
+        release = f"({tags['date'][:4]}) {artist} - {album}"
+        filename = f"{artist} - {album} - {number} - {title}.flac"
+        files.append(_mk(file_id, f"{artist}/{release}", filename, **tags))
+        # Windows drops a folder name's trailing dot, which must not flag either.
+        files.append(_mk(file_id + 100, f"{artist}/{release.rstrip('.')}", filename, **tags))
+
+    report = mismatch._classify(files, _MUSIC)
+
+    assert report.rows == []
+
+
+# --- exceptions ----------------------------------------------------------------------
+
+
+def test_curated_and_nested_files_are_exceptions_outside_flagged() -> None:
+    nested = "Lusine/2002 - Iron city/2002 - Iron City_320/Iron City"
+    files = [
+        _mk(1, "Artist/Singles", "a.mp3", albumartist="Artist", album="A Single", date="1999"),
+        _mk(2, nested, "01 Song.mp3", albumartist="Lusine", album="Iron City", title="Song"),
+        # An exception file that also differs is flagged and listed as an exception.
+        _mk(3, nested, "02 Other.mp3", albumartist="Lusine", album="Iron City", title="Angry"),
+        # Disc subfolders, wrappers and root albums are not exceptions.
+        _mk(4, "Tool [Discography]/Undertow/CD1", "a.mp3", albumartist="Tool"),
+        _mk(5, "Root Album", "a.mp3", albumartist="Band"),
+        *_padding(),
+    ]
+
+    report = mismatch._classify(files, _MUSIC)
+
+    assert [(r.file_id, r.exception) for r in report.exception_rows] == [
+        (1, "curated"),
+        (2, "nested"),
+        (3, "nested"),
+    ]
+    assert report.exceptions_undecided == 3
+    assert [r.file_id for r in report.rows] == [3]
+    assert report.rows[0].exception == "nested"
+    assert report.flagged == 1
+
+
+# --- tiers and the reliability guard -------------------------------------------------
+
+
+def _tier(report: mismatch.MismatchesReport, file_id: int) -> str | None:
+    row = _find(report, file_id)
+    return None if row is None else row.tier
+
+
+def test_top_folder_artist_tiers_by_group_shape() -> None:
+    files = [
+        _mk(1, "Ozzy/Down", "a.mp3", albumartist="Jem"),
+        _mk(2, "Ozzy/Down", "b.mp3", albumartist="Ozzy"),
+        _mk(3, "Luna/Album", "a.mp3", albumartist="Wrong"),
+        _mk(4, "Luna/Album", "b.mp3", albumartist="Wrong"),
+        _mk(5, "Solo/Single", "a.mp3", albumartist="Other"),
+        _mk(6, "Band/Album", "a.mp3", artist="Stranger"),
+        _mk(7, "Band/Album", "b.mp3", artist="Band"),
+        *_padding(),
+    ]
+
+    report = mismatch._classify(files, _MUSIC)
+
+    assert report.path_signal_unreliable is False
+    assert {fid: _tier(report, fid) for fid in (1, 3, 4, 5, 6)} == {
+        1: "high",
+        3: "medium",
+        4: "medium",
+        5: "low",
+        6: "low",
+    }
+
+
+def test_name_and_number_tiers_and_the_most_severe_wins() -> None:
+    files = [
+        _mk(1, "A/Bark at the Moon", "a.mp3", albumartist="A", album="Down To Earth"),
+        _mk(2, "A/Best Hits Collection", "a.mp3", albumartist="A", album="Greatest Hits Vol 2"),
+        _mk(3, "A/Millenium", "a.mp3", albumartist="A", album="Millennium"),
+        _mk(
+            4,
+            "A/Millenium (2001)",
+            "02 Song.mp3",
+            albumartist="A",
+            album="Millennium",
+            tracknumber="3",
+        ),
+    ]
+
+    report = mismatch._classify(files, _MUSIC)
+
+    assert {fid: _tier(report, fid) for fid in (1, 2, 3, 4)} == {
+        1: "high",
+        2: "medium",
+        3: "low",
+        4: "high",
+    }
+
+
+def test_reliability_guard_tiers_top_folder_differences_low_and_drops_nothing() -> None:
+    files = [_mk(i, f"Folder{i}/Album", "a.mp3", albumartist=f"Someone{i}") for i in range(1, 5)]
+    files.append(_mk(10, "Real/Album", "a.mp3", albumartist="Real"))
+
+    report = mismatch._classify(files, _MUSIC)
+
+    assert report.path_signal_unreliable is True
+    assert report.disagreement_rate == pytest.approx(0.8)
+    assert sorted(r.file_id for r in report.rows) == [1, 2, 3, 4]
+    assert {r.tier for r in report.rows} == {"low"}
+    assert "path signal unreliable" in report.summary
+
+
+# --- report shape, groups and the view -----------------------------------------------
+
+_ALBUM = "Artist/(1999) Artist - Album"
+
+
+def _grouped_library() -> list[mismatch._FileInput]:
+    common = {"albumartist": "Artist", "album": "Album", "date": "1999"}
+    return [
+        _mk(1, f"{_ALBUM}/CD1", "01 Song.mp3", discnumber="2", **common),
+        _mk(2, f"{_ALBUM}/CD2", "01 Other.mp3", discnumber="2", **common),
+        _mk(3, _ALBUM, "05 Togetger.mp3", title="Together", musicbrainz_albumid="mb", **common),
+        _mk(4, "Artist/Singles", "single.mp3", albumartist="Artist"),
+        *_padding(),
+    ]
+
+
+def test_report_rows_and_header_shape() -> None:
+    report = mismatch._classify(_grouped_library(), _MUSIC)
+    payload = report.to_dict()
+
+    assert set(payload) == {
+        "rows",
+        "exception_rows",
+        "groups",
+        "total_files",
+        "flagged",
+        "group_count",
+        "by_comparison",
+        "high",
+        "medium",
+        "low",
+        "exceptions_undecided",
+        "disagreement_rate",
+        "path_signal_unreliable",
+        "suppressed",
+        "container_suppressed",
+        "summary",
+    }
+    assert payload["flagged"] == 2
+    assert payload["group_count"] == 2
+    assert payload["by_comparison"] == {DISC_FOLDER_NUMBER: 1, FILENAME_TITLE: 1}
+    assert payload["exceptions_undecided"] == 1
+    assert (payload["high"], payload["medium"], payload["low"]) == (1, 0, 1)
+    rows = payload["rows"]
+    assert isinstance(rows, list)
+    assert rows[0] == {
+        "file_id": 1,
+        "folder": str(_MUSIC / _ALBUM / "CD1"),
+        "filename": "01 Song.mp3",
+        "tier": "high",
+        "differences": [{"comparison": DISC_FOLDER_NUMBER, "tag_value": "2", "path_value": "CD1"}],
+        "exception": None,
+    }
+    exception_rows = payload["exception_rows"]
+    assert isinstance(exception_rows, list)
+    assert [r["file_id"] for r in exception_rows] == [4]
+
+
+def test_to_dict_rounds_disagreement_rate() -> None:
+    # The engine keeps full precision for the RELIABILITY_FLOOR comparison, but the payload an
+    # LLM reads on every call must not carry 17 digits of noise.
+    report = replace(
+        mismatch._classify(_grouped_library(), _MUSIC),
+        disagreement_rate=0.01250861814242096,
+    )
+
+    assert report.to_dict()["disagreement_rate"] == 0.0125
+    assert report.disagreement_rate == 0.01250861814242096
+
+
+def test_groups_key_on_the_release_folder() -> None:
+    report = mismatch._classify(_grouped_library(), _MUSIC)
+
+    grouped = _view(report, group=True)
+
+    assert grouped.rows == []
+    album, singles = grouped.groups
+    assert album.to_dict() == {
+        "folder": str(_MUSIC / _ALBUM),
+        "file_count": 3,
+        "flagged": 2,
+        "tier": "high",
+        "comparisons": {
+            DISC_FOLDER_NUMBER: {"files": 1, "tag": "2", "path": "CD1"},
+            FILENAME_TITLE: {"files": 1, "tag": "Together", "path": "Togetger"},
+        },
+        "mb_stamped": False,
+        "exception": None,
+        "suppressed": {},
+        "file_ids": [1, 3],
+        "unflagged_ids": [2],
+    }
+    assert singles.folder == str(_MUSIC / "Artist" / "Singles")
+    assert (singles.flagged, singles.exception, singles.file_ids) == (0, "curated", [4])
+    assert singles.tier is None
+
+
+def test_view_filters_by_tier_comparison_folder_and_limit() -> None:
+    report = mismatch._classify(_grouped_library(), _MUSIC)
+    album_key = path_keys.path_key(_MUSIC / _ALBUM)
+
+    by_tier = _view(report, tier="low")
+    by_comparison = _view(report, comparison=DISC_FOLDER_NUMBER)
+    by_group = _view(report, folder_key=album_key, group=True)
+    by_disc_folder = _view(report, folder_key=path_keys.path_key(_MUSIC / _ALBUM / "CD1"))
+    by_parent = _view(report, folder_key=path_keys.path_key(_MUSIC / "Artist"))
+    stamped = _view(report, comparison=FILENAME_TITLE, group=True)
+
+    assert [r.file_id for r in by_tier.rows] == [3]
+    assert by_tier.exception_rows == []
+    assert [r.file_id for r in by_comparison.rows] == [1]
+    assert by_comparison.exception_rows == []
+    assert [r.file_id for r in by_group.rows] == [1, 3]
+    assert by_group.groups == []
+    assert [r.file_id for r in by_disc_folder.rows] == [1]
+    assert by_parent.rows == []
+    assert [g.mb_stamped for g in stamped.groups] == [True]
+    assert len(_view(report, limit=1).rows) == 1
+    assert len(_view(report, group=True, limit=1).groups) == 1
+    # Counts describe the whole library in every view.
+    assert by_tier.flagged == by_comparison.flagged == report.flagged == 2
+
+
+# --- dispositions --------------------------------------------------------------------
+
+_OZZY = "Ozzy Osbourne/(2001) Ozzy Osbourne - Down To Earth"
+
+
+def _disposition_library() -> list[mismatch._FileInput]:
+    return [
+        _mk(100, _OZZY, "01 Gets Me Through.mp3", albumartist="Jem", artist="Ozzy Osbourne"),
+        _mk(101, _OZZY, "03 Dreamer.mp3", albumartist="Ozzy Osbourne"),
+        _mk(150, "Blue Stahli/Singles", "a.mp3", albumartist="Future Islands"),
+        *_padding(),
+    ]
+
+
+def _disp(status: str, field: str | None, value: str | None) -> store.MismatchStatusRow:
+    return store.MismatchStatusRow(status=status, source_field=field, source_value=value)
+
+
+def test_fresh_disposition_silences_its_file_and_reports_it() -> None:
+    dispositions = {100: _disp("legit_ignore", "albumartist", "Jem")}
+    files = [
+        *_disposition_library(),
+        _mk(102, _OZZY, "04 Iron Gland.mp3", albumartist="Ozzy Osbourne", title="Angry Chair"),
+    ]
+
+    report = mismatch._classify(files, _MUSIC, dispositions=dispositions)
+
+    assert _find(report, 100) is None
+    assert report.flagged == 2
+    assert report.suppressed == {"legit_ignore": 1}
+    ozzy = next(g for g in _view(report, group=True).groups if g.folder == str(_MUSIC / _OZZY))
+    assert ozzy.suppressed == {"legit_ignore": 1}
+    assert ozzy.unflagged_ids == [100, 101]
+
+
+def test_stale_disposition_resurfaces() -> None:
+    dispositions = {100: _disp("legit_ignore", "albumartist", "Old Name")}
+
+    report = mismatch._classify(_disposition_library(), _MUSIC, dispositions=dispositions)
+
+    assert _tier(report, 100) == "high"
+    assert report.suppressed == {}
+
+
+def test_both_statuses_silence_flagged_and_exception_rows() -> None:
+    dispositions = {
+        100: _disp("legit_ignore", "albumartist", "Jem"),
+        150: _disp("misfiled_deferred", "albumartist", "Future Islands"),
+    }
+
+    report = mismatch._classify(_disposition_library(), _MUSIC, dispositions=dispositions)
+
+    assert report.rows == []
+    assert report.exception_rows == []
+    assert report.suppressed == {"legit_ignore": 1, "misfiled_deferred": 1}
+
+
+# --- layout_of -----------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("rel", "expected"),
+    [
+        ("Tool [Discography]/(1993) Undertow", ("Tool", "(1993) Undertow", None, None, None)),
+        ("A/Album/Cd1", ("A", "Album", "Cd1", 1, None)),
+        ("A/Album/[DISC.02]", ("A", "Album", "[DISC.02]", 2, None)),
+        ("A/Album/1", ("A", "Album", "1", 1, None)),
+        ("A/Album/Bonus CD", ("A", "Album", "Bonus CD", None, None)),
+        ("A/Album/01-04 Songs", ("A", "Album", "01-04 Songs", None, None)),
+        ("A/Singles", ("A", None, None, None, "curated")),
+        ("A/Remixes/Club Mix", ("A", "Club Mix", None, None, "curated")),
+        ("A/Box/Album", ("A", "Album", None, None, "nested")),
+        ("Root Album", (None, "Root Album", None, None, None)),
+    ],
+)
+def test_layout_of_names_each_level(
+    engine_settings: Settings,
+    music_dir: Path,
+    rel: str,
+    expected: tuple[str | None, str | None, str | None, int | None, str | None],
+) -> None:
+    layout = mismatch.layout_of(engine_settings, str(music_dir / rel), "01.mp3")
+
+    assert (
+        layout.top_folder,
+        layout.release_folder,
+        layout.disc_folder,
+        layout.disc_number,
+        layout.exception,
+    ) == expected
+    assert layout.disc_numbered is (expected[3] is not None)
+    assert layout.filename == "01.mp3"
+
+
+def test_layout_of_reads_the_release_years_and_container(tmp_path: Path, music_dir: Path) -> None:
+    settings = Settings(
+        music_path=music_dir,
+        lastfm_api_key=None,
+        db_path=tmp_path / "ledger.sqlite3",
+        container_folders=("Soundtracks",),
+    )
+
+    dated = mismatch.layout_of(settings, str(music_dir / "A" / "A - 1999 - Live 2001"), "x.mp3")
+    contained = mismatch.layout_of(settings, str(music_dir / "Soundtracks" / "Movie"), "x.mp3")
+
+    assert dated.release_years == ("1999", "2001")
+    assert dated.container is False
+    assert contained.container is True
+
+
+def test_layout_of_requires_music_path(tmp_path: Path) -> None:
+    settings = Settings(music_path=None, lastfm_api_key=None, db_path=tmp_path / "l.sqlite3")
+
+    with pytest.raises(ValueError, match="music_path not configured"):
+        mismatch.layout_of(settings, str(tmp_path), "x.mp3")
+
+
+# --- integration: scan real audio, then detect ---------------------------------------
+
+
+def _make_mislabeled_library(music_dir: Path) -> Path:
+    """Create clean, agreeing tracks and a Jem-mislabeled Ozzy folder. Return the Ozzy folder.
+
+    The four clean folders keep the top-folder difference rate under the reliability floor,
+    so the mislabeled ``Jem`` file surfaces as high (a mixed-albumartist group).
     """
     for name in ("CleanA", "CleanB", "CleanC", "CleanD"):
-        make_track(music_dir / name / "01.mp3", {"albumartist": [name], "artist": [name]})
+        make_track(
+            music_dir / name / "Album" / "01.mp3",
+            {"albumartist": [name], "artist": [name]},
+        )
     ozzy = music_dir / "Ozzy Osbourne" / "(2001) Ozzy Osbourne - Down To Earth"
     make_track(
         ozzy / "01 Gets Me Through.mp3",
@@ -43,363 +846,6 @@ def _make_mislabeled_library(music_dir: Path) -> Path:
     )
     make_track(ozzy / "03 Dreamer.mp3", {"albumartist": ["Ozzy Osbourne"], "artist": ["Ozzy"]})
     return ozzy
-
-
-def _mk(
-    file_id: int,
-    folder: Path,
-    filename: str,
-    *,
-    albumartist: str | None = None,
-    artist: str | None = None,
-) -> mismatch._FileInput:
-    return mismatch._FileInput(
-        file_id=file_id,
-        folder=str(folder),
-        filename=filename,
-        albumartist=albumartist,
-        artist=artist,
-    )
-
-
-def _find(report: mismatch.MismatchesReport, file_id: int) -> mismatch.MismatchRow | None:
-    return next((r for r in report.rows if r.file_id == file_id), None)
-
-
-def _find_context(
-    report: mismatch.MismatchesReport,
-    file_id: int,
-) -> mismatch.MismatchRow | None:
-    return next((r for r in report.folder_context_rows if r.file_id == file_id), None)
-
-
-# --- _top_artist --------------------------------------------------------------------
-
-
-def test_top_artist_extracts_and_strips_discography() -> None:
-    assert mismatch._top_artist(str(_MUSIC / "Ozzy Osbourne" / "Album"), _MUSIC) == "Ozzy Osbourne"
-    stp = _MUSIC / "Stone Temple Pilots [Discography]" / "MP3"
-    assert mismatch._top_artist(str(stp), _MUSIC) == "Stone Temple Pilots"
-
-
-def test_top_artist_none_at_root_or_outside() -> None:
-    # A file directly under music_path has empty relative parts -> None (no path signal).
-    assert mismatch._top_artist(str(_MUSIC), _MUSIC) is None
-    # A folder not under music_path -> relative_to ValueError -> None.
-    assert mismatch._top_artist(str(Path("/somewhere/else")), _MUSIC) is None
-
-
-# --- _primary_artist ----------------------------------------------------------------
-
-
-def test_primary_artist_splits_feat_and_separators() -> None:
-    assert mismatch._primary_artist("Neon Hitch feat. Someone") == "Neon Hitch"
-    assert mismatch._primary_artist("A & B") == "A"
-    assert mismatch._primary_artist("A, B, C") == "A"
-    assert mismatch._primary_artist("Solo Artist") == "Solo Artist"
-
-
-# --- _disagrees (bidirectional containment) -----------------------------------------
-
-
-def test_disagrees_bidirectional_and_none_top() -> None:
-    track = _MUSIC / "Lusine" / "(2005) Lusine - Album" / "01.mp3"
-    # Alias/suffix in the folder's artist -> agrees (top-artist contained in albumartist).
-    assert mismatch._disagrees("Lusine ICL", str(track), "Lusine") is False
-    reverse = _MUSIC / "Lusine ICL" / "Album" / "01.mp3"
-    # And the reverse containment (albumartist contained in top-artist) also agrees.
-    assert mismatch._disagrees("Lusine", str(reverse), "Lusine ICL") is False
-    # A genuinely unrelated albumartist disagrees.
-    ozzy = _MUSIC / "Ozzy Osbourne" / "Down To Earth" / "01.mp3"
-    assert mismatch._disagrees("Jem", str(ozzy), "Ozzy Osbourne") is True
-    # No top-artist means no path signal -> never disagrees.
-    assert mismatch._disagrees("Jem", str(ozzy), None) is False
-
-
-# --- pure classifier: every labeled class -------------------------------------------
-
-
-def _all_classes_library() -> list[mismatch._FileInput]:
-    """Constructed inputs reproducing each labeled class with clean padding.
-
-    Enough clean, agreeing files keep the library-wide disagreement rate below the
-    reliability floor so the HIGH/MEDIUM path tiers stay active.
-    """
-    ozzy = _MUSIC / "Ozzy Osbourne" / "(2001) Ozzy Osbourne - Down To Earth"
-    chiasm = _MUSIC / "Chiasm" / "(2003) Chiasm - Divided We Fall"
-    singles = _MUSIC / "Blue Stahli" / "Singles"
-    leaether = _MUSIC / "Leaether Strip" / "(1990) Album"
-    lusine = _MUSIC / "Lusine" / "(2005) Lusine - Serial"
-    various = _MUSIC / "Various Artists" / "(1999) Comp"
-    neon_single = _MUSIC / "Neon Hitch" / "(2012) Single"
-    gym = _MUSIC / "Gym Class Heroes" / "(2011) Album"
-    files = [_mk(i, _MUSIC / f"Clean{i}", "01.mp3", albumartist=f"Clean{i}") for i in range(1, 19)]
-    files += [
-        # Ozzy: mixed albumartist folder -> Jem=HIGH, Ozzy=LOW (folder-consistency).
-        _mk(100, ozzy, "01 Gets Me Through.mp3", albumartist="Jem", artist="Ozzy Osbourne"),
-        _mk(101, ozzy, "03 Dreamer.mp3", albumartist="Ozzy Osbourne", artist="Ozzy Osbourne"),
-        # Chiasm: uniformly mis-stamped folder -> MEDIUM.
-        _mk(110, chiasm, "01.mp3", albumartist="Bill Leverty"),
-        _mk(111, chiasm, "02.mp3", albumartist="Bill Leverty"),
-        # Diacritic/ligature variant -> agrees, not flagged.
-        _mk(120, leaether, "01.mp3", albumartist="Leæther Strip"),
-        # Alias/suffix -> bidirectional containment, not flagged.
-        _mk(130, lusine, "01.mp3", albumartist="Lusine ICL"),
-        # Various Artists -> excluded entirely.
-        _mk(140, various, "01.mp3", albumartist="Various Artists"),
-        # Singles (non-album guard) -> path disagreement demoted to LOW.
-        _mk(150, singles, "a.mp3", albumartist="Future Islands"),
-        _mk(151, singles, "b.mp3", albumartist="Celldweller"),
-        # 1-file folder (non-album guard) -> LOW.
-        _mk(160, neon_single, "01.mp3", albumartist="Gym Class Heroes"),
-        # No albumartist, artist disagrees -> artist fallback LOW.
-        _mk(170, gym, "01.mp3", artist="Neon Hitch feat. X"),
-    ]
-    return files
-
-
-def test_classify_every_labeled_class() -> None:
-    report = mismatch._classify(_all_classes_library(), _MUSIC)
-
-    assert report.path_signal_suppressed is False
-
-    # HIGH: Ozzy's Jem-stamped file (mixed-albumartist folder + path disagreement).
-    jem = _find(report, 100)
-    assert jem is not None
-    assert jem.tier == "high"
-    assert jem.field == "albumartist"
-    assert jem.tag_value == "Jem"
-    assert jem.path_artist == "Ozzy Osbourne"
-
-    # MEDIUM: uniformly mis-stamped folder.
-    assert (_find(report, 110), _find(report, 111)) != (None, None)
-    assert report.medium == 2
-    for fid in (110, 111):
-        row = _find(report, fid)
-        assert row is not None
-        assert row.tier == "medium"
-
-    # NOT flagged: diacritic variant, alias/suffix, Various Artists.
-    assert _find(report, 120) is None
-    assert _find(report, 130) is None
-    assert _find(report, 140) is None
-
-    # LOW: non-album guards (Singles + 1-file) and the artist fallback.
-    for fid in (150, 151, 160):
-        row = _find(report, fid)
-        assert row is not None
-        assert row.tier == "low"
-    fallback = _find(report, 170)
-    assert fallback is not None
-    assert fallback.tier == "low"
-    assert fallback.field == "artist"
-
-    # FOLDER CONTEXT: the mixed-folder clean sibling agrees with its path -> not a defect.
-    assert _find(report, 101) is None
-    sibling = _find_context(report, 101)
-    assert sibling is not None
-    assert sibling.reason == mismatch._REASON_VARIANT
-
-    assert report.high == 1
-    assert report.low == 4
-    assert report.flagged == 7
-    assert report.high + report.medium + report.low == report.flagged
-    assert report.folder_context == 1
-
-
-def test_a_dotted_ep_folder_is_non_album() -> None:
-    # The non-album test ignores punctuation, so ``E.P.`` is guarded like ``EP``.
-    clean = [_mk(i, _MUSIC / f"Clean{i}", "01.mp3", albumartist=f"Clean{i}") for i in range(1, 19)]
-    ep = _MUSIC / "Chiasm" / "E.P."
-    files = [
-        *clean,
-        _mk(200, ep, "01.mp3", albumartist="Bill Leverty"),
-        _mk(201, ep, "02.mp3", albumartist="Bill Leverty"),
-    ]
-
-    report = mismatch._classify(files, _MUSIC)
-
-    for fid in (200, 201):
-        row = _find(report, fid)
-        assert row is not None
-        assert row.tier == "low"
-        assert row.reason == mismatch._REASON_GUARDED
-    assert report.medium == 0
-
-
-# --- reliability guard --------------------------------------------------------------
-
-
-def test_reliability_guard_suppresses_path_tiers() -> None:
-    genres = ["Rock", "Pop", "Jazz", "Metal", "Blues"]
-    artists = ["Foo Fighters", "Madonna", "Miles Davis", "Metallica", "B.B. King"]
-    files = [
-        _mk(index, _MUSIC / genre / "Album", "01.mp3", albumartist=artist)
-        for index, (genre, artist) in enumerate(zip(genres, artists, strict=True), start=1)
-    ]
-    mixed = _MUSIC / "Mixed" / "Comp"
-    files += [
-        _mk(10, mixed, "a.mp3", albumartist="X Artist"),
-        _mk(11, mixed, "b.mp3", albumartist="Y Artist"),
-        # An artist-fallback candidate: must also be suppressed (it is a path signal).
-        _mk(20, _MUSIC / "Genre7" / "Album", "01.mp3", artist="Some Artist"),
-    ]
-
-    report = mismatch._classify(files, _MUSIC)
-
-    assert report.path_signal_suppressed is True
-    assert report.high == 0
-    assert report.medium == 0
-    # The genre-organized single-artist folders and the artist fallback are all suppressed.
-    for fid in (1, 2, 3, 4, 5, 20):
-        assert _find(report, fid) is None
-    # Only the naming-agnostic folder-consistency LOW survives.
-    assert report.low == 2
-    for fid in (10, 11):
-        row = _find(report, fid)
-        assert row is not None
-        assert row.tier == "low"
-
-
-def test_reliability_guard_keeps_disagreeing_files_flagged() -> None:
-    """The guard must not turn genuine disagreements into folder context.
-
-    When the path signal is suppressed library-wide the folder-consistency LOW tier is the
-    only surviving output, so splitting on the fallback branch alone would empty ``flagged``.
-    The split keys on the file's own path agreement instead.
-    """
-    genres = ["Rock", "Pop", "Jazz", "Metal", "Blues"]
-    performers = ["Foo Fighters", "Madonna", "Miles Davis", "Metallica", "B.B. King"]
-    files = [
-        _mk(index, _MUSIC / genre / "Album", "01.mp3", albumartist=performer)
-        for index, (genre, performer) in enumerate(zip(genres, performers, strict=True), start=1)
-    ]
-    mixed = _MUSIC / "Mixed" / "Comp"
-    agreeing = _MUSIC / "Mixed2" / "Comp"
-    files += [
-        _mk(10, mixed, "a.mp3", albumartist="X Artist"),
-        _mk(11, mixed, "b.mp3", albumartist="Y Artist"),
-        # Same messy-folder shape, but this file agrees with its own path -> context.
-        _mk(20, agreeing, "a.mp3", albumartist="Mixed2"),
-        _mk(21, agreeing, "b.mp3", albumartist="Z Artist"),
-    ]
-
-    report = mismatch._classify(files, _MUSIC)
-
-    assert report.path_signal_suppressed is True
-    # The three disagreeing files stay flagged, each with the suppressed-path reason.
-    assert report.flagged == 3
-    assert report.high + report.medium + report.low == report.flagged
-    for fid in (10, 11, 21):
-        row = _find(report, fid)
-        assert row is not None
-        assert row.tier == "low"
-        assert row.reason == mismatch._REASON_SUPPRESSED
-    # Only the file that agrees with its path is context.
-    assert report.folder_context == 1
-    context = _find_context(report, 20)
-    assert context is not None
-    assert context.reason == mismatch._REASON_VARIANT
-
-
-# --- folder context: agrees-with-path rows are not defects --------------------------
-
-
-def _singles_library() -> list[mismatch._FileInput]:
-    """The live-run shape: one mis-stamped single plus two siblings that agree with the path."""
-    singles = _MUSIC / "Blue Stahli" / "Singles"
-    files = [_mk(i, _MUSIC / f"Clean{i}", "01.mp3", albumartist=f"Clean{i}") for i in range(1, 5)]
-    files += [
-        _mk(100, singles, "a.mp3", albumartist="Celldweller"),
-        _mk(101, singles, "b.mp3", albumartist="Blue Stahli"),
-        _mk(102, singles, "c.mp3", albumartist="Blue Stahli"),
-    ]
-    return files
-
-
-def test_agreeing_siblings_are_context_not_flagged() -> None:
-    report = mismatch._classify(_singles_library(), _MUSIC)
-
-    # Only the mis-stamped file is a defect.
-    assert report.flagged == 1
-    assert report.high + report.medium + report.low == report.flagged
-    mis_stamped = _find(report, 100)
-    assert mis_stamped is not None
-    assert mis_stamped.tag_value == "Celldweller"
-
-    # Its two correct siblings are review context, out of every tier tally.
-    assert report.folder_context == 2
-    assert {r.file_id for r in report.folder_context_rows} == {101, 102}
-    for fid in (101, 102):
-        assert _find(report, fid) is None
-        row = _find_context(report, fid)
-        assert row is not None
-        assert row.reason == mismatch._REASON_VARIANT
-
-    # The summary states both numbers without calling the context files defects.
-    assert "Flagged 1 of 7 file(s)" in report.summary
-    assert "plus 2 folder-context file(s) that agree with their path" in report.summary
-
-
-def test_tier_filter_never_returns_context_rows() -> None:
-    report = mismatch._classify(_singles_library(), _MUSIC)
-    assert report.folder_context_rows  # the unfiltered view carries them
-
-    low_only = mismatch._limit_report(report, tier="low", limit=None)
-
-    assert {r.file_id for r in low_only.rows} == {100}
-    assert low_only.folder_context_rows == []
-    assert low_only.folder_context == 2  # the count stays library-wide
-
-
-def test_grouped_view_splits_flagged_and_context_per_folder() -> None:
-    files = _singles_library()
-    report = mismatch._classify(files, _MUSIC)
-
-    grouped = mismatch._grouped_report(report, mismatch._folder_stats(files), tier=None, limit=None)
-
-    singles = next(g for g in grouped.groups if g.folder == str(_MUSIC / "Blue Stahli" / "Singles"))
-    assert singles.flagged == 1
-    assert singles.folder_context == 2
-    assert singles.file_ids == [100]  # context files never enter the fix batch
-    assert singles.to_dict()["folder_context"] == 2
-
-
-def test_grouped_view_respects_tier() -> None:
-    files = _all_classes_library()
-    report = mismatch._classify(files, _MUSIC)
-
-    grouped = mismatch._grouped_report(
-        report,
-        mismatch._folder_stats(files),
-        tier="high",
-        limit=None,
-    )
-
-    ozzy = str(_MUSIC / "Ozzy Osbourne" / "(2001) Ozzy Osbourne - Down To Earth")
-    assert [g.folder for g in grouped.groups] == [ozzy]
-    assert grouped.groups[0].flagged == 1
-    assert grouped.groups[0].file_ids == [100]
-    assert grouped.groups[0].tiers == {"high": 1}
-    assert grouped.medium == 2  # library counts unchanged
-
-
-# --- library-root file must not crash -----------------------------------------------
-
-
-def test_root_level_file_no_crash_no_path_flag() -> None:
-    files = [
-        _mk(1, _MUSIC, "loose.mp3", albumartist="Random Artist"),  # folder == music_path
-        _mk(2, _MUSIC / "CleanA", "01.mp3", albumartist="CleanA"),
-    ]
-    report = mismatch._classify(files, _MUSIC)
-    # No path signal for the root file -> never HIGH/MEDIUM, and no crash.
-    assert _find(report, 1) is None
-    assert report.high == 0
-    assert report.medium == 0
-
-
-# --- integration: scan real audio, then detect --------------------------------------
 
 
 def _read_albumartist(settings: Settings, folder: Path, filename: str) -> list[str]:
@@ -432,13 +878,14 @@ def test_detect_integration_flags_high_and_is_read_only(
 
     report = detect_mismatches(engine_settings)
 
-    assert report.path_signal_suppressed is False
+    assert report.path_signal_unreliable is False
     jem_id = _file_id(engine_settings, ozzy, "01 Gets Me Through.mp3")
     row = _find(report, jem_id)
     assert row is not None
     assert row.tier == "high"
-    assert row.field == "albumartist"
-    assert row.tag_value == "Jem"
+    assert [d.to_dict() for d in row.differences] == [
+        {"comparison": TOP_FOLDER_ARTIST, "tag_value": "Jem", "path_value": "Ozzy Osbourne"},
+    ]
 
     # Read-only: nothing staged and the file's tags are untouched on disk/in the ledger.
     conn = connect(engine_settings.db_path)
@@ -447,6 +894,37 @@ def test_detect_integration_flags_high_and_is_read_only(
     finally:
         conn.close()
     assert _read_albumartist(engine_settings, ozzy, "01 Gets Me Through.mp3") == ["Jem"]
+
+
+def test_detect_reads_every_comparison_from_scanned_tags(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    album = music_dir / "Artist" / "(2001) Artist - Album"
+    make_track(
+        album / "Cd1" / "Artist - Album - 02 - Other Song.flac",
+        {
+            "albumartist": ["Artist"],
+            "album": ["Another Record"],
+            "date": ["1999"],
+            "discnumber": ["2"],
+            "tracknumber": ["3"],
+            "title": ["Angry Chair"],
+        },
+    )
+    scan_library(engine_settings)
+
+    report = detect_mismatches(engine_settings)
+
+    assert report.flagged == 1
+    assert {d.comparison for d in report.rows[0].differences} == {
+        RELEASE_FOLDER_ALBUM,
+        RELEASE_FOLDER_YEAR,
+        DISC_FOLDER_NUMBER,
+        FILENAME_TRACK,
+        FILENAME_TITLE,
+    }
+    assert report.groups == []
 
 
 @pytest.mark.parametrize("spelling", FOLDER_SPELLINGS)
@@ -463,9 +941,6 @@ def test_folder_argument_variants_match_the_same_rows(
 
     assert exact.rows
     assert [r.file_id for r in variant.rows] == [r.file_id for r in exact.rows]
-    assert [r.file_id for r in variant.folder_context_rows] == [
-        r.file_id for r in exact.folder_context_rows
-    ]
 
 
 def test_folder_outside_music_path_is_refused(
@@ -476,7 +951,7 @@ def test_folder_outside_music_path_is_refused(
         detect_mismatches(engine_settings, folder=str(tmp_path / "elsewhere"))
 
 
-def test_detect_tier_filter_and_unknown_tier(
+def test_detect_tier_filter_and_unknown_tier_or_comparison(
     engine_settings: Settings,
     music_dir: Path,
 ) -> None:
@@ -487,12 +962,11 @@ def test_detect_tier_filter_and_unknown_tier(
     assert all(r.tier == "high" for r in high_only.rows)
     # Counts stay library-wide even when rows are filtered to one tier.
     assert high_only.high == 1
-    assert high_only.folder_context == 1
-    # A tier query asks for defects, so it never returns the agrees-with-path context rows.
-    assert high_only.folder_context_rows == []
 
     with pytest.raises(ValueError, match="unknown tier"):
         detect_mismatches(engine_settings, tier="bogus")
+    with pytest.raises(ValueError, match="unknown comparison"):
+        detect_mismatches(engine_settings, comparison="folder_artist")
 
 
 def test_detect_requires_music_path(tmp_path: Path) -> None:
@@ -505,7 +979,7 @@ def test_detect_requires_music_path(tmp_path: Path) -> None:
         detect_mismatches(settings)
 
 
-# --- CLI + MCP wiring ---------------------------------------------------------------
+# --- CLI + MCP wiring ----------------------------------------------------------------
 
 
 def test_cli_detect_mismatches_reports_high(music_dir: Path) -> None:
@@ -518,8 +992,7 @@ def test_cli_detect_mismatches_reports_high(music_dir: Path) -> None:
     assert result.exit_code == 0
     assert "HIGH" in result.stdout
     assert "Jem" in result.stdout
-    # The context files leave `rows`, so the summary must still account for them.
-    assert "folder-context" in result.stdout
+    assert "exception file(s) undecided" in result.stdout
 
 
 def test_mcp_detect_tool_listed_and_callable(music_dir: Path) -> None:
@@ -535,195 +1008,14 @@ def test_mcp_detect_tool_listed_and_callable(music_dir: Path) -> None:
     assert payload["ok"] is True
     assert payload["high"] == 1
     assert payload["flagged"] == 1
-    assert payload["folder_context"] == 1
+    assert payload["by_comparison"] == {TOP_FOLDER_ARTIST: 1}
     rows = payload["rows"]
     assert isinstance(rows, list)
-    assert any(r["tag_value"] == "Jem" and r["tier"] == "high" for r in rows)
-    context_rows = payload["folder_context_rows"]
-    assert isinstance(context_rows, list)
-    assert [r["tag_value"] for r in context_rows] == ["Ozzy Osbourne"]
+    assert rows[0]["differences"][0]["tag_value"] == "Jem"
 
-
-# --- disposition skip-filter (pure classifier) --------------------------------------
-
-_OZZY_FOLDER = str(_MUSIC / "Ozzy Osbourne" / "(2001) Ozzy Osbourne - Down To Earth")
-
-
-def _disp(status: str, field: str | None, value: str | None) -> store.MismatchStatusRow:
-    return store.MismatchStatusRow(status=status, source_field=field, source_value=value)
-
-
-def test_zero_disposition_output_is_byte_compatible() -> None:
-    files = _all_classes_library()
-    base = mismatch._classify(files, _MUSIC)
-    explicit_empty = mismatch._classify(files, _MUSIC, dispositions={})
-
-    assert base.to_dict() == explicit_empty.to_dict()
-    # New fields present, empty, and the existing fields unchanged from the legacy detector.
-    assert base.suppressed == {}
-    assert base.groups == []
-    payload = base.to_dict()
-    assert payload["suppressed"] == {}
-    assert payload["groups"] == []
-    assert payload["flagged"] == 7
-    assert payload["high"] == 1
-    assert payload["low"] == 4
-    assert payload["folder_context"] == 1
-    context_rows = payload["folder_context_rows"]
-    assert isinstance(context_rows, list)
-    assert [r["file_id"] for r in context_rows] == [101]
-
-
-def test_to_dict_rounds_disagreement_rate() -> None:
-    # The engine keeps full float precision (for the RELIABILITY_FLOOR comparison), but
-    # the JSON payload an LLM reads on every call must not carry 17 digits of noise.
-    report = mismatch.MismatchesReport(
-        rows=[],
-        total_files=80,
-        flagged=1,
-        high=1,
-        medium=0,
-        low=0,
-        disagreement_rate=0.01250861814242096,
-        path_signal_suppressed=False,
-        summary="1 flagged",
-    )
-
-    assert report.to_dict()["disagreement_rate"] == 0.0125
-    assert report.disagreement_rate == 0.01250861814242096  # engine float untouched
-
-
-def test_fresh_disposition_suppresses_row_and_reports_it() -> None:
-    files = _all_classes_library()
-    dispositions = {100: _disp("legit_ignore", "albumartist", "Jem")}
-
-    report = mismatch._classify(files, _MUSIC, dispositions=dispositions)
-
-    assert _find(report, 100) is None  # the HIGH Jem row is silenced
-    assert report.high == 0
-    assert report.flagged == 6  # was 7
-    assert report.suppressed == {"legit_ignore": 1}
-
-
-def test_stale_disposition_resurfaces() -> None:
-    files = _all_classes_library()
-    # Snapshot recorded "Old Name" but the file's current albumartist is "Jem" -> stale.
-    dispositions = {100: _disp("legit_ignore", "albumartist", "Old Name")}
-
-    report = mismatch._classify(files, _MUSIC, dispositions=dispositions)
-
-    jem = _find(report, 100)
-    assert jem is not None
-    assert jem.tier == "high"
-    assert report.suppressed == {}
-
-
-def test_both_disposition_statuses_suppress_when_fresh() -> None:
-    files = _all_classes_library()
-    dispositions = {
-        100: _disp("legit_ignore", "albumartist", "Jem"),
-        150: _disp("misfiled_deferred", "albumartist", "Future Islands"),
-    }
-
-    report = mismatch._classify(files, _MUSIC, dispositions=dispositions)
-
-    assert _find(report, 100) is None
-    assert _find(report, 150) is None
-    assert report.suppressed == {"legit_ignore": 1, "misfiled_deferred": 1}
-
-
-def test_disposition_silences_a_context_row_too() -> None:
-    files = _singles_library()
-    dispositions = {101: _disp("legit_ignore", "albumartist", "Blue Stahli")}
-
-    report = mismatch._classify(files, _MUSIC, dispositions=dispositions)
-
-    assert _find_context(report, 101) is None
-    assert report.folder_context == 1
-    assert report.suppressed == {"legit_ignore": 1}
-
-
-# --- grouped view -------------------------------------------------------------------
-
-
-def test_grouped_view_shape() -> None:
-    files = _all_classes_library()
-    report = mismatch._classify(files, _MUSIC)
-    grouped = mismatch._grouped_report(report, mismatch._folder_stats(files), tier=None, limit=None)
-
-    assert grouped.rows == []
-    assert grouped.groups  # non-empty
-
-    ozzy = next(g for g in grouped.groups if g.folder == _OZZY_FOLDER)
-    assert ozzy.path_artist == "Ozzy Osbourne"
-    assert ozzy.file_count == 2  # two tracked files in the folder
-    assert ozzy.flagged == 1  # only the Jem (HIGH) row is a defect
-    assert ozzy.folder_context == 1  # the clean sibling, reported separately
-    assert ozzy.file_ids == [100]  # the fix flow never picks up the context file
-    assert ozzy.tiers == {"high": 1}
-    assert ozzy.fields == ["albumartist"]
-    assert ozzy.tag_values == {"Jem": 1}
-    assert ozzy.suppressed == {}
-
-
-def test_grouped_view_reports_suppressed_per_folder() -> None:
-    files = _all_classes_library()
-    dispositions = {100: _disp("legit_ignore", "albumartist", "Jem")}
-    report = mismatch._classify(files, _MUSIC, dispositions=dispositions)
-    grouped = mismatch._grouped_report(report, mismatch._folder_stats(files), tier=None, limit=None)
-
-    ozzy = next(g for g in grouped.groups if g.folder == _OZZY_FOLDER)
-    assert ozzy.flagged == 0  # the only defect is disposition-silenced
-    assert ozzy.folder_context == 1  # the clean sibling still shows as context
-    assert ozzy.file_ids == []
-    assert ozzy.suppressed == {"legit_ignore": 1}
-
-
-def test_grouped_tier_filters_rows_before_grouping() -> None:
-    files = _all_classes_library()
-    report = mismatch._classify(files, _MUSIC)
-    grouped = mismatch._grouped_report(
-        report,
-        mismatch._folder_stats(files),
-        tier="high",
-        limit=None,
-    )
-    assert len(grouped.groups) == 1  # only the Ozzy folder holds a HIGH row
-    assert grouped.groups[0].folder == _OZZY_FOLDER
-    assert grouped.groups[0].tiers == {"high": 1}
-
-
-def test_grouped_limit_caps_groups() -> None:
-    files = _all_classes_library()
-    report = mismatch._classify(files, _MUSIC)
-    all_groups = mismatch._grouped_report(
-        report,
-        mismatch._folder_stats(files),
-        tier=None,
-        limit=None,
-    )
-    assert len(all_groups.groups) > 1
-    capped = mismatch._grouped_report(report, mismatch._folder_stats(files), tier=None, limit=1)
-    assert len(capped.groups) == 1
-
-
-# --- folder expansion (exact path equality, never a prefix/LIKE) --------------------
-
-
-def test_folder_expansion_is_exact_equality() -> None:
-    files = _all_classes_library()
-    report = mismatch._classify(files, _MUSIC)
-
-    expanded = mismatch._expand_folder(
-        report, path_keys.path_key(_OZZY_FOLDER), tier=None, limit=None
-    )
-    assert {r.file_id for r in expanded.rows} == {100}
-    assert {r.file_id for r in expanded.folder_context_rows} == {101}
-    assert expanded.groups == []
-
-    # A parent prefix must NOT match (equality, not substring/LIKE).
-    prefix = path_keys.path_key(_MUSIC / "Ozzy Osbourne")
-    assert mismatch._expand_folder(report, prefix, tier=None, limit=None).rows == []
+    filtered = mcp_server.detect_mismatches(comparison="filename_title")
+    assert filtered["rows"] == []
+    assert filtered["flagged"] == 1
 
 
 # --- disposition verbs + staleness (engine, real library) ---------------------------
@@ -797,18 +1089,18 @@ def test_disposition_goes_stale_when_albumartist_edited(
     assert resurfaced is not None  # the stale disposition no longer silences it
 
 
-# --- end-to-end mismatch-fix flow (criterion 11) ------------------------------------
+# --- end-to-end mismatch-fix flow ----------------------------------------------------
 
 
 def _make_fix_flow_library(music_dir: Path) -> dict[str, Path]:
-    """Mixed poisoned folder (2 Jem-stamped + 1 clean exemplar) + a container-FP single.
+    """Mixed poisoned folder (2 Jem-stamped + 1 clean exemplar) + a curated-folder single.
 
-    Ten clean single-artist folders keep the library-wide disagreement rate under the
-    reliability floor so the mis-stamped files surface as HIGH.
+    Ten clean single-artist folders keep the top-folder difference rate under the reliability
+    floor so the mis-stamped files surface as high.
     """
     for index in range(10):
         make_track(
-            music_dir / f"Clean{index}" / "01.mp3",
+            music_dir / f"Clean{index}" / "Album" / "01.mp3",
             {"albumartist": [f"Clean{index}"], "artist": [f"Clean{index}"]},
         )
     poisoned = music_dir / "Ozzy Osbourne" / "(2001) Ozzy Osbourne - Down To Earth"
@@ -824,7 +1116,7 @@ def _make_fix_flow_library(music_dir: Path) -> dict[str, Path]:
         poisoned / "03 Dreamer.mp3",
         {"albumartist": ["Ozzy Osbourne"], "artist": ["Ozzy Osbourne"], "genre": ["Rock"]},
     )
-    # Container false positive: a legit remix single credited to another artist.
+    # A legit remix single credited to another artist, in a curated folder.
     fp = music_dir / "Blue Stahli" / "Singles"
     make_track(fp / "remix.mp3", {"albumartist": ["Celldweller"], "artist": ["Celldweller"]})
     return {"poisoned": poisoned, "fp": fp}
@@ -856,17 +1148,19 @@ def test_mismatch_fix_flow_end_to_end(
     artists.set_artist_status(engine_settings, file_ids=[jem1, jem2], status="manual")
     assert _derived(engine_settings, jem1) == ("done", "no_identity", "manual")
 
-    # 1. detect flags the two Jem files (HIGH) and the container FP.
+    # 1. detect flags the two Jem files (high) and the curated single.
     report = detect_mismatches(engine_settings)
     assert {r.file_id for r in report.rows} >= {jem1, jem2, fp_id}
     assert _find(report, jem1).tier == "high"  # type: ignore[union-attr]
+    assert [r.file_id for r in report.exception_rows] == [fp_id]
 
-    # 2. silence the container FP -> suppressed + reported, not in rows.
+    # 2. silence the curated single -> suppressed + reported, not in rows.
     assert (
         mismatch.set_mismatch_status(engine_settings, file_ids=[fp_id], status="legit_ignore") == 1
     )
     silenced = detect_mismatches(engine_settings)
     assert _find(silenced, fp_id) is None
+    assert silenced.exception_rows == []
     assert silenced.suppressed == {"legit_ignore": 1}
 
     # 3. batch-stage the corrected identity for the flagged files (one atomic call).
@@ -930,7 +1224,7 @@ def _derived(settings: Settings, file_id: int) -> tuple[str, str, str]:
         conn.close()
 
 
-# --- MCP + CLI wiring for the new surface --------------------------------------------
+# --- MCP + CLI wiring for the disposition surface ------------------------------------
 
 
 def test_mcp_new_mismatch_tools_listed() -> None:
@@ -979,6 +1273,7 @@ def test_mcp_detect_group_and_folder(music_dir: Path) -> None:
     assert expanded["groups"] == []
     rows = expanded["rows"]
     assert isinstance(rows, list)
+    assert rows
     assert all(r["folder"] == str(ozzy) for r in rows)
 
 
@@ -991,7 +1286,7 @@ def test_cli_detect_mismatches_group_lists_folders(music_dir: Path) -> None:
     assert result.exit_code == 0
     assert "Ozzy Osbourne" in result.stdout
     assert "flagged" in result.stdout
-    assert "context" in result.stdout
+    assert TOP_FOLDER_ARTIST in result.stdout
 
 
 def test_mcp_stage_tags_batch_atomic_and_commits_once(music_dir: Path) -> None:
@@ -1115,113 +1410,62 @@ def test_mcp_reopen_axes_rejects_auto_commit(music_dir: Path) -> None:
     assert mcp_server.reopen_axes(9999)["ok"] is False  # unknown commit id
 
 
-# --- container-folder path-signal suppression ---------------------------------------
-
-_CONTAINER = frozenset({text_keys.alnum_ascii_key("Soundtracks")})
+# --- container folders ---------------------------------------------------------------
 
 
 def _container_library() -> list[mismatch._FileInput]:
-    """Soundtracks container (uniform composer leaves) + clean padding + a genuine artist.
-
-    Without the container setting the Soundtracks leaves flag MEDIUM (uniform path
-    disagreement); the padding keeps the library-wide rate under the reliability floor. The
-    genuine ``The Luna Sequence`` folder flags MEDIUM regardless of the setting.
-    """
-    files = [_mk(i, _MUSIC / f"Clean{i}", "01.mp3", albumartist=f"Clean{i}") for i in range(1, 21)]
-    soundtracks = _MUSIC / "Soundtracks"
-    files += [
-        _mk(100, soundtracks / "Album A", "01.mp3", albumartist="Composer A"),
-        _mk(101, soundtracks / "Album A", "02.mp3", albumartist="Composer A"),
-        _mk(102, soundtracks / "Album B", "01.mp3", albumartist="Composer B"),
-        _mk(103, soundtracks / "Album B", "02.mp3", albumartist="Composer B"),
+    """A Soundtracks container of composer albums, clean padding and a mislabeled artist."""
+    files = [
+        _mk(100, "Soundtracks/Album A", "01.mp3", albumartist="Composer A"),
+        _mk(101, "Soundtracks/Album A", "02.mp3", albumartist="Composer A"),
+        _mk(102, "Soundtracks/Album B", "01.mp3", albumartist="Composer B"),
+        _mk(103, "Soundtracks/Album B", "02.mp3", albumartist="Composer B"),
+        _mk(200, "The Luna Sequence/(2010) Album", "01.mp3", albumartist="Wrong Artist"),
+        _mk(201, "The Luna Sequence/(2010) Album", "02.mp3", albumartist="Wrong Artist"),
     ]
-    luna = _MUSIC / "The Luna Sequence" / "(2010) Album"
-    files += [
-        _mk(200, luna, "01.mp3", albumartist="Wrong Artist"),
-        _mk(201, luna, "02.mp3", albumartist="Wrong Artist"),
-    ]
-    return files
+    return [*files, *_padding()]
 
 
-def test_container_folder_suppresses_path_signal() -> None:
+def test_container_folder_skips_only_the_top_folder_comparison() -> None:
     files = _container_library()
-    soundtracks_ids = (100, 101, 102, 103)
+    files.append(_mk(104, "Soundtracks/Album C", "01.mp3", albumartist="Composer C", album="Z"))
 
-    # Baseline (no setting): the Soundtracks composer leaves flag MEDIUM on the path signal.
     baseline = mismatch._classify(files, _MUSIC)
-    assert baseline.path_signal_suppressed is False
-    for fid in soundtracks_ids:
-        row = _find(baseline, fid)
-        assert row is not None
-        assert row.tier == "medium"
+    report = mismatch._classify(files, _MUSIC, container_keys=_SOUNDTRACKS)
 
-    # With Soundtracks listed: zero rows for those files, still counted + visibly suppressed.
-    report = mismatch._classify(files, _MUSIC, container_folders=_CONTAINER)
-    for fid in soundtracks_ids:
-        assert _find(report, fid) is None
-    assert report.container_suppressed == {"Soundtracks": 4}
-    assert report.total_files == baseline.total_files  # suppressed files still count
-    assert report.suppressed == {}  # distinct from the disposition map
+    assert {r.file_id for r in baseline.rows} >= {100, 101, 102, 103, 104}
+    assert {r.file_id: {d.comparison for d in r.differences} for r in report.rows} == {
+        104: {RELEASE_FOLDER_ALBUM},
+        200: {TOP_FOLDER_ARTIST},
+        201: {TOP_FOLDER_ARTIST},
+    }
+    assert report.container_suppressed == {"Soundtracks": 5}
+    assert report.total_files == baseline.total_files
     assert "container folder" in report.summary
 
-    # A genuine artist folder (The Luna Sequence) is untouched -> still flags MEDIUM.
-    for fid in (200, 201):
-        row = _find(report, fid)
-        assert row is not None
-        assert row.tier == "medium"
 
-
-def test_container_mixed_leaf_still_flags_variant_low() -> None:
-    """A mixed-albumartist album folder INSIDE a container still surfaces (documented scope).
-
-    The path signal is suppressed for both files, but the folder-consistency variant-LOW
-    fallback keys on the leaf folder's albumartist variance (independent of the path signal),
-    so an in-container misfile is still flagged.
-    """
-    mixed = _MUSIC / "Soundtracks" / "Weird Album"
-    files = [
-        _mk(1, _MUSIC / "CleanA", "01.mp3", albumartist="CleanA"),
-        _mk(300, mixed, "01.mp3", albumartist="Artist One"),
-        _mk(301, mixed, "02.mp3", albumartist="Artist Two"),
-    ]
-
-    report = mismatch._classify(files, _MUSIC, container_folders=_CONTAINER)
-
-    for fid in (300, 301):
-        row = _find(report, fid)
-        assert row is not None
-        assert row.tier == "low"
-        # No path signal means agreement is unknown, never "agrees" -> not folder context.
-        assert row.reason == mismatch._REASON_NO_SIGNAL
-    assert report.folder_context == 0
-    assert report.container_suppressed == {"Soundtracks": 2}
-
-
-def test_container_reliability_excludes_suppressed_files() -> None:
+def test_container_files_leave_the_reliability_sample() -> None:
     files = _container_library()
 
     baseline = mismatch._classify(files, _MUSIC)
-    report = mismatch._classify(files, _MUSIC, container_folders=_CONTAINER)
+    report = mismatch._classify(files, _MUSIC, container_keys=_SOUNDTRACKS)
 
-    # 20 clean + 4 soundtrack + 2 luna = 26 considered, 6 disagreeing -> ~0.231.
+    # 20 clean + 4 soundtrack + 2 luna = 26 compared, 6 differing.
     assert baseline.disagreement_rate == pytest.approx(6 / 26)
-    # The 4 container files leave the sample -> 22 considered, 2 disagreeing -> ~0.091.
+    # The 4 container files leave the sample: 22 compared, 2 differing.
     assert report.disagreement_rate == pytest.approx(2 / 22)
 
 
 def test_container_and_disposition_suppression_are_distinct() -> None:
-    files = _container_library()
     dispositions = {200: _disp("legit_ignore", "albumartist", "Wrong Artist")}
 
     report = mismatch._classify(
-        files,
+        _container_library(),
         _MUSIC,
         dispositions=dispositions,
-        container_folders=_CONTAINER,
+        container_keys=_SOUNDTRACKS,
     )
 
-    assert report.container_suppressed == {"Soundtracks": 4}
-    assert report.suppressed == {"legit_ignore": 1}  # the Luna row, disposition-silenced
     assert _find(report, 200) is None
     payload = report.to_dict()
     assert payload["container_suppressed"] == {"Soundtracks": 4}
@@ -1229,10 +1473,10 @@ def test_container_and_disposition_suppression_are_distinct() -> None:
 
 
 def _make_container_real_library(music_dir: Path) -> None:
-    """12 clean single-artist folders + a Soundtracks container of uniform composer years."""
+    """12 clean single-artist folders + a Soundtracks container of composer albums."""
     for index in range(12):
         make_track(
-            music_dir / f"Clean{index}" / "01.mp3",
+            music_dir / f"Clean{index}" / "Album" / "01.mp3",
             {"albumartist": [f"Clean{index}"], "artist": [f"Clean{index}"]},
         )
     soundtracks = music_dir / "Soundtracks"
@@ -1247,7 +1491,7 @@ def test_detect_container_suppression_integration(tmp_path: Path, music_dir: Pat
     plain = Settings(music_path=music_dir, lastfm_api_key=None, db_path=db_path)
     scan_library(plain)
 
-    # Without the setting the Soundtracks composer albums flag on the path signal.
+    # Without the setting the Soundtracks composer albums differ from their top folder.
     assert detect_mismatches(plain).flagged > 0
 
     listed = Settings(
@@ -1259,6 +1503,5 @@ def test_detect_container_suppression_integration(tmp_path: Path, music_dir: Pat
     report = detect_mismatches(listed)
     assert report.flagged == 0
     assert report.container_suppressed == {"Soundtracks": 4}
-    # Exact-folder expansion of a container leaf yields no rows.
     leaf = str(music_dir / "Soundtracks" / "Album A")
     assert detect_mismatches(listed, folder=leaf).rows == []

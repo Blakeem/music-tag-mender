@@ -26,7 +26,7 @@ Blank-fill each album's original release year (`originaldate`) from MusicBrainz 
 
 ### 🔍 Mislabeled-file detection
 
-Find files whose identity tags disagree with their folder path — the fingerprint of a tagger matching the wrong release (e.g. an Ozzy Osbourne album stamped as another artist's) — with `tagmend detect-mismatches` or the `detect_mismatches` MCP tool. A read-only, confidence-tiered (high/medium/low) report; nothing is changed on disk.
+Find files whose path disagrees with their own tags with `tagmend detect-mismatches` or the `detect_mismatches` MCP tool. The report compares the top folder, the release folder and its year, a disc subfolder, and the filename's track number and title with the tags. Formatting alone never flags. The report is read-only and tiered high, medium or low.
 
 ### 🕳️ Blank-album gap detection
 
@@ -129,7 +129,7 @@ The MCP server exposes 38 tools. All tag edits are staged in memory and only wri
 | `get_library_stats` | Report library-wide snapshot counts |
 | `list_files` | List tracked files with their current managed tags (to discover file ids) |
 | `get_file` | Return one tracked file with its managed tags, by stable `file_id` |
-| `detect_mismatches` | Detect files whose identity tags disagree with their folder path (read-only report) |
+| `detect_mismatches` | Detect files whose folders or filename disagree with their own tags (read-only report) |
 | `detect_album_gaps` | Find files with a blank `album` tag, grouped by folder, with tiered fill proposals (read-only report) |
 | `detect_track_conflicts` | Find files sharing a `(disc, track)` slot with a folder sibling, tiered by how the titles and containers compare (read-only report) |
 | `detect_album_conflicts` | Find files whose album identity differs from their folder siblings', tiered by whether a release ID, a name or year, or a disc suffix splits the folder (read-only report) |
@@ -192,7 +192,7 @@ The MCP server exposes 38 tools. All tag edits are staged in memory and only wri
 
 ### Mismatch fixing
 
-Use `detect_mismatches` (above) to find files whose identity tags disagree with their folder path, then drive the fix through the staging engine (`stage_tags_batch` → `commit_tags` → `reopen_axes`) and disposition the false positives.
+Use `detect_mismatches` (above) to find files whose path disagrees with their own tags, then drive the fix through the staging engine (`stage_tags_batch` → `commit_tags` → `reopen_axes`) and disposition the false positives.
 
 | Tool | Description |
 |------|-------------|

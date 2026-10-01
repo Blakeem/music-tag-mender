@@ -143,7 +143,7 @@ def detect_mismatches(
         typer.Option(help="Expand exactly this folder's flat rows (exact path, never a prefix)."),
     ] = None,
 ) -> None:
-    """List files whose albumartist/artist tag disagrees with their folder path (read-only)."""
+    """List files whose path, at any level, disagrees with their own tags (read-only)."""
     settings = config.load_settings()
     try:
         report = mismatch.detect_mismatches(
@@ -161,13 +161,15 @@ def detect_mismatches(
     for group_row in report.groups:
         typer.echo(
             f"  {group_row.flagged:3}/{group_row.file_count:<3} flagged  "
-            f"{group_row.folder_context:3} context  "
-            f"path={group_row.path_artist!r}  {group_row.folder}",
+            f"exception={group_row.exception}  {','.join(group_row.comparisons)}  "
+            f"{group_row.folder}",
         )
     for row in report.rows:
+        differences = "  ".join(
+            f"{d.comparison}: {d.tag_value!r} vs {d.path_value!r}" for d in row.differences
+        )
         typer.echo(
-            f"  [{row.tier.upper():6}] {row.field}={row.tag_value!r} "
-            f"path={row.path_artist!r}  {row.folder}\\{row.filename}",
+            f"  [{(row.tier or '').upper():6}] {differences}  {row.folder}\\{row.filename}",
         )
 
 

@@ -19,9 +19,19 @@ import pytest
 from mcp.types import TextContent
 
 from conftest import make_track
-from tagmend import mcp_server
+from tagmend import config, mcp_server
 from tagmend.config import load_settings
-from tagmend.engine import axis, commits, genres, health, library, staging, store, versioning
+from tagmend.engine import (
+    axis,
+    commits,
+    genres,
+    health,
+    library,
+    mismatch,
+    staging,
+    store,
+    versioning,
+)
 from tagmend.engine.acoustid import AcoustidKeyError, FpcalcUnavailableError
 from tagmend.engine.db import connect
 from tagmend.engine.lastfm import LastfmError
@@ -657,6 +667,25 @@ def test_each_disagreement_report_is_qualified_by_what_it_compares() -> None:
         "detect_release_disagreements",
         "detect_year_disagreements",
     ]
+
+
+def test_detect_mismatches_offers_every_engine_comparison() -> None:
+    tools = asyncio.run(mcp_server.mcp.list_tools())
+
+    tool = next(tool for tool in tools if tool.name == "detect_mismatches")
+    schema = json.dumps(tool.inputSchema)
+
+    assert set(tool.inputSchema["properties"]) == {"tier", "limit", "group", "folder", "comparison"}
+    assert all(f'"{name}"' in schema for name in mismatch.COMPARISONS)
+
+
+def test_detect_mismatches_rejects_an_unknown_comparison(music_dir: Path) -> None:
+    config.set_setting("music_path", str(music_dir))
+
+    payload = mcp_server.detect_mismatches(comparison="folder_artist")
+
+    assert payload["ok"] is False
+    assert "unknown comparison" in str(payload["error"])
 
 
 def test_tool_schemas_survive_the_envelope() -> None:

@@ -471,73 +471,80 @@ def detect_mismatches(
     limit: int | None = None,
     group: bool = False,  # noqa: FBT001, FBT002 - MCP tool surface, not a Python API
     folder: str | None = None,
+    comparison: Literal[
+        "top_folder_artist",
+        "release_folder_album",
+        "release_folder_year",
+        "disc_folder_number",
+        "filename_track",
+        "filename_title",
+    ]
+    | None = None,
 ) -> dict[str, object]:
-    """Detect files whose identity tags disagree with their folder path (read-only report).
+    """Detect files whose path, at any level, disagrees with their own tags (read-only report).
 
-    Flags the fingerprint of a MusicBrainz Picard release mis-match: files stamped with the
-    WRONG ``albumartist`` (with an ``artist`` fallback for files that have none) while their
-    folder path kept the truth — e.g. Ozzy's *Down to Earth* files tagged as *Jem*. Pure read
-    over the snapshot: writes nothing, stages nothing, no network. Run ``scan_library`` first.
+    Each file's path is read as named levels: the top folder (wrapper decoration such as
+    ``[Discography]`` stripped), the release folder, a disc subfolder (``Cd1``, ``[DISC.02]``,
+    ``1``, ``Bonus CD``, ``01-04 Songs``) and the filename. Six comparisons run over them:
 
-    Recommended workflow: start with ``group=true`` for a compact one-line-per-folder overview
-    (cheap on a big library), then expand a single folder with ``folder="<exact folder path>"``
-    to see its flagged rows, research the correct identity, and fix them with ``stage_tags_batch``
-    → ``commit_tags(path=<folder>)`` → ``reopen_axes``. ``commit_tags(path=<folder>)`` and
-    ``diff_tags(path=<folder>)`` cover that folder AND every folder nested under it. Run
-    ``diff_tags(path=<folder>)`` first and ``unstage_tags`` any nested change you do not want in
-    this commit. Silence a false positive or defer a misfiled file with ``set_mismatch_status``.
-    Such files are dropped from the flagged rows and reported under ``suppressed`` (a
-    disposition-status → count map), so nothing is hidden silently. The disposition goes stale
-    (and the file re-surfaces) if its identity tag changes.
+    * ``top_folder_artist``: the top folder against ``albumartist``, else ``artist``. Skipped
+      under a ``container_folders`` top folder and for a root album.
+    * ``release_folder_album``: the release folder, without its years, artist and ``[...]``
+      tags, against ``album``.
+    * ``release_folder_year``: the release folder's year tokens against ``date`` and
+      ``originaldate``. Either year agrees.
+    * ``disc_folder_number``: a numbered disc subfolder against ``discnumber``.
+    * ``filename_track``: the filename's number against ``tracknumber``. ``101`` and ``1-01``
+      read as disc 1, track 1.
+    * ``filename_title``: the filename's title text against ``title``.
 
-    Each file is classified by ``albumartist``-vs-path bidirectional containment into a
-    confidence tier: ``high`` (path disagreement in a folder with mixed albumartists),
-    ``medium`` (path disagreement in a uniformly mis-stamped folder), or ``low`` (a
-    folder-consistency fallback, a non-album/singles folder, or the artist fallback).
-    Various-Artists/soundtrack albumartists are excluded. A library-wide reliability guard
-    suppresses the ``high``/``medium`` path tiers (emitting only the naming-agnostic ``low``
-    tier) when the path likely does not encode artist — reported via ``path_signal_suppressed``
-    and ``disagreement_rate``.
+    Formatting never flags: case, punctuation, diacritics, ``&`` versus ``and``, number words,
+    roman numerals, ``Vol.`` versus ``Volume``, a leading article, zero padding and the year's
+    position are all tolerated. A blank tag never flags. Pure read over the snapshot: writes
+    nothing, stages nothing, no network. Run ``scan_library`` first.
 
-    Configure the ``container_folders`` setting (a semicolon-delimited list via
-    ``tagmend config-set container_folders "<TopFolder>;<Other>"``) to name top-level folders
-    that hold many unrelated albumartists. Files under such a folder have their path signal
-    suppressed — they never flag on the ``path='<container>'`` signal (present and future) and
-    are counted in the ``container_suppressed`` map — while a mixed-albumartist album folder
-    INSIDE a container still surfaces as ``low`` (in-container misfile detection is preserved).
+    A file under a curated subfolder (``Singles``, ``Remixes``, ``Live``, ...) or a nested
+    middle folder is an exception. It is listed in ``exception_rows`` and counted by
+    ``exceptions_undecided``, outside ``flagged``. A curated file skips the album and year
+    comparisons. An exception file that also differs is in ``rows`` as well.
 
-    ``flagged`` counts only files that need work. A file sitting in a mixed-albumartist folder
-    while agreeing with its OWN path is review context, not a defect: it is reported in
-    ``folder_context_rows`` and counted by ``folder_context``, outside ``flagged`` and the
-    tier counts (so the tier counts always sum to ``flagged``). Such rows usually clear
-    themselves once the folder's real mismatch is fixed. A file that disagrees, or whose path
-    signal is unavailable (reliability guard, container folder, library root), stays flagged.
+    Recommended workflow: start with ``group=true`` for one line per release folder, then expand
+    one with ``folder="<group folder>"``. Fix a wrong tag with ``stage_tags_batch`` ->
+    ``diff_tags`` -> ``commit_tags(path=<folder>)`` -> ``reopen_axes``. Silence a correct path
+    or defer a misfiled file with ``set_mismatch_status``. A silenced file leaves the rows and is
+    counted under ``suppressed``. The disposition goes stale, and the file re-surfaces, when its
+    ``albumartist`` (or ``artist``) changes.
+
+    Tiers: a ``top_folder_artist`` difference is ``high`` in a group with mixed albumartists,
+    ``medium`` in a uniform group, and ``low`` in a one-file or curated group, for the
+    ``artist`` fallback, or while ``path_signal_unreliable`` is true (more than 30 percent of
+    files differ from their top folder). A number difference is ``high``. A name difference is
+    ``low`` for a near spelling, ``high`` when no word is shared, else ``medium``. A file's tier
+    is its most severe difference.
 
     Args:
-        tier: Return only rows/groups in this tier (``high`` | ``medium`` | ``low``). The
-            tier filters rows first, and the grouped view is built from the filtered rows, so a
-            group appears only when it holds a file of that tier and its ``flagged``,
-            ``file_ids`` and tier counts describe only those files. The
-            ``high``/``medium``/``low``/``flagged``/``folder_context`` counts still describe
-            the whole library, and context rows are never returned under a tier filter.
-        limit: Cap the number of rows returned (or groups, with ``group=true``); counts
-            unaffected.
-        group: Return one compact group per folder instead of flat rows (``rows`` is then
-            empty; each group carries ``folder``, ``path_artist``, ``file_count``, ``flagged``,
-            ``folder_context``, ``tag_values``, ``tiers``, ``fields``, ``file_ids``,
-            ``suppressed`` — the per-folder ``file_ids`` list holds flagged files only).
-        folder: Return the flat rows of exactly this folder, never a subfolder. Takes
+        tier: Return only files of this tier. Exception rows are dropped. In the grouped view,
+            groups are built from the remaining files.
+        limit: Cap the rows (or groups, with ``group=true``). Counts unaffected.
+        group: Return one group per release folder instead of flat rows. A file under a disc
+            subfolder joins its release folder's group. Each group carries ``folder``,
+            ``file_count``, ``flagged``, ``tier``, ``comparisons`` (``{name: {files, tag,
+            path}}``, one example pair each), ``mb_stamped`` (every flagged file carries
+            ``musicbrainz_albumid``), ``exception``, ``suppressed``, ``file_ids`` (flagged and
+            exception files) and ``unflagged_ids`` (every other present file).
+        folder: Return the flat rows of the group this folder keys, or of this folder. Takes
             precedence over ``group``. Compared as a path: case and ``/`` versus backslash do
             not matter on Windows, and a relative folder resolves under ``music_path``.
+        comparison: Return only files carrying this difference. Each row still lists every
+            difference of its file. Exception rows are dropped.
 
     Returns:
-        ``{"ok": True, rows, folder_context_rows, groups, total_files, flagged, high, medium,
-        low, folder_context, disagreement_rate, path_signal_suppressed, suppressed,
-        container_suppressed, summary}``
-        — ``container_suppressed`` is a top-folder → file-count map (files whose path signal a
-        ``container_folders`` entry suppressed); each row is
-        ``{file_id, folder, filename, field, tag_value, path_artist, tier, reason}`` — or
-        ``{"ok": False, "error": ...}`` (e.g. no music path configured).
+        ``{"ok": True, rows, exception_rows, groups, total_files, flagged, group_count,
+        by_comparison, high, medium, low, exceptions_undecided, disagreement_rate,
+        path_signal_unreliable, suppressed, container_suppressed, summary}``. Each row is
+        ``{file_id, folder, filename, tier, differences: [{comparison, tag_value, path_value}],
+        exception}``. The counts describe the whole library. Or ``{"ok": False, "error": ...}``
+        (no music path configured, an unknown tier or comparison).
     """
     report = mismatch.detect_mismatches(
         load_settings(),
@@ -545,6 +552,7 @@ def detect_mismatches(
         limit=limit,
         group=group,
         folder=folder,
+        comparison=comparison,
     )
     return {"ok": True, **report.to_dict()}
 

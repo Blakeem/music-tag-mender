@@ -85,7 +85,7 @@ Protocol. It returns an `MBRelease` (the album title, the album-artist credit, a
 `MBMedium`'s `MBTrack` tracklist), cached in `musicbrainz_release_cache` as one JSON payload
 because a release is a nested document and nothing queries inside it. The
 `detect_release_disagreements` tool (`release_disagreements.py`) is the third comparison in the coherence
-family: `detect_mismatches` compares a file's tags against the folder PATH,
+family: `detect_mismatches` compares a file's tags against its PATH (every folder level and the filename),
 `detect_album_conflicts` and `detect_track_conflicts` compare a file against its folder
 SIBLINGS, and this compares a file against an EXTERNAL authority, the release its own
 `musicbrainz_albumid` names. That id is what lets it say what a tag SHOULD be rather than only
@@ -235,7 +235,7 @@ Rules, in order:
 7. One concept = one term, both directions, across tool names, CLI commands, engine
    module/function/class names, `Axis.name` values, status tables, and prose.
 
-Glossary — the comparison behind each finding noun: `mismatch` = tags ↔ folder path · `gap` = tag ↔
+Glossary — the comparison behind each finding noun: `mismatch` = tags ↔ path (folders and filename) · `gap` = tag ↔
 absent · `disagreement` = tag ↔ external source (MusicBrainz) · `conflict` = tag ↔ sibling tags in
 the same folder (coined) · `deviation` = current path ↔ canonical path generated from tags by the
 naming pattern (coined).
@@ -329,7 +329,8 @@ src/tagmend/
     artists.py      resolve_artists + set/reset_artist_status: MusicBrainz-by-MBID then getCorrection cascade-stage + file_artist_status workflow
     songs.py        resolve_songs + set/reset_song_status: AcoustID folder consensus, anchored check, rebind report, manual release path
     years.py        resolve_years + set/reset_year_status: MusicBrainz originaldate blank-fill + file_year_status workflow
-    mismatch.py     detect_mismatches + set/reset_mismatch_status: identity tags vs folder path, tiered
+    mismatch.py     detect_mismatches + set/reset_mismatch_status + layout_of: tags vs every path level, tiered
+    path_text.py    clean_value: the value rule a tag obeys inside one path part
     track_conflicts.py  detect_track_conflicts: intra-folder (disc, track) slot collisions
     album_conflicts.py  detect_album_conflicts: intra-folder album-identity splits, tiered
     release_disagreements.py  detect_release_disagreements: tags vs the MusicBrainz release the file's album id names, tiered

@@ -1647,6 +1647,14 @@ def resolve_songs(
     (``error_items``, naming the fpcalc exit code, the HTTP status or the timeout) store
     nothing either. An empty answer is asked again after 7 days.
 
+    ``review_values`` rows are proposals and are never staged. A held gated file with a blank
+    title gets one with the audio's recording title (``field: "title"``). A gated file with no
+    ``artist`` and no ``albumartist`` whose recordings credit one artist gets one with that
+    credit (``field: "artist"``, ``proposal`` and ``musicbrainz_artistid``), whatever its song
+    outcome. ``review_files`` counts the files holding a row. A real call records a verified or
+    filled file ``done`` in the same pass that reports its artist row, so no later call reports
+    that row again. Keep the artist rows from the dry run.
+
     Workflow: run ``dry_run=True`` over the whole library first, repeating while ``more`` is
     true, then ``limit=0`` for the free whole-library tally. Review it, then make the real
     calls and apply each with ``diff_tags`` and ``commit_tags``. For each ``rebind_folders``

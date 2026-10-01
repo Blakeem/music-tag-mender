@@ -25,6 +25,7 @@ from tagmend import __version__
 from tagmend.config import PROJECT_URL, Settings
 from tagmend.engine import acoustid
 from tagmend.engine.acoustid import (
+    AcoustidArtist,
     AcoustidClient,
     AcoustidError,
     AcoustidKeyError,
@@ -205,6 +206,10 @@ _OK_BODY: dict[str, object] = {
                         _release_payload(),
                         {"id": "rel-2", "date": {"year": 2001}},
                     ],
+                    "artists": [
+                        {"id": "art-1", "name": "Swingin' Utters", "joinphrase": " feat. "},
+                        {"id": "art-2", "name": "Mike Ness"},
+                    ],
                 },
                 {"id": "rec-2", "sources": 1},
             ],
@@ -248,8 +253,19 @@ _EXPECTED_RESULT = AcoustidResult(
                             medium_count=None,
                         ),
                     ),
+                    artists=(
+                        AcoustidArtist(id="art-1", name="Swingin' Utters", joinphrase=" feat. "),
+                        AcoustidArtist(id="art-2", name="Mike Ness", joinphrase=""),
+                    ),
                 ),
-                AcoustidRecording(id="rec-2", title="", duration=None, sources=1, releases=()),
+                AcoustidRecording(
+                    id="rec-2",
+                    title="",
+                    duration=None,
+                    sources=1,
+                    releases=(),
+                    artists=(),
+                ),
             ),
         ),
     ),
@@ -315,6 +331,18 @@ def test_the_compressed_response_parses_into_the_dataclasses() -> None:
     assert result == _EXPECTED_RESULT
 
 
+def test_an_artist_credit_parses_in_order_and_a_missing_one_reads_empty() -> None:
+    client, _ = _client([httpx.Response(200, json=_OK_BODY)])
+    with client:
+        credited, uncredited = client.lookup(_FP).results[0].recordings
+
+    assert [(a.id, a.name, a.joinphrase) for a in credited.artists] == [
+        ("art-1", "Swingin' Utters", " feat. "),
+        ("art-2", "Mike Ness", ""),
+    ]
+    assert uncredited.artists == ()
+
+
 def test_a_medium_holding_the_recording_twice_yields_one_ref_per_track() -> None:
     release = _release_payload()
     release["mediums"] = [
@@ -345,6 +373,8 @@ def test_a_medium_holding_the_recording_twice_yields_one_ref_per_track() -> None
             "status": "ok",
             "results": [{"recordings": [{"id": "r", "releases": [{"id": "x", "date": "1997"}]}]}],
         },
+        {"status": "ok", "results": [{"recordings": [{"id": "r", "artists": "Moby"}]}]},
+        {"status": "ok", "results": [{"recordings": [{"id": "r", "artists": [{"name": 7}]}]}]},
     ],
 )
 def test_a_wrong_type_raises(body: dict[str, object]) -> None:
@@ -554,6 +584,17 @@ def test_a_lookup_round_trips_byte_exact_through_zlib(db_conn: sqlite3.Connectio
     assert get_lookup(db_conn, _FP, _NOW + timedelta(days=365)) == _EXPECTED_RESULT
 
 
+def test_a_cached_lookup_keeps_its_artist_credit(db_conn: sqlite3.Connection) -> None:
+    put_lookup(db_conn, _FP, _EXPECTED_RESULT, _NOW)
+
+    cached = get_lookup(db_conn, _FP, _NOW)
+
+    assert cached is not None
+    credited, uncredited = cached.results[0].recordings
+    assert credited.artists == _EXPECTED_RESULT.results[0].recordings[0].artists
+    assert uncredited.artists == ()
+
+
 def test_an_empty_lookup_is_served_at_six_days_and_missed_at_eight(
     db_conn: sqlite3.Connection,
 ) -> None:
@@ -574,7 +615,7 @@ def test_a_lookup_for_another_fingerprint_or_duration_misses(db_conn: sqlite3.Co
 
 @pytest.mark.parametrize(
     ("constant", "value"),
-    [("_META", "recordings releases tracks sources"), ("_LOOKUP_VERSION", "2")],
+    [("_META", "recordings releases tracks sources"), ("_LOOKUP_VERSION", "next")],
 )
 def test_a_key_built_from_another_meta_or_version_misses(
     db_conn: sqlite3.Connection,
@@ -589,6 +630,17 @@ def test_a_key_built_from_another_meta_or_version_misses(
         assert get_lookup(db_conn, _FP, _NOW) is None
 
     assert get_lookup(db_conn, _FP, _NOW) == _EXPECTED_RESULT
+
+
+def test_a_row_cached_before_the_artist_credit_was_parsed_misses(
+    db_conn: sqlite3.Connection,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with monkeypatch.context() as patch:
+        patch.setattr(acoustid, "_LOOKUP_VERSION", "1")
+        put_lookup(db_conn, _FP, _EXPECTED_RESULT, _NOW)
+
+    assert get_lookup(db_conn, _FP, _NOW) is None
 
 
 def test_an_unreadable_payload_is_a_miss(db_conn: sqlite3.Connection) -> None:

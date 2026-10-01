@@ -24,7 +24,7 @@ from conftest import make_track
 from tagmend.engine import axis, library, songs, staging, store, versioning
 from tagmend.engine.acoustid import AcoustidClient, Fingerprinter
 from tagmend.engine.db import connect
-from tagmend.engine.musicbrainz import MBMedium, MBRelease, MBTrack
+from tagmend.engine.musicbrainz import MBMedium, MBRelease, MBTrack, MusicBrainzError
 from tagmend.engine.schema import apply_schema
 from tagmend.engine.tags import read_tags
 from test_health import _run_ok
@@ -131,9 +131,14 @@ def _recording(
     *slots: Slot,
     sources: int = 20,
     duration: int = _DURATION,
+    artists: Sequence[tuple[str, str]] = (),
 ) -> dict[str, object]:
-    """Return one recording entry of a compressed AcoustID response."""
-    return {
+    """Return one recording entry of a compressed AcoustID response.
+
+    *artists* is the credit as ``(id, name)`` pairs. Without it the entry has no ``artists`` key.
+    """
+    credit = {"artists": [{"id": aid, "name": name} for aid, name in artists]} if artists else {}
+    return credit | {
         "id": recording_id,
         "title": title,
         "duration": duration,
@@ -224,15 +229,17 @@ def _lp_bodies(names: Sequence[str], *extra: Slot) -> dict[str, dict[str, object
 # --- library helpers -----------------------------------------------------------------
 
 _NAMES = tuple(f"0{n} {title}.flac" for n, title in enumerate(_TITLES, 1))
+_BASE_TAGS: Mapping[str, Sequence[str]] = {"artist": ["The Band"], "album": ["LP"]}
 
 
 def _make_folder(
     folder: Path,
     tags: Sequence[Mapping[str, Sequence[str]]],
     names: Sequence[str] = _NAMES,
+    base: Mapping[str, Sequence[str]] = _BASE_TAGS,
 ) -> None:
     for name, file_tags in zip(names, tags, strict=False):
-        make_track(folder / name, {"artist": ["The Band"], "album": ["LP"], **file_tags})
+        make_track(folder / name, {**base, **file_tags})
 
 
 def _ids(settings: Settings) -> dict[str, int]:
@@ -555,6 +562,26 @@ def test_manual_release_path_assigns_a_gate_failure_corroborated_by_its_stem(
     assert _diffs(engine_settings)[_NAMES[1]].target["title"] == ["Song Two"]
 
 
+def test_manual_release_path_reports_a_lookup_error_in_error_items(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    folder = _wrong_stamp_folder(music_dir)
+    library.scan_library(engine_settings)
+    file_id = _ids(engine_settings)[_NAMES[3]]
+    kit = _wrong_stamp_kit()
+    kit.acoustid.statuses[f"fp-{_NAMES[3]}"] = 503
+
+    result = _resolve(engine_settings, kit, folder=str(folder), release_id=_LP)
+
+    assert result.unassigned == [{"file_id": file_id, "filename": _NAMES[3], "reason": "error"}]
+    assert result.errors == 1
+    [item] = result.error_items
+    assert item["key"] == str(file_id)
+    assert "503" in item["message"]
+    assert result.staged_files == 0
+
+
 def test_release_id_without_a_scope_is_rejected(engine_settings: Settings) -> None:
     with pytest.raises(ValueError, match="release_id needs folder or file_ids"):
         songs.resolve_songs(engine_settings, release_id=_LP)
@@ -698,6 +725,189 @@ def test_a_settled_sibling_still_votes_when_a_lookup_recovers(
     assert second.staged_files == 1
     assert _diffs(engine_settings)[_NAMES[3]].diff["tracknumber"] == {"from": [], "to": ["4/4"]}
     assert _status(engine_settings, ids[_NAMES[0]]) == "done"
+
+
+# --- the artist review row -----------------------------------------------------------
+
+_ALBUM_ONLY: Mapping[str, Sequence[str]] = {"album": ["LP"]}
+_MOBY = ("art-moby", "Moby")
+
+
+class FailingReleases(FakeReleases):
+    """A release source whose every lookup fails transiently."""
+
+    def release_by_mbid(self, mbid: str) -> MBRelease | None:
+        self.lookups.append(mbid)
+        message = f"MusicBrainz answered HTTP 503 for {mbid}"
+        raise MusicBrainzError(message)
+
+
+def _credited(n: int, *artists: tuple[str, str], sources: int = 20) -> dict[str, object]:
+    """Return recording ``rec-N`` on the LP crediting *artists*."""
+    return _recording(f"rec-{n}", _TITLES[n - 1], Slot(_LP, n), sources=sources, artists=artists)
+
+
+def _credited_bodies(first: Sequence[dict[str, object]]) -> dict[str, dict[str, object]]:
+    """Return a body per file: *first* for the first file, one Moby credit for every other."""
+    bodies = {f"fp-{name}": _body(_credited(n, _MOBY)) for n, name in enumerate(_NAMES, 1)}
+    bodies[f"fp-{_NAMES[0]}"] = _body(*first)
+    return bodies
+
+
+def _artist_rows(result: songs.ResolveSongsResult) -> list[dict[str, object]]:
+    return [row for row in result.review_values if row["field"] == "artist"]
+
+
+def test_an_artist_less_folder_gets_one_artist_review_row_per_file_and_stages_none(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    folder = music_dir / "LP"
+    _make_folder(folder, _blank_tracknumbers(), base=_ALBUM_ONLY)
+    library.scan_library(engine_settings)
+    ids = _ids(engine_settings)
+    # The first file's audio names two recordings crediting one artist, one name padded.
+    first = [
+        _credited(1, ("art-moby", " Moby ")),
+        _recording("rec-1-b", _TITLES[0], artists=[_MOBY]),
+    ]
+    kit = Kit(
+        acoustid=FakeAcoustid(_credited_bodies(first)),
+        releases=FakeReleases(_release(_LP)),
+    )
+
+    result = _resolve(engine_settings, kit)
+
+    # Three fills and one verified file, so the row does not depend on the song outcome.
+    assert (result.staged_files, result.verified_files) == (3, 1)
+    assert _artist_rows(result) == [
+        {
+            "file_id": ids[name],
+            "folder": str(folder),
+            "filename": name,
+            "field": "artist",
+            "proposal": "Moby",
+            "musicbrainz_artistid": "art-moby",
+        }
+        for name in _NAMES
+    ]
+    assert result.review_files == 4
+    for view in _diffs(engine_settings).values():
+        assert not {"artist", "albumartist", "musicbrainz_artistid"} & set(view.diff)
+
+
+@pytest.mark.parametrize(
+    ("tags", "first"),
+    [
+        pytest.param({"artist": ["The Band"]}, [_credited(1, _MOBY)], id="artist_tag"),
+        pytest.param({"albumartist": ["The Band"]}, [_credited(1, _MOBY)], id="albumartist_only"),
+        pytest.param({}, [_credited(1, _MOBY, ("art-other", "Other"))], id="two_artist_credit"),
+        pytest.param(
+            {},
+            [
+                _credited(1, _MOBY),
+                _recording("rec-1-b", _TITLES[0], artists=[("art-other", "Moby")]),
+            ],
+            id="differing_ids",
+        ),
+        pytest.param({}, [_credited(1)], id="no_credit"),
+        pytest.param(
+            {},
+            [
+                _recording("rec-x", "Other Song", sources=60, artists=[_MOBY]),
+                _credited(1, _MOBY, sources=40),
+            ],
+            id="ungated",
+        ),
+    ],
+)
+def test_a_blocked_file_gets_no_artist_review_row(
+    engine_settings: Settings,
+    music_dir: Path,
+    tags: Mapping[str, Sequence[str]],
+    first: Sequence[dict[str, object]],
+) -> None:
+    _make_folder(music_dir / "LP", [tags, {}, {}, {}], base=_ALBUM_ONLY)
+    library.scan_library(engine_settings)
+    ids = _ids(engine_settings)
+    kit = Kit(
+        acoustid=FakeAcoustid(_credited_bodies(first)),
+        releases=FakeReleases(_release(_LP)),
+    )
+
+    result = _resolve(engine_settings, kit)
+
+    assert [row["file_id"] for row in _artist_rows(result)] == [ids[n] for n in _NAMES[1:]]
+
+
+def test_a_rebind_folder_gets_no_artist_review_row(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    _make_folder(
+        music_dir / "Greatest Hits",
+        [
+            {"title": [title], "tracknumber": [f"{n}/16"], "musicbrainz_albumid": ["rel-wrong"]}
+            for n, title in enumerate(_TITLES, 1)
+        ],
+        base=_ALBUM_ONLY,
+    )
+    library.scan_library(engine_settings)
+    wrong = _release("rel-wrong", ["Numb", "Crawling", "Faint", "Papercut"], recordings=["x1"] * 4)
+    kit = Kit(
+        acoustid=FakeAcoustid(_credited_bodies([_credited(1, _MOBY)])),
+        releases=FakeReleases(_release(_LP), wrong),
+    )
+
+    result = _resolve(engine_settings, kit)
+
+    assert len(result.rebind_folders) == 1
+    assert _artist_rows(result) == []
+
+
+def test_a_musicbrainz_error_folder_gets_no_artist_review_row(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    _make_folder(music_dir / "LP", [{}] * 4, base=_ALBUM_ONLY)
+    library.scan_library(engine_settings)
+    kit = Kit(
+        acoustid=FakeAcoustid(_credited_bodies([_credited(1, _MOBY)])),
+        releases=FailingReleases(),
+    )
+
+    result = _resolve(engine_settings, kit)
+
+    assert result.errors == 4
+    assert "503" in result.error_items[0]["message"]
+    assert _artist_rows(result) == []
+
+
+def test_a_held_file_with_a_title_and_an_artist_review_row_counts_once(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    _make_folder(music_dir / "Pair", [{}, {}], _NAMES[:2], base=_ALBUM_ONLY)
+    library.scan_library(engine_settings)
+    # Each file sits on a release of its own, so the folder misses the floor and holds both.
+    bodies = {
+        f"fp-{name}": _body(
+            _recording(f"rec-{n}", _TITLES[n - 1], Slot(f"rel-{n}", 1, 1), artists=[_MOBY]),
+        )
+        for n, name in enumerate(_NAMES[:2], 1)
+    }
+    kit = Kit(acoustid=FakeAcoustid(bodies), releases=FakeReleases())
+
+    result = _resolve(engine_settings, kit)
+
+    assert result.held_unconverged == 2
+    assert sorted(str(row["field"]) for row in result.review_values) == [
+        "artist",
+        "artist",
+        "title",
+        "title",
+    ]
+    assert result.review_files == 2
 
 
 # --- the status model ----------------------------------------------------------------

@@ -51,7 +51,7 @@ logger = get_logger(__name__)
 _LOOKUP_URL: Final = "https://api.acoustid.org/v2/lookup"
 _META: Final = "recordings releases tracks compress sources"
 # Folded into the lookup cache key, so changing what the parser extracts re-fetches every lookup.
-_LOOKUP_VERSION: Final = "1"
+_LOOKUP_VERSION: Final = "2"
 _EMPTY_TTL: Final = timedelta(days=7)
 _USER_AGENT: Final = build_user_agent(PROJECT_URL)
 _FORM_HEADERS: Final = {
@@ -125,14 +125,27 @@ class AcoustidReleaseRef:
 
 
 @dataclass(frozen=True, slots=True)
+class AcoustidArtist:
+    """One credited artist of a recording. ``joinphrase`` joins it to the next credited name."""
+
+    id: str
+    name: str
+    joinphrase: str
+
+
+@dataclass(frozen=True, slots=True)
 class AcoustidRecording:
-    """One MusicBrainz recording linked to a fingerprint. ``title`` is empty when unknown."""
+    """One MusicBrainz recording linked to a fingerprint. ``title`` is empty when unknown.
+
+    ``artists`` is the recording's artist credit in order, empty when AcoustID gave none.
+    """
 
     id: str
     title: str
     duration: int | None
     sources: int
     releases: tuple[AcoustidReleaseRef, ...]
+    artists: tuple[AcoustidArtist, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -511,6 +524,19 @@ def _parse_recording(entry: Mapping[str, object]) -> AcoustidRecording | None:
             for release in _objects(entry, "releases", "recording")
             for ref in _parse_release_refs(release)
         ),
+        artists=_parse_artists(entry, "recording"),
+    )
+
+
+def _parse_artists(entry: Mapping[str, object], where: str) -> tuple[AcoustidArtist, ...]:
+    """Parse a recording's artist credit in order. A missing field reads as empty."""
+    return tuple(
+        AcoustidArtist(
+            id=_text(credit, "id", where) or "",
+            name=_text(credit, "name", where) or "",
+            joinphrase=_text(credit, "joinphrase", where) or "",
+        )
+        for credit in _objects(entry, "artists", where)
     )
 
 
@@ -783,4 +809,5 @@ def _recording_from_json(entry: Mapping[str, object]) -> AcoustidRecording:
             )
             for ref in _objects(entry, "releases", where)
         ),
+        artists=_parse_artists(entry, where),
     )

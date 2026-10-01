@@ -17,7 +17,8 @@ its tags. One :func:`resolve_songs` call runs these stages, top to bottom:
    settles the folder on one release its voters share.
 7. Outcome router. A fill stages the blank song fields (``origin='auto'``) and records ``done``.
    A verified file records ``done``. Held, review, ``lookup_empty`` and error outcomes are
-   reported and store nothing.
+   reported and store nothing. A gated target with no ``artist`` and no ``albumartist`` whose
+   dominant recordings credit one artist also gets a review row naming it, never a stage.
 
 The manual release path (``release_id``) skips the stamp check and the route selector. It
 assigns every file in scope to its track on that release, all or nothing, and stages the whole
@@ -88,6 +89,9 @@ _TRACK: Final = "tracknumber"
 _DISC: Final = "discnumber"
 _ALBUM_ID: Final = "musicbrainz_albumid"
 _RECORDING_ID: Final = "musicbrainz_trackid"
+_ARTIST: Final = "artist"
+_ALBUM_ARTIST: Final = "albumartist"
+_ARTIST_ID: Final = "musicbrainz_artistid"
 
 # Recording gate thresholds, as the song-axis decision run measured them.
 _SCORE_FLOOR: Final = 0.9
@@ -206,6 +210,10 @@ class _Tally:
     review_values: list[dict[str, object]] = field(default_factory=list)
     mappings: list[dict[str, object]] = field(default_factory=list)
     rebind_folders: list[dict[str, object]] = field(default_factory=list)
+
+    def add_error(self, file_id: int, message: str) -> None:
+        """Record one transient failure. The file stays pending and the next call retries it."""
+        self.error_items.append({"key": str(file_id), "message": message})
 
 
 # --- stage data ----------------------------------------------------------------------
@@ -798,6 +806,34 @@ def _held(
     return _Outcome(file_id=ballot.voter.file_id, kind="held", held=kind, row=row, review=review)
 
 
+def _artist_review(ballot: _Ballot) -> dict[str, object] | None:
+    """Return a gated artist-less target's review row naming its one credited artist, else None.
+
+    Every dominant recording must credit exactly one artist, the same id on each. The artist
+    axis owns ``artist``, so the song axis proposes it whatever the target's song outcome.
+    """
+    voter = ballot.voter
+    dominant_credits = [recording.artists for recording in ballot.gate.dominant]
+    tagged = bool(voter.value(_ARTIST) or voter.value(_ALBUM_ARTIST))
+    if not voter.target or tagged or not ballot.gate.passed or not dominant_credits:
+        return None
+    if any(len(credit) != 1 for credit in dominant_credits):
+        return None
+    artist = dominant_credits[0][0]
+    name = artist.name.strip()
+    shared = {credit[0].id for credit in dominant_credits} == {artist.id}
+    if not shared or not artist.id or not name:
+        return None
+    return {
+        "file_id": voter.file_id,
+        "folder": voter.row.folder,
+        "filename": voter.row.filename,
+        "field": _ARTIST,
+        "proposal": name,
+        _ARTIST_ID: artist.id,
+    }
+
+
 def _ungated(ballot: _Ballot) -> _Outcome:
     """Return the outcome of a target the recording gate did not pass."""
     file_id = ballot.voter.file_id
@@ -1239,7 +1275,10 @@ class _AutoRun:
         return ballots
 
     def _settle(self, ballots: list[_Ballot]) -> None:
-        """Route one folder and apply its outcomes. A MusicBrainz error leaves it pending."""
+        """Route one folder, apply its outcomes and add its artist review rows.
+
+        A MusicBrainz error leaves the folder pending. A rebind folder adds only its report.
+        """
         try:
             route = _route(ballots)
             if route == "rebind":
@@ -1253,9 +1292,12 @@ class _AutoRun:
         except MusicBrainzError as exc:
             logger.warning("musicbrainz error in %s: %s", ballots[0].voter.row.folder, exc)
             for ballot in (b for b in ballots if b.voter.target):
-                self._error(ballot.voter.file_id, str(exc))
+                self._tally.add_error(ballot.voter.file_id, str(exc))
             return
         self._apply(outcomes)
+        self._tally.review_values.extend(
+            review for ballot in ballots if (review := _artist_review(ballot)) is not None
+        )
 
     def _apply(self, outcomes: list[_Outcome]) -> None:
         """Run the outcome router: stage every fill, then record each ``done`` in one write."""
@@ -1271,7 +1313,7 @@ class _AutoRun:
             elif outcome.kind == "lookup_empty":
                 self._tally.lookup_empty += 1
             elif outcome.kind == "error":
-                self._error(outcome.file_id, outcome.message)
+                self._tally.add_error(outcome.file_id, outcome.message)
         self._tally.settled += len(done)
         if self._dry_run or not done:
             return
@@ -1301,7 +1343,7 @@ class _AutoRun:
                 fill_only=outcome.fill_only,
             )
         except ValueError as exc:
-            self._error(outcome.file_id, str(exc))
+            self._tally.add_error(outcome.file_id, str(exc))
             return False
         # Disk gained every value since the scan: nothing staged, and the next rescan re-opens it.
         if staged:
@@ -1315,10 +1357,6 @@ class _AutoRun:
             self._tally.held_values.append(outcome.row)
         if outcome.review is not None:
             self._tally.review_values.append(outcome.review)
-
-    def _error(self, file_id: int, message: str) -> None:
-        """Record one transient failure. The file stays pending and the next call retries it."""
-        self._tally.error_items.append({"key": str(file_id), "message": message})
 
 
 # --- manual release path -------------------------------------------------------------
@@ -1360,6 +1398,8 @@ def _resolve_release(  # noqa: PLR0913 - cohesive keyword-only run inputs
     for ballot in ballots:
         slots = placements[ballot.voter.file_id]
         reason = _evidence_reason(ballot) or _slot_reason(ballot, slots, claims)
+        if reason == "error":
+            tally.add_error(ballot.voter.file_id, ballot.evidence.error or "")
         if reason is not None:
             unassigned.append(
                 {
@@ -1454,11 +1494,11 @@ def _stamp(release: MBRelease, track: MBTrack, voter: _Voter) -> dict[str, list[
         _TITLE: [track.title],
         _TRACK: [f"{track.position}/{track_count}"],
         _DISC: [f"{0 if medium is None else medium.position}/{len(release.media)}"],
-        "artist": _one(track.artist_credit),
+        _ARTIST: _one(track.artist_credit),
         "artistsort": _one(track.artist_sort),
-        "musicbrainz_artistid": list(track.artist_mbids),
+        _ARTIST_ID: list(track.artist_mbids),
         "artists": [],
-        "albumartist": _one(release.artist_credit),
+        _ALBUM_ARTIST: _one(release.artist_credit),
         "albumartistsort": _one(release.artist_sort),
         "musicbrainz_albumartistid": list(release.artist_mbids),
         "album": [release.title],
@@ -1541,7 +1581,7 @@ def _build_result(
         held_slot_collision=tally.held["slot_collision"],
         held_release_mismatch=tally.held["release_mismatch"],
         held_unconverged=tally.held["unconverged"],
-        review_files=len(tally.review_values),
+        review_files=len({row["file_id"] for row in tally.review_values}),
         lookup_empty=tally.lookup_empty,
         skipped_manual=tally.skipped_manual,
         mappings=list(tally.mappings),

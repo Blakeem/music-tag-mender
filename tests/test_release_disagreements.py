@@ -48,6 +48,7 @@ def _track(  # noqa: PLR0913 - one keyword per track field, cohesive by design
     rt: str = "",
     rec: str = "",
     credit: str = "Band",
+    mbids: tuple[str, ...] = ("artist-1",),
 ) -> MBTrack:
     """Build one track. *position* defaults to *number* when that is a plain integer.
 
@@ -62,7 +63,7 @@ def _track(  # noqa: PLR0913 - one keyword per track field, cohesive by design
         recording_mbid=rec or f"rec-{resolved}",
         artist_credit=credit,
         artist_sort=credit,
-        artist_mbids=("artist-1",),
+        artist_mbids=mbids,
     )
 
 
@@ -659,6 +660,152 @@ def test_the_artist_is_not_checked_without_a_matched_track() -> None:
     report = _run([_f(release_track_mbid=None, recording_mbid=None, artist="Somebody Else")])
 
     assert "artist" not in {r.field for r in report.rows}
+
+
+# --- matching artist ids leave the spelling to the artist axis -----------------------
+
+
+def test_an_albumartist_whose_ids_match_the_release_credit_is_not_compared() -> None:
+    # resolve_artists writes the canonical name where the release prints its credited one.
+    release = _release(_track("1", "Song One"), artist_credit="Smashing Pumpkins")
+    report = _run(
+        [_f(albumartist="The Smashing Pumpkins", albumartist_mbids=("artist-1",))],
+        release,
+    )
+
+    assert report.flagged == 0
+    assert "albumartist" not in {r.field for r in report.fill_rows}
+
+
+def test_an_artist_whose_ids_match_the_track_credit_is_not_compared() -> None:
+    release = _release(_track("1", "Song One", credit="Sonny"))
+    report = _run([_f(artist="Skrillex", artist_mbids=("artist-1",))], release)
+
+    assert report.flagged == 0
+
+
+@pytest.mark.parametrize("file_mbids", [("artist-9",), ()], ids=["other id", "no id"])
+@pytest.mark.parametrize(
+    ("field_name", "id_field"),
+    [("albumartist", "albumartist_mbids"), ("artist", "artist_mbids")],
+)
+def test_a_name_difference_without_matching_ids_still_disagrees(
+    field_name: str,
+    id_field: str,
+    file_mbids: tuple[str, ...],
+) -> None:
+    overrides: dict[str, object] = {field_name: "The Band", id_field: file_mbids}
+    report = _run([_f(1, **overrides)])
+
+    assert [(r.field, r.have, r.want) for r in report.rows] == [(field_name, "The Band", "Band")]
+
+
+def test_a_multi_artist_credit_is_compared_by_name_even_with_matching_ids() -> None:
+    # resolve_artists settles a name by its MusicBrainz id only when the field holds one id.
+    credit = "Kruder & Dorfmeister"
+    ids = ("id-k", "id-d")
+    release = _release(
+        _track("1", "Song One", credit=credit, mbids=ids),
+        artist_credit=credit,
+        artist_mbids=ids,
+    )
+    report = _run(
+        [
+            _f(
+                albumartist="Kruder and Dorfmeister",
+                albumartist_mbids=ids,
+                artist="Kruder and Dorfmeister",
+                artist_mbids=ids,
+            )
+        ],
+        release,
+    )
+
+    assert {r.field for r in report.rows} == {"albumartist", "artist"}
+
+
+def test_a_credit_without_ids_and_a_file_without_ids_still_disagree() -> None:
+    release = _release(
+        _track("1", "Song One", mbids=()),
+        artist_mbids=(),
+    )
+    report = _run([_f(albumartist="The Band", artist="The Band")], release)
+
+    assert {r.field for r in report.rows} == {"albumartist", "artist"}
+
+
+@pytest.mark.parametrize(
+    ("file_mbids", "flagged"),
+    [(("guest-1",), False), (("artist-1",), True)],
+    ids=["track credit id", "release credit id"],
+)
+def test_a_guest_track_artist_is_judged_by_the_track_credit_ids(
+    file_mbids: tuple[str, ...],
+    flagged: bool,  # noqa: FBT001 - pytest parameter
+) -> None:
+    guest = _track("2", "Song Two", credit="Guest", mbids=("guest-1",))
+    release = _release(_track("1", "Song One"), guest)
+    report = _run(
+        [
+            _f(
+                release_track_mbid="rt-2",
+                recording_mbid="rec-2",
+                title="Song Two",
+                tracknumber="2",
+                artist="The Guest",
+                artist_mbids=file_mbids,
+            )
+        ],
+        release,
+    )
+
+    assert ("artist" in {r.field for r in report.rows}) is flagged
+
+
+def test_a_blank_albumartist_with_matching_ids_is_still_a_fill() -> None:
+    report = _run([_f(albumartist=None, albumartist_mbids=("artist-1",))])
+
+    assert report.flagged == 0
+    assert [(r.field, r.have, r.want) for r in report.fill_rows] == [("albumartist", "", "Band")]
+
+
+@pytest.mark.parametrize(
+    ("filename", "stored_ids", "flagged"),
+    [
+        ("a.flac", ["id-a"], 0),
+        ("a.flac", ["id-a", "id-b"], 1),
+        ("a.mp3", ["id-a/id-b"], 1),
+    ],
+    ids=["the credit's one id", "a second id value", "id3v2.3 slash join"],
+)
+def test_album_artist_ids_are_read_from_every_stored_value(
+    engine_settings: Settings,
+    music_dir: Path,
+    filename: str,
+    stored_ids: list[str],
+    flagged: int,
+) -> None:
+    make_track(
+        music_dir / filename,
+        {
+            "album": ["Real Album"],
+            "albumartist": ["The Band"],
+            "musicbrainz_albumartistid": stored_ids,
+            "title": ["Song One"],
+            "tracknumber": ["1"],
+            "musicbrainz_albumid": [_RELEASE_ID],
+            "musicbrainz_releasetrackid": ["rt-1"],
+        },
+    )
+    scan_library(engine_settings)
+    release = _release(_track("1", "Song One"), artist_mbids=("id-a",))
+
+    report = release_disagreements.detect_release_disagreements(
+        engine_settings,
+        client=FakeReleaseSource({_RELEASE_ID: release}),
+    )
+
+    assert report.flagged == flagged
 
 
 # --- vinyl numbering and typography are not disagreements ----------------------------

@@ -676,6 +676,10 @@ def detect_release_disagreements(  # noqa: PLR0913 - one parameter per scope/vie
     track: a guest track carries its own. No ``discnumber`` is proposed for a single-medium
     release, since Picard routinely omits it there.
 
+    ``albumartist`` and ``artist`` are not compared by name when the credit names one artist and
+    the file's own id field (``musicbrainz_albumartistid``, ``musicbrainz_artistid``) holds
+    exactly that id. ``resolve_artists`` owns the spelling of a single identified artist.
+
     **A blank field is a fill, not a disagreement.** ``flagged`` counts the files with at least
     one field where the file says one thing and the release says another, and
     ``flagged_fields`` counts those fields. Fields the file simply lacks are collected under

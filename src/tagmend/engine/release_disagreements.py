@@ -21,6 +21,11 @@ Two levels of field are checked, and they fail independently:
   track, and are skipped when there is none. ``artist`` is track-level because a credit is per
   track: a guest track carries its own, and that is the one the file should name.
 
+``albumartist`` and ``artist`` are not compared by name when the credit names one artist and the
+file's own id field (``musicbrainz_albumartistid``, ``musicbrainz_artistid``) holds exactly that
+id. The artist axis owns that spelling, since it writes a single artist's canonical name where
+the release prints its credited one.
+
 A blank field is a **fill**, not a disagreement. The repo's glossary separates the two
 (``gap`` is tag against absent, ``disagreement`` is tag against an external source), and so
 does this report: ``flagged`` counts only fields where the file says something and the release
@@ -74,6 +79,11 @@ _DETECT_FIELDS: Final = (
     "musicbrainz_albumstatus",
 )
 
+# Each artist name field's own id field. Picard writes one id per credited artist, so every value
+# is read: a file naming two artists must not pass as its first.
+_ALBUMARTIST_ID_FIELD: Final = "musicbrainz_albumartistid"
+_ARTIST_ID_FIELD: Final = "musicbrainz_artistid"
+
 # How many distinct releases one call fetches when the caller names no limit. At the one
 # request per second MusicBrainz asks for, this is about three minutes of wall clock.
 _DEFAULT_RELEASE_LIMIT: Final = 200
@@ -110,6 +120,8 @@ class _FileInput:
     date: str | None = None
     releasecountry: str | None = None
     musicbrainz_albumstatus: str | None = None
+    albumartist_mbids: tuple[str, ...] = ()
+    artist_mbids: tuple[str, ...] = ()
 
 
 # --- public result types -------------------------------------------------------------
@@ -285,6 +297,15 @@ def _tier_for(field_name: str) -> Tier:
     return Tier.MEDIUM if field_name in _MEDIUM_FIELDS else Tier.LOW
 
 
+def _artist_axis_owns_spelling(
+    have: str,
+    file_mbids: tuple[str, ...],
+    credit_mbids: tuple[str, ...],
+) -> bool:
+    """Return whether a non-blank artist name names the credit's one artist by id exactly."""
+    return bool(have) and len(credit_mbids) == 1 and file_mbids == credit_mbids
+
+
 # --- pure classifier -----------------------------------------------------------------
 
 
@@ -336,6 +357,10 @@ def _compare_one(
         if not want:
             continue
         have = (getattr(file, field_name) or "").strip()
+        if field_name == "albumartist" and _artist_axis_owns_spelling(
+            have, file.albumartist_mbids, release.artist_mbids
+        ):
+            continue
         agrees = (
             _date_agrees(have, want)
             if field_name == "date"
@@ -404,6 +429,10 @@ def _compare_track(
         ),
     ):
         have = (have_raw or "").strip()
+        if field_name == "artist" and _artist_axis_owns_spelling(
+            have, file.artist_mbids, track.artist_mbids
+        ):
+            continue
         if want and release_match.text_key(have) != release_match.text_key(want):
             add(field_name, have, want, f"the release says {want!r}")
 
@@ -651,12 +680,14 @@ def _load_inputs(
 ) -> list[_FileInput]:
     """Read every in-scope present file's detect fields out of the snapshot mirror."""
     tag_values = store.load_tag_values(connection, _DETECT_FIELDS)
+    id_lists = store.load_tag_lists(connection, (_ALBUMARTIST_ID_FIELD, _ARTIST_ID_FIELD))
     wanted = None if scoped_ids is None else set(scoped_ids)
     inputs: list[_FileInput] = []
     for row in store.list_files(connection):
         if row.is_missing or (wanted is not None and row.id not in wanted):
             continue
         values = tag_values.get(row.id, {})
+        ids = id_lists.get(row.id, {})
         inputs.append(
             _FileInput(
                 file_id=row.id,
@@ -674,9 +705,16 @@ def _load_inputs(
                 date=values.get("date"),
                 releasecountry=values.get("releasecountry"),
                 musicbrainz_albumstatus=values.get("musicbrainz_albumstatus"),
+                albumartist_mbids=_artist_mbids(ids.get(_ALBUMARTIST_ID_FIELD, [])),
+                artist_mbids=_artist_mbids(ids.get(_ARTIST_ID_FIELD, [])),
             ),
         )
     return inputs
+
+
+def _artist_mbids(values: list[str]) -> tuple[str, ...]:
+    """Return a file's artist ids in order, one per tag value."""
+    return tuple(mbid for value in values if (mbid := value.strip()))
 
 
 def detect_release_disagreements(  # noqa: PLR0913 - cohesive keyword-only scope + injection params

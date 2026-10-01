@@ -1600,6 +1600,28 @@ def load_tag_values(
     return result
 
 
+def load_tag_lists(
+    conn: sqlite3.Connection,
+    names: tuple[str, ...],
+) -> dict[int, dict[str, list[str]]]:
+    """Return ``{file_id: {name: values}}`` with every value of each requested tag, in order.
+
+    The multi-value sibling of :func:`load_tag_values`, for a tag whose later values matter.
+    """
+    if not names:
+        return {}
+    placeholders = ",".join("?" for _ in names)
+    cursor = conn.execute(
+        "SELECT file_id, name, value FROM file_tags "  # noqa: S608 - '?' bind markers only
+        f"WHERE name IN ({placeholders}) ORDER BY file_id, name, ordinal",
+        names,
+    )
+    result: dict[int, dict[str, list[str]]] = {}
+    for row in cursor.fetchall():
+        result.setdefault(db.as_int(row[0]), {}).setdefault(str(row[1]), []).append(str(row[2]))
+    return result
+
+
 def missing_file_ids(conn: sqlite3.Connection) -> set[int]:
     """Return the ids of every file the last scan flagged missing from disk."""
     cursor = conn.execute("SELECT id FROM files WHERE is_missing = 1")

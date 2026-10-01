@@ -100,8 +100,10 @@ that something is wrong. Inside the release a file finds its track by
 `musicbrainz_releasetrackid`, or failing that by `musicbrainz_trackid`. Position is never a
 fallback, because a wrong track number is one of the defects reported here. Release-level
 fields (`album`, `albumartist`, `date`, `releasecountry`, `musicbrainz_albumstatus`) are
-checked even for a file carrying no track id. Track-level fields (`title`, `tracknumber`,
-`discnumber`) need a matched track and are skipped without one. A blank field is a **fill**,
+checked even for a file carrying no track id. Track-level fields (`title`, `artist`, `tracknumber`,
+`discnumber`) need a matched track and are skipped without one. `albumartist` and `artist` are not
+compared by name when the credit names one artist and the file's own id field holds exactly that
+id, since `resolve_artists` owns the spelling of a single identified artist. A blank field is a **fill**,
 not a disagreement: `flagged` counts only fields where the file says one thing and the release
 says another, while `fill_rows` collects what the release can supply for free. `detect_year_disagreements` (`year_disagreements.py`)
 compares a file's year tags with the first-release year of its album's MusicBrainz release group,

@@ -388,6 +388,90 @@ def test_anchored_route_verifies_and_holds_a_disagreement(
     ]
 
 
+def _anchored_lp_folder(music_dir: Path) -> None:
+    """Make a folder whose four files carry their LP track's ids."""
+    _make_folder(
+        music_dir / "LP",
+        [
+            {
+                "title": [_TITLES[n]],
+                "tracknumber": [f"{n + 1}/4"],
+                "discnumber": ["1/1"],
+                "musicbrainz_albumid": [_LP],
+                "musicbrainz_releasetrackid": [_track_id(_LP, n + 1)],
+            }
+            for n in range(4)
+        ],
+    )
+
+
+def _off_release_kit(*indexes: int) -> Kit:
+    """Return the LP kit with the files at *indexes* heard only on another release."""
+    kit = _converging_kit()
+    for n in indexes:
+        kit.acoustid.bodies[f"fp-{_NAMES[n]}"] = _body(
+            _recording(f"rec-off-{n}", _TITLES[n], Slot("rel-single", 1, 1)),
+        )
+    return kit
+
+
+def test_a_manual_file_off_its_release_leaves_its_siblings_on_the_anchored_route(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    _anchored_lp_folder(music_dir)
+    library.scan_library(engine_settings)
+    ids = _ids(engine_settings)
+    songs.set_song_status(engine_settings, file_ids=[ids[_NAMES[0]]], status="manual")
+
+    result = _resolve(engine_settings, _off_release_kit(0))
+
+    assert result.rebind_folders == []
+    assert result.skipped_manual == 1
+    assert result.verified_files == 3
+    assert [_status(engine_settings, ids[name]) for name in _NAMES] == [
+        "manual",
+        "done",
+        "done",
+        "done",
+    ]
+
+
+def test_a_pending_file_off_its_release_routes_rebind_and_alone_is_flagged(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    _anchored_lp_folder(music_dir)
+    library.scan_library(engine_settings)
+    ids = _ids(engine_settings)
+    songs.set_song_status(engine_settings, file_ids=[ids[_NAMES[0]]], status="manual")
+
+    result = _resolve(engine_settings, _off_release_kit(0, 1))
+
+    [rebind] = result.rebind_folders
+    assert rebind["flagged_file_ids"] == [ids[_NAMES[1]]]
+    assert result.verified_files == 0
+
+
+def test_an_out_of_scope_pending_file_off_its_release_still_routes_rebind(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    _anchored_lp_folder(music_dir)
+    library.scan_library(engine_settings)
+    ids = _ids(engine_settings)
+
+    result = _resolve(
+        engine_settings,
+        _off_release_kit(3),
+        file_ids=[ids[name] for name in _NAMES[:3]],
+    )
+
+    [rebind] = result.rebind_folders
+    assert rebind["flagged_file_ids"] == [ids[_NAMES[3]]]
+    assert result.verified_files == 0
+
+
 # --- stamp check and the manual release path -----------------------------------------
 
 _WRONG_STAMP = {

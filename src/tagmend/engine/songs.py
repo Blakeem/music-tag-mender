@@ -10,8 +10,8 @@ its tags. One :func:`resolve_songs` call runs these stages, top to bottom:
 2. Fingerprint stage. A ``fingerprint_cache`` row at the files-row signature, else fpcalc.
 3. Lookup stage. An ``acoustid_cache`` row, else one AcoustID request.
 4. Recording gate stage. Per voter, the dominant recordings its audio names, or no contribution.
-5. Stamp check stage. A gated voter whose tagged release its audio is absent from sends the
-   folder to the rebind route.
+5. Stamp check stage. A gated pending voter whose tagged release its audio is absent from sends
+   the folder to the rebind route.
 6. Route selector. The rebind route reports ranked candidate releases and stages nothing. The
    anchored route checks each voter against the release it already names. The convergence route
    settles the folder on one release its voters share.
@@ -221,11 +221,16 @@ class _Tally:
 
 @dataclass(frozen=True, slots=True)
 class _Voter:
-    """One present file of a selected folder. *target* marks a pending in-scope file."""
+    """One present file of a selected folder.
+
+    *unsettled* marks a file whose song status is ``pending``, in scope or not. *target* marks an
+    unsettled in-scope file, the only kind that receives an outcome.
+    """
 
     row: store.FileRow
     tags: dict[str, list[str]]
     target: bool
+    unsettled: bool
 
     @property
     def file_id(self) -> int:
@@ -720,8 +725,13 @@ def _stamp_fails(ballot: _Ballot) -> bool:
 
 
 def _route(ballots: list[_Ballot]) -> str:
-    """Pick the folder's route. First match wins: rebind, anchored, convergence."""
-    if any(_stamp_fails(ballot) for ballot in ballots):
+    """Pick the folder's route. First match wins: rebind, anchored, convergence.
+
+    Only an unsettled voter's stamp check can pick rebind, whatever the call's scope. A settled
+    voter is verified, the owner's ``manual`` call or staged to change, so it never holds its
+    pending siblings on the rebind route.
+    """
+    if any(_stamp_fails(ballot) for ballot in ballots if ballot.voter.unsettled):
         return "rebind"
     if all(ballot.voter.value(_ALBUM_ID) for ballot in ballots):
         return "anchored"
@@ -1182,7 +1192,9 @@ def _rebind_report(ballots: list[_Ballot], lookups: _Lookups) -> dict[str, objec
     return {
         "folder": ballots[0].voter.row.folder,
         "tagged_releases": tagged,
-        "flagged_file_ids": [b.voter.file_id for b in ballots if _stamp_fails(b)],
+        "flagged_file_ids": [
+            b.voter.file_id for b in ballots if b.voter.unsettled and _stamp_fails(b)
+        ],
         "candidates": candidates,
     }
 
@@ -1264,8 +1276,15 @@ class _AutoRun:
         """Build each voter's ballot: its tags, its evidence and its gate verdict."""
         ballots: list[_Ballot] = []
         for row in rows:
+            target = row.id in pending
+            unsettled = target or (
+                store.derived_status(self._conn, axis.SONG_AXIS, row.id) == "pending"
+            )
             voter = _Voter(
-                row=row, tags=store.get_tags(self._conn, row.id), target=row.id in pending
+                row=row,
+                tags=store.get_tags(self._conn, row.id),
+                target=target,
+                unsettled=unsettled,
             )
             ballots.append(
                 _Ballot(
@@ -1388,7 +1407,7 @@ def _resolve_release(  # noqa: PLR0913 - cohesive keyword-only run inputs
     ballots: list[_Ballot] = []
     for row in rows:
         evidence = _fresh_evidence(conn, row, lookups, now)
-        voter = _Voter(row=row, tags=store.get_tags(conn, row.id), target=True)
+        voter = _Voter(row=row, tags=store.get_tags(conn, row.id), target=True, unsettled=True)
         ballots.append(_Ballot(voter=voter, evidence=evidence, gate=_gate(evidence, voter.stem)))
     placements = {b.voter.file_id: _slots_on(release, b.gate.titled) for b in ballots}
     claims = _claims(placements)

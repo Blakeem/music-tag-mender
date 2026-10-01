@@ -41,8 +41,9 @@ re-applied after a crash still records it. `axis_status.py` is the one implement
 every `set_/reset_<axis>_status` pair. The song axis (`songs.py`) identifies each file's recording
 by its AcoustID fingerprint. A folder whose files carry `musicbrainz_albumid` is checked against
 those releases, a folder without ids converges on the one Official release most of its files share
-and fills only blank `title`/`tracknumber`/`discnumber` as `auto`, and a folder whose audio is not
-on its tagged release is reported in `rebind_folders`. `resolve_songs(release_id=...)` stamps a
+and fills only blank `title`/`tracknumber`/`discnumber` as `auto`, and a folder holding a pending
+file whose audio is not on its tagged release is reported in `rebind_folders`. A `done` or `manual`
+file off its release never holds its pending siblings on that route. `resolve_songs(release_id=...)` stamps a
 whole folder onto one chosen release as a single `manual` batch. The **mismatch-fix** surface
 records one path decision per file in `file_mismatch_status`. `legit_ignore` keeps the folder and
 renders the filename. `misfiled_deferred` lets the tags render every path level. No status keeps a

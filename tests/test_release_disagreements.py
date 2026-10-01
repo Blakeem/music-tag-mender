@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 from conftest import FOLDER_SPELLINGS, make_track, spell_folder
-from tagmend.engine import release_disagreements
+from tagmend.engine import musicbrainz, release_disagreements
 from tagmend.engine.detector_core import Tier
 from tagmend.engine.library import scan_library
 from tagmend.engine.musicbrainz import MBMedium, MBRelease, MBTrack, MusicBrainzError
@@ -166,6 +166,47 @@ def test_a_file_whose_track_id_is_not_on_the_release_is_high() -> None:
     assert report.high == 1
     assert report.rows[0].field == "musicbrainz_releasetrackid"
     assert "not on" in report.rows[0].reason
+
+
+def test_a_file_on_the_parsed_pregap_track_is_matched() -> None:
+    def entry(position: int, title: str) -> dict[str, object]:
+        return {
+            "position": position,
+            "number": str(position),
+            "title": title,
+            "id": f"rt-{position}",
+            "recording": {"id": f"rec-{position}"},
+        }
+
+    credit = [{"name": "Band", "joinphrase": "", "artist": {"id": "artist-1"}}]
+    medium = {
+        "position": 1,
+        "format": "CD",
+        "track-count": 2,
+        "pregap": entry(0, "Hidden Intro"),
+        "tracks": [entry(1, "Song One")],
+    }
+    body: dict[str, object] = {
+        "title": "Real Album",
+        "artist-credit": credit,
+        "date": "1997",
+        "country": "US",
+        "status": "Official",
+        "media": [medium],
+    }
+    release = musicbrainz._parse_release(_RELEASE_ID, body)
+    assert release is not None
+    pregap_file = _f(
+        release_track_mbid="rt-0",
+        recording_mbid="rec-0",
+        title="Hidden Intro",
+        tracknumber="0",
+    )
+
+    report = _run([pregap_file], release)
+
+    assert report.unmatched_tracks == 0
+    assert all(row.field != "musicbrainz_releasetrackid" for row in report.rows)
 
 
 def test_a_release_musicbrainz_does_not_know_is_reported_not_an_error() -> None:

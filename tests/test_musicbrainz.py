@@ -18,7 +18,9 @@ from tagmend.engine.musicbrainz import (
     MusicBrainzError,
     _artist_request_key,
     _recording_request_key,
+    _release_from_json,
     _release_request_key,
+    _release_to_json,
     _request_key,
 )
 from tagmend.engine.store import (
@@ -967,9 +969,28 @@ def test_bumping_the_release_version_changes_the_request_key(
     assert _release_request_key("abc") != before
 
 
-def test_the_release_version_is_two() -> None:
-    # Version 2 added the sort credits, so every release cached under version 1 re-fetches.
-    assert musicbrainz._RELEASE_VERSION == "2"
+def test_the_release_version_is_three() -> None:
+    # Version 3 added the pregap and data tracks, so every release cached earlier re-fetches.
+    assert musicbrainz._RELEASE_VERSION == "3"
+
+
+def test_release_by_mbid_keeps_the_pregap_and_data_tracks_in_disc_order(
+    db_conn: sqlite3.Connection,
+) -> None:
+    body = _release_body()
+    media = body["media"]
+    assert isinstance(media, list)
+    media[0]["pregap"] = _track(0, "0", "Hidden Intro")
+    media[0]["data-tracks"] = [_track(3, "3", "Enhanced Video")]
+    client, _ = _client(db_conn, [_json_response(body)])
+    with client:
+        release = client.release_by_mbid("rel-1")
+
+    assert release is not None
+    titles = ["Hidden Intro", "Enemy Throttle", "In the Skin", "Enhanced Video"]
+    assert [t.title for t in release.media[0].tracks] == titles
+    assert release.track_by_release_track_mbid("rt-0") is not None
+    assert _release_from_json("rel-1", _release_to_json(release)) == release
 
 
 def _sorted_part(name: str, sort_name: str, join: str, mbid: str) -> dict[str, object]:

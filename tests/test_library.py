@@ -14,7 +14,17 @@ import pytest
 
 from conftest import make_track
 from tagmend.config import Settings
-from tagmend.engine import artists, axis, mismatch, path_keys, staging, store, versioning, years
+from tagmend.engine import (
+    artists,
+    axis,
+    library,
+    mismatch,
+    path_keys,
+    staging,
+    store,
+    versioning,
+    years,
+)
 from tagmend.engine.db import connect
 from tagmend.engine.library import (
     ScanMode,
@@ -26,7 +36,7 @@ from tagmend.engine.library import (
     scan_library,
 )
 from tagmend.engine.schema import apply_schema
-from tagmend.engine.tags import TAG_READER_VERSION
+from tagmend.engine.tags import TAG_READER_VERSION, TrackTags, read_tags
 
 _N = 3
 
@@ -298,6 +308,45 @@ def test_changed_tags_are_reread(engine_settings: Settings, music_dir: Path) -> 
 
     assert result.updated >= 1
     assert result.tags_read == 1
+    assert _stored_genre(engine_settings, music_dir, tracks[0].name) == ["Darksynth"]
+
+
+def test_an_edit_a_presence_scan_saw_is_reread_by_the_next_incremental_scan(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    tracks = _populate(music_dir, _N)
+    scan_library(engine_settings)
+    make_track(tracks[0], {"artist": ["Artist 0"], "genre": ["Darksynth"]})
+    scan_library(engine_settings, mode=ScanMode.PRESENCE)  # stores the new signature only
+
+    scan_library(engine_settings)
+
+    assert _stored_genre(engine_settings, music_dir, tracks[0].name) == ["Darksynth"]
+
+
+def test_an_edit_whose_reread_failed_is_reread_by_the_next_incremental_scan(
+    engine_settings: Settings,
+    music_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tracks = _populate(music_dir, _N)
+    scan_library(engine_settings)
+    make_track(tracks[0], {"artist": ["Artist 0"], "genre": ["Darksynth"]})
+
+    def failing_read_tags(path: Path) -> TrackTags:
+        if path.name == tracks[0].name:
+            message = "simulated read failure"
+            raise OSError(message)
+        return read_tags(path)
+
+    monkeypatch.setattr(library, "read_tags", failing_read_tags)
+    failed = scan_library(engine_settings)
+    monkeypatch.setattr(library, "read_tags", read_tags)
+
+    scan_library(engine_settings)
+
+    assert failed.errors == 1
     assert _stored_genre(engine_settings, music_dir, tracks[0].name) == ["Darksynth"]
 
 

@@ -252,6 +252,11 @@ def stamp_reader_version(conn: sqlite3.Connection, file_id: int) -> None:
     )
 
 
+def mark_reader_stale(conn: sqlite3.Connection, file_id: int) -> None:
+    """Make the next incremental scan re-read *file_id*, whose new signature had no tag re-read."""
+    conn.execute("UPDATE files SET reader_version = 0 WHERE id = ?", (file_id,))
+
+
 def tracked_files_under(conn: sqlite3.Connection, root_key: str) -> list[FileRow]:
     """Return every tracked file whose folder is the folder keyed *root_key* or nested under it.
 

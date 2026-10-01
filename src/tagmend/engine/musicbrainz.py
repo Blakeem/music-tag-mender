@@ -106,7 +106,7 @@ _SELECTION_VERSION: Final = "2"
 _ARTIST_VERSION: Final = "1"
 
 # The release lookup's own version token, for the same reason the artist lookup has one.
-_RELEASE_VERSION: Final = "2"
+_RELEASE_VERSION: Final = "3"
 
 # One trailing parenthetical/bracketed segment — the edition suffix a tag carries and a release
 # group does not (``Fiction (Deluxe Edition)``, ``The Red Album [Deluxe Edition]``).
@@ -905,8 +905,7 @@ def _parse_release(mbid: str, body: dict[str, object]) -> MBRelease | None:
             tracks = [
                 track
                 for track in (
-                    _parse_track(entry, release_credit)
-                    for entry in (raw_medium.get("tracks") or [])
+                    _parse_track(entry, release_credit) for entry in _medium_entries(raw_medium)
                 )
                 if track is not None
             ]
@@ -932,6 +931,20 @@ def _parse_release(mbid: str, body: dict[str, object]) -> MBRelease | None:
         barcode=_as_str(body.get("barcode")),
         media=tuple(media),
     )
+
+
+def _medium_entries(raw_medium: dict[str, object]) -> list[object]:
+    """Return a medium's track entries in disc order: the pregap, the audio, the data tracks.
+
+    The WS/2 JSON moves the pregap and the data tracks out of ``tracks``, and Picard tags both.
+    """
+    pregap = raw_medium.get("pregap")
+    entries: list[object] = [pregap] if isinstance(pregap, dict) else []
+    for key in ("tracks", "data-tracks"):
+        listed = raw_medium.get(key)
+        if isinstance(listed, list):
+            entries.extend(listed)
+    return entries
 
 
 def _as_str(value: object) -> str:

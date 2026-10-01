@@ -22,7 +22,7 @@ import mutagen
 import pytest
 
 from conftest import make_track
-from tagmend.engine import artists, staging, store, versioning
+from tagmend.engine import artists, axis, staging, store, versioning
 from tagmend.engine.db import connect
 from tagmend.engine.lastfm import ArtistCorrection, LastfmError
 from tagmend.engine.library import list_files as library_list
@@ -1469,6 +1469,37 @@ def test_resolve_artists_skips_missing_files(
     assert result.pending_remaining == 0
     assert result.staged_files == 1
     assert [view.filename for view in staging.diff_tags(engine_settings)] == [kept.name]
+
+
+def test_a_file_that_cannot_be_staged_is_reported_and_stays_pending(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    make_track(music_dir / "a.mp3", {"artist": ["foo"]})
+    gone = make_track(music_dir / "b.mp3", {"artist": ["foo"]})
+    make_track(music_dir / "c.mp3", {"artist": ["foo"]})
+    scan_library(engine_settings)
+    ids = {name: _file_id(engine_settings, music_dir, name) for name in ("a.mp3", "b.mp3", "c.mp3")}
+    gone.unlink()  # no rescan, so the file is still a carrier
+
+    fake = FakeCorrectionSource({"foo": ArtistCorrection("Foo Canon", "mbid-foo")})
+    result = artists.resolve_artists(engine_settings, client=fake)
+
+    assert result.staged_files == 2
+    assert [item["key"] for item in result.error_items] == [f"file_id={ids['b.mp3']}"]
+    conn = connect(engine_settings.db_path)
+    try:
+        apply_schema(conn)
+        outcomes = {
+            name: axis.get_outcome(conn, axis.ARTIST_AXIS, file_id) for name, file_id in ids.items()
+        }
+    finally:
+        conn.close()
+    assert outcomes["b.mp3"] is None
+    assert outcomes["a.mp3"] is not None
+    assert outcomes["a.mp3"].status == "done"
+    assert outcomes["c.mp3"] is not None
+    assert outcomes["c.mp3"].status == "done"
 
 
 # --- (12) the multi-value artists list ---------------------------------------------

@@ -580,6 +580,35 @@ def test_lastfm_error_is_counted_and_itemized(
     assert staging.diff_tags(engine_settings) == []
 
 
+def test_a_file_that_cannot_be_staged_is_reported_and_stays_pending(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    for name in ("a.mp3", "b.mp3", "c.mp3"):
+        make_track(music_dir / name, {"artist": ["Daft Punk"], "genre": ["Old"]})
+    make_track(music_dir / "z.mp3", {"artist": ["Justice"], "genre": ["Old"]})
+    scan_library(engine_settings)
+    ids = {
+        name: _file_id(engine_settings, music_dir, name)
+        for name in ("a.mp3", "b.mp3", "c.mp3", "z.mp3")
+    }
+    (music_dir / "b.mp3").unlink()  # no rescan, so the file is still selected
+    assert ids["z.mp3"] > max(ids["a.mp3"], ids["b.mp3"], ids["c.mp3"])
+
+    fake = FakeTagSource({"Daft Punk": _DAFT_PUNK_TAGS, "Justice": _DAFT_PUNK_TAGS})
+    result = genres.resolve_genres(engine_settings, client=fake)
+
+    assert result.settled == 3
+    assert result.staged_files == 3
+    assert [item["key"] for item in result.error_items] == [str(ids["b.mp3"])]
+    assert _genre_status(engine_settings, ids["b.mp3"]) is None
+    assert _status_of(engine_settings, ids["b.mp3"]) == "pending"
+    for name in ("a.mp3", "c.mp3", "z.mp3"):
+        row = _genre_status(engine_settings, ids[name])
+        assert row is not None
+        assert row.status == "done"
+
+
 # --- limit / more loop ---------------------------------------------------------------
 
 

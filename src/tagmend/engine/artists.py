@@ -282,6 +282,8 @@ class _Tally:
     needs_review_values: list[dict[str, str]] = field(default_factory=list)
     name_id_disagreement_values: list[dict[str, str]] = field(default_factory=list)
     error_items: list[dict[str, str]] = field(default_factory=list)
+    # Carriers whose stage raised: no outcome row, so each stays pending for the next call.
+    failed_files: set[int] = field(default_factory=set)
     # value -> resolution: only the substantive ones a tier's gate accepts.
     corrections: dict[str, _Resolution] = field(default_factory=dict)
 
@@ -315,8 +317,9 @@ def resolve_artists(  # noqa: PLR0913 - cohesive keyword-only scope + injection 
     id field, and on the MusicBrainz tier its own sort field. A corrected ``artists`` element is
     rewritten in place with its aligned ``musicbrainz_artistid`` entry. Every other managed tag
     is preserved. Finally each selected file records its outcome: ``no_match`` for a multi-value
-    file, a ``feat`` credit or a held value, nothing for a transient lookup error (the file stays
-    ``pending``), ``done`` otherwise. An unselected carrier gets no row.
+    file, a ``feat`` credit or a held value, nothing for a transient lookup error or a file that
+    cannot be staged (the file stays ``pending``), ``done`` otherwise. An unselected carrier gets
+    no row.
 
     *dry_run* returns the proposed ``value → canonical`` mappings and the would-settle and
     would-stage counts and writes nothing. Lookups still run. A cached answer costs nothing and
@@ -663,7 +666,13 @@ def _stage_files(
             continue
 
         if not dry_run:
-            _stage_target(settings, fid, target)
+            try:
+                _stage_target(settings, fid, target)
+            except ValueError as exc:
+                logger.warning("cannot stage artist correction for file_id=%s: %s", fid, exc)
+                tally.error_items.append({"key": f"file_id={fid}", "message": str(exc)})
+                tally.failed_files.add(fid)
+                continue
         tally.staged_files += 1
 
 
@@ -817,6 +826,8 @@ def _settle_selected(
     errored = {item["key"] for item in tally.error_items}
     outcomes: list[tuple[int, str]] = []
     for fid in selected:
+        if fid in tally.failed_files:
+            continue
         tags = store.get_tags(conn, fid)
         if _is_multi_value(tags):
             tally.skipped_multi_artist += 1
@@ -904,7 +915,7 @@ def _summarize(tally: _Tally, *, pending_remaining: int, dry_run: bool) -> str:
         parts.append(f"{pending_remaining} file(s) still pending. Call again to continue.")
     if tally.error_items:
         parts.append(
-            f"{len(tally.error_items)} value(s) errored and their files stay pending. "
+            f"{len(tally.error_items)} item(s) errored and their files stay pending. "
             f"Re-run to retry.",
         )
     return " ".join(parts)

@@ -706,6 +706,7 @@ def _process_existing_file(  # noqa: PLR0913 - cohesive reconcile inputs, all re
     sig_changed = existing.size_bytes != size_bytes or existing.mtime_ns != mtime_ns
     if sig_changed:
         store.update_signature(conn, existing.id, size_bytes=size_bytes, mtime_ns=mtime_ns, now=now)
+        store.mark_reader_stale(conn, existing.id)
         counters.updated += 1
     else:
         counters.unchanged += 1

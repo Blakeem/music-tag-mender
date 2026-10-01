@@ -134,12 +134,21 @@ def _check_music_path(music_path: Path | None) -> Check:
 
 
 def _check_database(db_path: Path) -> Check:
-    """Confirm the SQLite ledger can be opened and queried."""
+    """Confirm the SQLite ledger opens and accepts this tagmend's schema.
+
+    Applying the schema is the check, because every other tool refuses a ledger it rejects.
+    """
     name = "database"
     try:
-        db.check_connection(db_path)
+        connection = db.connect(db_path)
+        try:
+            schema.apply_schema(connection)
+        finally:
+            connection.close()
     except (sqlite3.Error, OSError) as exc:
         return Check(name=name, ok=False, detail=f"cannot open ledger at {db_path}: {exc}")
+    except RuntimeError as exc:
+        return Check(name=name, ok=False, detail=f"ledger at {db_path} refused: {exc}")
     return Check(name=name, ok=True, detail=f"ledger OK at {db_path}")
 
 
@@ -158,7 +167,7 @@ def _check_interrupted_commits(db_path: Path) -> Check:
             interrupted = commits.get_applying_commits(connection)
         finally:
             connection.close()
-    except (sqlite3.Error, OSError) as exc:
+    except (sqlite3.Error, OSError, RuntimeError) as exc:
         return Check(name=name, ok=True, detail=f"(could not check interrupted runs: {exc})")
 
     if not interrupted:
@@ -183,7 +192,7 @@ def _check_path_staging(settings: Settings) -> Check:
     name = "paths"
     try:
         report = paths.staging_report(settings)
-    except (sqlite3.Error, OSError) as exc:
+    except (sqlite3.Error, OSError, RuntimeError) as exc:
         return Check(name=name, ok=True, detail=f"(could not check staged moves: {exc})")
 
     parts = [f"{report.staged} staged move(s)"]

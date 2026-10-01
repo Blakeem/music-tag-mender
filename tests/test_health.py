@@ -19,7 +19,7 @@ from tagmend.config import Settings
 from tagmend.engine import acoustid, commits
 from tagmend.engine.db import connect
 from tagmend.engine.health import HealthReport, check_health
-from tagmend.engine.schema import apply_schema
+from tagmend.engine.schema import SCHEMA_VERSION, apply_schema
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -192,6 +192,24 @@ def test_database_check_creates_ledger(temp_library: Path, tmp_path: Path) -> No
     report = _run_ok(settings)
     assert report.ready
     assert db_path.exists()
+
+
+def test_a_refused_ledger_is_reported_not_raised(temp_library: Path, tmp_path: Path) -> None:
+    settings = _settings(temp_library, tmp_path, lastfm_api_key=_LASTFM_KEY)
+    conn = connect(settings.db_path)
+    try:
+        conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION + 1}")
+        conn.commit()
+    finally:
+        conn.close()
+
+    report = _run_ok(settings)
+
+    database = next(c for c in report.checks if c.name == "database")
+    assert not database.ok
+    assert "refused" in database.detail
+    assert "newer than this tagmend" in database.detail
+    assert not report.ready
 
 
 # --- lastfm / musicbrainz network checks ---------------------------------------------

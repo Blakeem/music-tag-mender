@@ -33,12 +33,3 @@ def connect(db_path: Path) -> sqlite3.Connection:
 def as_int(value: object) -> int:
     """Coerce a SQLite scalar to ``int`` for strict typing. ``None`` raises :class:`TypeError`."""
     return int(cast("SupportsInt", value))
-
-
-def check_connection(db_path: Path) -> None:
-    """Open the ledger, run a trivial query, and close it. Raises on failure."""
-    connection = connect(db_path)
-    try:
-        connection.execute("SELECT 1").fetchone()
-    finally:
-        connection.close()

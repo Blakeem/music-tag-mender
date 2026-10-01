@@ -125,7 +125,8 @@ def resolve_genres(  # noqa: PLR0913 - cohesive keyword-only scope + injection p
     looked up and classified. Each selected file then settles: ``done`` when the resolved genres
     equal its current ones, ``done`` and staged (``origin='auto'``, only ``genre`` changed) when
     they differ, ``no_match`` when nothing usable came back. A transient Last.fm error leaves the
-    group ``pending`` and is reported, never aborting the call.
+    group ``pending`` and is reported, never aborting the call. A file that cannot be staged is
+    reported in ``error_items`` and stays ``pending``.
 
     *dry_run* counts what would settle and stage without staging or writing any status row. It
     still reads the lookup cache and fetches on a cache miss.
@@ -241,6 +242,7 @@ def _process_one_group(  # noqa: PLR0913 - cohesive per-group inputs
         return
 
     changed: list[int] = []
+    failed: set[int] = set()
     status = "no_match"
     if resolved:
         status = "done"
@@ -260,9 +262,19 @@ def _process_one_group(  # noqa: PLR0913 - cohesive per-group inputs
     # Every stage runs before any row write, because stage_tags needs the write lock this
     # connection would otherwise hold.
     for fid in changed:
-        _stage_resolved(settings, fid, resolved)
+        try:
+            _stage_resolved(settings, fid, resolved)
+        except ValueError as exc:
+            logger.warning("cannot stage genre for file_id=%s: %s", fid, exc)
+            tally.error_items.append({"key": str(fid), "message": str(exc)})
+            failed.add(fid)
+    # A file that could not be staged writes no row, so it stays pending for the next call.
+    tally.settled -= len(failed)
+    tally.staged_files -= len(failed)
     now = clock.utc_now()
     for fid in file_ids:
+        if fid in failed:
+            continue
         store.record_outcome(conn, axis.GENRE_AXIS, file_id=fid, status=status, now=now)
     conn.commit()
 
@@ -346,7 +358,7 @@ def _summarize(tally: _Tally, *, pending_remaining: int, dry_run: bool) -> str:
     elif pending_remaining > 0:
         parts.append(f"{pending_remaining} file(s) still pending. Call again to continue.")
     if errors > 0:
-        parts.append(f"{errors} artist(s) errored and stay pending. Re-run to retry.")
+        parts.append(f"{errors} item(s) errored and their files stay pending. Re-run to retry.")
     return " ".join(parts)
 
 

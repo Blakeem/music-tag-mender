@@ -74,6 +74,7 @@ def test_artist_axis_fields() -> None:
     assert ARTIST_AXIS.fields == (
         "artist",
         "albumartist",
+        "artists",
         "musicbrainz_artistid",
         "musicbrainz_albumartistid",
         "artistsort",
@@ -166,6 +167,7 @@ def test_field_values_lists_every_axis_field_and_absent_as_empty() -> None:
     assert field_values(ARTIST_AXIS, tags) == {
         "artist": ["A"],
         "albumartist": [],
+        "artists": [],
         "musicbrainz_artistid": [],
         "musicbrainz_albumartistid": [],
         "artistsort": ["A, The"],

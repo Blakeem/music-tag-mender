@@ -68,6 +68,12 @@ EasyMP4Tags.RegisterFreeformKey("originaldate", "originaldate")  # type: ignore[
 # as absent on ~7,960 files and writing it creates a second value the rest of the world ignores.
 EasyID3.RegisterTextKey("albumartistsort", "TSO2")  # type: ignore[no-untyped-call]
 
+# Neither easy layer maps the multi-value ``artists`` list. Picard writes it to ``TXXX:ARTISTS``
+# on ID3 and to the uppercase ``ARTISTS`` freeform atom on MP4, the only spellings this library
+# carries (8,015 MP3s and 5 M4As). Vorbis carries ``ARTISTS`` natively.
+EasyID3.RegisterTXXXKey("artists", "ARTISTS")  # type: ignore[no-untyped-call]
+EasyMP4Tags.RegisterFreeformKey("artists", "ARTISTS")  # type: ignore[no-untyped-call]
+
 # The two MusicBrainz ids in :data:`MANAGED_TAGS` that EasyMP4 has no built-in mapping for
 # (the other four — album/albumartist/artist/track ids + album type — are native). Register
 # them here on the SAME iTunes freeform atom names Picard writes (verified against a real
@@ -183,38 +189,43 @@ RELEASE_STAMP_TAGS: Final[frozenset[str]] = frozenset(
     },
 )
 
-# The set of tags TagMend is allowed to write/revert (25 = 5 original + 13 identity + 7 release
-# stamp). A CLOSED set: anything outside it (``comment``/``composer``/art…) is never read,
-# written, or deleted, and every key here MUST be provably writable on all four formats. The
-# mismatch-fix flow can repair a poisoned release in one commit, and revert restores every field
-# the target revision's own managed set governed (see
+# The multi-value list a library server builds its artist entities from when a file carries
+# it, ``artist`` then being only the display credit. Managed so an artist-name fix renames both.
+_ARTIST_LIST_TAGS: Final[frozenset[str]] = frozenset({"artists"})
+
+# The set of tags TagMend is allowed to write/revert (26 = 5 original + 13 identity + 7 release
+# stamp + the artists list). A CLOSED set: anything outside it (``comment``/``composer``/art…)
+# is never read, written, or deleted, and every key here MUST be provably writable on all four
+# formats. The mismatch-fix flow can repair a poisoned release in one commit, and revert restores
+# every field the target revision's own managed set governed (see
 # :func:`tagmend.engine.versioning._revert_target_tags`).
 # ``date`` (reissue year, MP4 ``©day``) and ``originaldate`` (original year, MP4 freeform) are
 # BOTH managed and kept distinct.
 MANAGED_TAGS: Final[frozenset[str]] = (
-    ORIGINAL_MANAGED_TAGS | _WIDENED_MANAGED_TAGS | RELEASE_STAMP_TAGS
+    ORIGINAL_MANAGED_TAGS | _WIDENED_MANAGED_TAGS | RELEASE_STAMP_TAGS | _ARTIST_LIST_TAGS
 )
 
 # Which managed set governed a given revision, so revert can tell "this tag was empty then"
 # from "this tag was not tracked then". Version 1 is the pre-widening five-tag set, version 2
-# adds the thirteen identity fields, version 3 the seven release-stamp fields. Every new
-# revision is stamped with :data:`MANAGED_SET_VERSION`;
+# adds the thirteen identity fields, version 3 the seven release-stamp fields, version 4 the
+# ``artists`` list. Every new revision is stamped with :data:`MANAGED_SET_VERSION`;
 # :func:`tagmend.engine.versioning._revert_target_tags` looks the stamp up here. Widening the
-# set again means a new entry and a bump — never editing an existing entry, since stored
+# set again means a new entry and a bump, never editing an existing entry, since stored
 # revisions point at it.
-MANAGED_SET_VERSION: Final = 3
+MANAGED_SET_VERSION: Final = 4
 
 MANAGED_SETS: Final[Mapping[int, frozenset[str]]] = {
     1: ORIGINAL_MANAGED_TAGS,
     2: ORIGINAL_MANAGED_TAGS | _WIDENED_MANAGED_TAGS,
-    3: MANAGED_TAGS,
+    3: ORIGINAL_MANAGED_TAGS | _WIDENED_MANAGED_TAGS | RELEASE_STAMP_TAGS,
+    4: MANAGED_TAGS,
 }
 
 # Which reader produced a snapshot row, so an incremental scan can spot rows left behind by
 # an older one and re-read them exactly once. BUMP THIS IN THE SAME COMMIT as any change to
 # what :func:`read_tags` produces (the managed set, a Vorbis spelling, a format registration), or
 # every already-scanned file keeps serving the old reader's output to every detector.
-TAG_READER_VERSION: Final = 6
+TAG_READER_VERSION: Final = 7
 
 
 @dataclass(frozen=True, slots=True)

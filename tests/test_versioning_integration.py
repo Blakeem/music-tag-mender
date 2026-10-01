@@ -33,10 +33,11 @@ _NOW = "2026-06-02T00:00:00+00:00"
 _LATER = "2026-06-02T01:00:00+00:00"
 
 # A value for every tag in the closed managed set, so the "revert restores emptiness" test
-# covers all 25 rather than a sample.
+# covers every managed tag rather than a sample.
 _ALL_MANAGED_TAGS = {
     "genre": ["Electronic"],
     "artist": ["Artist"],
+    "artists": ["Artist", "Guest"],
     "albumartist": ["Album Artist"],
     "originaldate": ["1985"],
     "musicbrainz_artistid": ["mb-artist"],
@@ -315,7 +316,7 @@ def test_revert_to_empty_baseline_clears_every_managed_tag(
     music_dir: Path,
 ) -> None:
     # The revert-fidelity defect in full: a v0 baseline captured with NO managed tags means
-    # all 25 were empty, so reverting to it must delete all 25. Before the managed-set stamp
+    # all 26 were empty, so reverting to it must delete all 26. Before the managed-set stamp
     # the 13 widened fields were preserved instead and the revert reported success while the
     # file kept them.
     assert set(_ALL_MANAGED_TAGS) == MANAGED_TAGS
@@ -325,7 +326,7 @@ def test_revert_to_empty_baseline_clears_every_managed_tag(
 
     _baseline(engine_settings, file_id, {})
     assert _edit(engine_settings, track, file_id, _ALL_MANAGED_TAGS) == 1
-    assert set(read_tags(track).tags) >= MANAGED_TAGS  # all 25 really landed on disk
+    assert set(read_tags(track).tags) >= MANAGED_TAGS  # all 26 really landed on disk
 
     result = versioning.revert_tags(engine_settings, file_id, 0)
 

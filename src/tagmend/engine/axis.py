@@ -172,6 +172,7 @@ ARTIST_AXIS: Final = Axis(
     fields=(
         "artist",
         "albumartist",
+        "artists",
         "musicbrainz_artistid",
         "musicbrainz_albumartistid",
         "artistsort",

@@ -119,15 +119,16 @@ def test_originaldate_writes_to_freeform_atom_on_m4a(tmp_path: Path) -> None:
     assert raw["©day"] == ["2015"]
 
 
-# The full wrong-release "stamp" the mismatch-fix flow repairs: the five original fields plus
-# the 13 widened ones (the six MB ids, identity title/album/date, track/disc numbers, and the
-# two sort names). ``date``/``originaldate`` need valid year values on MP3 (EasyID3 silently
+# The five original fields, the 13 widened ones (the six MB ids, identity title/album/date,
+# track/disc numbers, and the two sort names), the seven release-stamp fields and the
+# ``artists`` list. ``date``/``originaldate`` need valid year values on MP3 (EasyID3 silently
 # drops an unparseable TDRC), so the round-trip uses realistic values per field.
 _EXPECTED_MANAGED = frozenset(
     {
         "genre",
         "albumartist",
         "artist",
+        "artists",
         "musicbrainz_artistid",
         "originaldate",
         "title",
@@ -529,13 +530,75 @@ def test_reads_releasecountry_from_picard_atom_on_m4a(tmp_path: Path) -> None:
     assert read_tags(track).tags.get("releasecountry") == ["GB"]
 
 
-def test_managed_set_version_3_registered() -> None:
-    assert MANAGED_SET_VERSION == 3
-    assert MANAGED_SETS[3] == MANAGED_TAGS
+_TWO_ARTISTS = ["Bryan EL", "Guest"]
+
+
+def _write_picard_artists(track: Path, values: list[str]) -> None:
+    """Write the ``artists`` list under the raw name Picard uses on *track*'s container."""
+    if track.suffix == ".mp3":
+        frames = ID3(track)  # type: ignore[no-untyped-call]
+        frames.add(TXXX(encoding=3, desc="ARTISTS", text=values))  # type: ignore[no-untyped-call]
+        frames.save()
+    elif track.suffix == ".m4a":
+        atoms = MP4(track)  # type: ignore[no-untyped-call]
+        atoms["----:com.apple.iTunes:ARTISTS"] = [value.encode() for value in values]
+        atoms.save()  # type: ignore[no-untyped-call]
+    else:
+        audio = mutagen.File(track)  # type: ignore[attr-defined]
+        audio["ARTISTS"] = values
+        audio.save()
+
+
+def _raw_artists_entries(track: Path) -> list[str]:
+    """Return every raw entry name on *track* that spells the ``artists`` list, in any case."""
+    if track.suffix == ".mp3":
+        frames = ID3(track)  # type: ignore[no-untyped-call]
+        return sorted(key for key in frames if key.upper() == "TXXX:ARTISTS")
+    if track.suffix == ".m4a":
+        atoms = MP4(track)  # type: ignore[no-untyped-call]
+        return sorted(key for key in atoms if key.upper().endswith(":ARTISTS"))
+    audio = mutagen.File(track)  # type: ignore[attr-defined]
+    return sorted({key for key, _ in audio.tags if key.upper() == "ARTISTS"})
+
+
+_NATIVE_ARTISTS_ENTRY = {
+    ".mp3": ["TXXX:ARTISTS"],
+    ".m4a": ["----:com.apple.iTunes:ARTISTS"],
+    ".flac": ["ARTISTS"],
+    ".ogg": ["ARTISTS"],
+}
+
+
+@pytest.mark.parametrize("suffix", _ALL_FORMATS)
+def test_reads_the_picard_artists_list(tmp_path: Path, suffix: str) -> None:
+    track = make_track(tmp_path / f"picard{suffix}", {"title": ["T"]})
+    _write_picard_artists(track, _TWO_ARTISTS)
+
+    assert read_tags(track).tags.get("artists") == _TWO_ARTISTS
+
+
+@pytest.mark.parametrize("suffix", _ALL_FORMATS)
+def test_artists_list_round_trips_in_order_on_its_native_entry(
+    tmp_path: Path,
+    suffix: str,
+) -> None:
+    track = make_track(tmp_path / f"track{suffix}", {"title": ["T"]})
+    _write_picard_artists(track, ["Old One", "Old Two"])
+
+    write_managed_tags(track, {**_managed(track), "artists": _TWO_ARTISTS})
+
+    assert read_tags(track).tags["artists"] == _TWO_ARTISTS
+    assert _raw_artists_entries(track) == _NATIVE_ARTISTS_ENTRY[suffix]
+
+
+def test_managed_set_version_4_registered() -> None:
+    assert MANAGED_SET_VERSION == 4
+    assert MANAGED_SETS[4] == MANAGED_TAGS
     # Older stamps must stay frozen: stored revisions point at them.
     assert MANAGED_SETS[1] == ORIGINAL_MANAGED_TAGS
     assert len(MANAGED_SETS[2]) == 18
-    assert TAG_READER_VERSION == 6
+    assert MANAGED_SETS[3] == MANAGED_TAGS - {"artists"}
+    assert TAG_READER_VERSION == 7
 
 
 def test_write_leaves_unchanged_frames_untouched(tmp_path: Path) -> None:

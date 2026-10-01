@@ -2,12 +2,14 @@
 
 The artist-side mirror of :mod:`tagmend.engine.genres`. Where a value's canonical form
 differs, it cascade-stages the corrected name across every file carrying that value
-(rewriting ``artist`` and/or ``albumartist``, exact-match only) through the ``origin='auto'``
-commit engine. Two lookup tiers decide the canonical form, in order.
+(rewriting ``artist``, ``albumartist`` and each element of the multi-value ``artists`` list,
+exact-match only) through the ``origin='auto'`` commit engine. Two lookup tiers decide the
+canonical form, in order.
 
 The MusicBrainz name tier handles every value whose files carry ``musicbrainz_artistid`` (or
-``musicbrainz_albumartistid`` for ``albumartist``) and looks the artist up by that id through
-:meth:`tagmend.engine.musicbrainz.MusicBrainzClient.artist_by_mbid` (cached in
+``musicbrainz_albumartistid`` for ``albumartist``, or the ``musicbrainz_artistid`` entry at an
+``artists`` element's own index while the two lists align) and looks the artist up by that id
+through :meth:`tagmend.engine.musicbrainz.MusicBrainzClient.artist_by_mbid` (cached in
 ``musicbrainz_artist_cache``). It accepts a spelling that folds to the canonical name
 (``source: musicbrainz``) or to a registered alias (``source: musicbrainz_alias``).
 
@@ -23,13 +25,16 @@ Design notes (the spec):
   corrected field writes its own id field, and on the MusicBrainz tier its own sort field
   (``artist`` with ``musicbrainz_artistid`` and ``artistsort``, ``albumartist`` with
   ``musicbrainz_albumartistid`` and ``albumartistsort``). Last.fm publishes no sort name, so
-  its tier leaves the sort field untouched.
+  its tier leaves the sort field untouched. A corrected ``artists`` element keeps the list's
+  order and length and rewrites its aligned ``musicbrainz_artistid`` entry.
 * **Per-file accumulation:** a file whose ``artist`` and ``albumartist`` both need
   correction is staged once with both fields set (not two passes clobbering each other).
 * **Guards (skip + report, never rewrite):** the ``feat``/``ft``/``featuring`` family,
   compilation sentinels (``various artists``/``various``/``va``), and empty values are
-  dropped from the distinct-value scan. The multi-value guard is separate and runs per
-  file: a file whose ``artist`` or ``albumartist`` list has ``len > 1`` is never staged on.
+  dropped from the distinct-value scan, each ``artists`` element on its own. The multi-value
+  guard is separate and runs per file: a file whose ``artist`` or ``albumartist`` list has
+  ``len > 1`` is never staged on. A multi-element ``artists`` list is a collaboration, not a
+  multi-value file.
 * **Correction gate (post-lookup, held not staged):** Last.fm casing is not trustworthy, so
   a case-only difference is already canonical. A canonical name contained in the source is
   a collapsed multi-artist credit (``Skrillex & The Doors`` → ``Skrillex``) and is held
@@ -88,6 +93,15 @@ logger = get_logger(__name__)
 # sort fields ride along on a changed file but never trigger a change on their own.
 _NAME_FIELDS: Final = ("artist", "albumartist")
 
+# The multi-value list a library server builds its artist entities from, ``artist`` then being
+# only the display credit. Each element is a name value of its own, and Picard aligns the list
+# with ``musicbrainz_artistid`` by position.
+_ARTISTS_FIELD: Final = "artists"
+_ARTISTS_ID_FIELD: Final = "musicbrainz_artistid"
+
+# Every field whose values are looked up: the two name fields and each ``artists`` element.
+_VALUE_FIELDS: Final = (*_NAME_FIELDS, _ARTISTS_FIELD)
+
 # Compilation sentinels (fold-cased): never a real artist to correct.
 _SENTINELS: Final = frozenset({"various artists", "various", "va"})
 
@@ -139,6 +153,23 @@ def _is_sentinel(value: str) -> bool:
 def _is_guarded(value: str) -> bool:
     """Return whether *value* must be skipped outright (empty, feat., or a sentinel)."""
     return not value.strip() or _is_feat(value) or _is_sentinel(value)
+
+
+def _name_values(tags: Mapping[str, list[str]]) -> list[str]:
+    """Return every ``artist``, ``albumartist`` and ``artists`` value on a file, in that order."""
+    return [value for field_name in _VALUE_FIELDS for value in tags.get(field_name, [])]
+
+
+def _aligned_ids(tags: Mapping[str, list[str]]) -> list[str] | None:
+    """Return the ``musicbrainz_artistid`` list when it aligns with ``artists``, else ``None``.
+
+    Only equal lengths say which id names which element. Any other shape pairs no element.
+    """
+    elements = tags.get(_ARTISTS_FIELD, [])
+    ids = tags.get(_ARTISTS_ID_FIELD, [])
+    if not elements or len(ids) != len(elements):
+        return None
+    return list(ids)
 
 
 def _is_placeholder(name: str) -> bool:
@@ -273,16 +304,17 @@ def resolve_artists(  # noqa: PLR0913 - cohesive keyword-only scope + injection 
     Scope is *file_ids* when given, else every file carrying *value* as ``artist`` or
     ``albumartist``, else the whole library. The selection is the first *limit* (every one when
     ``None``) present files in scope that derive ``pending`` on the artist axis. Every distinct
-    ``artist`` + ``albumartist`` value on them is resolved except the guarded ones (empty /
-    ``feat.`` / compilation sentinels). A value whose files carry its own MBID is looked up by
-    that id on MusicBrainz via *mb_client* first. Every value left over is looked up on Last.fm
-    getCorrection via *client*. Both tiers are cached and paced, and together they build a
-    ``value → correction`` map of the values that actually change.
+    ``artist``, ``albumartist`` and ``artists`` element value on them is resolved except the
+    guarded ones (empty / ``feat.`` / compilation sentinels). A value whose files carry its own
+    MBID is looked up by that id on MusicBrainz via *mb_client* first. Every value left over is
+    looked up on Last.fm getCorrection via *client*. Both tiers are cached and paced, and
+    together they build a ``value → correction`` map of the values that actually change.
 
     Each correction is then staged as an ``origin='auto'`` change on every in-scope carrier: a
     present file that is not ``manual`` and not multi-value. Each corrected field writes its own
-    id field, and on the MusicBrainz tier its own sort field. Every other managed tag is
-    preserved. Finally each selected file records its outcome: ``no_match`` for a multi-value
+    id field, and on the MusicBrainz tier its own sort field. A corrected ``artists`` element is
+    rewritten in place with its aligned ``musicbrainz_artistid`` entry. Every other managed tag
+    is preserved. Finally each selected file records its outcome: ``no_match`` for a multi-value
     file, a ``feat`` credit or a held value, nothing for a transient lookup error (the file stays
     ``pending``), ``done`` otherwise. An unselected carrier gets no row.
 
@@ -368,23 +400,22 @@ def _distinct_values(
     selected: list[int],
     tally: _Tally,
 ) -> list[str]:
-    """Return the distinct, non-guarded ``artist`` + ``albumartist`` values on *selected*.
+    """Return the distinct, non-guarded ``artist``, ``albumartist`` and ``artists`` values.
 
-    Mutates *tally* with the sentinel/guard skip count. Order is stable (first-seen).
+    Reads *selected*. Mutates *tally* with the sentinel/guard skip count. Order is stable
+    (first-seen).
     """
     seen: set[str] = set()
     ordered: list[str] = []
     for fid in selected:
-        tags = store.get_tags(conn, fid)
-        for field_name in _NAME_FIELDS:
-            for value in tags.get(field_name, []):
-                if value in seen:
-                    continue
-                seen.add(value)
-                if _is_guarded(value):
-                    tally.skipped_sentinel += 1
-                    continue
-                ordered.append(value)
+        for value in _name_values(store.get_tags(conn, fid)):
+            if value in seen:
+                continue
+            seen.add(value)
+            if _is_guarded(value):
+                tally.skipped_sentinel += 1
+                continue
+            ordered.append(value)
     return ordered
 
 
@@ -399,21 +430,34 @@ def _value_mbids(
 
     The pairing is per field (``artist`` with ``musicbrainz_artistid``, ``albumartist`` with
     ``musicbrainz_albumartistid``) and only from single-valued fields, where the value and the
-    id unambiguously describe each other. An empty set means the value carries no id anywhere;
-    a set larger than one means the library disagrees with itself about who this is.
+    id unambiguously describe each other. An ``artists`` element pairs with the
+    ``musicbrainz_artistid`` entry at its own index while the two lists align. An empty set
+    means the value carries no id anywhere. A set larger than one means the library disagrees
+    with itself about who this is.
     """
     pairing: dict[str, set[str]] = {}
     for fid in candidate_ids:
-        tags = store.get_tags(conn, fid)
-        for field_name, id_field in _ID_FIELDS.items():
-            names = tags.get(field_name, [])
-            if len(names) != 1:
-                continue
-            ids = tags.get(id_field, [])
-            bucket = pairing.setdefault(names[0], set())
-            if len(ids) == 1 and ids[0].strip():
-                bucket.add(ids[0].strip())
+        for name, mbid in _name_id_pairs(store.get_tags(conn, fid)):
+            bucket = pairing.setdefault(name, set())
+            if mbid:
+                bucket.add(mbid)
     return pairing
+
+
+def _name_id_pairs(tags: Mapping[str, list[str]]) -> list[tuple[str, str]]:
+    """Return each pairable name value on a file with its stripped id, ``""`` when it has none."""
+    pairs: list[tuple[str, str]] = []
+    for field_name, id_field in _ID_FIELDS.items():
+        names = tags.get(field_name, [])
+        if len(names) != 1:
+            continue
+        ids = tags.get(id_field, [])
+        pairs.append((names[0], ids[0].strip() if len(ids) == 1 else ""))
+    elements = tags.get(_ARTISTS_FIELD, [])
+    aligned = _aligned_ids(tags)
+    for index, element in enumerate(elements):
+        pairs.append((element, "" if aligned is None else aligned[index].strip()))
+    return pairs
 
 
 # --- the MusicBrainz name tier -------------------------------------------------------
@@ -649,11 +693,13 @@ def _build_target(
     (accumulating both fields). Each field's MBID and sort name ride along on that field's
     OWN id and sort fields, name-change only: writing ``musicbrainz_artistid`` for an
     ``albumartist`` correction would rebind the track artist to the album artist, and writing
-    ``artistsort`` there would misfile it in a browse list.
+    ``artistsort`` there would misfile it in a browse list. Each ``artists`` element is
+    rewritten in place by :func:`_element_target`, so an ``artist`` corrected from X to Y turns
+    every ``X`` element into ``Y`` in the same target.
     """
-    target: dict[str, list[str]] = {}
-    note = ""
-    changed = False
+    target, element_resolutions = _element_target(tags, corrections)
+    elements = target.get(_ARTISTS_FIELD, tags.get(_ARTISTS_FIELD, []))
+    applied: list[_Resolution] = []
     for field_name in _NAME_FIELDS:
         current = tags.get(field_name, [])
         if len(current) != 1:
@@ -662,17 +708,50 @@ def _build_target(
         if resolution is None:
             continue
         target[field_name] = [resolution.name]
-        changed = True
-        if resolution.mbid:
+        applied.append(resolution)
+        # musicbrainz_artistid aligns with artists by position, so artist may set it only while
+        # that list is absent or holds this one name.
+        if resolution.mbid and (field_name != "artist" or elements in ([], [resolution.name])):
             target[_ID_FIELDS[field_name]] = [resolution.mbid]
         if resolution.sort_name:
             target[_SORT_FIELDS[field_name]] = [resolution.sort_name]
-        if not note:
-            note = f"{resolution.source}: {resolution.name}"
+    applied.extend(element_resolutions)
 
-    if not changed:
+    if not applied:
         return None
-    return _Target(tags=target, note=note)
+    first = applied[0]
+    return _Target(tags=target, note=f"{first.source}: {first.name}")
+
+
+def _element_target(
+    tags: Mapping[str, list[str]],
+    corrections: dict[str, _Resolution],
+) -> tuple[dict[str, list[str]], list[_Resolution]]:
+    """Return the rewritten ``artists`` list and aligned ids, plus the resolutions applied.
+
+    The list keeps its order and length, and only the elements with a resolution change. Each
+    one's id entry changes with it while the two lists align. Returns ``({}, [])`` when no
+    element changes.
+    """
+    elements = tags.get(_ARTISTS_FIELD, [])
+    aligned = _aligned_ids(tags)
+    rewritten = list(elements)
+    applied: list[_Resolution] = []
+    for index, element in enumerate(elements):
+        resolution = corrections.get(element)
+        if resolution is None:
+            continue
+        rewritten[index] = resolution.name
+        applied.append(resolution)
+        if aligned is not None and resolution.mbid:
+            aligned[index] = resolution.mbid
+
+    if not applied:
+        return {}, []
+    target = {_ARTISTS_FIELD: rewritten}
+    if aligned is not None:
+        target[_ARTISTS_ID_FIELD] = aligned
+    return target, applied
 
 
 def _stage_target(
@@ -718,7 +797,7 @@ def _file_outcome(
     """
     if _is_multi_value(tags):
         return "no_match"
-    values = [value for field_name in _NAME_FIELDS for value in tags.get(field_name, [])]
+    values = _name_values(tags)
     if any(_is_feat(value) or value in held for value in values):
         return "no_match"
     if any(value in errored for value in values):

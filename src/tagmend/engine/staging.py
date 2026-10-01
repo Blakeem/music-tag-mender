@@ -64,6 +64,9 @@ _STAGED_ORIGINS = frozenset({"auto", "manual"})
 # the rest naming the old entity. Sort names and the release stamp only follow a name, never lead.
 _IDENTITY_GROUPS: Final[tuple[tuple[tuple[str, ...], tuple[str, ...]], ...]] = (
     (("artist", "musicbrainz_artistid"), ("artist", "musicbrainz_artistid", "artistsort")),
+    # Picard aligns these two lists by position, so one rewritten without the other pairs a
+    # name with another artist's id.
+    (("artists", "musicbrainz_artistid"), ("artists", "musicbrainz_artistid")),
     (
         ("albumartist", "musicbrainz_albumartistid"),
         ("albumartist", "musicbrainz_albumartistid", "albumartistsort"),

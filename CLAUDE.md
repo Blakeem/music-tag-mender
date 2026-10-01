@@ -122,9 +122,11 @@ names are case-sensitive and its `releasecountry` atom is a word off from Picard
 prefers the container-native one; write emits the native one and drops the alternate, so a file
 never carries two contradicting values for one concept. Collapse a pair ONLY after measuring that
 the two names never disagree in the wild — `organization`/`label` is left unmapped and unmanaged
-because 245 real FLACs hold a different label in each. **`MANAGED_TAGS` is 25** (5 original + 13
-identity + 7 release-stamp = managed-set version 3; `MANAGED_SETS` keeps every older set frozen
-because stored revisions point at them). Any change to what `read_tags` produces bumps
+because 245 real FLACs hold a different label in each. **`MANAGED_TAGS` is 26** (5 original + 13
+identity + 7 release-stamp + the `artists` list = managed-set version 4; `MANAGED_SETS` keeps every
+older set frozen because stored revisions point at them). `artists` is the Picard ARTISTS list
+Navidrome links artists from: `TXXX:ARTISTS` on ID3, the `ARTISTS` freeform atom on MP4, `ARTISTS`
+on Vorbis. Any change to what `read_tags` produces bumps
 `TAG_READER_VERSION` in the same commit, which is what makes the next incremental scan re-read a
 stale row exactly once. Every write verifies its temp copy before the atomic swap (audio payload
 hash except on Ogg, unmanaged entries, ID3v1/APEv2 presence, managed read-back) and raises

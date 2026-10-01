@@ -1088,6 +1088,7 @@ def test_previous_ledger_gains_axis_outcomes_in_place() -> None:
             for name in (
                 "albumartist",
                 "albumartistsort",
+                "artists",
                 "artistsort",
                 "musicbrainz_albumartistid",
                 "musicbrainz_artistid",

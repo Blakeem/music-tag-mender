@@ -1267,6 +1267,49 @@ def test_diff_flags_a_name_changed_without_its_sort_name(
     ]
 
 
+def test_diff_flags_an_artists_list_changed_without_its_ids(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    # Picard aligns the two lists by position, so a renamed element keeps the old id beside it.
+    make_track(
+        music_dir / "t.flac",
+        {"artists": ["A", "B"], "musicbrainz_artistid": ["id-a", "id-b"]},
+    )
+    scan_library(engine_settings)
+    file_id = _file_id(engine_settings, music_dir, "t.flac")
+
+    staging.stage_tags(engine_settings, file_id=file_id, tags={"artists": ["A", "C"]})
+
+    assert staging.diff_tags(engine_settings)[0].stale_identity == [
+        {
+            "changed": "artists",
+            "stale_field": "musicbrainz_artistid",
+            "stale_value": ["id-a", "id-b"],
+        },
+    ]
+
+
+@pytest.mark.parametrize("suffix", _FORMATS)
+def test_commit_then_revert_restores_the_artists_list(
+    engine_settings: Settings,
+    music_dir: Path,
+    suffix: str,
+) -> None:
+    track = make_track(music_dir / f"t{suffix}", {"artists": ["Bryan El", "Guest"]})
+    scan_library(engine_settings)
+    file_id = _file_id(engine_settings, music_dir, track.name)
+
+    staging.stage_tags(engine_settings, file_id=file_id, tags={"artists": ["Bryan EL", "Guest"]})
+    result = staging.commit_tags(engine_settings)
+    assert result.commit_id is not None
+    assert read_tags(track).tags["artists"] == ["Bryan EL", "Guest"]
+
+    versioning.revert_commit(engine_settings, result.commit_id)
+
+    assert read_tags(track).tags["artists"] == ["Bryan El", "Guest"]
+
+
 def test_diff_does_not_flag_a_sort_only_change(
     engine_settings: Settings,
     music_dir: Path,

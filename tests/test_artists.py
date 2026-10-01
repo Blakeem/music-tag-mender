@@ -1469,3 +1469,180 @@ def test_resolve_artists_skips_missing_files(
     assert result.pending_remaining == 0
     assert result.staged_files == 1
     assert [view.filename for view in staging.diff_tags(engine_settings)] == [kept.name]
+
+
+# --- (12) the multi-value artists list ---------------------------------------------
+#
+# A library server builds its artist entities from ``artists`` when a file carries it, so each
+# element is a name value of its own, aligned with ``musicbrainz_artistid`` by position.
+
+
+@pytest.mark.parametrize("suffix", _FORMATS)
+def test_an_artist_correction_renames_the_equal_artists_element(
+    engine_settings: Settings,
+    music_dir: Path,
+    suffix: str,
+) -> None:
+    # The live drift: an artist-only rewrite left the server linking the old spelling.
+    track = make_track(
+        music_dir / f"a{suffix}",
+        {
+            "artist": ["Bryan El"],
+            "artists": ["Bryan El"],
+            "musicbrainz_artistid": ["mbid-bryan"],
+        },
+    )
+    scan_library(engine_settings)
+
+    mb = FakeArtistSource({"mbid-bryan": _mb("Bryan EL", mbid="mbid-bryan")})
+    result = artists.resolve_artists(
+        engine_settings,
+        client=FakeCorrectionSource({}),
+        mb_client=mb,
+    )
+    staging.commit_tags(engine_settings)
+
+    assert result.staged_files == 1
+    on_disk = read_tags(track).tags
+    assert on_disk["artist"] == ["Bryan EL"]
+    assert on_disk["artists"] == ["Bryan EL"]
+    assert on_disk["musicbrainz_artistid"] == ["mbid-bryan"]
+
+
+def test_a_collaboration_element_is_resolved_by_its_aligned_mbid(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    track = make_track(
+        music_dir / "a.flac",
+        {
+            "artist": ["A & B"],
+            "artists": ["A", "b"],
+            "musicbrainz_artistid": ["id-a", "id-b"],
+        },
+    )
+    scan_library(engine_settings)
+
+    mb = FakeArtistSource({"id-a": _mb("A", mbid="id-a"), "id-b": _mb("B", mbid="id-b")})
+    lastfm = FakeCorrectionSource({})
+    result = artists.resolve_artists(engine_settings, client=lastfm, mb_client=mb)
+    staging.commit_tags(engine_settings)
+
+    # The joined credit pairs with no single id, so only Last.fm sees it.
+    assert sorted(mb.lookups) == ["id-a", "id-b"]
+    assert lastfm.lookups == ["A & B"]
+    assert result.mappings == [
+        {"from": "b", "to": "B", "mbid": "id-b", "source": "musicbrainz"},
+    ]
+    on_disk = read_tags(track).tags
+    assert on_disk["artists"] == ["A", "B"]
+    assert on_disk["artist"] == ["A & B"]
+    assert on_disk["musicbrainz_artistid"] == ["id-a", "id-b"]
+
+
+def test_an_element_correction_rewrites_its_aligned_id_only(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    make_track(
+        music_dir / "a.flac",
+        {
+            "artist": ["A & Bee"],
+            "artists": ["A", "Bee"],
+            "musicbrainz_artistid": ["id-a", "id-stale"],
+        },
+    )
+    scan_library(engine_settings)
+
+    # MusicBrainz does not know the stale id, so Last.fm supplies the name and a new id.
+    lastfm = FakeCorrectionSource(
+        {"A": None, "Bee": ArtistCorrection("The Bee", "id-bee"), "A & Bee": None},
+    )
+    mb = FakeArtistSource({"id-a": _mb("A", mbid="id-a")})
+    artists.resolve_artists(engine_settings, client=lastfm, mb_client=mb)
+
+    view = next(iter(staging.diff_tags(engine_settings)))
+    assert view.diff["artists"] == {"from": ["A", "Bee"], "to": ["A", "The Bee"]}
+    assert view.diff["musicbrainz_artistid"] == {
+        "from": ["id-a", "id-stale"],
+        "to": ["id-a", "id-bee"],
+    }
+    assert "artist" not in view.diff
+
+
+def test_an_unaligned_element_uses_only_the_lastfm_tier_and_keeps_the_ids(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    # Two elements and one id: the id belongs to the single-valued artist, not to an element.
+    make_track(
+        music_dir / "a.flac",
+        {
+            "artist": ["A & b"],
+            "artists": ["A", "b"],
+            "musicbrainz_artistid": ["id-duo"],
+        },
+    )
+    scan_library(engine_settings)
+
+    mb = FakeArtistSource({"id-duo": _mb("A & b", mbid="id-duo")})
+    lastfm = FakeCorrectionSource(
+        {"A": ArtistCorrection("A", None), "b": ArtistCorrection("Bea", "id-bea")},
+    )
+    artists.resolve_artists(engine_settings, client=lastfm, mb_client=mb)
+
+    assert mb.lookups == ["id-duo"]
+    assert sorted(lastfm.lookups) == ["A", "b"]
+    view = next(iter(staging.diff_tags(engine_settings)))
+    assert view.diff["artists"] == {"from": ["A", "b"], "to": ["A", "Bea"]}
+    assert "musicbrainz_artistid" not in view.diff
+
+
+def test_a_whole_credit_correction_leaves_a_collaboration_list_ids_alone(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    # One id written for the display credit would misalign the two-element list.
+    make_track(
+        music_dir / "a.flac",
+        {"artist": ["A & B"], "artists": ["A", "B"], "musicbrainz_artistid": ["id-a", "id-b"]},
+    )
+    scan_library(engine_settings)
+
+    lastfm = FakeCorrectionSource({"A & B": ArtistCorrection("A and B", "id-duo")})
+    mb = FakeArtistSource({"id-a": _mb("A", mbid="id-a"), "id-b": _mb("B", mbid="id-b")})
+    artists.resolve_artists(engine_settings, client=lastfm, mb_client=mb)
+
+    view = next(iter(staging.diff_tags(engine_settings)))
+    assert view.diff["artist"] == {"from": ["A & B"], "to": ["A and B"]}
+    assert "musicbrainz_artistid" not in view.diff
+    assert "artists" not in view.diff
+
+
+def test_guards_and_held_buckets_apply_to_each_artists_element(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    track = make_track(
+        music_dir / "a.flac",
+        {"artist": ["Solo"], "artists": ["Solo", "Various Artists", "Guest feat. Other", "Odd"]},
+    )
+    scan_library(engine_settings)
+    file_id = _file_id(engine_settings, music_dir, track.name)
+
+    lastfm = FakeCorrectionSource(
+        {"Solo": ArtistCorrection("Solo", None), "Odd": ArtistCorrection("Oddity", None)},
+    )
+    result = artists.resolve_artists(
+        engine_settings,
+        client=lastfm,
+        mb_client=FakeArtistSource({}),
+    )
+
+    # The sentinel and the feat credit are never looked up, and the unverified correction is held.
+    assert result.skipped_sentinel == 2
+    assert sorted(lastfm.lookups) == ["Odd", "Solo"]
+    assert result.needs_review_values == [{"from": "Odd", "to": "Oddity"}]
+    assert result.staged_files == 0
+    view = next(v for v in library_list(engine_settings) if v.file_id == file_id)
+    assert view.artist_status == "no_match"

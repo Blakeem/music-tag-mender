@@ -164,15 +164,15 @@ def stage_tags(
     """Stage a managed-tag change for one file (the git "index"). Writes nothing to disk.
 
     Records *tags* for *file_id*, replacing any pending change for that file. Only managed
-    tags are allowed. The closed ``tags.MANAGED_TAGS`` set holds 25 keys: ``genre``, ``artist``,
-    ``albumartist``, ``artistsort``, ``albumartistsort``, ``title``, ``album``, ``date``,
-    ``originaldate``, ``tracknumber``, ``discnumber``, the six MusicBrainz ids
-    (``musicbrainz_artistid``, ``musicbrainz_albumartistid``, ``musicbrainz_albumid``,
-    ``musicbrainz_releasegroupid``, ``musicbrainz_trackid``, ``musicbrainz_releasetrackid``),
-    ``musicbrainz_albumtype``, and the release stamp (``musicbrainz_albumstatus``, ``media``,
-    ``releasecountry``, ``barcode``, ``catalognumber``, ``isrc``, ``asin``). Any other key is
-    rejected. The music file is not touched and no history is recorded until you call
-    ``commit_tags``.
+    tags are allowed. The closed ``tags.MANAGED_TAGS`` set holds 26 keys: ``genre``, ``artist``,
+    the multi-value ``artists`` list, ``albumartist``, ``artistsort``, ``albumartistsort``,
+    ``title``, ``album``, ``date``, ``originaldate``, ``tracknumber``, ``discnumber``, the six
+    MusicBrainz ids (``musicbrainz_artistid``, ``musicbrainz_albumartistid``,
+    ``musicbrainz_albumid``, ``musicbrainz_releasegroupid``, ``musicbrainz_trackid``,
+    ``musicbrainz_releasetrackid``), ``musicbrainz_albumtype``, and the release stamp
+    (``musicbrainz_albumstatus``, ``media``, ``releasecountry``, ``barcode``, ``catalognumber``,
+    ``isrc``, ``asin``). Any other key is rejected. The music file is not touched and no history
+    is recorded until you call ``commit_tags``.
 
     *tags* is merged **onto** the file's current managed tags: keys you omit are left
     alone, so staging ``{"genre": ["Synthwave"]}`` changes only the genre and preserves
@@ -1070,12 +1070,13 @@ def resolve_artists(
     Two tiers, tried in that order, so the strongest evidence decides first.
 
     **The MusicBrainz name tier** handles every value whose files already carry a
-    ``musicbrainz_artistid`` (or ``musicbrainz_albumartistid`` for ``albumartist``). That id
-    is the file's own claim about who the artist is, so this is a direct lookup with no
-    search and no candidate ranking. The canonical name and the artist's registered aliases
-    then settle the value: a spelling differing only in casing, typography or a dash-vs-space
-    word break is the same name (staged, ``source: musicbrainz``); a name MusicBrainz records
-    as an alias of this artist is merged onto the canonical one (staged,
+    ``musicbrainz_artistid`` (or ``musicbrainz_albumartistid`` for ``albumartist``, or the
+    ``musicbrainz_artistid`` entry at an ``artists`` element's own index while the two lists
+    have equal length). That id is the file's own claim about who the artist is, so this is a
+    direct lookup with no search and no candidate ranking. The canonical name and the artist's
+    registered aliases then settle the value: a spelling differing only in casing, typography
+    or a dash-vs-space word break is the same name (staged, ``source: musicbrainz``); a name
+    MusicBrainz records as an alias of this artist is merged onto the canonical one (staged,
     ``source: musicbrainz_alias``). MusicBrainz casing IS trusted here, unlike Last.fm's.
 
     **The Last.fm correction tier** sees only what is left: values carrying no MBID anywhere,
@@ -1083,11 +1084,15 @@ def resolve_artists(
     because Last.fm has no id to anchor it (``source: lastfm``).
 
     The selection is the first ``limit`` ``pending`` files in scope, and every name value on
-    them is resolved. Where a value resolves, the canonical name cascade-stages across every
-    in-scope file carrying it (rewriting ``artist`` and/or ``albumartist``, exact-match only)
-    plus that field's OWN id field, as an ``auto`` change replacing ONLY those fields (every
-    other managed tag, incl. ``genre``, is preserved). A ``manual`` file and a multi-value file
-    are never staged on. Review with ``diff_tags`` and apply with ``commit_tags``.
+    them is resolved: ``artist``, ``albumartist`` and each element of the multi-value
+    ``artists`` list a library server builds its artist entities from. Where a value resolves,
+    the canonical name cascade-stages across every in-scope file carrying it (rewriting
+    ``artist``, ``albumartist`` and each equal ``artists`` element, exact-match only) plus that
+    field's OWN id field, as an ``auto`` change replacing ONLY those fields (every other managed
+    tag, incl. ``genre``, is preserved). An ``artists`` element is rewritten in place, keeping
+    the list's order and length, with its aligned ``musicbrainz_artistid`` entry. A ``manual``
+    file and a file whose ``artist`` or ``albumartist`` holds several values are never staged
+    on. Review with ``diff_tags`` and apply with ``commit_tags``.
     ``revert_commit``/``revert_tags`` undo it.
 
     Each file's status on this axis is ``pending``, ``staged``, ``done``, ``no_match``,

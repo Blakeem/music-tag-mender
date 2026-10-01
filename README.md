@@ -18,7 +18,7 @@ Pull community top-tags for each artist (optionally each album), fold them throu
 
 ### 🎤 Artist-name normalization (MusicBrainz + Last.fm)
 
-Resolve name variants to a single canonical spelling across both `artist` and `albumartist`. A file that already carries a MusicBrainz artist ID is settled by a direct lookup of that ID, against the artist's canonical name and registered aliases. A rewritten name carries MusicBrainz's sort name to its own sort field, `artistsort` for `artist` and `albumartistsort` for `albumartist`. Values with no ID fall through to Last.fm `artist.getCorrection`. That tier leaves the sort field alone, because Last.fm publishes no sort name. Feat/sentinel/empty values and multi-value fields are guarded so nothing ambiguous gets rewritten. A name that disagrees with the ID its own file carries is reported, never rewritten.
+Resolve name variants to a single canonical spelling across `artist`, `albumartist` and each element of the multi-value `artists` tag. A file that already carries a MusicBrainz artist ID is settled by a direct lookup of that ID, against the artist's canonical name and registered aliases. A rewritten name carries MusicBrainz's sort name to its own sort field, `artistsort` for `artist` and `albumartistsort` for `albumartist`. Values with no ID fall through to Last.fm `artist.getCorrection`. That tier leaves the sort field alone, because Last.fm publishes no sort name. Feat/sentinel/empty values and a multi-value `artist` or `albumartist` field are guarded so nothing ambiguous gets rewritten. A name that disagrees with the ID its own file carries is reported, never rewritten.
 
 ### 📅 Year fill (MusicBrainz)
 

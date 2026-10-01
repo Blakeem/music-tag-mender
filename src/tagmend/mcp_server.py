@@ -24,14 +24,15 @@ from tagmend.engine import (
     album_gaps,
     artists,
     commits,
-    disagreements,
     genres,
     health,
     library,
     mismatch,
+    release_disagreements,
     staging,
     track_conflicts,
     versioning,
+    year_disagreements,
     years,
 )
 from tagmend.engine.lastfm import LastfmError
@@ -604,7 +605,7 @@ def detect_track_conflicts(
 
 @mcp.tool()
 @_error_envelope
-def detect_disagreements(  # noqa: PLR0913 - one parameter per scope/view knob, cohesive
+def detect_release_disagreements(  # noqa: PLR0913 - one parameter per scope/view knob, cohesive
     tier: Literal["high", "medium", "low"] | None = None,
     path: str | None = None,
     folder: str | None = None,
@@ -689,7 +690,7 @@ def detect_disagreements(  # noqa: PLR0913 - one parameter per scope/view knob, 
         ``file_ids`` names the flagged files only and ``releases`` lists ``{release_mbid,
         release_title, file_count}``. On failure, ``{"ok": False, "error": ...}``.
     """
-    report = disagreements.detect_disagreements(
+    report = release_disagreements.detect_release_disagreements(
         load_settings(),
         tier=tier,
         path=Path(path) if path is not None else None,
@@ -698,6 +699,89 @@ def detect_disagreements(  # noqa: PLR0913 - one parameter per scope/view knob, 
         release_limit=release_limit,
         limit=limit,
         group=group,
+    )
+    return {"ok": True, **report.to_dict()}
+
+
+@mcp.tool()
+@_error_envelope
+def detect_year_disagreements(
+    tier: Literal["high", "medium", "low"] | None = None,
+    limit: int | None = None,
+    group: bool = False,  # noqa: FBT001, FBT002 - MCP tool surface, not a Python API
+    folder: str | None = None,
+    release_limit: int | None = None,
+) -> dict[str, object]:
+    """Find files whose years contradict the first release of their MusicBrainz release group.
+
+    The year sibling of ``detect_release_disagreements``, which compares a file against the
+    release its own ``musicbrainz_albumid`` names. This compares a file's ``originaldate`` (the
+    original first-release date) and ``date`` (this release's date) against the first-release
+    year of the release group its ``(albumartist-else-artist, album)`` resolves to. That is the
+    lookup ``resolve_years`` makes, sharing its cache, so an album ``resolve_years`` already
+    looked up costs no request.
+
+    Tiers, on the year alone, because the cached lookup keeps only the first-release year:
+
+    * ``high``: the file's ``originaldate`` year differs from the first-release year.
+    * ``medium``: the file's ``date`` year is EARLIER than the first-release year. A later
+      ``date`` is a reissue and is not a finding.
+
+    No row is ``low``. A blank ``originaldate`` is not a row, since ``resolve_years`` fills it.
+    Each file counts once, in the tier of its most severe row, so the tier counts sum to
+    ``flagged``. A folder holding several albums is grouped once per album, since each has its
+    own release group. A folder named ``Singles``/``Remixes``/``Featured``/etc. holds several
+    releases by design, so its rows are reported under ``folder_context`` instead, outside
+    ``flagged`` and outside the tier counts.
+
+    Review-only: it stages nothing. A match by album name can land on the wrong release group
+    (a re-release, a soundtrack, a compilation), so confirm each correction before staging it.
+    Reads the snapshot, so run ``scan_library`` first. The only ledger writes are lookup cache
+    rows.
+
+    Each uncached album is looked up once, paced at MusicBrainz's requested one request per
+    second. ``release_limit`` caps those network lookups this call (default 200, about three
+    minutes). A cached album never counts toward it, so re-running reaches the albums the last
+    call left under ``release_groups_remaining``/``more``.
+
+    Recommended workflow: start with ``group=true`` for one line per album per folder, then
+    expand a single folder with ``folder="<exact folder path>"``, confirm the release group,
+    then fix with ``stage_tags_batch`` -> ``diff_tags`` -> ``commit_tags(path=<folder>)``.
+    ``commit_tags(path=<folder>)`` and ``diff_tags(path=<folder>)`` cover that folder AND every
+    folder nested under it. Run ``diff_tags(path=<folder>)`` first and ``unstage_tags`` any
+    nested change you do not want in this commit.
+
+    Args:
+        tier: Keep only rows in this tier (``high`` | ``medium`` | ``low``). The tier filters
+            rows first, and the grouped view is built from the filtered rows. The report-level
+            counts still describe the whole library.
+        limit: Cap the rows returned, or the groups with ``group=true``. Counts are
+            unaffected.
+        group: Return one compact line per album per folder instead of flat rows.
+        folder: Expand exactly this folder's rows, never a subfolder. Takes precedence over
+            ``group``. Compared as a path: case and ``/`` versus backslash do not matter on
+            Windows, and a relative folder resolves under ``music_path``.
+        release_limit: Max uncached release groups to look up over the network this call.
+
+    Returns:
+        ``{"ok": True, rows, total_files, flagged, flagged_fields, high, medium, low,
+        folder_context, folder_context_rows, release_groups_checked, release_groups_remaining,
+        more, unknown_release_groups, skipped_no_identity, errors, error_items, groups,
+        summary}``, where ``error_items`` is ``{key, message}`` keyed by ``"<artist> -
+        <album>"``. Each row is ``{file_id, folder, filename, artist, album, field, have,
+        first_release_year, release_group_mbid, release_group_title, tier, reason}``. Each
+        group is ``{folder, artist, album, first_release_year, release_group_mbid,
+        release_group_title, file_count, flagged, folder_context, tiers, file_ids, fields}``,
+        where ``file_ids`` names the flagged files only. On failure,
+        ``{"ok": False, "error": ...}``.
+    """
+    report = year_disagreements.detect_year_disagreements(
+        load_settings(),
+        tier=tier,
+        limit=limit,
+        group=group,
+        folder=folder,
+        release_limit=release_limit,
     )
     return {"ok": True, **report.to_dict()}
 

@@ -118,7 +118,7 @@ The release-by-MBID lookup adds one cache (schema v16, purely additive, created 
 no migration):
 
 * ``musicbrainz_release_cache`` holds the parsed release and tracklist as one JSON
-  ``payload``, because nothing queries inside it. Feeds ``detect_disagreements``.
+  ``payload``, because nothing queries inside it. Feeds ``detect_release_disagreements``.
 
 The data-safety pass adds two columns, two indexes and four triggers (schema v17, no new
 tables. A v16 ledger upgrades in place with every row preserved):
@@ -417,7 +417,7 @@ CREATE TABLE IF NOT EXISTS musicbrainz_release_group_cache (
 # release under that id; 1 = found). A release is a nested document (media, each with
 # tracks), so the parsed form is one JSON ``payload`` rather than three shredded tables:
 # nothing queries inside it, since the key is always the MBID and the caller wants the whole
-# tracklist. Feeds ``detect_disagreements``.
+# tracklist. Feeds ``detect_release_disagreements``.
 _MUSICBRAINZ_RELEASE_CACHE_DDL: Final = """
 CREATE TABLE IF NOT EXISTS musicbrainz_release_cache (
   request_key TEXT PRIMARY KEY,

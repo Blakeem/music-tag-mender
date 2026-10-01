@@ -1,4 +1,4 @@
-"""Unit tests for the tag-vs-MusicBrainz-release detector (``engine/disagreements.py``).
+"""Unit tests for the tag-vs-MusicBrainz-release detector (``engine/release_disagreements.py``).
 
 The release lookup is injected as a fake :class:`MBReleaseSource`, so these never touch the
 network. Most cases drive the pure classifier with :class:`_FileInput` rows; the end-to-end
@@ -7,17 +7,18 @@ path through the real tool is covered once at the bottom via ``make_track``.
 
 from __future__ import annotations
 
+import importlib.util
 import unicodedata
 from typing import TYPE_CHECKING
 
 import pytest
 
 from conftest import FOLDER_SPELLINGS, make_track, spell_folder
-from tagmend.engine import disagreements
+from tagmend.engine import release_disagreements
 from tagmend.engine.detector_core import Tier
-from tagmend.engine.disagreements import _classify, _FileInput
 from tagmend.engine.library import scan_library
 from tagmend.engine.musicbrainz import MBMedium, MBRelease, MBTrack, MusicBrainzError
+from tagmend.engine.release_disagreements import _classify, _FileInput
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -114,7 +115,7 @@ def _f(file_id: int = 1, **overrides: object) -> _FileInput:
 def _run(
     files: list[_FileInput],
     release: MBRelease | None = None,
-) -> disagreements.DisagreementsReport:
+) -> release_disagreements.ReleaseDisagreementsReport:
     source = FakeReleaseSource({_RELEASE_ID: release or _release(_track("1", "Song One"))})
     return _classify(files, source, release_limit=None)
 
@@ -322,7 +323,7 @@ def test_flagged_counts_files_and_flagged_fields_counts_rows() -> None:
 
 def test_a_negative_release_limit_is_refused(engine_settings: Settings) -> None:
     with pytest.raises(ValueError, match="release_limit must be >= 0"):
-        disagreements.detect_disagreements(
+        release_disagreements.detect_release_disagreements(
             engine_settings,
             release_limit=-1,
             client=FakeReleaseSource({}),
@@ -398,8 +399,12 @@ def test_group_file_ids_exclude_fill_only_files() -> None:
 def test_groups_ship_only_in_the_grouped_view() -> None:
     report = _run([_f(1, album="Wrong Album")])
 
-    flat = disagreements._narrow(report, tier=None, folder_key=None, limit=None, group=False)
-    grouped = disagreements._narrow(report, tier=None, folder_key=None, limit=None, group=True)
+    flat = release_disagreements._narrow(
+        report, tier=None, folder_key=None, limit=None, group=False
+    )
+    grouped = release_disagreements._narrow(
+        report, tier=None, folder_key=None, limit=None, group=True
+    )
 
     assert flat.groups == []
     assert len(grouped.groups) == 1
@@ -414,7 +419,9 @@ def test_grouped_view_respects_tier() -> None:
         ],
     )
 
-    view = disagreements._narrow(report, tier="high", folder_key=None, limit=None, group=True)
+    view = release_disagreements._narrow(
+        report, tier="high", folder_key=None, limit=None, group=True
+    )
 
     assert [g.folder for g in view.groups] == [r"C:\m\Band\High"]
     assert view.groups[0].flagged == 1
@@ -435,7 +442,12 @@ def test_the_recording_mbid_still_matches_when_the_release_track_mbid_is_wrong()
 # --- end to end through the real tool ------------------------------------------------
 
 
-def test_detect_disagreements_end_to_end(
+def test_the_release_detector_answers_only_to_its_qualified_name() -> None:
+    assert importlib.util.find_spec("tagmend.engine.disagreements") is None
+    assert not hasattr(release_disagreements, "detect_disagreements")
+
+
+def test_detect_release_disagreements_end_to_end(
     engine_settings: Settings,
     music_dir: Path,
 ) -> None:
@@ -453,7 +465,7 @@ def test_detect_disagreements_end_to_end(
     scan_library(engine_settings)
 
     source = FakeReleaseSource({_RELEASE_ID: _release(_track("1", "Song One"))})
-    report = disagreements.detect_disagreements(engine_settings, client=source)
+    report = release_disagreements.detect_release_disagreements(engine_settings, client=source)
 
     # One real contradiction. The fields the generated file simply lacks are fills.
     assert report.flagged == 1
@@ -493,13 +505,13 @@ def test_folder_argument_variants_match_the_same_rows(
     scan_library(engine_settings)
     source = FakeReleaseSource({_RELEASE_ID: _release(_track("1", "Song One"))})
 
-    exact = disagreements.detect_disagreements(
+    exact = release_disagreements.detect_release_disagreements(
         engine_settings,
         path=music_dir / "Band",
         folder=str(album),
         client=source,
     )
-    variant = disagreements.detect_disagreements(
+    variant = release_disagreements.detect_release_disagreements(
         engine_settings,
         path=music_dir / "Band",
         folder=spell_folder(album, spelling),
@@ -548,7 +560,9 @@ def test_a_bare_folder_without_a_run_scope_is_refused(
     source = _two_release_source()
 
     with pytest.raises(ValueError, match="path="):
-        disagreements.detect_disagreements(engine_settings, folder=str(folder_a), client=source)
+        release_disagreements.detect_release_disagreements(
+            engine_settings, folder=str(folder_a), client=source
+        )
 
     assert source.lookups == []
 
@@ -560,7 +574,7 @@ def test_path_scopes_the_run_and_fetches_nothing_outside_it(
     _scan_two_releases(music_dir, engine_settings)
     source = _two_release_source()
 
-    report = disagreements.detect_disagreements(
+    report = release_disagreements.detect_release_disagreements(
         engine_settings,
         path=music_dir / "A",
         client=source,
@@ -586,12 +600,12 @@ def test_folder_narrows_a_scoped_run_and_wins_over_group(
     )
     scan_library(engine_settings)
 
-    whole = disagreements.detect_disagreements(
+    whole = release_disagreements.detect_release_disagreements(
         engine_settings,
         path=music_dir / "A",
         client=_two_release_source(),
     )
-    view = disagreements.detect_disagreements(
+    view = release_disagreements.detect_release_disagreements(
         engine_settings,
         path=music_dir / "A",
         folder=str(folder_a),
@@ -801,7 +815,7 @@ def test_a_limit_caps_both_row_lists() -> None:
             _f(2, album="Wrong Too", releasecountry="XX", date=None),
         ]
     )
-    view = disagreements._narrow(report, tier=None, folder_key=None, limit=1, group=False)
+    view = release_disagreements._narrow(report, tier=None, folder_key=None, limit=1, group=False)
 
     assert len(view.rows) == 1
     assert len(view.fill_rows) == 1

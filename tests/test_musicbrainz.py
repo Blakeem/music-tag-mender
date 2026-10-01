@@ -105,6 +105,28 @@ def _client(
     return client, calls
 
 
+# --- cache probe ---------------------------------------------------------------------
+
+
+def test_has_cached_album_probes_the_cache_without_a_request(db_conn: sqlite3.Connection) -> None:
+    client, calls = _client(db_conn, [_json_response(_body(_group()))])
+    with client:
+        before = client.has_cached_album("Black Sabbath", "Paranoid")
+        client.album_first_release("Black Sabbath", "Paranoid")
+        after = client.has_cached_album("Black Sabbath", "Paranoid")
+        other = client.has_cached_album("Black Sabbath", "Master of Reality")
+
+    assert (before, after, other) == (False, True, False)
+    assert len(calls) == 1
+
+
+def test_has_cached_album_counts_a_negative_answer(db_conn: sqlite3.Connection) -> None:
+    client, _ = _client(db_conn, [_json_response(_body())])
+    with client:
+        assert client.album_first_release("Black Sabbath", "Paranoid") is None
+        assert client.has_cached_album("Black Sabbath", "Paranoid") is True
+
+
 # --- found / selection ---------------------------------------------------------------
 
 

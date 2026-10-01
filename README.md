@@ -118,7 +118,7 @@ Edits apply on the next tool call; every command and MCP tool re-reads `settings
 
 ## Tools
 
-The MCP server exposes 34 tools. All tag edits are staged in memory and only written to disk on `commit_tags`, and everything is revertible.
+The MCP server exposes 35 tools. All tag edits are staged in memory and only written to disk on `commit_tags`, and everything is revertible.
 
 ### Core & Library
 
@@ -133,7 +133,8 @@ The MCP server exposes 34 tools. All tag edits are staged in memory and only wri
 | `detect_album_gaps` | Find files with a blank `album` tag, grouped by folder, with tiered fill proposals (read-only report) |
 | `detect_track_conflicts` | Find files sharing a `(disc, track)` slot with a folder sibling, tiered by how the titles and containers compare (read-only report) |
 | `detect_album_conflicts` | Find files whose album identity differs from their folder siblings', tiered by whether a release ID, a name or year, or a disc suffix splits the folder (read-only report) |
-| `detect_disagreements` | Find files whose tags contradict the MusicBrainz release their own `musicbrainz_albumid` names, reporting the value the release says each tag should hold (read-only report) |
+| `detect_release_disagreements` | Find files whose tags contradict the MusicBrainz release their own `musicbrainz_albumid` names, reporting the value the release says each tag should hold (read-only report) |
+| `detect_year_disagreements` | Find files whose `originaldate` names a different year than the first release of their MusicBrainz release group, or whose `date` is earlier than that first release (read-only report) |
 
 ### Staging & Commits
 

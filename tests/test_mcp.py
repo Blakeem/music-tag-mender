@@ -637,8 +637,17 @@ def test_error_envelope_lets_a_bug_raise(monkeypatch: pytest.MonkeyPatch) -> Non
 def test_every_tool_is_enveloped() -> None:
     tools = mcp_server.mcp._tool_manager.list_tools()
 
-    assert len(tools) == 34
+    assert len(tools) == 35
     assert [tool.name for tool in tools if not hasattr(tool.fn, "__wrapped__")] == []
+
+
+def test_each_disagreement_report_is_qualified_by_what_it_compares() -> None:
+    names = {tool.name for tool in mcp_server.mcp._tool_manager.list_tools()}
+
+    assert sorted(name for name in names if name.endswith("disagreements")) == [
+        "detect_release_disagreements",
+        "detect_year_disagreements",
+    ]
 
 
 def test_tool_schemas_survive_the_envelope() -> None:
@@ -660,8 +669,10 @@ _NEGATIVE_LIMIT_CALLS = [
     ("detect_track_conflicts", {"limit": -1}),
     ("detect_album_conflicts", {"limit": -1}),
     ("detect_album_gaps", {"limit": -1}),
-    ("detect_disagreements", {"limit": -1}),
-    ("detect_disagreements", {"release_limit": -1}),
+    ("detect_release_disagreements", {"limit": -1}),
+    ("detect_release_disagreements", {"release_limit": -1}),
+    ("detect_year_disagreements", {"limit": -1}),
+    ("detect_year_disagreements", {"release_limit": -1}),
 ]
 
 

@@ -120,7 +120,7 @@ class _FileInput:
 
 
 @dataclass(frozen=True, slots=True)
-class DisagreementRow:
+class ReleaseDisagreementRow:
     """One field on one file that contradicts the release the file names."""
 
     file_id: int
@@ -156,7 +156,7 @@ class DisagreementRow:
 
 
 @dataclass(frozen=True, slots=True)
-class DisagreementGroup:
+class ReleaseDisagreementGroup:
     """One folder's disagreements, compact enough to scan a whole library at a glance.
 
     ``flagged`` counts files, matching the headline count, so the groups sum to it. One file
@@ -193,15 +193,15 @@ class DisagreementGroup:
 
 
 @dataclass(frozen=True, slots=True)
-class DisagreementsReport:
-    """Immutable summary of one :func:`detect_disagreements` run, JSON-ready for the tool.
+class ReleaseDisagreementsReport:
+    """Immutable summary of one :func:`detect_release_disagreements` run, JSON-ready for the tool.
 
     ``flagged`` counts files with at least one contradiction and ``flagged_fields`` counts the
     contradicting fields. Each file sits in the tier of its most severe contradiction, so the
     tier counts sum to ``flagged``.
     """
 
-    rows: list[DisagreementRow]
+    rows: list[ReleaseDisagreementRow]
     total_files: int
     flagged: int
     flagged_fields: int
@@ -218,9 +218,9 @@ class DisagreementsReport:
     unmatched_tracks: int
     errors: int
     summary: str
-    fill_rows: list[DisagreementRow] = field(default_factory=list)
+    fill_rows: list[ReleaseDisagreementRow] = field(default_factory=list)
     error_items: list[dict[str, str]] = field(default_factory=list)
-    groups: list[DisagreementGroup] = field(default_factory=list)
+    groups: list[ReleaseDisagreementGroup] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, object]:
         """JSON-serializable form for the MCP tool."""
@@ -347,13 +347,13 @@ def _compare_one(
     file: _FileInput,
     release: MBRelease,
     track: MBTrack | None,
-) -> list[DisagreementRow]:
+) -> list[ReleaseDisagreementRow]:
     """Return every field on *file* that contradicts *release* (and *track* when matched)."""
-    rows: list[DisagreementRow] = []
+    rows: list[ReleaseDisagreementRow] = []
 
     def add(field_name: str, have: str, want: str, tier: Tier, reason: str) -> None:
         rows.append(
-            DisagreementRow(
+            ReleaseDisagreementRow(
                 file_id=file.file_id,
                 folder=file.folder,
                 filename=file.filename,
@@ -403,13 +403,13 @@ def _compare_track(
     file: _FileInput,
     release: MBRelease,
     track: MBTrack,
-) -> list[DisagreementRow]:
+) -> list[ReleaseDisagreementRow]:
     """Return every track-level field on *file* that contradicts its matched *track*."""
-    rows: list[DisagreementRow] = []
+    rows: list[ReleaseDisagreementRow] = []
 
     def add(field_name: str, have: str, want: str, reason: str) -> None:
         rows.append(
-            DisagreementRow(
+            ReleaseDisagreementRow(
                 file_id=file.file_id,
                 folder=file.folder,
                 filename=file.filename,
@@ -479,7 +479,7 @@ def _classify(
     client: MBReleaseSource,
     *,
     release_limit: int | None,
-) -> DisagreementsReport:
+) -> ReleaseDisagreementsReport:
     """Compare every in-scope file against the release it names, one lookup per release."""
     # Input: group by release so each is fetched at most once, in first-seen order.
     by_release: dict[str, list[_FileInput]] = defaultdict(list)
@@ -496,7 +496,7 @@ def _classify(
     to_check = order[:cap]
 
     # Process: one lookup per release, then every field of every file on it.
-    rows: list[DisagreementRow] = []
+    rows: list[ReleaseDisagreementRow] = []
     errors: list[dict[str, str]] = []
     unknown = 0
     unmatched = 0
@@ -524,7 +524,7 @@ def _classify(
     contradictions = [r for r in rows if not r.is_fill]
     fills = [r for r in rows if r.is_fill]
     tiers = _tiers_by_file(contradictions)
-    return DisagreementsReport(
+    return ReleaseDisagreementsReport(
         rows=_ordered(contradictions),
         total_files=len(files),
         flagged=sum(tiers.values()),
@@ -557,12 +557,12 @@ def _classify(
     )
 
 
-def _ordered(rows: list[DisagreementRow]) -> list[DisagreementRow]:
+def _ordered(rows: list[ReleaseDisagreementRow]) -> list[ReleaseDisagreementRow]:
     """Return *rows* most-severe first, then stably by location and field."""
     return sorted(rows, key=lambda r: (TIER_RANK[Tier(r.tier)], r.folder, r.filename, r.field))
 
 
-def _tiers_by_file(contradictions: list[DisagreementRow]) -> Counter[str]:
+def _tiers_by_file(contradictions: list[ReleaseDisagreementRow]) -> Counter[str]:
     """Count files by their most severe contradiction, so the counts sum to the file count."""
     worst: dict[int, Tier] = {}
     for row in contradictions:
@@ -589,16 +589,16 @@ def _releases_in(folder_files: list[_FileInput], titles: dict[str, str]) -> list
 
 
 def _build_groups(
-    rows: list[DisagreementRow],
+    rows: list[ReleaseDisagreementRow],
     files: list[_FileInput],
     titles: dict[str, str],
-) -> list[DisagreementGroup]:
+) -> list[ReleaseDisagreementGroup]:
     """Fold the rows into one line per folder, sorted by folder."""
     rows_by_folder = group_by_folder(rows)
     files_by_folder = group_by_folder(files)
-    groups: list[DisagreementGroup] = []
+    groups: list[ReleaseDisagreementGroup] = []
     for folder in sorted(rows_by_folder):
-        base = DisagreementGroup(
+        base = ReleaseDisagreementGroup(
             folder=folder,
             file_count=len(files_by_folder.get(folder, [])),
             flagged=0,
@@ -614,7 +614,9 @@ def _build_groups(
     return groups
 
 
-def _refold_group(group: DisagreementGroup, rows: list[DisagreementRow]) -> DisagreementGroup:
+def _refold_group(
+    group: ReleaseDisagreementGroup, rows: list[ReleaseDisagreementRow]
+) -> ReleaseDisagreementGroup:
     """Return *group* with its counts describing exactly *rows*, contradictions and fills."""
     contradictions = [r for r in rows if not r.is_fill]
     tiers = _tiers_by_file(contradictions)
@@ -631,7 +633,7 @@ def _refold_group(group: DisagreementGroup, rows: list[DisagreementRow]) -> Disa
 
 def _summarize(  # noqa: PLR0913 - one keyword per reported count, cohesive by design
     *,
-    rows: list[DisagreementRow],
+    rows: list[ReleaseDisagreementRow],
     fills: int,
     tiers: Counter[str],
     checked: int,
@@ -667,13 +669,13 @@ def _summarize(  # noqa: PLR0913 - one keyword per reported count, cohesive by d
 
 
 def _narrow(
-    report: DisagreementsReport,
+    report: ReleaseDisagreementsReport,
     *,
     tier: str | None,
     folder_key: str | None,
     limit: int | None,
     group: bool,
-) -> DisagreementsReport:
+) -> ReleaseDisagreementsReport:
     """Return *report* with its rows filtered for display. The run counts never change.
 
     Groups ride only on the grouped view. A *folder_key* wins over *group*: that call returns
@@ -741,7 +743,7 @@ def _load_inputs(
     return inputs
 
 
-def detect_disagreements(  # noqa: PLR0913 - cohesive keyword-only scope + injection params
+def detect_release_disagreements(  # noqa: PLR0913 - cohesive keyword-only scope + injection params
     settings: Settings,
     *,
     tier: str | None = None,
@@ -752,7 +754,7 @@ def detect_disagreements(  # noqa: PLR0913 - cohesive keyword-only scope + injec
     limit: int | None = None,
     group: bool = False,
     client: MBReleaseSource | None = None,
-) -> DisagreementsReport:
+) -> ReleaseDisagreementsReport:
     """Report files whose tags contradict the MusicBrainz release their album id names.
 
     Reads the snapshot, so run ``scan_library`` first.
@@ -772,8 +774,8 @@ def detect_disagreements(  # noqa: PLR0913 - cohesive keyword-only scope + injec
     """
     if folder is not None and path is None and file_ids is None:
         message = (
-            "detect_disagreements fetches from MusicBrainz, so scope the run with path=<folder> "
-            "or file_ids. folder= only narrows a scoped run's view"
+            "detect_release_disagreements fetches from MusicBrainz, so scope the run with "
+            "path=<folder> or file_ids. folder= only narrows a scoped run's view"
         )
         raise ValueError(message)
     check_limit(release_limit, name="release_limit")
@@ -802,7 +804,7 @@ def detect_disagreements(  # noqa: PLR0913 - cohesive keyword-only scope + injec
         connection.close()
 
     logger.info(
-        "disagreements: flagged=%s over %s release(s), %s file(s)",
+        "release disagreements: flagged=%s over %s release(s), %s file(s)",
         report.flagged,
         report.releases_checked,
         report.total_files,

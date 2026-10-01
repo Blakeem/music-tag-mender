@@ -79,7 +79,7 @@ already owns them. `musicbrainz.py` then gained `release_by_mbid`, a direct
 Protocol. It returns an `MBRelease` (the album title, the album-artist credit, and every
 `MBMedium`'s `MBTrack` tracklist), cached in `musicbrainz_release_cache` as one JSON payload
 because a release is a nested document and nothing queries inside it. The
-`detect_disagreements` tool (`disagreements.py`) is the third comparison in the coherence
+`detect_release_disagreements` tool (`release_disagreements.py`) is the third comparison in the coherence
 family: `detect_mismatches` compares a file's tags against the folder PATH,
 `detect_album_conflicts` and `detect_track_conflicts` compare a file against its folder
 SIBLINGS, and this compares a file against an EXTERNAL authority, the release its own
@@ -91,8 +91,12 @@ fields (`album`, `albumartist`, `date`, `releasecountry`, `musicbrainz_albumstat
 checked even for a file carrying no track id. Track-level fields (`title`, `tracknumber`,
 `discnumber`) need a matched track and are skipped without one. A blank field is a **fill**,
 not a disagreement: `flagged` counts only fields where the file says one thing and the release
-says another, while `fill_rows` collects what the release can supply for free.
-34 MCP tools total. Schema is **v21** (additive: v11 adds
+says another, while `fill_rows` collects what the release can supply for free. `detect_year_disagreements` (`year_disagreements.py`)
+compares a file's year tags with the first-release year of its album's MusicBrainz release group,
+found by the album identity (album artist else artist, album). `high` means the `originaldate` year
+differs, `medium` means the `date` year is earlier than the first release. `release_limit` (default
+200) caps the uncached lookups one call makes, and cache writes are its only ledger writes.
+35 MCP tools total. Schema is **v21** (additive: v11 adds
 `musicbrainz_recording_cache`, v12 renames `file_album_status` → `file_year_status` in place —
 dispositions preserved; v13 adds `tag_revisions.managed_set`, stamping which managed-tag set
 governed each revision so a revert can restore emptiness on the widened fields; v14 adds
@@ -291,7 +295,7 @@ src/tagmend/
   log.py            shared logger (use everywhere)
   config.py         settings.json (platformdirs) + typed Settings
   cli.py            Typer CLI (thin)
-  mcp_server.py     FastMCP server (thin) — 34 tools
+  mcp_server.py     FastMCP server (thin) — 35 tools
   engine/
     db.py           SQLite connection (WAL)
     schema.py       all DDL + PRAGMA user_version (v21)
@@ -316,7 +320,8 @@ src/tagmend/
     mismatch.py     detect_mismatches + set/reset_mismatch_status: identity tags vs folder path, tiered
     track_conflicts.py  detect_track_conflicts: intra-folder (disc, track) slot collisions
     album_conflicts.py  detect_album_conflicts: intra-folder album-identity splits, tiered
-    disagreements.py  detect_disagreements: tags vs the MusicBrainz release the file's album id names, tiered
+    release_disagreements.py  detect_release_disagreements: tags vs the MusicBrainz release the file's album id names, tiered
+    year_disagreements.py  detect_year_disagreements: year tags vs the release group's first-release year, tiered
     album_gaps.py   detect_album_gaps: blank-album files grouped by folder + tiered fill proposals
     parsing.py      pure folder/filename → (artist, album) parsing for the album-gap fills
     paths.py        STUB + PathDomain paper sketch — M6 (organize/paths)

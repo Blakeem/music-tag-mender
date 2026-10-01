@@ -17,7 +17,7 @@ reissue *release* ``date`` (the edition year). Four endpoints are used:
 * ``/ws/2/artist/<mbid>?inc=aliases``: a direct lookup by the MBID a file carries, feeding
   ``resolve_artists``' MusicBrainz tier.
 * ``/ws/2/release/<mbid>?inc=recordings+artist-credits``: a direct release and tracklist
-  lookup, feeding ``detect_disagreements``.
+  lookup, feeding ``detect_release_disagreements``.
 
 Each lookup's parsed result is cached persistently, so every unique entity is queried at most
 once. Release groups live in ``musicbrainz_release_group_cache``, recordings in
@@ -246,6 +246,16 @@ class MBReleaseGroupSource(Protocol):
         """Return the album's original first-release resolution, or ``None`` if none usable."""
 
 
+class MBReleaseGroupCacheSource(MBReleaseGroupSource, Protocol):
+    """The release-group lookup plus a cache probe, for a caller that caps network lookups.
+
+    Separate from :class:`MBReleaseGroupSource` so a ``resolve_years`` fake gains no obligation.
+    """
+
+    def has_cached_album(self, artist: str, album: str) -> bool:
+        """Return whether :meth:`album_first_release` answers *artist*/*album* without a request."""
+
+
 class MBRecordingSource(Protocol):
     """The recording lookup the album-gaps detector depends on (so it can use a fake in tests).
 
@@ -280,7 +290,7 @@ class MBReleaseSource(Protocol):
 class MusicBrainzClient:
     """Cached, paced MusicBrainz client for release-group, recording, artist and release lookups.
 
-    Implements :class:`MBReleaseGroupSource`, :class:`MBRecordingSource`,
+    Implements :class:`MBReleaseGroupCacheSource`, :class:`MBRecordingSource`,
     :class:`MBArtistSource` and :class:`MBReleaseSource`.
 
     Owns one :class:`httpx.Client` for its lifetime via the context-manager protocol; use it
@@ -367,6 +377,10 @@ class MusicBrainzClient:
             )
 
         return self._fetch_and_cache(artist, album, request_key)
+
+    def has_cached_album(self, artist: str, album: str) -> bool:
+        """Return whether :meth:`album_first_release` answers from the cache, hit or negative."""
+        return get_cached_mb_release_group(self._conn, _request_key(artist, album)) is not None
 
     def recording_search(self, artist: str, title: str) -> MBRecording | None:
         """Return the recording *title* by *artist*'s resolved album, or ``None``.

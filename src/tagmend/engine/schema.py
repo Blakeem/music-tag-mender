@@ -1,229 +1,50 @@
-"""SQLite schema for the library snapshot + staging/commit/revision logs (M1 + M3).
+"""SQLite schema of the ledger: its tables, indexes and triggers, and how an older one upgrades.
 
-Defines the tables that hold the read-path snapshot: ``files`` (one row per audio
-file, anchored by its ``(folder, filename)`` at first scan and assigned a stable
-integer ``id`` surrogate) and ``file_tags`` (normalized EAV rows for each tag value).
-The ``id`` is the durable identity that all history tables reference, per PLAN.md §7.
+The tables, by role:
 
-The change-tracking model mirrors git (PLAN.md §7):
+* Snapshot: ``files`` holds one row per audio file. Its integer ``id`` is the identity the
+  revision, staging and status tables reference. Its ``path_key`` is the path's identity key
+  from :mod:`tagmend.engine.path_keys`. The UNIQUE index ``idx_files_path_key`` keeps one row per
+  key. The column is nullable. A NULL key never collides, so every engine insert sets it.
+  ``file_tags`` holds the file's tag values, one row per value.
+* Change tracking, modelled on git: ``commits`` holds one row per commit with its status. The
+  statuses are documented beside ``_COMMIT_STATUSES`` in :mod:`tagmend.engine.commits`.
+  ``tag_revisions`` and ``path_revisions`` are the per-file histories, keyed
+  ``(file_id, version)``. Version 0 is the baseline. ``reverted_to_version``, on
+  ``tag_revisions``, ``path_revisions`` and ``path_revisions_staged``, holds the version a revert
+  restores. ``reverted_from``, on ``commits`` and on both sidecar tables, holds the row a revert
+  undid.
+* Staging, git's index: ``tag_revisions_staged`` and ``path_revisions_staged`` hold one pending
+  target per file. Each row keeps the file's signature at stage time, which the commit checks.
+* Sidecars: ``sidecar_moves`` logs each non-audio file that moved with its album folder. Its rows
+  are keyed by their own paths, not by ``files.id``. Its ``unit_key`` is the key of the album
+  folder the file sat under before the move. A revert finds the album's current folder from it
+  by depth. ``sidecar_moves_staged`` holds the pending sidecar moves.
+* Axis status: ``file_genre_status``, ``file_artist_status``, ``file_year_status`` and
+  ``file_song_status`` each hold at most one outcome row per file (:mod:`tagmend.engine.axis`).
+  Each axis names its own two identity columns. ``file_mismatch_status`` holds one path decision
+  per file as a JSON snapshot.
+* Lookup caches: ``lastfm_cache``, ``lastfm_correction_cache``,
+  ``musicbrainz_release_group_cache``, ``musicbrainz_recording_cache``,
+  ``musicbrainz_artist_cache``, ``musicbrainz_release_cache`` and ``acoustid_cache`` are each
+  keyed by a request hash. Their ``found`` column is the negative-cache sentinel.
+  ``fingerprint_cache`` holds one fpcalc result per file at the signature it was taken at.
 
-* ``commits`` — one row per *commit*: a group of individual changes applied together.
-  Its ``id`` is the ``commit_id`` the revision rows reference. Holds the group's
-  message/time/origin and a status (``applying``→``applied``, or a terminal
-  ``interrupted`` left by a crashed run). A lingering ``applying`` row means an
-  interrupted run; recovery is just running the commit again (no resume machinery).
-* ``tag_revisions_staged`` / ``path_revisions_staged`` — the staging area (git's
-  index). One pending change per file (PK ``file_id``); holds the *desired target*.
-  Staged rows no longer carry a ``commit_id`` (no claiming): a commit turns each
-  staged row into a real revision row, then deletes it.
-* ``tag_revisions`` — the managed-tag content history (PLAN.md §7). Logic lives in
-  :mod:`tagmend.engine.versioning`.
-* ``path_revisions`` — the location history (PLAN.md §18), written by
-  :mod:`tagmend.engine.paths`. Its paths are relative to ``music_path``.
+Every path in ``path_revisions``, ``path_revisions_staged``, ``sidecar_moves`` and
+``sidecar_moves_staged`` is relative to ``music_path``.
 
-The two revision logs are append-only, keyed by ``files.id`` with a composite PK
-``(file_id, version)`` (version 0 = baseline with ``commit_id`` NULL, +1 per change).
-Triggers enforce it: an ``UPDATE`` or ``DELETE`` on either log aborts, and so does a
-``DELETE FROM files`` that would cascade into one.
+``tag_revisions``, ``path_revisions`` and ``sidecar_moves`` are append-only.
+:func:`apply_append_only_triggers` creates the triggers that abort an ``UPDATE`` or ``DELETE`` on
+them. It also creates one that aborts a ``tag_revisions`` insert with no ``managed_set``.
 
-:func:`apply_schema` runs the migrations and the DDL only when the stored
-``PRAGMA user_version`` is older than :data:`SCHEMA_VERSION`, so every later schema change
-must bump :data:`SCHEMA_VERSION`.
-
-The M2 Last.fm genre path adds two side tables (PLAN — Last.fm genre tagging, phase 1):
-
-* ``lastfm_cache`` — a persistent cache of parsed Last.fm tag lists keyed by a request
-  hash, surviving MCP restarts. ``found`` is the negative-cache sentinel (0 = the
-  artist/album genuinely is not on Last.fm; 1 = found), distinct from ``found=1`` with an
-  empty ``tags`` array.
-* ``file_genre_status``: the genre axis's per-file status row. v21 below gives its shape.
-
-The M4 artist normalization path adds one more side table (schema v7, purely additive):
-
-* ``file_artist_status``: the artist-axis twin of ``file_genre_status``.
-
-The album original-year path adds two more side tables (schema v8, purely additive — a v7
-ledger upgrades in place with no data loss):
-
-* ``file_year_status`` (named ``file_album_status`` until v12): the year-axis twin of
-  ``file_genre_status``.
-* ``musicbrainz_release_group_cache`` (named ``musicbrainz_cache`` until v20) is a persistent
-  cache of MusicBrainz release-group lookups keyed by a request hash. ``found`` is the
-  negative-cache sentinel (0 = no usable Album release group), mirroring ``lastfm_cache``.
-
-The mismatch-fix re-pend path adds one more side table (schema v9, purely additive — a v8
-ledger upgrades in place with no data loss):
-
-* ``voided_auto``: a per-``(file_id, field)`` watermark that re-opened auto-resolved values
-  after a manual identity fix. v21 drops it.
-
-The mismatch-fix review surface adds one more side table (schema v10, purely additive — a v9
-ledger upgrades in place with no data loss):
-
-* ``file_mismatch_status``: one path decision per file (``legit_ignore`` or
-  ``misfiled_deferred``). An accepted fix needs no row. v24 below gives its shape.
-
-The album-gaps MusicBrainz recording-search tier adds one more side table (schema v11, purely
-additive — a v10 ledger upgrades in place with no data loss):
-
-* ``musicbrainz_recording_cache`` — a persistent cache of MusicBrainz recording-search
-  lookups keyed by a request hash (the ``(artist, title)`` twin of the release-group cache,
-  mirroring ``lastfm_cache``). ``found`` is the negative-cache sentinel (0 = no usable Album
-  release group for the recording; 1 = found). The found columns hold the selected recording's
-  release-group title/id + the recording MBID. Feeds ``detect_album_gaps``' review-only tier;
-  cache writes are its ONLY ledger writes.
-
-The tool-naming pass renames one table (schema v12, no new tables — a v11 ledger upgrades in
-place with no data loss):
-
-* ``file_album_status`` → ``file_year_status``. The album *axis* became the **year** axis
-  (it fills ``originaldate``, never the ``album`` tag), so its status table follows the axis
-  name. :func:`apply_schema` performs a SQLite-native ``ALTER TABLE ... RENAME TO`` before the
-  DDL runs, so every stored ``'no_match'`` / ``'manual'`` disposition is preserved. Nothing
-  about the album *entity* changes (the release-group cache, the ``album`` tag, ``list_albums``).
-
-The revert-fidelity pass adds one column (schema v13, no new tables — a v12 ledger upgrades in
-place with every row preserved):
-
-* ``tag_revisions.managed_set`` — which managed-tag set governed that revision (the versions in
-  :data:`tagmend.engine.tags.MANAGED_SETS`). Without it, revert cannot tell a snapshot that
-  omits a tag because it was empty from one that omits it because the set did not track it yet,
-  so it preserved every widened field on every snapshot and reported success while changing
-  nothing. :func:`_migrate_v13_managed_set` stamps pre-existing rows by capture date.
-
-The scan-staleness pass adds one column (schema v14, no new tables — a v13 ledger upgrades in
-place with every row preserved):
-
-* ``files.reader_version`` — which tag reader produced that snapshot row (the value of
-  :data:`tagmend.engine.tags.TAG_READER_VERSION` at read time). An incremental scan re-reads
-  only on a size/mtime change, so a row written by an older reader would never refresh and
-  every detector would keep reading it. :func:`_migrate_v14_reader_version` defaults
-  pre-existing rows to 0, below any real reader version, so the next incremental scan
-  re-reads each of them exactly once.
-
-The artist-by-MBID lookup adds one cache (schema v15, purely additive, created by its DDL with
-no migration):
-
-* ``musicbrainz_artist_cache`` holds the canonical name, sort name, disambiguation and alias
-  set per artist MBID. ``found`` is the negative-cache sentinel. Feeds ``resolve_artists``'
-  MusicBrainz tier.
-
-The release-by-MBID lookup adds one cache (schema v16, purely additive, created by its DDL with
-no migration):
-
-* ``musicbrainz_release_cache`` holds the parsed release and tracklist as one JSON
-  ``payload``, because nothing queries inside it. Feeds ``detect_release_disagreements``.
-
-The data-safety pass adds two columns, two indexes and four triggers (schema v17, no new
-tables. A v16 ledger upgrades in place with every row preserved):
-
-* ``tag_revisions_staged.base_size_bytes`` / ``base_mtime_ns``: the file's signature when it
-  was staged. A commit refuses a file whose signature moved since, because writing the stored
-  target would overwrite the external edit. :func:`_migrate_staged_base_signature` adds both as
-  NULL on pre-existing rows, which skips the check for them.
-* ``idx_tag_revisions_commit_id`` / ``idx_path_revisions_commit_id``: the per-commit change
-  set that ``revert_commit`` and ``reopen_axes`` read.
-* The four append-only triggers from :func:`apply_append_only_triggers`. A migration that
-  rebuilds or updates a log drops its triggers first and relies on the DDL phase, which runs
-  after every migration, to recreate them.
-
-The path-identity pass adds one column and one index (schema v18, no new tables. A v17 ledger
-upgrades in place with every row preserved):
-
-* ``files.path_key`` + ``idx_files_path_key`` (UNIQUE): the platform identity key of the file's
-  path (:mod:`tagmend.engine.path_keys`). NTFS ignores case, so ``(folder, filename)`` alone let
-  one file on disk become two rows. The column is nullable in both shapes, and every engine
-  insert sets it. :func:`_migrate_files_path_key` backfills it and refuses a ledger in which two
-  rows already share a key.
-
-The commit-origin pass changes no shape (schema v19. A v18 ledger upgrades in place with every
-row preserved):
-
-* ``commits.origin`` is derived from the staged rows a commit sweeps, so a commit is ``auto``
-  only when every change in it came from a resolver. Earlier builds stamped every MCP commit
-  ``manual``. :func:`_migrate_commit_origin` restamps each ``manual`` commit whose revisions
-  are all ``auto``.
-
-The naming and schema-hygiene pass renames, moves and drops in place (schema v20. A v19 ledger
-upgrades in place with every row preserved):
-
-* ``tag_revisions.reverted_from`` becomes ``reverted_to_version``, since it holds the version a
-  revert restored. ``commits.reverted_from`` keeps its name, since it holds the undone commit.
-* ``musicbrainz_cache`` becomes ``musicbrainz_release_group_cache``, and ``release_group_id``
-  becomes ``release_group_mbid`` in both MusicBrainz caches that carry it.
-* ``files.status`` is dropped. Only its DEFAULT ever wrote it, and nothing read it.
-* ``lastfm_correction_cache`` holds ``artist.getCorrection`` answers in typed columns.
-  :func:`_migrate_lastfm_correction_cache` moves the library's correction rows out of
-  ``lastfm_cache``, which now holds top tags only.
-* The ``tag_revisions_managed_set_required`` trigger refuses a revision without a managed set.
-  :func:`_migrate_managed_set_required` refuses to upgrade a ledger already holding one.
-
-The axis-status pass adds one column to four tables and drops one table (schema v21. A v20
-ledger upgrades in place with every status and staged row preserved):
-
-* ``file_genre_status``, ``file_artist_status`` and ``file_year_status`` each hold at most one
-  outcome row per file (``done``, ``no_match`` or ``manual``) with two snapshots: the identity
-  it was decided against in the two ``source_*`` columns and the new ``source_value``, the JSON
-  of the axis fields' values. :func:`tagmend.engine.store.derived_status` derives every status
-  from that row (:mod:`tagmend.engine.axis`).
-* :func:`_migrate_axis_outcomes` adds ``source_value`` (NULL on existing rows), writes
-  ``manual`` rows from the manual revisions and drops ``voided_auto``.
-* ``tag_revisions_staged.changed_fields``: the JSON list of fields a staged target changes
-  against the tags on disk at stage time. The commit records ``manual`` on the axes it names.
-  :func:`_migrate_staged_changed_fields` adds it as NULL, and the commit then falls back to
-  the diff against the tags on disk at commit time.
-
-The audio-identification layer adds two caches (schema v22, purely additive, created by its DDL
-with no migration):
-
-* ``fingerprint_cache`` holds one fpcalc outcome per file at the files-row signature it was
-  taken at: the fingerprint and duration, or the failing exit code with both NULL.
-* ``acoustid_cache`` holds one AcoustID lookup per request hash, the parsed result as
-  zlib-compressed JSON. ``found`` is the negative-cache sentinel (0 = no match).
-
-The song axis adds one table and one column (schema v23. A v22 ledger upgrades in place):
-
-* ``file_song_status``: the song-axis twin of ``file_genre_status``. Its identity snapshot is
-  the release and release-track ids, so an identity fix that rebinds a file re-opens it.
-* ``tag_revisions_staged.supplied_keys``: the JSON list of the keys the caller supplied for a
-  staged file. :func:`_migrate_staged_supplied_keys` adds it as NULL.
-
-The path-decision pass reshapes one table (schema v24. A v23 ledger upgrades in place with every
-row preserved):
-
-* ``file_mismatch_status.source_value`` holds one JSON snapshot per decision. It records the
-  names the decision covers, the values of their tags, the file's path version and, on a
-  ``legit_ignore`` row, the key of the folder it keeps. ``source_field`` is dropped.
-  :func:`_migrate_mismatch_covers` rewrites each earlier row as a decision on the top-folder
-  comparison alone.
-
-The path executor gives the path staging area its commit inputs (schema v25. A v24 ledger
-upgrades in place with every row preserved):
-
-* ``path_revisions_staged.to_key``: the identity key of the target, relative to ``music_path``,
-  with the UNIQUE ``idx_path_revisions_staged_to_key``, so two staged moves never share a target.
-* ``base_size_bytes`` / ``base_mtime_ns``: the file's signature at stage time. A move keeps both,
-  which is how a commit recognises a file that already landed at its target.
-* ``reverted_from``: on a revert row, the version whose location it restores.
-  :func:`_migrate_path_staging` adds the four columns as NULL on earlier rows.
-
-The sidecar pass adds two tables (schema v26, purely additive, created by its DDL with no
-migration):
-
-* ``sidecar_moves``: the append-only log of the non-audio files that move with their album
-  folder, one row per move with both paths and keys relative to ``music_path``, the signature
-  the file kept across the move and ``unit_key``, the key of the album folder the file sat
-  under. A revert reads ``unit_key`` to find the folder the album occupies after the move.
-* ``sidecar_moves_staged``: one pending sidecar move per source key, its target key unique, so
-  two sidecars never share a target.
-
-The revert-term pass renames two columns in place (schema v27. A v26 ledger upgrades in place
-with every row preserved):
-
-* ``path_revisions.reverted_from`` and ``path_revisions_staged.reverted_from`` become
-  ``reverted_to_version``, the name ``tag_revisions`` uses, since each holds the version a revert
-  restores. :func:`_migrate_path_reverted_to_version` renames them. ``commits.reverted_from`` and
-  ``sidecar_moves.reverted_from`` keep their name, since each holds the undone row.
+:func:`apply_schema` acts only when ``PRAGMA user_version`` is older than
+:data:`SCHEMA_VERSION`. Every schema change therefore bumps the version.
+``CREATE TABLE IF NOT EXISTS`` never alters an existing table. A new table or a new plain index
+needs only its DDL. Every other change needs an idempotent ``_migrate_*`` step: a renamed table,
+a column added, renamed or dropped, a row rewrite, or a UNIQUE index that existing rows could
+break. The steps run before the DDL. The triggers persist in a ledger. A migration that updates
+or deletes rows of an append-only log first drops that log's triggers. :func:`apply_schema`
+recreates them after the DDL. A column rename fires no trigger.
 """
 
 from __future__ import annotations
@@ -468,7 +289,7 @@ CREATE TABLE IF NOT EXISTS lastfm_correction_cache (
 )
 """
 
-# The three tag-axis status tables share one shape (:mod:`tagmend.engine.axis`). Each row is
+# The four tag-axis status tables share one shape (:mod:`tagmend.engine.axis`). Each row is
 # one outcome (``done``/``no_match``/``manual``), the identity it was decided against in the
 # two ``source_*`` columns, and ``source_value``: the JSON of the axis fields' values it
 # describes, NULL on a row written before v21. A ``done``/``no_match`` row counts only while
@@ -1324,30 +1145,14 @@ def apply_schema(connection: sqlite3.Connection) -> None:
     never waits on the write lock a running scan holds. A ledger stamped newer than this build
     raises :class:`RuntimeError` rather than being stamped down.
 
-    An older ledger, or a fresh one stamped 0, runs the in-place migrations first, then every
-    ``CREATE ... IF NOT EXISTS``, then the append-only triggers, then the stamp. The migrations
-    preserve real data: v12 renames ``file_album_status`` to ``file_year_status``
-    (:func:`_migrate_v12_year_status`), v13 adds and stamps ``tag_revisions.managed_set``
-    (:func:`_migrate_v13_managed_set`), v14 adds ``files.reader_version``
-    (:func:`_migrate_v14_reader_version`), v17 adds the staged base signature
-    (:func:`_migrate_staged_base_signature`), v18 adds and backfills ``files.path_key``
-    (:func:`_migrate_files_path_key`), v19 restamps all-auto commits
-    (:func:`_migrate_commit_origin`) and v20 renames, moves and drops in place
-    (:func:`_migrate_reverted_to_version`, :func:`_migrate_managed_set_required`,
-    :func:`_migrate_release_group_cache_name`, :func:`_migrate_mbid_columns`,
-    :func:`_migrate_drop_files_status`, :func:`_migrate_lastfm_correction_cache`) and v21
-    snapshots the tag-axis status rows (:func:`_migrate_axis_outcomes`) and adds the staged
-    changed fields (:func:`_migrate_staged_changed_fields`), v23 adds the staged supplied
-    keys (:func:`_migrate_staged_supplied_keys`), v24 rewrites the mismatch rows as covers
-    snapshots (:func:`_migrate_mismatch_covers`), v25 adds the path staging columns
-    (:func:`_migrate_path_staging`) and v27 renames the path tables' ``reverted_from`` to
-    ``reverted_to_version`` (:func:`_migrate_path_reverted_to_version`). v15, v16 and v22 add
-    cache tables only, v23 adds
-    ``file_song_status`` and v26 adds the two sidecar tables, which the DDL creates, so they
-    need no migration step. The triggers come after every migration, so a migration that
-    updates a log runs before they exist.
+    An older ledger, or a fresh one stamped 0, runs the in-place migrations first
+    (:func:`_apply_migrations`). It then runs every ``CREATE ... IF NOT EXISTS``, then the
+    append-only triggers, then the stamp. A migration keeps the ledger's rows unless its own
+    docstring says otherwise. Two migrations refuse an older ledger with :class:`RuntimeError`.
+    :func:`_migrate_files_path_key` refuses one where two file rows share a path key.
+    :func:`_migrate_managed_set_required` refuses one holding a revision with no managed set.
 
-    ``commits`` is created before the revision/staging tables that reference it.
+    ``commits`` is created before every table that references it.
     """
     current = int(connection.execute("PRAGMA user_version").fetchone()[0])
     if current == SCHEMA_VERSION:

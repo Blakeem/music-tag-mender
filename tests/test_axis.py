@@ -18,6 +18,7 @@ from tagmend.engine.axis import (
     GENRE_AXIS,
     MISMATCH_AXIS,
     RESOLVER_OUTCOMES,
+    SONG_AXIS,
     TAG_AXES,
     YEAR_AXIS,
     Identity,
@@ -113,8 +114,23 @@ def test_no_identity_in_genre_artist_year_but_not_mismatch() -> None:
     assert "no_identity" not in MISMATCH_AXIS.workflow_statuses
 
 
-def test_tag_axes_are_genre_artist_year_in_report_order() -> None:
-    assert TAG_AXES == (GENRE_AXIS, ARTIST_AXIS, YEAR_AXIS)
+def test_tag_axes_are_genre_artist_year_song_in_report_order() -> None:
+    assert TAG_AXES == (GENRE_AXIS, ARTIST_AXIS, YEAR_AXIS, SONG_AXIS)
+
+
+def test_song_axis_descriptor() -> None:
+    assert SONG_AXIS.name == "song"
+    assert SONG_AXIS.fields == ("title", "tracknumber", "discnumber")
+    assert SONG_AXIS.status_table == "file_song_status"
+    assert SONG_AXIS.scope_fields == ("album",)
+    # The resolver never writes no_match, and the identity is never None.
+    assert frozenset({"pending", "manual", "staged", "done"}) == SONG_AXIS.workflow_statuses
+
+
+def test_song_identity_is_the_release_ids_and_never_none() -> None:
+    assert identity_of(SONG_AXIS, {}) == Identity(primary="", secondary="")
+    tags = {"musicbrainz_albumid": ["rel"], "musicbrainz_releasetrackid": [" ", "rt"]}
+    assert identity_of(SONG_AXIS, tags) == Identity(primary="rel", secondary="rt")
 
 
 def test_resolver_outcomes_are_done_and_no_match() -> None:

@@ -27,7 +27,7 @@ def test_apply_schema_stamps_current_version(db_conn: sqlite3.Connection) -> Non
     # db_conn already applied the schema; the stamp must match the constant the code ships.
     version = db_conn.execute("PRAGMA user_version").fetchone()[0]
     assert version == SCHEMA_VERSION
-    assert SCHEMA_VERSION == 22
+    assert SCHEMA_VERSION == 23
 
 
 def test_apply_schema_creates_genre_tables(db_conn: sqlite3.Connection) -> None:
@@ -498,6 +498,7 @@ def test_v16_ledger_gains_the_staged_base_signature_in_place() -> None:
         conn.execute("ALTER TABLE tag_revisions_staged DROP COLUMN base_size_bytes")
         conn.execute("ALTER TABLE tag_revisions_staged DROP COLUMN base_mtime_ns")
         conn.execute("ALTER TABLE tag_revisions_staged DROP COLUMN changed_fields")
+        conn.execute("ALTER TABLE tag_revisions_staged DROP COLUMN supplied_keys")
         conn.execute("PRAGMA user_version = 16")
         conn.execute(
             """
@@ -515,12 +516,13 @@ def test_v16_ledger_gains_the_staged_base_signature_in_place() -> None:
         assert _staged_columns(conn) == fresh_columns
         row = conn.execute(
             """
-            SELECT managed_tags, note, base_size_bytes, base_mtime_ns, changed_fields
+            SELECT managed_tags, note, base_size_bytes, base_mtime_ns, changed_fields,
+                   supplied_keys
             FROM tag_revisions_staged WHERE file_id = ?
             """,
             (file_id,),
         ).fetchone()
-        assert row == ('{"genre":["Rock"]}', "kept", None, None, None)
+        assert row == ('{"genre":["Rock"]}', "kept", None, None, None, None)
     finally:
         conn.close()
 
@@ -1254,3 +1256,72 @@ def test_fingerprint_cache_cascades_on_file_delete(db_conn: sqlite3.Connection) 
         (file_id,),
     ).fetchone()
     assert remaining[0] == 0
+
+
+# --- v23: the song axis --------------------------------------------------------------
+
+_SONG_STATUS_COLUMNS = [
+    "file_id",
+    "status",
+    "source_album_mbid",
+    "source_release_track_mbid",
+    "source_value",
+    "updated_at",
+]
+
+
+def test_fresh_ledger_has_the_song_status_table_and_supplied_keys(
+    db_conn: sqlite3.Connection,
+) -> None:
+    assert _columns(db_conn, "file_song_status") == _SONG_STATUS_COLUMNS
+    assert _staged_columns(db_conn)[-1] == "supplied_keys"
+
+
+def test_v22_ledger_gains_the_song_axis_in_place() -> None:
+    conn = sqlite3.connect(":memory:")
+    try:
+        apply_schema(conn)
+        file_id = _insert_file(conn)
+        conn.execute("DROP TABLE file_song_status")
+        conn.execute("ALTER TABLE tag_revisions_staged DROP COLUMN supplied_keys")
+        conn.execute(
+            """
+            INSERT INTO tag_revisions_staged (file_id, managed_tags, origin, note, staged_at)
+            VALUES (?, '{"title":["T"]}', 'manual', NULL, '2026-09-01T00:00:00+00:00')
+            """,
+            (file_id,),
+        )
+        conn.execute("PRAGMA user_version = 22")
+        conn.commit()
+
+        apply_schema(conn)  # the in-place upgrade
+        apply_schema(conn)  # idempotent: a current ledger runs nothing
+
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        assert _columns(conn, "file_song_status") == _SONG_STATUS_COLUMNS
+        kept = conn.execute(
+            "SELECT managed_tags, supplied_keys FROM tag_revisions_staged",
+        ).fetchall()
+        assert kept == [('{"title":["T"]}', None)]
+    finally:
+        conn.close()
+
+
+def test_v20_upgrade_replays_manual_revisions_without_the_song_table() -> None:
+    # The v21 replay runs before the DDL, so it must not reach for an axis added after it.
+    conn = sqlite3.connect(":memory:")
+    try:
+        ids = _build_previous_axis_ledger(conn)
+        conn.execute("DROP TABLE file_song_status")
+        retitled = {"artist": ["Right"], "album": ["LP"], "genre": ["jazz"], "title": ["New"]}
+        _insert_history(
+            conn, ids["fixed"], 3, "manual", retitled, {"title": {"from": [], "to": ["New"]}}
+        )
+        conn.commit()
+
+        apply_schema(conn)  # the in-place upgrade
+
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        assert conn.execute("SELECT COUNT(*) FROM file_song_status").fetchone()[0] == 0
+    finally:
+        conn.close()

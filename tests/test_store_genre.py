@@ -461,9 +461,15 @@ def test_pending_file_ids_skips_missing_and_settled_files(db_conn: sqlite3.Conne
 
 
 def _seed_status_matrix(conn: sqlite3.Connection, tag_axis: axis.Axis) -> dict[str, int]:
-    """Seed one present file in each workflow state on *tag_axis*. Returns name -> file id."""
+    """Seed one present file in each workflow state on *tag_axis*. Returns name -> file id.
+
+    A state the axis never derives (the song axis has no ``no_match`` and no ``no_identity``)
+    is not seeded.
+    """
     ids: dict[str, int] = {}
     for status in ("pending", "no_match", "manual", "done", "staged"):
+        if status not in tag_axis.workflow_statuses:
+            continue
         file_id = _insert(conn, filename=f"{status}.mp3")
         store.replace_tags(conn, file_id, {"artist": ["A"], "album": ["LP"]}, _NOW)
         ids[status] = file_id
@@ -471,7 +477,8 @@ def _seed_status_matrix(conn: sqlite3.Connection, tag_axis: axis.Axis) -> dict[s
             _stage_field(conn, file_id, tag_axis.fields[0])
         elif status != "pending":
             _record(conn, file_id, status, tag_axis)
-    ids["no_identity"] = _insert(conn, filename="none.mp3", artist=None)
+    if "no_identity" in tag_axis.workflow_statuses:
+        ids["no_identity"] = _insert(conn, filename="none.mp3", artist=None)
     return ids
 
 

@@ -118,7 +118,7 @@ Edits apply on the next tool call; every command and MCP tool re-reads `settings
 
 ## Tools
 
-The MCP server exposes 35 tools. All tag edits are staged in memory and only written to disk on `commit_tags`, and everything is revertible.
+The MCP server exposes 38 tools. All tag edits are staged in memory and only written to disk on `commit_tags`, and everything is revertible.
 
 ### Core & Library
 
@@ -182,6 +182,14 @@ The MCP server exposes 35 tools. All tag edits are staged in memory and only wri
 | `set_year_status` | Exclude files from the year fill (`manual`). The exclusion is sticky until `reset_year_status` |
 | `reset_year_status` | Clear any year status row for in-scope files, returning them to `pending` |
 
+### Songs (AcoustID + MusicBrainz)
+
+| Tool | Description |
+|------|-------------|
+| `resolve_songs` | Blank-fill `title`, `tracknumber` and `discnumber` from the release each file's audio is on (no disk write) |
+| `set_song_status` | Exclude files from the song fill (`manual`). The exclusion is sticky until `reset_song_status` |
+| `reset_song_status` | Clear any song status row for in-scope files, returning them to `pending` |
+
 ### Mismatch fixing
 
 Use `detect_mismatches` (above) to find files whose identity tags disagree with their folder path, then drive the fix through the staging engine (`stage_tags_batch` → `commit_tags` → `reopen_axes`) and disposition the false positives.
@@ -190,7 +198,7 @@ Use `detect_mismatches` (above) to find files whose identity tags disagree with 
 |------|-------------|
 | `set_mismatch_status` | Silence a mismatch false positive (`legit_ignore`) or defer a misfiled file (`misfiled_deferred`), or clear with `pending` |
 | `reset_mismatch_status` | Clear any mismatch disposition for in-scope files, returning them to `pending` |
-| `reopen_axes` | After committing a manual identity fix, re-open the file's genre, artist and year outcomes. `manual` rows are kept |
+| `reopen_axes` | After committing a manual identity fix, re-open the file's genre, artist, year and song outcomes. `manual` rows are kept |
 
 ## Development
 

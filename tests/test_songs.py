@@ -1,0 +1,781 @@
+"""Integration tests for the song resolver (:mod:`tagmend.engine.songs`).
+
+Every test runs the real engine on generated tracks with a real temp ledger. fpcalc never runs:
+a fake runner returns one fingerprint per filename. AcoustID never answers from the network: a
+real :class:`AcoustidClient` talks to an :class:`httpx.MockTransport` serving canned compressed
+responses per fingerprint, built by :func:`_recording` and :func:`_body`. MusicBrainz is a fake
+:class:`tagmend.engine.musicbrainz.MBReleaseSource` holding :class:`MBRelease` fixtures.
+"""
+
+from __future__ import annotations
+
+import gzip
+import json
+import urllib.parse
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+import httpx
+import pytest
+
+from conftest import make_track
+from tagmend.engine import axis, library, songs, staging, store, versioning
+from tagmend.engine.acoustid import AcoustidClient, Fingerprinter
+from tagmend.engine.db import connect
+from tagmend.engine.musicbrainz import MBMedium, MBRelease, MBTrack
+from tagmend.engine.schema import apply_schema
+from tagmend.engine.tags import read_tags
+from test_health import _run_ok
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping, Sequence
+
+    from tagmend.config import Settings
+
+_DURATION = 200
+_TITLES = ("Song One", "Song Two", "Song Three", "Song Four")
+_LP = "rel-lp"
+
+
+# --- fakes ---------------------------------------------------------------------------
+
+
+class FakeFpcalc:
+    """A fake fpcalc runner: one fingerprint per filename, or a failing exit."""
+
+    def __init__(self, failures: Mapping[str, int] | None = None) -> None:
+        self._failures = dict(failures or {})
+        self.calls: list[str] = []
+
+    def __call__(self, argv: Sequence[str], _timeout: float) -> tuple[int, str, str]:
+        name = Path(argv[-1]).name
+        self.calls.append(name)
+        if name in self._failures:
+            return self._failures[name], "", "ERROR: could not decode the file"
+        fingerprint = {"fingerprint": f"fp-{name}", "duration": _DURATION + 0.4}
+        return 0, json.dumps(fingerprint), ""
+
+
+class FakeAcoustid:
+    """A fake AcoustID server: a canned body per fingerprint, or a failing HTTP status."""
+
+    def __init__(self, bodies: Mapping[str, dict[str, object]]) -> None:
+        self.bodies = dict(bodies)
+        self.statuses: dict[str, int] = {}
+        self.requests: list[str] = []
+
+    def handle(self, request: httpx.Request) -> httpx.Response:
+        form = urllib.parse.parse_qs(gzip.decompress(request.content).decode("ascii"))
+        fingerprint = form["fingerprint"][0]
+        self.requests.append(fingerprint)
+        if fingerprint in self.statuses:
+            return httpx.Response(self.statuses[fingerprint])
+        return httpx.Response(200, json=self.bodies.get(fingerprint, _body()))
+
+
+class FakeReleases:
+    """An in-memory :class:`tagmend.engine.musicbrainz.MBReleaseSource` that records lookups."""
+
+    def __init__(self, *releases: MBRelease) -> None:
+        self._releases = {release.mbid: release for release in releases}
+        self.lookups: list[str] = []
+
+    def release_by_mbid(self, mbid: str) -> MBRelease | None:
+        self.lookups.append(mbid)
+        return self._releases.get(mbid)
+
+
+@dataclass
+class Kit:
+    """The three injected fakes one test drives the resolver with."""
+
+    acoustid: FakeAcoustid
+    releases: FakeReleases
+    fpcalc: FakeFpcalc = field(default_factory=FakeFpcalc)
+
+
+def _resolve(settings: Settings, kit: Kit, **kwargs: object) -> songs.ResolveSongsResult:
+    transport = httpx.MockTransport(kit.acoustid.handle)
+    with AcoustidClient("test-key", transport=transport, sleep=lambda _s: None) as client:
+        return songs.resolve_songs(
+            settings,
+            fingerprinter=Fingerprinter("fpcalc", runner=kit.fpcalc, is_windows=False),
+            acoustid_client=client,
+            releases=kit.releases,
+            **kwargs,  # type: ignore[arg-type]
+        )
+
+
+# --- canned AcoustID responses -------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Slot:
+    """One place a recording sits: a release, its medium, the track position and the counts."""
+
+    release: str
+    position: int
+    track_count: int = 4
+    date: int = 2000
+
+
+def _track_id(release: str, position: int) -> str:
+    return f"{release}-t{position}"
+
+
+def _recording(
+    recording_id: str,
+    title: str,
+    *slots: Slot,
+    sources: int = 20,
+    duration: int = _DURATION,
+) -> dict[str, object]:
+    """Return one recording entry of a compressed AcoustID response."""
+    return {
+        "id": recording_id,
+        "title": title,
+        "duration": duration,
+        "sources": sources,
+        "releases": [
+            {
+                "id": slot.release,
+                "title": f"{slot.release} title",
+                "country": "US",
+                "date": {"year": slot.date},
+                "medium_count": 1,
+                "track_count": slot.track_count,
+                "mediums": [
+                    {
+                        "position": 1,
+                        "format": "CD",
+                        "track_count": slot.track_count,
+                        "tracks": [
+                            {
+                                "id": _track_id(slot.release, slot.position),
+                                "position": slot.position,
+                            }
+                        ],
+                    },
+                ],
+            }
+            for slot in slots
+        ],
+    }
+
+
+def _body(*recordings: dict[str, object], score: float = 0.98) -> dict[str, object]:
+    """Return a compressed AcoustID lookup body holding *recordings* in one match."""
+    if not recordings:
+        return {"status": "ok", "results": []}
+    return {
+        "status": "ok",
+        "results": [{"id": "aid", "score": score, "recordings": list(recordings)}],
+    }
+
+
+def _release(
+    mbid: str,
+    titles: Sequence[str] = _TITLES,
+    *,
+    status: str = "Official",
+    recordings: Sequence[str] | None = None,
+) -> MBRelease:
+    """Return a one-medium release whose track N plays recording ``rec-N``."""
+    recording_ids = recordings or [f"rec-{n}" for n in range(1, len(titles) + 1)]
+    tracks = tuple(
+        MBTrack(
+            position=n,
+            number=str(n),
+            title=title,
+            release_track_mbid=_track_id(mbid, n),
+            recording_mbid=recording_ids[n - 1],
+            artist_credit="The Band",
+            artist_sort="Band, The",
+            artist_mbids=("art-band",),
+        )
+        for n, title in enumerate(titles, 1)
+    )
+    return MBRelease(
+        mbid=mbid,
+        title="LP",
+        artist_credit="The Band",
+        artist_sort="Band, The",
+        artist_mbids=("art-band",),
+        date="2000",
+        country="US",
+        status=status,
+        barcode="0123",
+        media=(
+            MBMedium(position=1, title="", format="CD", track_count=len(tracks), tracks=tracks),
+        ),
+    )
+
+
+def _lp_bodies(names: Sequence[str], *extra: Slot) -> dict[str, dict[str, object]]:
+    """Return a body per file: file N is recording ``rec-N`` on the LP (and on *extra*)."""
+    return {
+        f"fp-{name}": _body(_recording(f"rec-{n}", _TITLES[n - 1], Slot(_LP, n), *extra))
+        for n, name in enumerate(names, 1)
+    }
+
+
+# --- library helpers -----------------------------------------------------------------
+
+_NAMES = tuple(f"0{n} {title}.flac" for n, title in enumerate(_TITLES, 1))
+
+
+def _make_folder(
+    folder: Path,
+    tags: Sequence[Mapping[str, Sequence[str]]],
+    names: Sequence[str] = _NAMES,
+) -> None:
+    for name, file_tags in zip(names, tags, strict=False):
+        make_track(folder / name, {"artist": ["The Band"], "album": ["LP"], **file_tags})
+
+
+def _ids(settings: Settings) -> dict[str, int]:
+    return {view.filename: view.file_id for view in library.list_files(settings)}
+
+
+def _status(settings: Settings, file_id: int) -> str:
+    conn = connect(settings.db_path)
+    try:
+        apply_schema(conn)
+        return store.derived_status(conn, axis.SONG_AXIS, file_id)
+    finally:
+        conn.close()
+
+
+def _scalar(settings: Settings, sql: str, *params: object) -> object:
+    conn = connect(settings.db_path)
+    try:
+        apply_schema(conn)
+        return conn.execute(sql, params).fetchone()[0]
+    finally:
+        conn.close()
+
+
+def _diffs(settings: Settings) -> dict[str, staging.TagDiffView]:
+    return {view.filename: view for view in staging.diff_tags(settings)}
+
+
+def _blank_tracknumbers() -> list[dict[str, list[str]]]:
+    """Two blank titles, blank track numbers, and one fully agreeing file."""
+    return [
+        {"title": ["Song One"]},
+        {},
+        {"title": ["Track 03"]},
+        {"title": ["Song Four"], "tracknumber": ["4/4"]},
+    ]
+
+
+def _converging_kit() -> Kit:
+    return Kit(acoustid=FakeAcoustid(_lp_bodies(_NAMES)), releases=FakeReleases(_release(_LP)))
+
+
+# --- convergence route ---------------------------------------------------------------
+
+
+def test_convergence_route_fills_blanks_and_records_done(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    _make_folder(music_dir / "LP", _blank_tracknumbers())
+    library.scan_library(engine_settings)
+    ids = _ids(engine_settings)
+
+    result = _resolve(engine_settings, _converging_kit())
+
+    assert result.staged_files == 3
+    assert result.verified_files == 1
+    assert result.settled == 4
+    diffs = _diffs(engine_settings)
+    assert {view.origin for view in diffs.values()} == {"auto"}
+    # A non-blank field that agrees is never restaged.
+    assert diffs[_NAMES[0]].diff == {"tracknumber": {"from": [], "to": ["1/4"]}}
+    assert diffs[_NAMES[1]].diff == {
+        "title": {"from": [], "to": ["Song Two"]},
+        "tracknumber": {"from": [], "to": ["2/4"]},
+    }
+    # A placeholder title counts as blank.
+    assert diffs[_NAMES[2]].diff["title"] == {"from": ["Track 03"], "to": ["Song Three"]}
+    assert _NAMES[3] not in diffs
+    assert _status(engine_settings, ids[_NAMES[3]]) == "done"
+
+    staging.commit_tags(engine_settings)
+
+    assert [_status(engine_settings, ids[name]) for name in _NAMES] == ["done"] * 4
+    assert read_tags(music_dir / "LP" / _NAMES[1]).tags["title"] == ["Song Two"]
+
+
+def test_convergence_floor_holds_a_folder_too_few_voters_share(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    names = [f"0{n} Song {n}.flac" for n in range(1, 6)]
+    _make_folder(music_dir / "Loose", [{}] * 5, names)
+    library.scan_library(engine_settings)
+    # Two voters share one release, the other three each sit on a release of their own.
+    shared = {
+        f"fp-{names[n - 1]}": _body(_recording(f"rec-{n}", f"Song {n}", Slot("rel-x", n, 5)))
+        for n in (1, 2)
+    }
+    single = {
+        f"fp-{names[n - 1]}": _body(_recording(f"rec-{n}", f"Song {n}", Slot(f"rel-{n}", 1, 1)))
+        for n in (3, 4, 5)
+    }
+    # Every voter passes the gate and the shared release is Official, so only the family floor
+    # stops the two sharing voters from filling.
+    shared_release = _release("rel-x", [f"Song {n}" for n in range(1, 6)])
+    kit = Kit(acoustid=FakeAcoustid(shared | single), releases=FakeReleases(shared_release))
+
+    result = _resolve(engine_settings, kit)
+
+    assert result.held_unconverged == 5
+    assert result.staged_files == 0
+    assert result.settled == 0
+    assert staging.diff_tags(engine_settings) == []
+
+
+# --- anchored route ------------------------------------------------------------------
+
+
+def test_anchored_route_verifies_and_holds_a_disagreement(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    numbers = ["1/4", "2/4", "3/4", "9/4"]
+    _make_folder(
+        music_dir / "LP",
+        [
+            {
+                "title": [_TITLES[n]],
+                "tracknumber": [numbers[n]],
+                "discnumber": ["1/1"],
+                "musicbrainz_albumid": [_LP],
+                "musicbrainz_releasetrackid": [_track_id(_LP, n + 1)],
+            }
+            for n in range(4)
+        ],
+    )
+    library.scan_library(engine_settings)
+    ids = _ids(engine_settings)
+
+    result = _resolve(engine_settings, _converging_kit())
+
+    assert result.verified_files == 3
+    assert result.staged_files == 0
+    assert result.held_disagreement == 1
+    held = result.held_values[0]
+    assert held["file_id"] == ids[_NAMES[3]]
+    assert held["have"] == {"tracknumber": "9/4"}
+    assert held["want"] == {"tracknumber": "4/4"}
+    assert held["release_id"] == _LP
+    assert [_status(engine_settings, ids[name]) for name in _NAMES] == [
+        "done",
+        "done",
+        "done",
+        "pending",
+    ]
+
+
+# --- stamp check and the manual release path -----------------------------------------
+
+_WRONG_STAMP = {
+    "albumartist": ["Linkin Park"],
+    "artistsort": ["Linkin Park & Adema"],
+    "artists": ["Linkin Park"],
+    "date": ["2008"],
+    "discnumber": ["1/2"],
+    "originaldate": ["2008"],
+    "musicbrainz_albumid": ["rel-wrong"],
+    "musicbrainz_releasegroupid": ["rg-wrong"],
+}
+
+
+def _wrong_stamp_kit() -> Kit:
+    bodies = {
+        f"fp-{name}": _body(
+            _recording(f"rec-{n}", _TITLES[n - 1], Slot(_LP, n), Slot("rel-boot", n, date=1999)),
+        )
+        for n, name in enumerate(_NAMES, 1)
+    }
+    releases = FakeReleases(
+        _release(_LP),
+        _release("rel-boot", status="Bootleg"),
+        _release(
+            "rel-wrong",
+            ["Numb", "Crawling", "Faint", "Papercut"],
+            recordings=["x1", "x2", "x3", "x4"],
+        ),
+        _release("rel-three", _TITLES[:3]),
+    )
+    return Kit(acoustid=FakeAcoustid(bodies), releases=releases)
+
+
+def _wrong_stamp_folder(music_dir: Path) -> Path:
+    folder = music_dir / "Greatest Hits"
+    _make_folder(
+        folder,
+        [
+            {"title": [title], "tracknumber": [f"{n}/16"], **_WRONG_STAMP}
+            for n, title in enumerate(_TITLES, 1)
+        ],
+    )
+    return folder
+
+
+def test_stamp_check_reports_a_rebind_with_ranked_candidates(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    folder = _wrong_stamp_folder(music_dir)
+    library.scan_library(engine_settings)
+    ids = _ids(engine_settings)
+
+    result = _resolve(engine_settings, _wrong_stamp_kit())
+
+    assert result.staged_files == 0
+    assert result.settled == 0
+    [rebind] = result.rebind_folders
+    assert rebind["folder"] == str(folder)
+    assert rebind["flagged_file_ids"] == [ids[name] for name in _NAMES]
+    assert rebind["tagged_releases"] == [
+        {"release_id": "rel-wrong", "title": "LP", "status": "official"},
+    ]
+    candidates = rebind["candidates"]
+    assert isinstance(candidates, list)
+    # The bootleg is earlier, so it is fetched first, but the Official release ranks first.
+    assert [(c["release_id"], c["status"]) for c in candidates] == [
+        (_LP, "official"),
+        ("rel-boot", "bootleg"),
+    ]
+    assert staging.diff_tags(engine_settings) == []
+
+
+def test_manual_release_path_stages_the_whole_stamp_in_one_batch(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    folder = _wrong_stamp_folder(music_dir)
+    library.scan_library(engine_settings)
+    ids = _ids(engine_settings)
+
+    result = _resolve(engine_settings, _wrong_stamp_kit(), folder=str(folder), release_id=_LP)
+
+    assert result.staged_files == 4
+    assert result.unassigned == []
+    assert result.release is not None
+    assert result.release["release_id"] == _LP
+    diffs = _diffs(engine_settings)
+    assert {view.origin for view in diffs.values()} == {"manual"}
+    target = diffs[_NAMES[1]].target
+    assert target["title"] == ["Song Two"]
+    assert target["tracknumber"] == ["2/4"]
+    assert target["discnumber"] == ["1/1"]
+    assert target["artist"] == ["The Band"]
+    assert target["artistsort"] == ["Band, The"]
+    assert target["albumartist"] == ["The Band"]
+    assert target["albumartistsort"] == ["Band, The"]
+    assert target["musicbrainz_artistid"] == ["art-band"]
+    assert target["musicbrainz_albumid"] == [_LP]
+    assert target["musicbrainz_releasetrackid"] == [_track_id(_LP, 2)]
+    assert target["musicbrainz_trackid"] == ["rec-2"]
+    assert target["date"] == ["2000"]
+    assert target["musicbrainz_albumstatus"] == ["official"]
+    for cleared in ("artists", "originaldate", "musicbrainz_releasegroupid"):
+        assert not target.get(cleared)
+    assert diffs[_NAMES[1]].stale_identity == []
+
+    commit = staging.commit_tags(engine_settings)
+
+    assert commit.committed == 4
+    on_disk = read_tags(folder / _NAMES[1]).tags
+    assert on_disk["albumartist"] == ["The Band"]
+    assert "originaldate" not in on_disk
+    # The commit writer records the human decision on the song fields it changed.
+    assert _status(engine_settings, ids[_NAMES[1]]) == "manual"
+
+
+def test_manual_release_path_stages_nothing_when_a_file_is_not_on_the_release(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    folder = _wrong_stamp_folder(music_dir)
+    library.scan_library(engine_settings)
+    ids = _ids(engine_settings)
+    kit = _wrong_stamp_kit()
+    # The first three recordings also sit on a three-track release, the fourth does not.
+    kit.acoustid.bodies = {
+        f"fp-{name}": _body(
+            _recording(
+                f"rec-{n}",
+                _TITLES[n - 1],
+                Slot(_LP, n),
+                *([Slot("rel-three", n, 3)] if name != _NAMES[3] else []),
+            ),
+        )
+        for n, name in enumerate(_NAMES, 1)
+    }
+
+    result = _resolve(engine_settings, kit, folder=str(folder), release_id="rel-three")
+
+    assert result.staged_files == 0
+    assert result.unassigned == [
+        {"file_id": ids[_NAMES[3]], "filename": _NAMES[3], "reason": "not_on_release"},
+    ]
+    assert staging.diff_tags(engine_settings) == []
+
+
+def test_manual_release_path_assigns_a_gate_failure_corroborated_by_its_stem(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    _make_folder(music_dir / "Pair", [{}, {}], _NAMES[:2])
+    library.scan_library(engine_settings)
+    ids = _ids(engine_settings)
+    # The second file's audio is split 60/40, so the auto gate fails it on share.
+    bodies = _lp_bodies(_NAMES[:1])
+    bodies[f"fp-{_NAMES[1]}"] = _body(
+        _recording("rec-other", "Other Song", sources=60),
+        _recording("rec-2", "Song Two", Slot(_LP, 2), sources=40),
+    )
+    kit = Kit(acoustid=FakeAcoustid(bodies), releases=FakeReleases(_release(_LP)))
+
+    auto = _resolve(engine_settings, kit, dry_run=True)
+    manual = _resolve(engine_settings, kit, file_ids=list(ids.values()), release_id=_LP)
+
+    # Only the first file passes the gate, so the auto tier holds it and stages nothing.
+    assert auto.held_unconverged == 1
+    assert auto.staged_files == 0
+    assert manual.unassigned == []
+    assert manual.staged_files == 2
+    assert _diffs(engine_settings)[_NAMES[1]].target["title"] == ["Song Two"]
+
+
+def test_release_id_without_a_scope_is_rejected(engine_settings: Settings) -> None:
+    with pytest.raises(ValueError, match="release_id needs folder or file_ids"):
+        songs.resolve_songs(engine_settings, release_id=_LP)
+
+
+# --- transient errors and the caches -------------------------------------------------
+
+
+def test_acoustid_503_leaves_the_file_pending_and_caches_nothing(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    _make_folder(music_dir / "LP", [{}] * 4)
+    library.scan_library(engine_settings)
+    ids = _ids(engine_settings)
+    kit = _converging_kit()
+    kit.acoustid.statuses[f"fp-{_NAMES[3]}"] = 503
+
+    result = _resolve(engine_settings, kit)
+
+    assert result.staged_files == 3
+    assert result.errors == 1
+    assert result.error_items[0]["key"] == str(ids[_NAMES[3]])
+    assert "503" in result.error_items[0]["message"]
+    assert _status(engine_settings, ids[_NAMES[3]]) == "pending"
+    assert _scalar(engine_settings, "SELECT COUNT(*) FROM acoustid_cache") == 3
+
+
+def test_empty_answer_is_cached_stores_no_status_and_is_asked_again_after_a_week(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    _make_folder(music_dir / "LP", [{}], _NAMES[:1])
+    library.scan_library(engine_settings)
+    file_id = _ids(engine_settings)[_NAMES[0]]
+    kit = Kit(acoustid=FakeAcoustid({}), releases=FakeReleases())
+
+    first = _resolve(engine_settings, kit)
+    warm = _resolve(engine_settings, kit)
+
+    assert first.lookup_empty == 1
+    assert warm.lookup_empty == 1
+    assert _scalar(engine_settings, "SELECT found FROM acoustid_cache") == 0
+    assert _scalar(engine_settings, "SELECT COUNT(*) FROM file_song_status") == 0
+    assert _status(engine_settings, file_id) == "pending"
+    assert len(kit.acoustid.requests) == 1
+    assert kit.fpcalc.calls == [_NAMES[0]]
+
+    week_ago = (datetime.now(UTC) - timedelta(days=8)).isoformat()
+    conn = connect(engine_settings.db_path)
+    try:
+        conn.execute("UPDATE acoustid_cache SET fetched_at = ?", (week_ago,))
+        conn.commit()
+    finally:
+        conn.close()
+    _resolve(engine_settings, kit)
+
+    assert len(kit.acoustid.requests) == 2
+    assert kit.fpcalc.calls == [_NAMES[0]]
+
+
+def test_stored_fpcalc_failure_makes_its_folder_warm(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    _make_folder(music_dir / "LP", [{}], _NAMES[:1])
+    library.scan_library(engine_settings)
+    kit = Kit(
+        acoustid=FakeAcoustid({}),
+        releases=FakeReleases(),
+        fpcalc=FakeFpcalc(failures={_NAMES[0]: 2}),
+    )
+
+    cold = _resolve(engine_settings, kit)
+    warm = _resolve(engine_settings, kit, limit=0)
+
+    assert "exited 2" in cold.error_items[0]["message"]
+    assert "exited 2" in warm.error_items[0]["message"]
+    assert warm.cold_folders_remaining == 0
+    assert kit.fpcalc.calls == [_NAMES[0]]
+    assert kit.acoustid.requests == []
+
+
+def test_limit_counts_cold_folders_and_warm_folders_run_free(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    names = ["a.flac", "b.flac", "c.flac"]
+    for folder, name in zip(("A", "B", "C"), names, strict=True):
+        make_track(music_dir / folder / name, {"artist": ["The Band"]})
+    library.scan_library(engine_settings)
+    bodies = {
+        f"fp-{name}": _body(_recording(f"rec-{n}", f"Song {n}", Slot(f"rel-{n}", 1, 1)))
+        for n, name in enumerate(names, 1)
+    }
+    kit = Kit(acoustid=FakeAcoustid(bodies), releases=FakeReleases())
+
+    runs = [_resolve(engine_settings, kit, limit=1, dry_run=True) for _ in range(3)]
+
+    assert kit.fpcalc.calls == names
+    assert [run.cold_folders_remaining for run in runs] == [2, 1, 0]
+    assert [run.more for run in runs] == [True, True, False]
+
+    fpcalc_before, requests_before = len(kit.fpcalc.calls), len(kit.acoustid.requests)
+    warm = _resolve(engine_settings, kit, limit=0, dry_run=True)
+
+    assert warm.held_unconverged == 3  # every folder ran, each holding a release lookup failure
+    assert len(kit.fpcalc.calls) == fpcalc_before
+    assert len(kit.acoustid.requests) == requests_before
+
+
+# --- voters --------------------------------------------------------------------------
+
+
+def test_a_settled_sibling_still_votes_when_a_lookup_recovers(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    _make_folder(music_dir / "LP", [{}] * 4)
+    library.scan_library(engine_settings)
+    ids = _ids(engine_settings)
+    # The fourth recording also sits on an earlier ten-track compilation. Alone it names two
+    # slots, so only the settled siblings' votes narrow it to the LP.
+    bodies = _lp_bodies(_NAMES)
+    bodies[f"fp-{_NAMES[3]}"] = _body(
+        _recording("rec-4", "Song Four", Slot(_LP, 4), Slot("rel-comp", 7, 10, date=1990)),
+    )
+    kit = Kit(
+        acoustid=FakeAcoustid(bodies),
+        releases=FakeReleases(_release(_LP), _release("rel-comp", ["x"] * 10)),
+    )
+    kit.acoustid.statuses[f"fp-{_NAMES[3]}"] = 503
+
+    first = _resolve(engine_settings, kit)
+    staging.commit_tags(engine_settings)
+    del kit.acoustid.statuses[f"fp-{_NAMES[3]}"]
+    second = _resolve(engine_settings, kit)
+
+    assert first.staged_files == 3
+    assert second.held_unconverged == 0
+    assert second.staged_files == 1
+    assert _diffs(engine_settings)[_NAMES[3]].diff["tracknumber"] == {"from": [], "to": ["4/4"]}
+    assert _status(engine_settings, ids[_NAMES[0]]) == "done"
+
+
+# --- the status model ----------------------------------------------------------------
+
+
+def test_revert_of_a_committed_fill_reads_pending(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    _make_folder(music_dir / "LP", _blank_tracknumbers())
+    library.scan_library(engine_settings)
+    file_id = _ids(engine_settings)[_NAMES[1]]
+    _resolve(engine_settings, _converging_kit())
+    commit = staging.commit_tags(engine_settings)
+    assert commit.commit_id is not None
+    assert _status(engine_settings, file_id) == "done"
+
+    versioning.revert_commit(engine_settings, commit.commit_id)
+
+    assert _status(engine_settings, file_id) == "pending"
+
+
+def test_a_release_id_change_reopens_a_done_row_only_once_committed(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    _make_folder(music_dir / "LP", _blank_tracknumbers())
+    library.scan_library(engine_settings)
+    file_id = _ids(engine_settings)[_NAMES[1]]
+    _resolve(engine_settings, _converging_kit())
+    staging.commit_tags(engine_settings)
+
+    staging.stage_tags_batch(engine_settings, entries=[(file_id, {"musicbrainz_albumid": [_LP]})])
+
+    # Staging leaves the snapshot the classifier reads unchanged.
+    assert _status(engine_settings, file_id) == "done"
+    staging.commit_tags(engine_settings)
+    assert _status(engine_settings, file_id) == "pending"
+
+
+def test_a_manual_file_is_skipped_but_still_votes(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    _make_folder(music_dir / "LP", [{}] * 4)
+    library.scan_library(engine_settings)
+    ids = _ids(engine_settings)
+    songs.set_song_status(engine_settings, file_ids=[ids[_NAMES[0]]], status="manual")
+    # The fourth file finds nothing, so without the manual file's vote 2 of 3 voters fall
+    # below the floor.
+    kit = _converging_kit()
+    del kit.acoustid.bodies[f"fp-{_NAMES[3]}"]
+
+    result = _resolve(engine_settings, kit)
+
+    assert result.skipped_manual == 1
+    assert result.lookup_empty == 1
+    assert result.staged_files == 2
+    assert _NAMES[0] not in _diffs(engine_settings)
+    assert _status(engine_settings, ids[_NAMES[0]]) == "manual"
+
+
+def test_stats_list_files_and_health_carry_the_song_axis(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    _make_folder(music_dir / "LP", _blank_tracknumbers())
+    library.scan_library(engine_settings)
+    pending = library.list_files(engine_settings, song_status="pending")
+    _resolve(engine_settings, _converging_kit())
+
+    stats = library.get_library_stats(engine_settings)
+
+    assert [view.filename for view in pending] == list(_NAMES)
+    gauge = stats["song"]
+    assert gauge == {"pending": 0, "manual": 0, "staged": 3, "done": 1}
+    assert sum(gauge.values()) == stats["present"]
+    [done] = library.list_files(engine_settings, song_status="done")
+    assert done.song_status == "done"
+    names = {check.name for check in _run_ok(engine_settings).checks}
+    assert {"fpcalc", "acoustid"} <= names

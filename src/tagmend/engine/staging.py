@@ -396,7 +396,8 @@ def _stage_one(  # noqa: PLR0913 - cohesive keyword-only per-file staging payloa
     :func:`tagmend.engine.versioning.observe_widened_fields` writes), merges
     *tags* onto the file's current managed subset (P0: omitted keys are preserved),
     and upserts the staged row with the file's signature as its base, so the commit can refuse
-    a file edited since. A *fill_only* key is dropped when the file on disk already holds a
+    a file edited since, and with the caller's surviving keys as its ``supplied_keys``. A
+    *fill_only* key is dropped when the file on disk already holds a
     value for it, and when that leaves no caller-supplied key, nothing is staged and ``False``
     is returned. Raises :class:`ValueError` naming *file_id* on any invalid input. Leaves the
     transaction for the caller to commit or roll back.
@@ -468,6 +469,7 @@ def _stage_one(  # noqa: PLR0913 - cohesive keyword-only per-file staging payloa
         base_size_bytes=base.st_size,
         base_mtime_ns=base.st_mtime_ns,
         changed_fields=changed_fields,
+        supplied_keys=remaining.keys(),
     )
     return True
 
@@ -674,13 +676,16 @@ def _current_managed(
 def _stale_identity(
     diff: dict[str, dict[str, list[str]]],
     target: dict[str, list[str]],
+    supplied: frozenset[str] | None,
 ) -> list[dict[str, object]]:
     """Report coupled identity fields this change rewrites one half of.
 
     A group's name and its MusicBrainz ids describe the same thing, so changing the name while
     keeping the old id leaves the file naming one entity and pointing at another. Only a
-    trigger field counts as the change, so a sort-only edit flags nothing.
+    trigger field counts as the change, so a sort-only edit flags nothing. A member in
+    *supplied* is skipped: a value the caller wrote, even an unchanged one, is a confirmation.
     """
+    confirmed = supplied or frozenset()
     stale: list[dict[str, object]] = []
     for triggers, members in _IDENTITY_GROUPS:
         changed = [field_name for field_name in triggers if field_name in diff]
@@ -688,7 +693,7 @@ def _stale_identity(
             continue
         for field_name in members:
             retained = target.get(field_name)
-            if field_name not in diff and retained:
+            if field_name not in diff and field_name not in confirmed and retained:
                 stale.append(
                     {
                         "changed": changed[0],
@@ -741,7 +746,7 @@ def diff_tags(settings: Settings, *, path: Path | None = None) -> list[TagDiffVi
                     current=current,
                     target=target,
                     diff=diff,
-                    stale_identity=_stale_identity(diff, target),
+                    stale_identity=_stale_identity(diff, target, staged.supplied_keys),
                 ),
             )
         return views
@@ -879,8 +884,9 @@ def reopen_axes(settings: Settings, *, commit_id: int) -> ReopenResult:
 
     The post-fix step of the ``stage_tags_batch -> diff_tags -> commit_tags -> reopen_axes``
     spine. For every DISTINCT file with a ``tag_revisions`` row in *commit_id* it deletes, in
-    ONE transaction, the ``done`` and ``no_match`` rows on the genre, artist and year axes, so
-    each resolver re-derives them against the fixed tags. ``manual`` rows are kept, because
+    ONE transaction, the ``done`` and ``no_match`` rows on every tag axis
+    (:data:`tagmend.engine.axis.TAG_AXES`), so each resolver re-derives them against the fixed
+    tags. ``manual`` rows are kept, because
     ``reset_<axis>_status`` is their only hand-back. Call ``reset_artist_status`` next when a
     fixed name should be re-checked by the normaliser.
 

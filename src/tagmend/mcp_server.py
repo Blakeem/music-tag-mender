@@ -29,12 +29,14 @@ from tagmend.engine import (
     library,
     mismatch,
     release_disagreements,
+    songs,
     staging,
     track_conflicts,
     versioning,
     year_disagreements,
     years,
 )
+from tagmend.engine.acoustid import AcoustidError, FpcalcUnavailableError
 from tagmend.engine.lastfm import LastfmError
 from tagmend.engine.library import ScanMode
 from tagmend.engine.musicbrainz import MusicBrainzError
@@ -56,6 +58,8 @@ _ENVELOPED_ERRORS: Final = (
     sqlite3.OperationalError,
     LastfmError,
     MusicBrainzError,
+    AcoustidError,
+    FpcalcUnavailableError,
 )
 
 
@@ -139,18 +143,19 @@ def get_library_stats() -> dict[str, object]:
 
     Returns totals for tracked files, how many are present vs missing on disk, how many
     are still ``unprocessed`` (no tags read yet), a per-extension breakdown, the total
-    number of stored tag values, and four per-axis workflow-state blocks — each a
-    progress gauge for one resolver, drilled into with the matching ``list_files`` filter:
+    number of stored tag values, and five per-axis workflow-state blocks. Each block is a
+    progress gauge for one resolver, drilled into with the matching ``list_files`` filter.
 
-    * ``genre`` — ``pending`` / ``no_identity`` / ``staged`` / ``done`` / ``no_match`` /
-      ``manual`` for ``resolve_genres``; drill with ``list_files(genre_status=...)``.
-    * ``artist`` — ``pending`` / ``no_identity`` / ``staged`` / ``done`` / ``manual`` (no
-      ``no_match`` on this axis) for ``resolve_artists``; drill with
-      ``list_files(artist_status=...)``.
-    * ``year`` — ``pending`` / ``no_identity`` / ``staged`` / ``done`` / ``no_match`` /
-      ``manual`` for ``resolve_years``; drill with ``list_files(year_status=...)``.
-    * ``mismatch`` — ``pending`` / ``legit_ignore`` / ``misfiled_deferred`` for
-      ``detect_mismatches`` dispositions; drill with ``list_files(mismatch_status=...)``.
+    * ``genre``: ``pending`` / ``no_identity`` / ``staged`` / ``done`` / ``no_match`` /
+      ``manual`` for ``resolve_genres``. Drill with ``list_files(genre_status=...)``.
+    * ``artist``: ``pending`` / ``no_identity`` / ``staged`` / ``done`` / ``no_match`` /
+      ``manual`` for ``resolve_artists``. Drill with ``list_files(artist_status=...)``.
+    * ``year``: ``pending`` / ``no_identity`` / ``staged`` / ``done`` / ``no_match`` /
+      ``manual`` for ``resolve_years``. Drill with ``list_files(year_status=...)``.
+    * ``song``: ``pending`` / ``staged`` / ``done`` / ``manual`` for ``resolve_songs``. Drill
+      with ``list_files(song_status=...)``.
+    * ``mismatch``: ``pending`` / ``legit_ignore`` / ``misfiled_deferred`` for
+      ``detect_mismatches`` dispositions. Drill with ``list_files(mismatch_status=...)``.
     """
     return {"ok": True, **library.get_library_stats(load_settings())}
 
@@ -334,14 +339,14 @@ def commit_tags(message: str | None = None, path: str | None = None) -> dict[str
 @mcp.tool()
 @_error_envelope
 def reopen_axes(commit_id: int) -> dict[str, object]:
-    """Re-open the genre, artist and year axes after a manual identity fix (call it AFTER one).
+    """Re-open every tag axis after a manual identity fix (call it AFTER one).
 
     The spine is ``stage_tags_batch`` -> ``diff_tags`` -> ``commit_tags`` -> ``reopen_axes``.
     For every file the given commit changed, this deletes the ``done`` and ``no_match`` status
-    rows on all three axes, so ``resolve_genres``, ``resolve_artists`` and ``resolve_years``
-    re-derive them against the fixed tags. A ``manual`` row is kept: ``reset_<axis>_status`` is
-    its only hand-back. Call ``reset_artist_status`` next when a fixed name should be
-    re-checked by the normaliser. History is never touched.
+    rows on the genre, artist, year and song axes, so ``resolve_genres``, ``resolve_artists``,
+    ``resolve_years`` and ``resolve_songs`` re-derive them against the fixed tags. A ``manual``
+    row is kept: ``reset_<axis>_status`` is its only hand-back. Call ``reset_artist_status``
+    next when a fixed name should be re-checked by the normaliser. History is never touched.
 
     Call it with a ``manual`` (or ``revert``) commit id from ``commit_tags`` / ``list_commits``.
     A commit holding any auto-resolved revision is refused, whatever its own origin, since
@@ -350,8 +355,9 @@ def reopen_axes(commit_id: int) -> dict[str, object]:
 
     Returns:
         ``{"ok": True, "commit_id": ..., "files": <count>, "genre": {outcomes_reopened,
-        manual_kept}, "artist": {...}, "year": {...}}``, or ``{"ok": False, "error": ...}`` if
-        the commit id is unknown, holds an auto-resolved revision, or changed no tags.
+        manual_kept}, "artist": {...}, "year": {...}, "song": {...}}``, or ``{"ok": False,
+        "error": ...}`` if the commit id is unknown, holds an auto-resolved revision, or changed
+        no tags.
     """
     result = staging.reopen_axes(load_settings(), commit_id=commit_id)
     return {"ok": True, **result.to_dict()}
@@ -368,6 +374,7 @@ def list_files(  # noqa: PLR0913 - cohesive MCP discovery filters
     | None = None,
     year_status: Literal["pending", "no_identity", "no_match", "manual", "staged", "done"]
     | None = None,
+    song_status: Literal["pending", "manual", "staged", "done"] | None = None,
     mismatch_status: Literal["pending", "legit_ignore", "misfiled_deferred"] | None = None,
 ) -> dict[str, object]:
     """List tracked files with their current managed tags (to discover file ids).
@@ -408,6 +415,10 @@ def list_files(  # noqa: PLR0913 - cohesive MCP discovery filters
             Combined with the other filters, a file must match ALL. ``year_source_artist`` /
             ``year_source_album`` carry the resolved identity a stored decision was taken
             against.
+        song_status: Return only files in this song workflow state (``pending`` | ``manual``
+            | ``staged`` | ``done``). Combined with the other filters, a file must match ALL.
+            ``song_source_album_mbid`` / ``song_source_release_track_mbid`` carry the release
+            ids a stored decision was taken against.
         mismatch_status: Return only files with this mismatch disposition
             (``pending`` | ``legit_ignore`` | ``misfiled_deferred``). Combined with the other
             filters, a file must match ALL. ``mismatch_source_field`` / ``mismatch_source_value``
@@ -417,7 +428,8 @@ def list_files(  # noqa: PLR0913 - cohesive MCP discovery filters
         ``{"ok": True, "files": [{file_id, folder, filename, ext, is_missing,
         managed_tags, genre_status, genre_source_artist, genre_source_album,
         artist_status, artist_source_artist, artist_source_albumartist, year_status,
-        year_source_artist, year_source_album, mismatch_status, mismatch_source_field,
+        year_source_artist, year_source_album, song_status, song_source_album_mbid,
+        song_source_release_track_mbid, mismatch_status, mismatch_source_field,
         mismatch_source_value}, ...]}``,
         or ``{"ok": False, "error": ...}`` on a bad request.
     """
@@ -428,6 +440,7 @@ def list_files(  # noqa: PLR0913 - cohesive MCP discovery filters
         genre_status=genre_status,
         artist_status=artist_status,
         year_status=year_status,
+        song_status=song_status,
         mismatch_status=mismatch_status,
     )
     return {"ok": True, "files": [view.to_dict() for view in views]}
@@ -441,7 +454,8 @@ def get_file(file_id: int) -> dict[str, object]:
     Returns ``{"ok": True, "file": {file_id, folder, filename, ext, is_missing,
     managed_tags, genre_status, genre_source_artist, genre_source_album, artist_status,
     artist_source_artist, artist_source_albumartist, year_status, year_source_artist,
-    year_source_album, mismatch_status, mismatch_source_field, mismatch_source_value}}``,
+    year_source_album, song_status, song_source_album_mbid, song_source_release_track_mbid,
+    mismatch_status, mismatch_source_field, mismatch_source_value}}``,
     or ``{"ok": False, "error": ...}`` if the id is unknown.
     """
     view = library.get_file(load_settings(), file_id)
@@ -1600,6 +1614,140 @@ def reset_year_status(
         is unknown.
     """
     affected = years.reset_year_status(
+        load_settings(),
+        file_ids=file_ids,
+        value=value,
+    )
+    return {"ok": True, "affected": affected}
+
+
+@mcp.tool()
+@_error_envelope
+def resolve_songs(
+    folder: str | None = None,
+    file_ids: list[int] | None = None,
+    release_id: str | None = None,
+    limit: int | None = None,
+    dry_run: bool = False,  # noqa: FBT001, FBT002 - MCP tool surface, not a Python API
+) -> dict[str, object]:
+    """Settle ``title``, ``tracknumber`` and ``discnumber`` by each file's audio (no disk write).
+
+    Each file is fingerprinted with fpcalc and looked up on AcoustID, and both answers are
+    cached. Every file of a folder holding a ``pending`` file votes, and the folder settles in
+    one of three ways. A folder whose files all carry ``musicbrainz_albumid`` is checked
+    against those releases. A folder without ids converges on the one Official release most of
+    its files share, and its blank song fields are staged as an ``auto`` fill. A non-blank
+    value is never rewritten. A folder whose audio is not on the release it is tagged with
+    stages nothing and comes back in ``rebind_folders`` with ranked candidate releases.
+
+    A file that agrees with its release records ``done``. A fill records ``done`` once staged.
+    A disagreement, a slot two files claim, a file its release does not hold and a folder that
+    does not converge are held (``held_values``, with ``have``/``want`` on a disagreement) and
+    stay ``pending``. An empty AcoustID answer (``lookup_empty``) and a transient error
+    (``error_items``, naming the fpcalc exit code, the HTTP status or the timeout) store
+    nothing either. An empty answer is asked again after 7 days.
+
+    Workflow: run ``dry_run=True`` over the whole library first, repeating while ``more`` is
+    true, then ``limit=0`` for the free whole-library tally. Review it, then make the real
+    calls and apply each with ``diff_tags`` and ``commit_tags``. For each ``rebind_folders``
+    entry call ``resolve_songs(folder=F, release_id=R, dry_run=True)`` per candidate R, then
+    the real call, ``diff_tags``, ``commit_tags(path=F)``, ``reopen_axes(commit_id)``,
+    ``reset_year_status(file_ids=<the rebound files>)`` (the manual commit recorded year
+    ``manual`` when it cleared ``originaldate``), then ``resolve_years``.
+
+    With ``release_id`` the call takes the manual release path. Every file in scope must sit
+    on exactly one track of that release, or nothing is staged and the files come back in
+    ``unassigned`` with a reason. Otherwise the whole release stamp (names, sort names, ids,
+    date, numbers, release fields, ``artists`` cleared) is staged as one ``manual`` batch.
+
+    Args:
+        folder: Limit to the files directly in this folder. Compared as a path, and a
+            relative folder resolves under ``music_path``.
+        file_ids: Limit to these file ids (overrides ``folder``). An unknown id is refused.
+        release_id: Apply this MusicBrainz release to the scope (``folder`` or ``file_ids``
+            required).
+        limit: Max cold folders this call (default ``song_stage_limit``). A cold folder needs
+            fpcalc or an AcoustID request. Warm folders always run, so ``limit=0`` costs no
+            request and no fpcalc run.
+        dry_run: Write the caches and nothing else. Per-file ``mappings`` appear when
+            ``folder`` or ``file_ids`` scopes the call. A dry run skips the empty-staging
+            precondition.
+
+    Returns:
+        ``{"ok": True, settled, staged_files, errors, error_items, pending_remaining,
+        cold_folders_remaining, more, verified_files, held_disagreement, held_slot_collision,
+        held_release_mismatch, held_unconverged, review_files, lookup_empty, skipped_manual,
+        mappings, rebind_folders, held_values, review_values, summary}`` plus ``release`` and
+        ``unassigned`` on the manual release path, or ``{"ok": False, "error": ...}`` (pending
+        changes, no AcoustID key, fpcalc missing). ``more`` is ``cold_folders_remaining > 0``:
+        a held file stays ``pending`` by design, so only a cold folder is new work.
+    """
+    result = songs.resolve_songs(
+        load_settings(),
+        folder=folder,
+        file_ids=file_ids,
+        release_id=release_id,
+        limit=limit,
+        dry_run=dry_run,
+    )
+    return {"ok": True, **result.to_dict()}
+
+
+@mcp.tool()
+@_error_envelope
+def set_song_status(
+    status: Literal["manual"],
+    file_ids: list[int] | None = None,
+    value: str | None = None,
+) -> dict[str, object]:
+    """Record a deliberate human decision on the song axis (``manual``) for in-scope files.
+
+    ``resolve_songs`` gives a ``manual`` file no outcome, though the file still votes for its
+    folder. The row is sticky: an outside edit does not clear it, and ``reset_song_status`` is
+    its only hand-back. Committing a hand edit of ``title``, ``tracknumber`` or ``discnumber``
+    records ``manual`` too. With neither ``file_ids`` nor ``value`` the call changes nothing and
+    returns ``affected: 0``.
+
+    Args:
+        status: ``manual``, the one state a human sets on this axis.
+        file_ids: Limit to these file ids. An unknown id is refused.
+        value: Limit to files whose ``album`` tag equals this value (used when ``file_ids``
+            is omitted). The song axis has no lookup name field, so a whole album is the unit.
+
+    Returns:
+        ``{"ok": True, "affected": <count>}``, or ``{"ok": False, "error": ...}``.
+    """
+    affected = songs.set_song_status(
+        load_settings(),
+        file_ids=file_ids,
+        value=value,
+        status=status,
+    )
+    return {"ok": True, "affected": affected}
+
+
+@mcp.tool()
+@_error_envelope
+def reset_song_status(
+    file_ids: list[int] | None = None,
+    value: str | None = None,
+) -> dict[str, object]:
+    """Clear any song status row for in-scope files, returning them to ``pending``.
+
+    Removes ``done`` and ``manual`` alike, so ``resolve_songs`` reconsiders the files on its
+    next run. This is the only hand-back of a ``manual`` row. With neither ``file_ids`` nor
+    ``value`` the call changes nothing and returns ``affected: 0``.
+
+    Args:
+        file_ids: Limit to these file ids. An unknown id is refused.
+        value: Limit to files whose ``album`` tag equals this value (used when ``file_ids``
+            is omitted).
+
+    Returns:
+        ``{"ok": True, "affected": <count>}``, or ``{"ok": False, "error": ...}`` if a file id
+        is unknown.
+    """
+    affected = songs.reset_song_status(
         load_settings(),
         file_ids=file_ids,
         value=value,

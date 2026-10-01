@@ -296,6 +296,7 @@ def compute_stats(conn: sqlite3.Connection) -> dict[str, object]:
         "genre": status_counts(conn, axis.GENRE_AXIS),
         "artist": status_counts(conn, axis.ARTIST_AXIS),
         "year": status_counts(conn, axis.YEAR_AXIS),
+        "song": status_counts(conn, axis.SONG_AXIS),
         "mismatch": mismatch_status_counts(conn),
     }
 
@@ -488,7 +489,8 @@ def max_version(conn: sqlite3.Connection, file_id: int) -> int | None:
 # The ``commits`` table ops and the shared commit loop live in
 # :mod:`tagmend.engine.commits`; staged rows here no longer carry a ``commit_id``.
 _STAGED_TAG_COLUMNS = (
-    "file_id, managed_tags, origin, note, staged_at, base_size_bytes, base_mtime_ns, changed_fields"
+    "file_id, managed_tags, origin, note, staged_at, base_size_bytes, base_mtime_ns, "
+    "changed_fields, supplied_keys"
 )
 
 
@@ -499,7 +501,8 @@ class StagedTag:
     ``base_size_bytes``/``base_mtime_ns`` are the file's signature when it was staged, so a
     commit can refuse a file edited since. Both are ``None`` on a row staged before v17.
     ``changed_fields`` names the fields the target changes against the tags on disk at stage
-    time, ``None`` on a row staged before v21.
+    time, ``None`` on a row staged before v21. ``supplied_keys`` names the keys whose values
+    the caller supplied, ``None`` on a row staged before v23.
     """
 
     file_id: int
@@ -510,6 +513,12 @@ class StagedTag:
     base_size_bytes: int | None
     base_mtime_ns: int | None
     changed_fields: frozenset[str] | None
+    supplied_keys: frozenset[str] | None
+
+
+def _json_key_set(raw: object) -> frozenset[str] | None:
+    """Decode a nullable JSON list column into a key set."""
+    return None if raw is None else frozenset(cast("list[str]", json.loads(str(raw))))
 
 
 def _row_to_staged_tag(row: tuple[object, ...]) -> StagedTag:
@@ -522,9 +531,8 @@ def _row_to_staged_tag(row: tuple[object, ...]) -> StagedTag:
         staged_at=str(row[4]),
         base_size_bytes=None if row[5] is None else db.as_int(row[5]),
         base_mtime_ns=None if row[6] is None else db.as_int(row[6]),
-        changed_fields=(
-            None if row[7] is None else frozenset(cast("list[str]", json.loads(str(row[7]))))
-        ),
+        changed_fields=_json_key_set(row[7]),
+        supplied_keys=_json_key_set(row[8]),
     )
 
 
@@ -539,6 +547,7 @@ def upsert_staged_tag(  # noqa: PLR0913 - cohesive keyword-only staging payload
     base_size_bytes: int | None = None,
     base_mtime_ns: int | None = None,
     changed_fields: Collection[str] | None = None,
+    supplied_keys: Collection[str] | None = None,
 ) -> None:
     """Insert or replace the single pending change for *file_id*.
 
@@ -546,16 +555,17 @@ def upsert_staged_tag(  # noqa: PLR0913 - cohesive keyword-only staging payload
     pending change per file (the latest staged target wins). *base_size_bytes* and
     *base_mtime_ns* record the file's signature at stage time. A ``None`` pair skips the
     commit's changed-since-stage check. *changed_fields* names the fields the target changes
-    against the tags on disk at stage time.
+    against the tags on disk at stage time. *supplied_keys* names the keys the caller supplied.
     """
     changed_json = None if changed_fields is None else _dump_json(sorted(changed_fields))
+    supplied_json = None if supplied_keys is None else _dump_json(sorted(supplied_keys))
     conn.execute(
         """
         INSERT OR REPLACE INTO tag_revisions_staged (
             file_id, managed_tags, origin, note, staged_at, base_size_bytes, base_mtime_ns,
-            changed_fields
+            changed_fields, supplied_keys
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             file_id,
@@ -566,6 +576,7 @@ def upsert_staged_tag(  # noqa: PLR0913 - cohesive keyword-only staging payload
             base_size_bytes,
             base_mtime_ns,
             changed_json,
+            supplied_json,
         ),
     )
 
@@ -597,7 +608,7 @@ def list_staged_tags_under(conn: sqlite3.Connection, root_key: str) -> list[Stag
     cursor = conn.execute(
         """
         SELECT s.file_id, s.managed_tags, s.origin, s.note, s.staged_at,
-               s.base_size_bytes, s.base_mtime_ns, s.changed_fields
+               s.base_size_bytes, s.base_mtime_ns, s.changed_fields, s.supplied_keys
         FROM tag_revisions_staged s
         JOIN files f ON f.id = s.file_id
         WHERE f.path_key >= ? AND f.path_key < ?
@@ -1081,6 +1092,7 @@ def has_staged_change_for(
 GENRE_WORKFLOW_STATUSES: Final = axis.GENRE_AXIS.workflow_statuses
 ARTIST_WORKFLOW_STATUSES: Final = axis.ARTIST_AXIS.workflow_statuses
 YEAR_WORKFLOW_STATUSES: Final = axis.YEAR_AXIS.workflow_statuses
+SONG_WORKFLOW_STATUSES: Final = axis.SONG_AXIS.workflow_statuses
 
 
 def _outcome_holds(

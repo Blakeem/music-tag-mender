@@ -29,7 +29,7 @@ precondition; results cache in the existing `lastfm_cache`). M4 phase 2 shipped 
 `artist` and `albumartist`), `list_files(artist_status=...)` and a `get_library_stats['artist']`
 block. The year axis (`years.py`) shipped next (MusicBrainz `originaldate` blank-fill,
 `list_files(year_status=...)` and a `get_library_stats['year']` block). **One outcome-row status
-model** covers the three tag axes (genre, artist, year). A `file_<axis>_status` row records
+model** covers the four tag axes (genre, artist, year, song). A `file_<axis>_status` row records
 `done`, `no_match` or `manual` with a snapshot of the axis identity and of the field value it
 settled. `store.derived_status` reads a present file's status, first match wins: `staged` when a
 staged change alters the axis fields, a sticky `manual`, `no_identity`, the row's status while
@@ -38,13 +38,18 @@ unstage or an identity change therefore re-opens a `done` or `no_match` file wit
 `done`/`no_match`. The commit writer writes `manual` for a human change to an axis field, keyed on
 `tag_revisions_staged.changed_fields` (the fields the stage changed against disk), so a commit
 re-applied after a crash still records it. `axis_status.py` is the one implementation behind
-every `set_/reset_<axis>_status` pair. The **mismatch-fix** surface shipped last (decide run `fix-mismatches`, Run 2):
+every `set_/reset_<axis>_status` pair. The song axis (`songs.py`) identifies each file's recording
+by its AcoustID fingerprint. A folder whose files carry `musicbrainz_albumid` is checked against
+those releases, a folder without ids converges on the one Official release most of its files share
+and fills only blank `title`/`tracknumber`/`discnumber` as `auto`, and a folder whose audio is not
+on its tagged release is reported in `rebind_folders`. `resolve_songs(release_id=...)` stamps a
+whole folder onto one chosen release as a single `manual` batch. The **mismatch-fix** surface shipped last (decide run `fix-mismatches`, Run 2):
 `detect_mismatches` gained sticky per-file dispositions (`file_mismatch_status` —
 `legit_ignore`/`misfiled_deferred`, snapshot-and-go-stale), grouped output (`group=True`) +
 exact-folder expansion + a staleness-aware skip-filter; `set_mismatch_status`/
 `reset_mismatch_status`; `stage_tags_batch` (one atomic multi-file stage, always
 `origin="manual"`); and `reopen_axes(commit_id)`, which deletes the `done`/`no_match` rows of
-the files of a commit holding no `auto` revision, on all three tag axes, and keeps `manual`. `list_files(mismatch_status=...)` + a `get_library_stats['mismatch']` block
+the files of a commit holding no `auto` revision, on all four tag axes, and keeps `manual`. `list_files(mismatch_status=...)` + a `get_library_stats['mismatch']` block
 round it out. The `detect_album_gaps` tool (`album_gaps.py` + the pure, standalone
 `parsing.py`) groups blank-`album` files by folder and proposes sibling / folder-parse fills
 plus a review-only MusicBrainz `(artist, title)` recording tier (`mb_recording`, opt-out via
@@ -96,7 +101,7 @@ compares a file's year tags with the first-release year of its album's MusicBrai
 found by the album identity (album artist else artist, album). `high` means the `originaldate` year
 differs, `medium` means the `date` year is earlier than the first release. `release_limit` (default
 200) caps the uncached lookups one call makes, and cache writes are its only ledger writes.
-35 MCP tools total. Schema is **v22** (additive: v11 adds
+38 MCP tools total. Schema is **v23** (additive: v11 adds
 `musicbrainz_recording_cache`, v12 renames `file_album_status` → `file_year_status` in place —
 dispositions preserved; v13 adds `tag_revisions.managed_set`, stamping which managed-tag set
 governed each revision so a revert can restore emptiness on the widened fields; v14 adds
@@ -116,7 +121,9 @@ columns, drops the unused `files.status`, and makes `tag_revisions.managed_set` 
 `source_value` snapshot, replays manual revisions into `manual` rows, drops `voided_auto`, and adds
 `tag_revisions_staged.changed_fields`. v22 adds `fingerprint_cache` (one fpcalc result per file,
 keyed to its size and mtime) and `acoustid_cache` (AcoustID lookups keyed by a fingerprint hash,
-with a 7-day expiry on an empty answer). A newer
+with a 7-day expiry on an empty answer). v23 adds `file_song_status` and
+`tag_revisions_staged.supplied_keys`, the keys the caller passed that survive a `fill_only` drop,
+which the stale-identity warning in `diff_tags` treats as confirmed. A newer
 ledger is refused). M6 organize/paths (`paths.py`)
 is a paper sketch (its DDL ships in v6; logic deferred).
 
@@ -297,10 +304,10 @@ src/tagmend/
   log.py            shared logger (use everywhere)
   config.py         settings.json (platformdirs) + typed Settings
   cli.py            Typer CLI (thin)
-  mcp_server.py     FastMCP server (thin) — 35 tools
+  mcp_server.py     FastMCP server (thin) — 38 tools
   engine/
     db.py           SQLite connection (WAL)
-    schema.py       all DDL + PRAGMA user_version (v22)
+    schema.py       all DDL + PRAGMA user_version (v23)
     path_keys.py    path identity keys, subtree key ranges, the folder-argument normalizer
     text_keys.py    the shared text fold keys (alnum, display, artist name, loose, title)
     scan.py         filesystem discovery + signatures
@@ -320,6 +327,7 @@ src/tagmend/
     classify.py     genre vocab/overlay loader + fold-key index + classify.classify_genres (pure)
     genres.py       resolve_genres + set/reset_genre_status
     artists.py      resolve_artists + set/reset_artist_status: MusicBrainz-by-MBID then getCorrection cascade-stage + file_artist_status workflow
+    songs.py        resolve_songs + set/reset_song_status: AcoustID folder consensus, anchored check, rebind report, manual release path
     years.py        resolve_years + set/reset_year_status: MusicBrainz originaldate blank-fill + file_year_status workflow
     mismatch.py     detect_mismatches + set/reset_mismatch_status: identity tags vs folder path, tiered
     track_conflicts.py  detect_track_conflicts: intra-folder (disc, track) slot collisions

@@ -19,6 +19,7 @@ from tagmend.engine import (
     axis,
     genres,
     library,
+    songs,
     staging,
     store,
     versioning,
@@ -201,6 +202,7 @@ def test_set_status_manual_records_manual(
         "genre": genres.set_genre_status,
         "artist": artists.set_artist_status,
         "year": years.set_year_status,
+        "song": songs.set_song_status,
     }
 
     assert setters[tag_axis.name](engine_settings, file_ids=[file_id], status="manual") == 1
@@ -512,6 +514,8 @@ def test_reopen_axes_deletes_outcomes_and_keeps_manual(
     assert reopen["genre"] == {"outcomes_reopened": 1, "manual_kept": 0}
     assert reopen["year"] == {"outcomes_reopened": 1, "manual_kept": 0}
     assert reopen["artist"] == {"outcomes_reopened": 0, "manual_kept": 1}
+    # The hand-staged title is a human decision on the song axis.
+    assert reopen["song"] == {"outcomes_reopened": 0, "manual_kept": 1}
     assert _status(engine_settings, ids["fixed.flac"]) == "pending"
     assert _status(engine_settings, ids["fixed.flac"], axis.ARTIST_AXIS) == "manual"
     assert _status(engine_settings, ids["other.flac"]) == "done"

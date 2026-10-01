@@ -22,6 +22,7 @@ from conftest import make_track
 from tagmend import mcp_server
 from tagmend.config import load_settings
 from tagmend.engine import axis, commits, genres, health, library, staging, store, versioning
+from tagmend.engine.acoustid import AcoustidKeyError, FpcalcUnavailableError
 from tagmend.engine.db import connect
 from tagmend.engine.lastfm import LastfmError
 from tagmend.engine.musicbrainz import MusicBrainzError
@@ -139,6 +140,9 @@ def test_list_tools_exposes_expected_tools_and_schema() -> None:
         "list_albums",
         "set_year_status",
         "reset_year_status",
+        "resolve_songs",
+        "set_song_status",
+        "reset_song_status",
         "set_mismatch_status",
         "reset_mismatch_status",
     } <= names
@@ -163,6 +167,9 @@ def test_list_tools_exposes_expected_tools_and_schema() -> None:
         "staged",
         "done",
     }
+
+    song_status_schema = list_tool.inputSchema["properties"]["song_status"]
+    assert set(_enum_values(song_status_schema)) == axis.SONG_AXIS.workflow_statuses
 
     mismatch_status_schema = list_tool.inputSchema["properties"]["mismatch_status"]
     assert set(_enum_values(mismatch_status_schema)) == {
@@ -604,6 +611,8 @@ def test_unknown_ids_return_the_error_envelope() -> None:
         sqlite3.OperationalError("database is locked"),
         LastfmError("Last.fm artist.gettoptags failed after 3 attempt(s)"),
         MusicBrainzError("MusicBrainz HTTP 500 for release lookup"),
+        AcoustidKeyError("AcoustID rejected the API key. Check the acoustid_api_key setting."),
+        FpcalcUnavailableError("fpcalc is not on PATH and fpcalc_path is not set"),
     ],
     ids=lambda error: type(error).__name__,
 )
@@ -637,7 +646,7 @@ def test_error_envelope_lets_a_bug_raise(monkeypatch: pytest.MonkeyPatch) -> Non
 def test_every_tool_is_enveloped() -> None:
     tools = mcp_server.mcp._tool_manager.list_tools()
 
-    assert len(tools) == 35
+    assert len(tools) == 38
     assert [tool.name for tool in tools if not hasattr(tool.fn, "__wrapped__")] == []
 
 
@@ -665,6 +674,7 @@ _NEGATIVE_LIMIT_CALLS = [
     ("resolve_genres", {"limit": -1}),
     ("resolve_artists", {"limit": -1}),
     ("resolve_years", {"limit": -1}),
+    ("resolve_songs", {"limit": -1}),
     ("detect_mismatches", {"limit": -1}),
     ("detect_track_conflicts", {"limit": -1}),
     ("detect_album_conflicts", {"limit": -1}),

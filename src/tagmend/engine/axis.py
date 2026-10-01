@@ -1,9 +1,9 @@
-"""The metadata-axis abstraction: one outcome-row status model for genre, artist and year.
+"""The metadata-axis abstraction: one outcome-row status model for genre, artist, year and song.
 
-Each tag axis (genre, artist, year) keeps at most one ``file_<axis>_status`` row per file. The row
-holds one outcome (``done``, ``no_match`` or ``manual``) and two snapshots: the identity the outcome
-was decided against (the two :attr:`Axis.source_columns`) and the values of :attr:`Axis.fields` it
-describes (``source_value``, JSON, NULL on a row written before the snapshot existed).
+Each tag axis keeps at most one ``file_<axis>_status`` row per file. The row holds one outcome
+(``done``, ``no_match`` or ``manual``) and two snapshots: the identity the outcome was decided
+against (the two :attr:`Axis.source_columns`) and the values of :attr:`Axis.fields` it describes
+(``source_value``, JSON, NULL on a row written before the snapshot existed).
 :func:`tagmend.engine.store.derived_status` derives every user-facing status from that row, the
 staging area and the current tags. A ``done`` or ``no_match`` row counts only while both snapshots
 still match the file, so a revert, a rescan after an external edit or an identity fix re-opens the
@@ -149,7 +149,19 @@ def _artist_identity(tags: Mapping[str, list[str]]) -> Identity | None:
     return Identity(primary=artist, secondary=albumartist)
 
 
-# --- the four axes -------------------------------------------------------------------
+def _song_identity(tags: Mapping[str, list[str]]) -> Identity:
+    """Song identity: (release id, release-track id), each blank as ``""`` and never ``None``.
+
+    The song axis identifies a file by its audio, so a file with no artist or album still has a
+    song status. Carrying the release ids makes a rebind re-open a ``done`` row.
+    """
+    return Identity(
+        primary=first_nonblank(tags.get("musicbrainz_albumid")) or "",
+        secondary=first_nonblank(tags.get("musicbrainz_releasetrackid")) or "",
+    )
+
+
+# --- the five axes -------------------------------------------------------------------
 
 _TAG_AXIS_STATUSES: Final = frozenset(
     {"pending", "no_identity", "no_match", "manual", "staged", "done"},
@@ -195,6 +207,19 @@ YEAR_AXIS: Final = Axis(
     identity=_year_identity,
 )
 
+# The song resolver never writes no_match, since an empty AcoustID answer can be a timeout, and
+# its identity is never None.
+SONG_AXIS: Final = Axis(
+    name="song",
+    fields=("title", "tracknumber", "discnumber"),
+    status_table="file_song_status",
+    source_columns=("source_album_mbid", "source_release_track_mbid"),
+    workflow_statuses=frozenset({"pending", "manual", "staged", "done"}),
+    # No lookup name field exists on this axis, so a value scopes a whole album.
+    scope_fields=("album",),
+    identity=_song_identity,
+)
+
 MISMATCH_AXIS: Final = Axis(
     name="mismatch",
     # The two identity fields the detector reads. This axis has no staged/done derivation,
@@ -209,7 +234,7 @@ MISMATCH_AXIS: Final = Axis(
 )
 
 # The axes that keep outcome rows, in the order every report lists them.
-TAG_AXES: Final = (GENRE_AXIS, ARTIST_AXIS, YEAR_AXIS)
+TAG_AXES: Final = (GENRE_AXIS, ARTIST_AXIS, YEAR_AXIS, SONG_AXIS)
 
 # The outcomes only a resolver writes. Their rows count only while both snapshots match.
 RESOLVER_OUTCOMES: Final = frozenset({"done", "no_match"})

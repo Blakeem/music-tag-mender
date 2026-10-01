@@ -1416,3 +1416,36 @@ def test_albumartist_lookalike_survives_commit_and_revert(
     assert reverted["ALBUMARTIST"] == ["Smashing Pumpkins"]
     assert reverted["ARTIST"] == ["Smashing Pumpkins"]
     assert reverted[lookalike] == [""]
+
+
+@pytest.mark.parametrize(
+    ("supplied", "stale"),
+    [
+        pytest.param({"album": ["LP"]}, [], id="album-supplied-unchanged"),
+        pytest.param(
+            {},
+            [{"changed": "musicbrainz_albumid", "stale_field": "album", "stale_value": ["LP"]}],
+            id="album-left-out",
+        ),
+    ],
+)
+def test_diff_skips_a_group_member_the_caller_supplied(
+    engine_settings: Settings,
+    music_dir: Path,
+    supplied: dict[str, list[str]],
+    stale: list[dict[str, object]],
+) -> None:
+    # A value the caller wrote, even an unchanged one, confirms it rather than leaving it stale.
+    make_track(music_dir / "t.mp3", {"album": ["LP"], "musicbrainz_albumid": ["old-release"]})
+    scan_library(engine_settings)
+    file_id = _file_id(engine_settings, music_dir, "t.mp3")
+
+    staging.stage_tags_batch(
+        engine_settings,
+        entries=[(file_id, {"musicbrainz_albumid": ["new-release"], **supplied})],
+    )
+
+    staged = _staged(engine_settings, file_id)
+    assert staged is not None
+    assert staged.supplied_keys == frozenset({"musicbrainz_albumid", *supplied})
+    assert staging.diff_tags(engine_settings)[0].stale_identity == stale

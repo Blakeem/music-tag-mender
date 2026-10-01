@@ -59,6 +59,9 @@ class FileView:
     year_status: str = "pending"
     year_source_artist: str | None = None  # identity a no_match/manual was recorded against
     year_source_album: str | None = None
+    song_status: str = "pending"
+    song_source_album_mbid: str | None = None  # release ids a done/manual was recorded against
+    song_source_release_track_mbid: str | None = None
     mismatch_status: str = "pending"
     mismatch_source_field: str | None = None  # which tag a disposition was recorded against
     mismatch_source_value: str | None = None  # that tag's value at decision time
@@ -81,6 +84,9 @@ class FileView:
             "year_status": self.year_status,
             "year_source_artist": self.year_source_artist,
             "year_source_album": self.year_source_album,
+            "song_status": self.song_status,
+            "song_source_album_mbid": self.song_source_album_mbid,
+            "song_source_release_track_mbid": self.song_source_release_track_mbid,
             "mismatch_status": self.mismatch_status,
             "mismatch_source_field": self.mismatch_source_field,
             "mismatch_source_value": self.mismatch_source_value,
@@ -107,13 +113,14 @@ def _axis_view(
 def _to_view(conn: sqlite3.Connection, row: store.FileRow) -> FileView:
     """Build a :class:`FileView` from a file row, reading its managed-tag subset.
 
-    Also resolves the file's genre, artist, year and mismatch statuses. For a stored decision
+    Also resolves the file's genre, artist, year, song and mismatch statuses. For a stored decision
     the source values it was recorded against ride along so a reviewer can compare them with
     the current ``managed_tags``.
     """
     genre_status, genre_artist, genre_album = _axis_view(conn, axis.GENRE_AXIS, row.id)
     artist_status, artist_artist, artist_albumartist = _axis_view(conn, axis.ARTIST_AXIS, row.id)
     year_status, year_artist, year_album = _axis_view(conn, axis.YEAR_AXIS, row.id)
+    song_status, song_album_mbid, song_release_track_mbid = _axis_view(conn, axis.SONG_AXIS, row.id)
 
     mismatch_status = store.derived_mismatch_status(conn, row.id)
     mismatch_decision = store.get_mismatch_status(conn, row.id)
@@ -136,6 +143,9 @@ def _to_view(conn: sqlite3.Connection, row: store.FileRow) -> FileView:
         year_status=year_status,
         year_source_artist=year_artist,
         year_source_album=year_album,
+        song_status=song_status,
+        song_source_album_mbid=song_album_mbid,
+        song_source_release_track_mbid=song_release_track_mbid,
         mismatch_status=mismatch_status,
         mismatch_source_field=mismatch_decision.source_field
         if has_stored_mismatch and mismatch_decision
@@ -153,18 +163,20 @@ def _row_matches_status(  # noqa: PLR0913 - cohesive keyword-only status filters
     genre_status: str | None,
     artist_status: str | None,
     year_status: str | None,
+    song_status: str | None,
     mismatch_status: str | None,
 ) -> bool:
     """Return whether *row* satisfies every requested workflow-status filter.
 
     Each non-``None`` filter must match the file's derived status on that axis (the axes are
     independent and field-aware), and a ``None`` filter is ignored. A missing file has no
-    status on the genre, artist or year axis, so any of those filters excludes it.
+    status on the genre, artist, year or song axis, so any of those filters excludes it.
     """
     tag_filters = (
         (axis.GENRE_AXIS, genre_status),
         (axis.ARTIST_AXIS, artist_status),
         (axis.YEAR_AXIS, year_status),
+        (axis.SONG_AXIS, song_status),
     )
     for tag_axis, wanted in tag_filters:
         if wanted is None:
@@ -185,6 +197,7 @@ def list_files(  # noqa: PLR0913 - cohesive keyword-only discovery filters
     genre_status: str | None = None,
     artist_status: str | None = None,
     year_status: str | None = None,
+    song_status: str | None = None,
     mismatch_status: str | None = None,
 ) -> list[FileView]:
     """Return tracked files (id order) with their managed tags, for discovery.
@@ -193,10 +206,11 @@ def list_files(  # noqa: PLR0913 - cohesive keyword-only discovery filters
     :func:`tagmend.engine.path_keys.folder_arg_key`, so case and separators do not matter on
     Windows and a relative *path* resolves under ``music_path``), filtered to one genre, artist
     and/or year workflow status (``pending`` | ``no_identity`` | ``no_match`` | ``manual`` |
-    ``staged`` | ``done``), one mismatch disposition (``pending`` | ``legit_ignore`` |
+    ``staged`` | ``done``), one song workflow status (``pending`` | ``manual`` | ``staged`` |
+    ``done``), one mismatch disposition (``pending`` | ``legit_ignore`` |
     ``misfiled_deferred``), and/or capped at *limit* rows. ``genre_status="no_match"`` is the
     "fix by hand" worklist. ``no_identity`` lists the files the axis has no identity for, which
-    no resolver selects. A genre, artist or year filter never returns a missing file. With NO
+    no resolver selects. A genre, artist, year or song filter never returns a missing file. With NO
     status filter the cap is applied before reading tags, so a large library stays cheap to
     browse. With any filter, all candidate rows are examined, ALL filters are applied, and the
     cap counts the *matching* files. Raises :class:`ValueError` for an unknown status, a
@@ -206,6 +220,7 @@ def list_files(  # noqa: PLR0913 - cohesive keyword-only discovery filters
     require_choice("genre_status", genre_status, store.GENRE_WORKFLOW_STATUSES)
     require_choice("artist_status", artist_status, store.ARTIST_WORKFLOW_STATUSES)
     require_choice("year_status", year_status, store.YEAR_WORKFLOW_STATUSES)
+    require_choice("song_status", song_status, store.SONG_WORKFLOW_STATUSES)
     require_choice("mismatch_status", mismatch_status, store.MISMATCH_WORKFLOW_STATUSES)
     root_key = None if path is None else path_keys.folder_arg_key(settings, path)
 
@@ -213,6 +228,7 @@ def list_files(  # noqa: PLR0913 - cohesive keyword-only discovery filters
         genre_status is not None
         or artist_status is not None
         or year_status is not None
+        or song_status is not None
         or mismatch_status is not None
     )
 
@@ -240,6 +256,7 @@ def list_files(  # noqa: PLR0913 - cohesive keyword-only discovery filters
                 genre_status=genre_status,
                 artist_status=artist_status,
                 year_status=year_status,
+                song_status=song_status,
                 mismatch_status=mismatch_status,
             ):
                 continue

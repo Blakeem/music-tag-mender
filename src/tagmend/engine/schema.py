@@ -186,6 +186,13 @@ with no migration):
   taken at: the fingerprint and duration, or the failing exit code with both NULL.
 * ``acoustid_cache`` holds one AcoustID lookup per request hash, the parsed result as
   zlib-compressed JSON. ``found`` is the negative-cache sentinel (0 = no match).
+
+The song axis adds one table and one column (schema v23. A v22 ledger upgrades in place):
+
+* ``file_song_status``: the song-axis twin of ``file_genre_status``. Its identity snapshot is
+  the release and release-track ids, so an identity fix that rebinds a file re-opens it.
+* ``tag_revisions_staged.supplied_keys``: the JSON list of the keys the caller supplied for a
+  staged file. :func:`_migrate_staged_supplied_keys` adds it as NULL.
 """
 
 from __future__ import annotations
@@ -203,7 +210,7 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
-SCHEMA_VERSION: Final = 22
+SCHEMA_VERSION: Final = 23
 
 _FILES_DDL: Final = """
 CREATE TABLE IF NOT EXISTS files (
@@ -310,7 +317,8 @@ CREATE TABLE IF NOT EXISTS path_revisions (
 # staged, which the next commit sweeps into a new commit. See PLAN.md §7.
 # ``base_size_bytes``/``base_mtime_ns`` are the file's signature at stage time, so a commit can
 # refuse a file edited since. ``changed_fields`` keeps the stage's own change because a re-applied
-# commit finds disk already equal to the target. Migrations append these, so they sit last.
+# commit finds disk already equal to the target. ``supplied_keys`` tells a value the caller
+# confirmed from one the merge kept. Migrations append these, so they sit last.
 _TAG_REVISIONS_STAGED_DDL: Final = """
 CREATE TABLE IF NOT EXISTS tag_revisions_staged (
   file_id         INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
@@ -321,6 +329,7 @@ CREATE TABLE IF NOT EXISTS tag_revisions_staged (
   base_size_bytes INTEGER,
   base_mtime_ns   INTEGER,
   changed_fields  TEXT,
+  supplied_keys   TEXT,
   PRIMARY KEY (file_id)
 )
 """
@@ -400,6 +409,19 @@ CREATE TABLE IF NOT EXISTS file_year_status (
   source_album  TEXT,
   source_value  TEXT,
   updated_at    TEXT NOT NULL
+)
+"""
+
+# The identity is the release and release-track ids, blank as an empty string, so a file with no
+# artist still carries a song status.
+_FILE_SONG_STATUS_DDL: Final = """
+CREATE TABLE IF NOT EXISTS file_song_status (
+  file_id                   INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
+  status                    TEXT NOT NULL,
+  source_album_mbid         TEXT,
+  source_release_track_mbid TEXT,
+  source_value              TEXT,
+  updated_at                TEXT NOT NULL
 )
 """
 
@@ -669,6 +691,22 @@ def _migrate_staged_changed_fields(connection: sqlite3.Connection) -> None:
         return
     connection.execute("ALTER TABLE tag_revisions_staged ADD COLUMN changed_fields TEXT")
     logger.info("schema v21: added tag_revisions_staged.changed_fields")
+
+
+def _migrate_staged_supplied_keys(connection: sqlite3.Connection) -> None:
+    """v23: add ``tag_revisions_staged.supplied_keys`` as NULL.
+
+    Runs BEFORE the DDL, so a fresh ledger takes the column from
+    :data:`_TAG_REVISIONS_STAGED_DDL` instead. Idempotent through ``_column_exists``. A NULL
+    marks a row staged before the column existed, which the stale-identity report reads as
+    "no key confirmed".
+    """
+    if not _table_exists(connection, "tag_revisions_staged"):
+        return
+    if _column_exists(connection, "tag_revisions_staged", "supplied_keys"):
+        return
+    connection.execute("ALTER TABLE tag_revisions_staged ADD COLUMN supplied_keys TEXT")
+    logger.info("schema v23: added tag_revisions_staged.supplied_keys")
 
 
 def _keyed_file_rows(connection: sqlite3.Connection) -> list[tuple[int, str, str, str]]:
@@ -944,12 +982,16 @@ def _migrate_lastfm_correction_cache(connection: sqlite3.Connection) -> None:
     logger.info("schema v20: moved %d correction row(s) to lastfm_correction_cache", moved)
 
 
-# Each tag-axis status table with the DDL that creates it in its v21 shape.
+# Each tag-axis status table the v21 pass migrated, with the DDL that creates it in its v21 shape.
 _AXIS_STATUS_TABLES: Final = (
     ("file_genre_status", _FILE_GENRE_STATUS_DDL),
     ("file_artist_status", _FILE_ARTIST_STATUS_DDL),
     ("file_year_status", _FILE_YEAR_STATUS_DDL),
 )
+
+
+# The axes the v21 replay covers. A later axis has no table yet when this migration runs.
+_V21_TAG_AXES: Final = (axis.GENRE_AXIS, axis.ARTIST_AXIS, axis.YEAR_AXIS)
 
 
 def _axis_outcomes_migrated(connection: sqlite3.Connection) -> bool:
@@ -985,7 +1027,7 @@ def _replay_manual_revisions(connection: sqlite3.Connection) -> int:
         managed_tags = cast("dict[str, list[str]]", json.loads(str(row[2])))
         diff = cast("dict[str, object]", json.loads(str(row[3])))
         previously_governed = governed_tags(int(row[4]))
-        for tag_axis in axis.TAG_AXES:
+        for tag_axis in _V21_TAG_AXES:
             if not any(name in diff and name in previously_governed for name in tag_axis.fields):
                 continue
             axis.put_outcome(
@@ -1052,9 +1094,11 @@ def apply_schema(connection: sqlite3.Connection) -> None:
     :func:`_migrate_release_group_cache_name`, :func:`_migrate_mbid_columns`,
     :func:`_migrate_drop_files_status`, :func:`_migrate_lastfm_correction_cache`) and v21
     snapshots the tag-axis status rows (:func:`_migrate_axis_outcomes`) and adds the staged
-    changed fields (:func:`_migrate_staged_changed_fields`). v15, v16 and v22 add cache tables
-    only, which the DDL creates, so they need no migration step. The triggers come after
-    every migration, so a migration that updates a log runs before they exist.
+    changed fields (:func:`_migrate_staged_changed_fields`), and v23 adds the staged supplied
+    keys (:func:`_migrate_staged_supplied_keys`). v15, v16 and v22 add cache tables only, and
+    v23 adds ``file_song_status``, which the DDL creates, so they need no migration step. The
+    triggers come after every migration, so a migration that updates a log runs before they
+    exist.
 
     ``commits`` is created before the revision/staging tables that reference it.
     """
@@ -1083,6 +1127,7 @@ def apply_schema(connection: sqlite3.Connection) -> None:
     _migrate_lastfm_correction_cache(connection)
     _migrate_axis_outcomes(connection)
     _migrate_staged_changed_fields(connection)
+    _migrate_staged_supplied_keys(connection)
     connection.execute(_FILES_DDL)
     connection.execute(_FILES_PATH_KEY_INDEX_DDL)
     connection.execute(_FILE_TAGS_DDL)
@@ -1097,6 +1142,7 @@ def apply_schema(connection: sqlite3.Connection) -> None:
     connection.execute(_FILE_GENRE_STATUS_DDL)
     connection.execute(_FILE_ARTIST_STATUS_DDL)
     connection.execute(_FILE_YEAR_STATUS_DDL)
+    connection.execute(_FILE_SONG_STATUS_DDL)
     connection.execute(_MUSICBRAINZ_RELEASE_GROUP_CACHE_DDL)
     connection.execute(_MUSICBRAINZ_RECORDING_CACHE_DDL)
     connection.execute(_MUSICBRAINZ_ARTIST_CACHE_DDL)

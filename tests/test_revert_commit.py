@@ -83,7 +83,7 @@ def _commit_count(settings: Settings) -> int:
         conn.close()
 
 
-def _outcome(result: versioning.RevertCommitResult, file_id: int) -> versioning.FileRevertOutcome:
+def _outcome(result: commits.RevertCommitResult, file_id: int) -> commits.FileRevertOutcome:
     """Pluck the per-file outcome for *file_id* out of a result (one per file)."""
     return next(o for o in result.outcomes if o.file_id == file_id)
 

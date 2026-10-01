@@ -1,17 +1,19 @@
 """Domain-neutral commit core: ``commits``-table ops + the shared crash-safe loop (M3).
 
 This module owns everything about a *commit* that does not depend on whether the change
-is a tag edit or a future file move:
+is a tag edit or a file move:
 
 * the ``commits`` table data access (``create_commit`` / ``set_commit_status`` /
   ``get_commit_in`` / ``get_applying_commits`` / ``list_commits_in`` / ``mark_interrupted``);
-* the immutable result dataclasses a commit returns (:class:`CommitResult` and friends);
+* the immutable result dataclasses a commit or a commit revert returns
+  (:class:`CommitResult`, :class:`RevertCommitResult` and friends);
 * the :class:`RevisionDomain` seam plus the one shared :func:`run_commit` loop that
-  carries the delicate disk-first / append-then-delete-in-one-tx crash invariant.
+  carries the delicate no-durable-write-before-the-disk-action crash invariant.
 
-It deliberately imports **neither** :mod:`tagmend.engine.staging` **nor**
-:mod:`tagmend.engine.versioning` (which import it back), so there is no import cycle: a
-concrete domain (e.g. ``staging.TagDomain``) implements the Protocol and is passed in.
+It deliberately imports none of :mod:`tagmend.engine.staging`, :mod:`tagmend.engine.paths`
+and :mod:`tagmend.engine.versioning` (which import it back), so there is no import cycle: a
+concrete domain (``staging.TagDomain``, ``paths.PathDomain``) implements the Protocol and is
+passed in.
 
 Like the rest of the data-access layer, the ``commits``-table functions take an open
 connection and **never commit**; the orchestrator owns the transaction. The one
@@ -263,6 +265,76 @@ def summarize(*, commit_id: int | None, applied: list[_Applied]) -> CommitResult
     )
 
 
+@dataclass(frozen=True, slots=True)
+class FileRevertOutcome:
+    """What happened (or would happen, on a dry run) to one file of the target commit."""
+
+    file_id: int
+    target_version: int | None  # version restored (the commit's version - 1); None if not
+    new_version: int | None  # the appended revert revision; None if not reverted
+    status: str  # 'reverted' | 'noop' | 'skipped_later_changes' | 'missing' | 'error'
+    detail: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RevertCommitResult:
+    """Immutable summary of a commit-level revert run."""
+
+    commit_id: int | None  # the NEW revert commit; None on dry run / nothing revertable
+    reverted_from: int  # the target commit id
+    dry_run: bool
+    reverted: int
+    noop: int
+    skipped: int
+    missing: int
+    errors: int
+    outcomes: tuple[FileRevertOutcome, ...]
+
+    def to_dict(self) -> dict[str, object]:
+        """JSON-serializable form for the MCP tool."""
+        return {
+            "commit_id": self.commit_id,
+            "reverted_from": self.reverted_from,
+            "dry_run": self.dry_run,
+            "reverted": self.reverted,
+            "noop": self.noop,
+            "skipped": self.skipped,
+            "missing": self.missing,
+            "errors": self.errors,
+            "outcomes": [
+                {
+                    "file_id": o.file_id,
+                    "target_version": o.target_version,
+                    "new_version": o.new_version,
+                    "status": o.status,
+                    "detail": o.detail,
+                }
+                for o in self.outcomes
+            ],
+        }
+
+
+def summarize_revert(
+    *,
+    commit_id: int | None,
+    reverted_from: int,
+    dry_run: bool,
+    outcomes: list[FileRevertOutcome],
+) -> RevertCommitResult:
+    """Fold per-file outcomes into the public :class:`RevertCommitResult`."""
+    return RevertCommitResult(
+        commit_id=commit_id,
+        reverted_from=reverted_from,
+        dry_run=dry_run,
+        reverted=sum(1 for o in outcomes if o.status == "reverted"),
+        noop=sum(1 for o in outcomes if o.status == "noop"),
+        skipped=sum(1 for o in outcomes if o.status == "skipped_later_changes"),
+        missing=sum(1 for o in outcomes if o.status == "missing"),
+        errors=sum(1 for o in outcomes if o.status == "error"),
+        outcomes=tuple(outcomes),
+    )
+
+
 # --- the seam + the one shared loop -------------------------------------------------
 
 
@@ -326,10 +398,12 @@ class RevisionDomain(Protocol):
         commit_id: int,
         now: str,
     ) -> int | None:
-        """Do the disk action FIRST, then append the revision + delete the staged row.
+        """Do the disk action, append the revision and delete the staged row.
 
-        All DB writes are left in the open transaction (the caller commits). Returns the
-        new revision version, or ``None`` for a no-op (target already equals current).
+        No write becomes durable before the disk action: every DB write, including one made
+        before the disk action, is left in the open transaction the caller commits after this
+        returns. Returns the new revision version, or ``None`` for a no-op (target already
+        equals current).
         """
         ...
 
@@ -362,10 +436,11 @@ def run_commit(
     * a path that is gone -> ``flag_and_drop_missing`` + commit -> a ``missing`` outcome.
     * a file edited on disk since it was staged -> nothing written, the staged row kept -> a
       ``changed_since_stage`` outcome.
-    * otherwise the domain writes disk FIRST then appends the revision and deletes the
-      staged row, leaving the tx dirty. This function owns the ``conn.commit()`` so a
-      revision never becomes durable without its staged row already gone. A crash before
-      that commit rolls both back, leaving the staged row for the next commit to re-apply.
+    * otherwise the domain does the disk action, appends the revision and deletes the
+      staged row, leaving the tx dirty. This function owns the ``conn.commit()``, so nothing
+      becomes durable before the disk action and a revision never becomes durable without
+      its staged row already gone. A crash before that commit rolls every write back,
+      leaving the staged row for the next commit to re-apply.
     * one of ``domain.per_file_errors`` raised by the check or the apply -> rolled back, the
       staged row kept for a retry -> an ``error`` outcome, and the loop moves on. Any other
       exception is a bug and propagates.

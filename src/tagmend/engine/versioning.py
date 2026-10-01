@@ -36,7 +36,7 @@ from typing import TYPE_CHECKING, Final
 
 import mutagen
 
-from tagmend.engine import clock, commits, db, schema, store
+from tagmend.engine import clock, commits, db, paths, schema, store
 from tagmend.engine.tags import (
     MANAGED_SET_VERSION,
     MANAGED_TAGS,
@@ -378,7 +378,8 @@ def revert_tags(
     fresh single-file commit row, so it shows in ``list_commits`` and can itself be
     undone with :func:`revert_commit`. Refuses if the file has a pending staged change
     (commit or unstage it first — a staged target computed against the pre-revert
-    state would silently override the revert at the next commit).
+    state would silently override the revert at the next commit), or a staged path change,
+    since a tag write replaces the file the move is about to carry.
 
     The revision is appended either way, but ``status`` reports what actually happened:
     ``'reverted'`` when the managed tags moved, ``'noop'`` when the file already held the
@@ -403,6 +404,12 @@ def revert_tags(
         if store.is_staged(connection, file_id):
             message = (
                 f"file_id={file_id} has a staged change - commit or unstage it before reverting"
+            )
+            raise ValueError(message)
+        if store.get_staged_path(connection, file_id) is not None:
+            message = (
+                f"file_id={file_id} has a staged path change - run commit_paths or unstage_paths "
+                "before reverting"
             )
             raise ValueError(message)
 
@@ -450,55 +457,6 @@ def revert_tags(
 
 
 # --- commit-level revert (group undo; PLAN.md §7 "reverting a whole commit_id") ------
-
-
-@dataclass(frozen=True, slots=True)
-class FileRevertOutcome:
-    """What happened (or would happen, on a dry run) to one file of the target commit."""
-
-    file_id: int
-    target_version: int | None  # version restored (the commit's version - 1); None if not
-    new_version: int | None  # the appended revert revision; None if not reverted
-    status: str  # 'reverted' | 'noop' | 'skipped_later_changes' | 'missing' | 'error'
-    detail: str | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class RevertCommitResult:
-    """Immutable summary of a commit-level revert run."""
-
-    commit_id: int | None  # the NEW revert commit; None on dry run / nothing revertable
-    reverted_from: int  # the target commit id
-    dry_run: bool
-    reverted: int
-    noop: int
-    skipped: int
-    missing: int
-    errors: int
-    outcomes: tuple[FileRevertOutcome, ...]
-
-    def to_dict(self) -> dict[str, object]:
-        """JSON-serializable form for the MCP tool."""
-        return {
-            "commit_id": self.commit_id,
-            "reverted_from": self.reverted_from,
-            "dry_run": self.dry_run,
-            "reverted": self.reverted,
-            "noop": self.noop,
-            "skipped": self.skipped,
-            "missing": self.missing,
-            "errors": self.errors,
-            "outcomes": [
-                {
-                    "file_id": o.file_id,
-                    "target_version": o.target_version,
-                    "new_version": o.new_version,
-                    "status": o.status,
-                    "detail": o.detail,
-                }
-                for o in self.outcomes
-            ],
-        }
 
 
 # The two plan-pass kinds that go on to :func:`_revert_file`. A 'noop' file is still
@@ -576,35 +534,19 @@ def _classify_for_revert(conn: sqlite3.Connection, revision: Revision) -> str:
     return "revertable"
 
 
-def _summarize_revert(
-    *,
-    commit_id: int | None,
-    reverted_from: int,
-    dry_run: bool,
-    outcomes: list[FileRevertOutcome],
-) -> RevertCommitResult:
-    """Fold per-file outcomes into the public :class:`RevertCommitResult`."""
-    return RevertCommitResult(
-        commit_id=commit_id,
-        reverted_from=reverted_from,
-        dry_run=dry_run,
-        reverted=sum(1 for o in outcomes if o.status == "reverted"),
-        noop=sum(1 for o in outcomes if o.status == "noop"),
-        skipped=sum(1 for o in outcomes if o.status == "skipped_later_changes"),
-        missing=sum(1 for o in outcomes if o.status == "missing"),
-        errors=sum(1 for o in outcomes if o.status == "error"),
-        outcomes=tuple(outcomes),
-    )
-
-
 def revert_commit(
     settings: Settings,
     commit_id: int,
     *,
     note: str | None = None,
     dry_run: bool = False,
-) -> RevertCommitResult:
+) -> commits.RevertCommitResult:
     """Undo an entire commit as a unit: revert every file it changed to its pre-commit state.
+
+    Domain-neutral: a commit whose rows sit in ``path_revisions`` is undone by
+    :func:`tagmend.engine.paths.revert_commit_moves`, which moves each file back to its source.
+    A commit with rows in no log raises :class:`ValueError`. The rest of this docstring describes
+    a tag commit.
 
     The group counterpart of :func:`revert_tags` (PLAN.md §7: "reverting a whole
     ``commit_id`` undoes an entire run"). For each revision the target commit created,
@@ -620,10 +562,11 @@ def revert_commit(
     reported, a per-file disk failure is recorded as ``error`` and the rest of the group
     still completes.
 
-    Guards: the target must exist and not be ``status='applying'`` (run ``commit_tags``
-    to recover an interrupted run first). ``interrupted`` targets are allowed (reverts
-    whatever they durably committed). The staging area must be EMPTY: commit or
-    unstage pending work before rolling back (git's "commit or stash first").
+    Guards: the target must exist and not be ``status='applying'`` (run ``commit_tags`` or
+    ``commit_paths`` to recover an interrupted run first). ``interrupted`` targets are allowed
+    (reverts whatever they durably committed). The staging area, tag and path rows alike, must
+    be EMPTY: commit or unstage pending work before rolling back (git's "commit or stash
+    first").
 
     A file already holding its pre-commit state is reported ``noop``: the revert revision
     is still appended (revert is always audited), but it is not counted as ``reverted``,
@@ -650,14 +593,18 @@ def revert_commit(
         if target.status == "applying":
             message = (
                 f"commit {commit_id} is still applying (interrupted run?) - "
-                "run commit_tags to recover, then retry"
+                "run commit_tags or commit_paths to recover, then retry"
             )
             raise ValueError(message)
         if store.any_staged(connection):
-            message = (
-                "staging area is not empty - "
-                "commit or unstage pending changes before reverting a commit"
+            raise ValueError(paths.STAGING_NOT_EMPTY)
+        logs = store.commit_log_counts(connection, commit_id)
+        if "path_revisions" in logs:
+            return paths.revert_commit_moves(
+                connection, settings, commit_id, note=note, dry_run=dry_run
             )
+        if not logs:
+            message = f"commit {commit_id} holds no change in the tag or path log to revert"
             raise ValueError(message)
 
         # Plan pass (read-only): classify every file the target commit changed.
@@ -669,7 +616,7 @@ def revert_commit(
 
         if dry_run or not processable:
             outcomes = [
-                FileRevertOutcome(
+                commits.FileRevertOutcome(
                     file_id=revision.file_id,
                     target_version=revision.version - 1 if kind in _PROCESSABLE_KINDS else None,
                     new_version=None,
@@ -677,7 +624,7 @@ def revert_commit(
                 )
                 for revision, kind in planned
             ]
-            return _summarize_revert(
+            return commits.summarize_revert(
                 commit_id=None,
                 reverted_from=commit_id,
                 dry_run=dry_run,
@@ -697,7 +644,7 @@ def revert_commit(
         for revision, kind in planned:
             if kind not in _PROCESSABLE_KINDS:
                 outcomes.append(
-                    FileRevertOutcome(
+                    commits.FileRevertOutcome(
                         file_id=revision.file_id,
                         target_version=None,
                         new_version=None,
@@ -725,7 +672,7 @@ def revert_commit(
                     exc,
                 )
                 outcomes.append(
-                    FileRevertOutcome(
+                    commits.FileRevertOutcome(
                         file_id=revision.file_id,
                         target_version=revision.version - 1,
                         new_version=None,
@@ -735,7 +682,7 @@ def revert_commit(
                 )
                 continue
             outcomes.append(
-                FileRevertOutcome(
+                commits.FileRevertOutcome(
                     file_id=revision.file_id,
                     target_version=revision.version - 1,
                     new_version=new_version,
@@ -748,7 +695,7 @@ def revert_commit(
     finally:
         connection.close()
 
-    result = _summarize_revert(
+    result = commits.summarize_revert(
         commit_id=new_commit,
         reverted_from=commit_id,
         dry_run=False,
@@ -780,5 +727,18 @@ def history_tags(settings: Settings, file_id: int) -> list[Revision]:
             message = f"unknown file_id={file_id}"
             raise ValueError(message)
         return store.get_revisions(connection, file_id)
+    finally:
+        connection.close()
+
+
+def commit_logs(settings: Settings, commit_id: int) -> dict[str, int]:
+    """Return how many rows each revision log holds for *commit_id*, naming non-empty logs only.
+
+    Read-only. This is how ``get_commit`` says which domain a commit changed.
+    """
+    connection = db.connect(settings.db_path)
+    try:
+        schema.apply_schema(connection)
+        return store.commit_log_counts(connection, commit_id)
     finally:
         connection.close()

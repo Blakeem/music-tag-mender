@@ -133,6 +133,7 @@ def test_passes_for_valid_library(temp_library: Path, tmp_path: Path) -> None:
         "music_path",
         "database",
         "commits",
+        "paths",
         "lastfm",
         "musicbrainz",
         "fpcalc",
@@ -235,8 +236,8 @@ def test_lastfm_http_error_fails_gracefully(temp_library: Path, tmp_path: Path) 
     assert not lastfm_check.ok
     assert "unreachable" in lastfm_check.detail
     assert len(calls) == 1  # the round-trip was attempted
-    # A failed network check still yields a full seven-check report (no exception escapes).
-    assert len(report.checks) == 7
+    # A failed network check still yields a full eight-check report (no exception escapes).
+    assert len(report.checks) == 8
     assert not report.ready
 
 

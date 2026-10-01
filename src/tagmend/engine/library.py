@@ -452,6 +452,7 @@ class ScanResult:
     restored: int
     errors: int
     respelled: int
+    pending_commit: int
 
     def to_dict(self) -> dict[str, object]:
         """JSON-serializable form for the MCP tool."""
@@ -465,6 +466,7 @@ class ScanResult:
             "restored": self.restored,
             "errors": self.errors,
             "respelled": self.respelled,
+            "pending_commit": self.pending_commit,
         }
 
 
@@ -481,6 +483,7 @@ class _Counters:
     restored: int = 0
     errors: int = 0
     respelled: int = 0
+    pending_commit: int = 0
     seen_ids: set[int] = field(default_factory=set)
 
     def to_result(self) -> ScanResult:
@@ -495,6 +498,7 @@ class _Counters:
             restored=self.restored,
             errors=self.errors,
             respelled=self.respelled,
+            pending_commit=self.pending_commit,
         )
 
 
@@ -510,6 +514,10 @@ def scan_library(
     the configured ``music_path`` spelling plus each deeper folder's on-disk name, so every scan
     stores one spelling per file. A file found under a new spelling of a known path (a
     case-only rename) keeps its id and history and is counted ``respelled``.
+
+    The scan guard keeps a staged move's file under its id. A disk path whose key equals a
+    staged move's target is skipped and counted ``pending_commit``, and a file with a staged
+    move is never flagged missing, so a move that landed before a crash adds no second row.
 
     Raises :class:`ValueError` when no music path is configured, the path is not an existing
     directory, the path lies outside ``music_path``, or a relative path has no ``music_path``
@@ -540,9 +548,10 @@ def scan_library(
     try:
         schema.apply_schema(connection)
         counters = _Counters()
+        guard = _scan_guard(connection, music_path)
         for audio_path in scan.iter_audio_files(root):
-            _process_file(connection, audio_path, mode, counters)
-        _reconcile_missing(connection, root, counters)
+            _process_file(connection, audio_path, mode, counters, guard)
+        _reconcile_missing(connection, root, counters, guard)
         connection.commit()
     finally:
         connection.close()
@@ -551,7 +560,7 @@ def scan_library(
     result = counters.to_result()
     logger.info(
         "scan complete: mode=%s seen=%d added=%d updated=%d unchanged=%d "
-        "tags_read=%d restored=%d missing=%d errors=%d respelled=%d",
+        "tags_read=%d restored=%d missing=%d errors=%d respelled=%d pending_commit=%d",
         mode.value,
         result.total_seen,
         result.added,
@@ -562,8 +571,28 @@ def scan_library(
         result.missing_flagged,
         result.errors,
         result.respelled,
+        result.pending_commit,
     )
     return result
+
+
+@dataclass(frozen=True, slots=True)
+class _ScanGuard:
+    """The staged moves a scan must not disturb: their target keys and their file ids."""
+
+    target_keys: frozenset[str]
+    file_ids: frozenset[int]
+
+
+def _scan_guard(conn: sqlite3.Connection, music_path: Path | None) -> _ScanGuard:
+    """Return the scan guard of the moves staged now. Staged targets are relative to music_path."""
+    staged = store.list_staged_paths(conn)
+    if music_path is None:
+        return _ScanGuard(target_keys=frozenset(), file_ids=frozenset(s.file_id for s in staged))
+    return _ScanGuard(
+        target_keys=frozenset(path_keys.path_key(music_path / s.to_path) for s in staged),
+        file_ids=frozenset(s.file_id for s in staged),
+    )
 
 
 def _spell_under_music_path(root: Path, music_path: Path) -> Path:
@@ -592,12 +621,18 @@ def _process_file(
     path: Path,
     mode: ScanMode,
     counters: _Counters,
+    guard: _ScanGuard,
 ) -> None:
     """Reconcile a single on-disk file against the snapshot, updating *counters*."""
     counters.total_seen += 1
     folder = str(path.parent)
     filename = path.name
     ext = path.suffix.lower()
+    # Runs before the key lookup and the respell. A landed move's target would otherwise be
+    # added as a new file, or respell the source of a case-only rename.
+    if path_keys.file_path_key(folder, filename) in guard.target_keys:
+        counters.pending_commit += 1
+        return
 
     try:
         stat_result = path.stat()
@@ -743,11 +778,16 @@ def _try_read_and_store(
     counters.tags_read += 1
 
 
-def _reconcile_missing(conn: sqlite3.Connection, root: Path, counters: _Counters) -> None:
-    """Flag tracked files under *root* that were not seen on this pass."""
+def _reconcile_missing(
+    conn: sqlite3.Connection,
+    root: Path,
+    counters: _Counters,
+    guard: _ScanGuard,
+) -> None:
+    """Flag tracked files under *root* that were not seen on this pass, except staged moves."""
     now = clock.utc_now()
     for row in store.tracked_files_under(conn, path_keys.path_key(root)):
-        if row.id in counters.seen_ids or row.is_missing:
+        if row.id in counters.seen_ids or row.is_missing or row.id in guard.file_ids:
             continue
         store.flag_missing(conn, row.id, now)
         counters.missing_flagged += 1

@@ -12,7 +12,7 @@ import asyncio
 import json
 import sqlite3
 from collections.abc import Sequence
-from typing import TYPE_CHECKING
+from pathlib import Path
 
 import mutagen
 import pytest
@@ -37,9 +37,6 @@ from tagmend.engine.db import connect
 from tagmend.engine.lastfm import LastfmError
 from tagmend.engine.musicbrainz import MusicBrainzError
 from tagmend.engine.tags import MANAGED_SET_VERSION, read_tags
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 _N = 3
 
@@ -656,7 +653,7 @@ def test_error_envelope_lets_a_bug_raise(monkeypatch: pytest.MonkeyPatch) -> Non
 def test_every_tool_is_enveloped() -> None:
     tools = mcp_server.mcp._tool_manager.list_tools()
 
-    assert len(tools) == 38
+    assert len(tools) == 44
     assert [tool.name for tool in tools if not hasattr(tool.fn, "__wrapped__")] == []
 
 
@@ -742,3 +739,59 @@ def test_negative_limit_is_rejected_everywhere(tool_name: str, kwargs: dict[str,
 
     assert payload["ok"] is False
     assert "must be >= 0" in payload["error"]
+
+
+# --- the path tools ----------------------------------------------------------------------
+
+
+def test_path_tools_roundtrip(music_dir: Path) -> None:
+    config.set_setting("music_path", str(music_dir))
+    source = make_track(music_dir / "Artist" / "Album" / "01.mp3", {"albumartist": ["Artist"]})
+    mcp_server.scan_library()
+    file_id = _scanned_id(source)
+    to_path = str(Path("Artist") / "Moved" / "01.mp3")
+
+    staged = mcp_server.stage_paths_batch([{"file_id": file_id, "to_path": to_path}])
+    assert (staged["ok"], staged["file_ids"]) == (True, [file_id])
+    changes = mcp_server.diff_paths()["changes"]
+    assert isinstance(changes, list)
+    assert (changes[0]["to_path"], changes[0]["state"]) == (to_path, "at_source")
+
+    committed = mcp_server.commit_paths(message="move")
+    assert (committed["ok"], committed["committed"], committed["problems"]) == (True, 1, [])
+    commit_id = committed["commit_id"]
+    assert isinstance(commit_id, int)
+    assert (music_dir / to_path).exists()
+    assert mcp_server.get_commit(commit_id)["logs"] == {"path_revisions": 1}
+    history = mcp_server.history_paths(file_id)["history"]
+    assert isinstance(history, list)
+    assert [h["to_path"] for h in history] == [str(Path("Artist") / "Album" / "01.mp3"), to_path]
+
+    reverted = mcp_server.revert_commit(commit_id)
+    assert (reverted["ok"], reverted["reverted"]) == (True, 1)
+    assert source.exists()
+
+    again = mcp_server.revert_paths(file_id, 1, dry_run=True)
+    assert (again["ok"], again["status"], again["commit_id"]) == (True, "reverted", None)
+    assert mcp_server.unstage_paths(file_id=file_id) == {"ok": True, "removed": 0}
+
+
+def test_path_tools_return_the_error_envelope(music_dir: Path) -> None:
+    config.set_setting("music_path", str(music_dir))
+
+    assert mcp_server.unstage_paths()["ok"] is False
+    assert mcp_server.history_paths(9999)["ok"] is False
+    assert mcp_server.revert_paths(9999, 0)["ok"] is False
+    held = mcp_server.stage_paths_batch([{"file_id": 9999, "to_path": "a.mp3"}])
+    assert held["ok"] is False
+    assert "unknown_file" in str(held["error"])
+
+
+def _scanned_id(path: Path) -> int:
+    conn = connect(load_settings().db_path)
+    try:
+        row = store.get_file(conn, str(path.parent), path.name)
+        assert row is not None
+        return row.id
+    finally:
+        conn.close()

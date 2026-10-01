@@ -1,0 +1,1015 @@
+"""Tests for the paths domain (:mod:`tagmend.engine.paths`).
+
+Real generated audio in ``tmp_path`` and real ledgers. One test per cell of the module
+docstring's state table (six disk states by six events), a crash simulated by an exception that
+escapes the commit loop after the disk move and before the ledger commit, the batch holds, the
+c1 commit check, the pruner, the volume check, revert by commit and by file, and the scan guard.
+"""
+
+from __future__ import annotations
+
+import ast
+import contextlib
+import os
+import sqlite3
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+import mutagen
+import pytest
+
+from conftest import make_track
+from tagmend.engine import (
+    commits,
+    health,
+    mismatch,
+    path_keys,
+    paths,
+    staging,
+    store,
+    versioning,
+    years,
+)
+from tagmend.engine.db import connect
+from tagmend.engine.library import scan_library
+from tagmend.engine.schema import apply_schema
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+
+    from tagmend.config import Settings
+
+_SOURCE = Path("Artist") / "Album" / "01.mp3"
+_TARGET = Path("Artist") / "Moved" / "01.mp3"
+_OTHER_TARGET = Path("Artist") / "Elsewhere" / "01.mp3"
+_STATES = (
+    paths.AT_SOURCE,
+    paths.LANDED,
+    paths.LANDED_CHANGED,
+    paths.HALF_LINK,
+    paths.TARGET_TAKEN,
+    paths.GONE,
+)
+
+
+class _CrashError(BaseException):
+    """A process death: escapes every handler, so the ledger rolls back on close."""
+
+
+@dataclass(frozen=True)
+class _Lib:
+    settings: Settings
+    music: Path
+    x: int
+    y: int
+
+
+@contextlib.contextmanager
+def _ledger(settings: Settings) -> Iterator[sqlite3.Connection]:
+    conn = connect(settings.db_path)
+    try:
+        apply_schema(conn)
+        yield conn
+    finally:
+        conn.close()
+
+
+def _id_at(settings: Settings, path: Path) -> int:
+    with _ledger(settings) as conn:
+        row = store.get_file(conn, str(path.parent), path.name)
+        assert row is not None
+        return row.id
+
+
+def _library(settings: Settings, music: Path, *extra: Path) -> _Lib:
+    """Clean folders that keep the mismatch gate open, plus two Artist tracks and *extra*."""
+    for name in ("CleanA", "CleanB", "CleanC", "CleanD"):
+        make_track(music / name / "Album" / "01.mp3", {"albumartist": [name], "artist": [name]})
+    for relative in (_SOURCE, _SOURCE.with_name("02.mp3"), *extra):
+        top = relative.parts[0]
+        make_track(music / relative, {"albumartist": [top], "artist": [top]})
+    scan_library(settings)
+    assert mismatch.gate_state(settings).open
+    return _Lib(
+        settings=settings,
+        music=music,
+        x=_id_at(settings, music / _SOURCE),
+        y=_id_at(settings, music / _SOURCE.with_name("02.mp3")),
+    )
+
+
+@pytest.fixture
+def lib(engine_settings: Settings, music_dir: Path) -> _Lib:
+    return _library(engine_settings, music_dir)
+
+
+def _stage(lib: _Lib, *moves: tuple[int, Path | str]) -> list[int]:
+    return paths.stage_paths_batch(
+        lib.settings,
+        entries=[(file_id, str(target)) for file_id, target in moves],
+    )
+
+
+def _row(lib: _Lib, file_id: int) -> store.FileRow:
+    with _ledger(lib.settings) as conn:
+        row = store.get_file_by_id(conn, file_id)
+        assert row is not None
+        return row
+
+
+def _location(lib: _Lib, file_id: int) -> Path:
+    row = _row(lib, file_id)
+    return Path(row.folder) / row.filename
+
+
+def _staged(lib: _Lib, file_id: int) -> store.StagedPath | None:
+    with _ledger(lib.settings) as conn:
+        return store.get_staged_path(conn, file_id)
+
+
+def _state(lib: _Lib, file_id: int) -> str:
+    view = next(v for v in paths.diff_paths(lib.settings) if v.file_id == file_id)
+    return view.state
+
+
+def _file_count(lib: _Lib) -> int:
+    with _ledger(lib.settings) as conn:
+        return len(store.list_files(conn))
+
+
+def _external_write(path: Path) -> None:
+    """A tagger edit: new tag bytes and a later mtime."""
+    audio = mutagen.File(path, easy=True)  # type: ignore[attr-defined]
+    audio["title"] = ["Edited elsewhere"]
+    audio.save()
+    stat_result = path.stat()
+    os.utime(path, ns=(stat_result.st_atime_ns, stat_result.st_mtime_ns + 5_000_000_000))
+
+
+def _enter(lib: _Lib, state: str) -> None:
+    """Stage x to the target, then shape the disk into *state*."""
+    _stage(lib, (lib.x, _TARGET))
+    source = lib.music / _SOURCE
+    target = lib.music / _TARGET
+    if state == paths.GONE:
+        source.unlink()
+    elif state == paths.TARGET_TAKEN:
+        make_track(target, {"title": ["Intruder"]})
+    elif state == paths.HALF_LINK:
+        target.parent.mkdir(parents=True)
+        os.link(source, target)
+    elif state in {paths.LANDED, paths.LANDED_CHANGED}:
+        target.parent.mkdir(parents=True)
+        source.rename(target)
+        if state == paths.LANDED_CHANGED:
+            _external_write(target)
+    assert _state(lib, lib.x) == state
+
+
+# --- the state table: commit_paths ---------------------------------------------------
+
+_COMMIT_CELLS = {
+    paths.AT_SOURCE: "committed",
+    paths.LANDED: "committed",
+    paths.LANDED_CHANGED: "changed_since_stage",
+    paths.HALF_LINK: "committed",
+    paths.TARGET_TAKEN: "errors",
+    paths.GONE: "missing",
+}
+
+
+@pytest.mark.parametrize("state", _STATES)
+def test_commit_paths_cell(lib: _Lib, state: str) -> None:
+    _enter(lib, state)
+
+    result = paths.commit_paths(lib.settings).to_dict()
+
+    expected = _COMMIT_CELLS[state]
+    assert result[expected] == 1
+    if expected == "committed":
+        assert _location(lib, lib.x) == lib.music / _TARGET
+        assert _staged(lib, lib.x) is None
+        assert not (lib.music / _SOURCE).exists()
+        assert (lib.music / _TARGET).exists()
+        history = paths.history_paths(lib.settings, lib.x)
+        assert [(r.version, r.from_path, r.to_path) for r in history] == [
+            (0, str(_SOURCE), str(_SOURCE)),
+            (1, str(_SOURCE), str(_TARGET)),
+        ]
+        return
+    problems = result["problems"]
+    assert isinstance(problems, list)
+    assert problems[0]["status"] == ("error" if expected == "errors" else expected)
+    assert _location(lib, lib.x) == lib.music / _SOURCE
+    if expected == "missing":
+        assert _staged(lib, lib.x) is None
+        assert _row(lib, lib.x).is_missing
+    else:
+        assert _staged(lib, lib.x) is not None
+
+
+# --- the state table: unstage_paths ----------------------------------------------------
+
+
+@pytest.mark.parametrize("state", _STATES)
+def test_unstage_paths_cell(lib: _Lib, state: str) -> None:
+    _enter(lib, state)
+
+    if state in {paths.LANDED, paths.LANDED_CHANGED, paths.HALF_LINK}:
+        with pytest.raises(ValueError, match=rf"\[{lib.x}\].*commit_paths"):
+            paths.unstage_paths(lib.settings, file_id=lib.x)
+        assert _staged(lib, lib.x) is not None
+        return
+    assert paths.unstage_paths(lib.settings, file_id=lib.x) == 1
+    assert _staged(lib, lib.x) is None
+
+
+def test_unstage_paths_by_folder_refuses_the_whole_call_for_a_landed_move(lib: _Lib) -> None:
+    _stage(lib, (lib.y, Path("Artist") / "Second" / "02.mp3"))
+    _enter(lib, paths.LANDED)
+
+    with pytest.raises(ValueError, match="Nothing was unstaged"):
+        paths.unstage_paths(lib.settings, path=str(lib.music / "Artist"))
+
+    assert _staged(lib, lib.y) is not None
+    assert paths.unstage_paths(lib.settings, file_id=lib.y) == 1
+
+
+def test_unstage_paths_needs_exactly_one_argument(lib: _Lib) -> None:
+    with pytest.raises(ValueError, match="exactly one"):
+        paths.unstage_paths(lib.settings)
+    with pytest.raises(ValueError, match="exactly one"):
+        paths.unstage_paths(lib.settings, file_id=lib.x, path="Artist")
+    with pytest.raises(ValueError, match="unknown file_id"):
+        paths.unstage_paths(lib.settings, file_id=99999)
+
+
+# --- the state table: stage_paths_batch re-stage ---------------------------------------
+
+_RESTAGE_CELLS = [
+    (paths.AT_SOURCE, _TARGET, None),
+    (paths.AT_SOURCE, _OTHER_TARGET, None),
+    (paths.LANDED, _TARGET, None),
+    (paths.LANDED, _OTHER_TARGET, paths.LANDED_MOVE),
+    (paths.LANDED_CHANGED, _TARGET, None),
+    (paths.LANDED_CHANGED, _OTHER_TARGET, paths.LANDED_MOVE),
+    (paths.HALF_LINK, _TARGET, None),
+    (paths.HALF_LINK, _OTHER_TARGET, paths.LANDED_MOVE),
+    (paths.TARGET_TAKEN, _TARGET, paths.OCCUPIED),
+    (paths.TARGET_TAKEN, _OTHER_TARGET, None),
+    (paths.GONE, _TARGET, paths.MISSING),
+    (paths.GONE, _OTHER_TARGET, paths.MISSING),
+]
+
+
+@pytest.mark.parametrize(("state", "target", "held"), _RESTAGE_CELLS)
+def test_restage_cell(lib: _Lib, state: str, target: Path, held: str | None) -> None:
+    _enter(lib, state)
+    before = _staged(lib, lib.x)
+
+    if held is not None:
+        with pytest.raises(ValueError, match=rf"file_id={lib.x}\): {held}"):
+            _stage(lib, (lib.x, target))
+        assert _staged(lib, lib.x) == before
+        return
+    _stage(lib, (lib.x, target))
+
+    staged = _staged(lib, lib.x)
+    assert staged is not None
+    assert staged.to_path == str(target)
+    if state in {paths.LANDED, paths.LANDED_CHANGED}:
+        # The re-stage confirms the file found at the target.
+        assert _state(lib, lib.x) == paths.LANDED
+        assert paths.commit_paths(lib.settings).committed == 1
+        assert _location(lib, lib.x) == lib.music / _TARGET
+
+
+# --- the state table: scan_library ----------------------------------------------------
+
+_SCAN_PENDING = {
+    paths.AT_SOURCE: 0,
+    paths.LANDED: 1,
+    paths.LANDED_CHANGED: 1,
+    paths.HALF_LINK: 1,
+    paths.TARGET_TAKEN: 1,
+    paths.GONE: 0,
+}
+
+
+@pytest.mark.parametrize("state", _STATES)
+def test_scan_library_cell(lib: _Lib, state: str) -> None:
+    _enter(lib, state)
+    files_before = _file_count(lib)
+
+    result = scan_library(lib.settings)
+
+    assert result.pending_commit == _SCAN_PENDING[state]
+    assert result.missing_flagged == 0
+    assert _file_count(lib) == files_before
+    assert not _row(lib, lib.x).is_missing
+    assert _staged(lib, lib.x) is not None
+
+
+# --- the state table: revert_commit ----------------------------------------------------
+
+
+@pytest.mark.parametrize("state", _STATES)
+def test_revert_commit_cell(lib: _Lib, state: str) -> None:
+    _stage(lib, (lib.y, Path("Artist") / "Second" / "02.mp3"))
+    earlier = paths.commit_paths(lib.settings).commit_id
+    assert earlier is not None
+    _enter(lib, state)
+
+    with pytest.raises(ValueError, match=r"staging area is not empty.*commit_paths"):
+        versioning.revert_commit(lib.settings, earlier)
+
+    assert _location(lib, lib.y) == lib.music / "Artist" / "Second" / "02.mp3"
+
+
+# --- the state table: a crash inside the commit loop -----------------------------------
+
+_CRASH_CELLS = {
+    paths.AT_SOURCE: paths.LANDED,
+    paths.LANDED: paths.LANDED,
+    paths.LANDED_CHANGED: paths.LANDED_CHANGED,
+    paths.HALF_LINK: paths.LANDED,
+    paths.TARGET_TAKEN: paths.TARGET_TAKEN,
+    paths.GONE: paths.GONE,
+}
+
+
+def _crash_after_the_disk_action(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Kill the commit at the log append, or at the drop of a missing file's row."""
+
+    def crash(*_args: object, **_kwargs: object) -> None:
+        raise _CrashError
+
+    monkeypatch.setattr(store, "insert_path_revision", crash)
+    monkeypatch.setattr(store, "delete_staged_path", crash)
+
+
+@pytest.mark.parametrize("state", _STATES)
+def test_crash_in_the_commit_loop_cell(
+    lib: _Lib,
+    state: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enter(lib, state)
+
+    with monkeypatch.context() as patch:
+        _crash_after_the_disk_action(patch)
+        with contextlib.suppress(_CrashError):
+            paths.commit_paths(lib.settings)
+
+    assert _state(lib, lib.x) == _CRASH_CELLS[state]
+    assert _location(lib, lib.x) == lib.music / _SOURCE
+    assert not _row(lib, lib.x).is_missing
+    assert [r.version for r in paths.history_paths(lib.settings, lib.x)] == [0]
+
+
+def test_a_crashed_move_survives_a_scan_and_the_next_commit_finishes_it(
+    lib: _Lib,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stage(lib, (lib.x, _TARGET))
+    with monkeypatch.context() as patch:
+        _crash_after_the_disk_action(patch)
+        with pytest.raises(_CrashError):
+            paths.commit_paths(lib.settings)
+    assert _state(lib, lib.x) == paths.LANDED
+
+    scanned = scan_library(lib.settings)
+
+    assert (scanned.pending_commit, scanned.added, scanned.missing_flagged) == (1, 0, 0)
+    result = paths.commit_paths(lib.settings)
+    assert result.committed == 1
+    assert _location(lib, lib.x) == lib.music / _TARGET
+    assert scan_library(lib.settings).added == 0
+    with _ledger(lib.settings) as conn:
+        assert [c.status for c in commits.list_commits_in(conn)] == ["applied", "interrupted"]
+
+
+def test_an_edit_after_a_crashed_move_keeps_the_row_until_it_is_confirmed(
+    lib: _Lib,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stage(lib, (lib.x, _TARGET))
+    with monkeypatch.context() as patch:
+        _crash_after_the_disk_action(patch)
+        with pytest.raises(_CrashError):
+            paths.commit_paths(lib.settings)
+    _external_write(lib.music / _TARGET)
+
+    edited = paths.commit_paths(lib.settings)
+    assert edited.changed_since_stage == 1
+    assert _staged(lib, lib.x) is not None
+    with pytest.raises(ValueError, match="commit_paths"):
+        paths.unstage_paths(lib.settings, file_id=lib.x)
+
+    _stage(lib, (lib.x, _TARGET))
+    assert paths.commit_paths(lib.settings).committed == 1
+    assert _location(lib, lib.x) == lib.music / _TARGET
+
+
+def test_only_the_exact_landed_spelling_confirms_a_landed_move(
+    lib: _Lib,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    landed = _TARGET.with_name("One.mp3")
+    _stage(lib, (lib.x, landed))
+    with monkeypatch.context() as patch:
+        _crash_after_the_disk_action(patch)
+        with pytest.raises(_CrashError):
+            paths.commit_paths(lib.settings)
+    assert _state(lib, lib.x) == paths.LANDED
+
+    with pytest.raises(ValueError, match=rf"file_id={lib.x}\): {paths.LANDED_MOVE}"):
+        _stage(lib, (lib.x, landed.with_name("one.mp3")))
+
+    _stage(lib, (lib.x, landed))
+    assert paths.commit_paths(lib.settings).committed == 1
+    assert _location(lib, lib.x) == lib.music / landed
+    assert scan_library(lib.settings).added == 0
+
+
+# --- stage_paths_batch holds -------------------------------------------------------------
+
+
+def _entry_for(lib: _Lib, hold: str) -> tuple[int, str]:
+    """Shape the library so the returned entry is held for *hold*."""
+    file_id, target = lib.x, str(_TARGET)
+    if hold == paths.OCCUPIED:
+        target = str(Path("CleanA") / "Album" / "01.mp3")
+    elif hold == "occupied_on_disk":
+        (lib.music / "Artist" / "Album" / "untracked.mp3").write_bytes(bytes(1))
+        target = str(Path("Artist") / "Album" / "untracked.mp3")
+    elif hold == paths.SHARED_TARGET:
+        _stage(lib, (lib.y, _TARGET))
+    elif hold == paths.TOO_LONG:
+        target = str(Path("Artist") / ("x" * 256) / "01.mp3")
+    elif hold == paths.CUE_REFERENCE:
+        sheet = lib.music / "Artist" / "Album" / "album.cue"
+        sheet.write_text('FILE "01.mp3" MP3\n  TRACK 01 AUDIO\n', encoding="utf-8")
+    elif hold == paths.STAGED_TAG:
+        staging.stage_tags(lib.settings, file_id=lib.x, tags={"genre": ["Rock"]})
+    elif hold == paths.UNKNOWN_FILE:
+        file_id = 99999
+    return file_id, target
+
+
+@pytest.mark.parametrize(
+    ("hold", "reason"),
+    [
+        (paths.OCCUPIED, paths.OCCUPIED),
+        ("occupied_on_disk", paths.OCCUPIED),
+        (paths.SHARED_TARGET, paths.SHARED_TARGET),
+        (paths.TOO_LONG, paths.TOO_LONG),
+        (paths.CUE_REFERENCE, paths.CUE_REFERENCE),
+        (paths.STAGED_TAG, paths.STAGED_TAG),
+        (paths.UNKNOWN_FILE, paths.UNKNOWN_FILE),
+    ],
+)
+def test_batch_holds_the_entry_and_stages_nothing(lib: _Lib, hold: str, reason: str) -> None:
+    held_entry = _entry_for(lib, hold)
+    good_entry = (lib.y, str(Path("Artist") / "Fine" / "02.mp3"))
+    if hold == paths.SHARED_TARGET:
+        good_entry = (_id_at(lib.settings, lib.music / "CleanB" / "Album" / "01.mp3"), "B.mp3")
+
+    with pytest.raises(ValueError, match=rf"entry 0 \(file_id={held_entry[0]}\): {reason}"):
+        paths.stage_paths_batch(lib.settings, entries=[held_entry, good_entry])
+
+    assert _staged(lib, good_entry[0]) is None
+    assert _staged(lib, lib.x) is None
+
+
+@pytest.mark.parametrize(
+    "to_path",
+    [
+        str(Path("Artist") / "Bad:Name" / "01.mp3"),
+        str(Path("Artist") / "Dot." / "01.mp3"),
+        str(Path("Artist") / " Edge" / "01.mp3"),
+        str(Path("Artist") / "CON" / "01.mp3"),
+        str(Path("Artist") / "Album" / "01.flac"),
+        str(Path("..") / "Escape" / "01.mp3"),
+        str(_SOURCE),
+        "",
+    ],
+)
+def test_batch_holds_an_invalid_path(lib: _Lib, to_path: str) -> None:
+    with pytest.raises(ValueError, match=rf"file_id={lib.x}\): invalid_path"):
+        _stage(lib, (lib.x, to_path))
+    assert _staged(lib, lib.x) is None
+
+
+def test_batch_holds_an_absolute_path_outside_music_path(lib: _Lib, tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match=r"invalid_path: .* is outside music_path"):
+        _stage(lib, (lib.x, tmp_path / "elsewhere" / "01.mp3"))
+
+
+def test_batch_lists_every_held_entry(lib: _Lib) -> None:
+    entries = [
+        (lib.x, str(_TARGET)),
+        (lib.y, str(_TARGET)),
+        (99999, "z.mp3"),
+    ]
+
+    with pytest.raises(ValueError, match="staged nothing") as caught:
+        paths.stage_paths_batch(lib.settings, entries=entries)
+
+    message = str(caught.value)
+    assert f"entry 0 (file_id={lib.x}): shared_target" in message
+    assert f"entry 1 (file_id={lib.y}): shared_target" in message
+    assert "entry 2 (file_id=99999): unknown_file" in message
+
+
+def test_batch_refuses_malformed_entries(lib: _Lib) -> None:
+    with pytest.raises(ValueError, match="duplicate file_id"):
+        _stage(lib, (lib.x, _TARGET), (lib.x, _OTHER_TARGET))
+    with pytest.raises(ValueError, match="pair"):
+        paths.stage_paths_batch(lib.settings, entries=[{"file_id": lib.x}])
+    with pytest.raises(ValueError, match="to_path must be a string"):
+        paths.stage_paths_batch(lib.settings, entries=[(lib.x, None)])
+
+
+def test_batch_accepts_an_absolute_path_under_music_path(lib: _Lib) -> None:
+    _stage(lib, (lib.x, lib.music / _TARGET))
+    staged = _staged(lib, lib.x)
+    assert staged is not None
+    assert staged.to_path == str(_TARGET)
+    assert staged.to_key == path_keys.path_key(_TARGET)
+
+
+def test_batch_refuses_the_whole_call_while_the_gate_is_closed(lib: _Lib) -> None:
+    audio = mutagen.File(lib.music / _SOURCE.with_name("02.mp3"), easy=True)  # type: ignore[attr-defined]
+    audio["albumartist"] = ["Somebody Else"]
+    audio.save()
+    scan_library(lib.settings)
+
+    with pytest.raises(ValueError, match="path gate is closed"):
+        _stage(lib, (lib.x, _TARGET))
+    assert _staged(lib, lib.x) is None
+
+
+def test_a_valid_batch_commits_as_one_revertible_commit(lib: _Lib) -> None:
+    _stage(
+        lib, (lib.x, Path("Artist") / "New" / "01.mp3"), (lib.y, Path("Artist") / "New" / "02.mp3")
+    )
+
+    result = paths.commit_paths(lib.settings, message="regroup")
+
+    assert (result.committed, result.problems) == (2, ())
+    assert result.commit_id is not None
+    assert versioning.commit_logs(lib.settings, result.commit_id) == {"path_revisions": 2}
+    commit = commits.get_commit(lib.settings, result.commit_id)
+    assert commit is not None
+    assert (commit.origin, commit.message, commit.status) == ("manual", "regroup", "applied")
+
+
+# --- the c1 commit check ---------------------------------------------------------------
+
+
+def test_commit_paths_refuses_a_staged_file_that_flags_at_its_recorded_path(lib: _Lib) -> None:
+    _stage(lib, (lib.x, _TARGET))
+    audio = mutagen.File(lib.music / _SOURCE, easy=True)  # type: ignore[attr-defined]
+    audio["albumartist"] = ["Somebody Else"]
+    audio.save()
+    scan_library(lib.settings)
+
+    with pytest.raises(ValueError, match=rf"\({lib.x}, 'top_folder_artist'\).*unstage_paths"):
+        paths.commit_paths(lib.settings)
+
+    assert (lib.music / _SOURCE).exists()
+    assert _staged(lib, lib.x) is not None
+
+
+def _land_the_second_of_a_straight_through_two_disc_album(
+    lib: _Lib,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Crash at the second log append: y lands and flags alone at its recorded folder."""
+    for name, disc in (("01.mp3", "1"), ("02.mp3", "2")):
+        audio = mutagen.File(lib.music / _SOURCE.with_name(name), easy=True)  # type: ignore[attr-defined]
+        audio["discnumber"] = [disc]
+        audio["tracknumber"] = ["1"]
+        audio.save()
+    scan_library(lib.settings)
+    assert mismatch.gate_state(lib.settings).open
+    _stage(lib, (lib.x, _TARGET), (lib.y, _TARGET.with_name("02.mp3")))
+    appends: list[int] = []
+    append = store.insert_path_revision
+
+    def crash_on_the_second(*args: object, **kwargs: object) -> None:
+        appends.append(1)
+        if len(appends) == 2:  # the second file's append
+            raise _CrashError
+        append(*args, **kwargs)  # type: ignore[arg-type]
+
+    with monkeypatch.context() as patch:
+        patch.setattr(store, "insert_path_revision", crash_on_the_second)
+        with pytest.raises(_CrashError):
+            paths.commit_paths(lib.settings)
+    assert _state(lib, lib.y) == paths.LANDED
+    with _ledger(lib.settings) as conn:
+        assert mismatch.check_files(conn, lib.settings, [lib.y])
+
+
+def test_a_landed_move_that_flags_at_its_recorded_path_still_commits(
+    lib: _Lib,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _land_the_second_of_a_straight_through_two_disc_album(lib, monkeypatch)
+
+    result = paths.commit_paths(lib.settings)
+
+    assert result.committed == 1
+    assert _location(lib, lib.y) == lib.music / _TARGET.with_name("02.mp3")
+
+
+def test_an_edited_landed_move_that_flags_is_confirmed_while_the_gate_is_closed(
+    lib: _Lib,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _land_the_second_of_a_straight_through_two_disc_album(lib, monkeypatch)
+    landed = lib.music / _TARGET.with_name("02.mp3")
+    _external_write(landed)
+    assert paths.commit_paths(lib.settings).changed_since_stage == 1
+    assert not mismatch.gate_state(lib.settings).open
+    with pytest.raises(ValueError, match="path gate is closed"):
+        _stage(lib, (lib.y, _TARGET.with_name("02.mp3")), (lib.x, _OTHER_TARGET))
+
+    _stage(lib, (lib.y, _TARGET.with_name("02.mp3")))
+
+    assert paths.commit_paths(lib.settings).committed == 1
+    assert _location(lib, lib.y) == landed
+
+
+# --- folder case, filename case and the pruner ------------------------------------------
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="NTFS ignores case")
+def test_a_case_only_filename_rename_commits_and_keeps_the_id(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    lib = _library(engine_settings, music_dir, Path("Artist") / "Album" / "track.mp3")
+    track = _id_at(lib.settings, lib.music / "Artist" / "Album" / "track.mp3")
+    renamed = Path("Artist") / "Album" / "Track.mp3"
+
+    _stage(lib, (track, renamed))
+    result = paths.commit_paths(lib.settings)
+
+    assert result.committed == 1
+    assert "Track.mp3" in {p.name for p in (lib.music / "Artist" / "Album").iterdir()}
+    assert _row(lib, track).filename == "Track.mp3"
+    assert [r.to_path for r in paths.history_paths(lib.settings, track)] == [
+        str(Path("Artist") / "Album" / "track.mp3"),
+        str(renamed),
+    ]
+    assert scan_library(lib.settings).added == 0
+    assert _id_at(lib.settings, lib.music / renamed) == track
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="NTFS ignores case")
+def test_a_folder_part_reuses_the_on_disk_spelling(lib: _Lib) -> None:
+    _stage(lib, (lib.x, Path("ARTIST") / "moved" / "01.mp3"))
+
+    staged = _staged(lib, lib.x)
+    assert staged is not None
+    assert staged.to_path == str(Path("Artist") / "moved" / "01.mp3")
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="NTFS ignores case")
+def test_a_target_naming_the_files_own_entry_in_another_folder_spelling(lib: _Lib) -> None:
+    new = Path("Artist") / "New"
+    _stage(lib, (lib.x, new / "01.mp3"), (lib.y, Path("Artist") / "NEW" / "02.mp3"))
+    assert paths.commit_paths(lib.settings).committed == 2
+    on_disk = lib.music / new / "02.mp3"
+    assert Path(_row(lib, lib.y).folder).name == "NEW"
+
+    with pytest.raises(ValueError, match=rf"file_id={lib.y}\): invalid_path: .*already sits"):
+        _stage(lib, (lib.y, new / "02.mp3"))
+
+    # The probe and the mover must survive a row the batch refuses, so it is written directly.
+    with _ledger(lib.settings) as conn:
+        size, mtime_ns = on_disk.stat().st_size, on_disk.stat().st_mtime_ns
+        store.upsert_staged_path(
+            conn,
+            store.StagedPath(
+                file_id=lib.y,
+                to_path=str(new / "02.mp3"),
+                to_key=path_keys.path_key(new / "02.mp3"),
+                origin="manual",
+                note=None,
+                staged_at="2026-10-01",
+                base_size_bytes=size,
+                base_mtime_ns=mtime_ns,
+                reverted_from=None,
+            ),
+        )
+        conn.commit()
+    assert _state(lib, lib.y) == paths.AT_SOURCE
+
+    assert paths.commit_paths(lib.settings).committed == 1
+    assert on_disk.exists()
+    assert _location(lib, lib.y) == on_disk
+    assert Path(_row(lib, lib.y).folder).name == "New"
+
+
+def test_respell_folders_keeps_an_absent_folder_and_the_filename(lib: _Lib) -> None:
+    respelled = paths.respell_folders(lib.music, str(Path("Artist") / "New" / "ONE.mp3"))
+    assert respelled == str(Path("Artist") / "New" / "ONE.mp3")
+
+
+def test_the_pruner_removes_emptied_folders_up_to_music_path(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    lib = _library(engine_settings, music_dir, Path("Solo") / "Album" / "01.mp3")
+    solo = _id_at(lib.settings, music_dir / "Solo" / "Album" / "01.mp3")
+
+    _stage(lib, (solo, Path("Solo2") / "Album" / "01.mp3"))
+    paths.commit_paths(lib.settings)
+
+    assert not (music_dir / "Solo").exists()
+    assert music_dir.exists()
+    assert (music_dir / "Solo2" / "Album" / "01.mp3").exists()
+
+
+def test_the_pruner_keeps_a_folder_holding_a_hidden_file(lib: _Lib) -> None:
+    hidden = lib.music / "Artist" / "Album" / ".hidden"
+    hidden.write_bytes(b"\x00")
+    new = Path("Artist") / "New"
+    _stage(lib, (lib.x, new / "01.mp3"), (lib.y, new / "02.mp3"))
+
+    paths.commit_paths(lib.settings)
+
+    assert hidden.exists()
+    assert (lib.music / new / "01.mp3").exists()
+
+
+def test_the_pruner_removes_the_vacated_album_folder_only(lib: _Lib) -> None:
+    new = Path("Artist") / "New"
+    _stage(lib, (lib.x, new / "01.mp3"), (lib.y, new / "02.mp3"))
+
+    paths.commit_paths(lib.settings)
+
+    assert not (lib.music / "Artist" / "Album").exists()
+    assert (lib.music / "Artist").exists()
+
+
+# --- the volume check ------------------------------------------------------------------
+
+
+def test_the_volume_check_passes_on_the_test_filesystem(lib: _Lib) -> None:
+    assert paths.volume_refusal(lib.music) is None
+
+
+def test_the_volume_check_refuses_a_case_blind_posix_volume(
+    lib: _Lib,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stage(lib, (lib.y, Path("Artist") / "Second" / "02.mp3"))
+    monkeypatch.setattr(paths, "_case_blind_volume", lambda _music_path: True)
+
+    with pytest.raises(ValueError, match="ignores case"):
+        _stage(lib, (lib.x, _TARGET))
+    with pytest.raises(ValueError, match="ignores case"):
+        paths.commit_paths(lib.settings)
+    check = health._check_path_staging(lib.settings)
+    assert check.ok
+    assert "ignores case" in check.detail
+    assert (lib.music / _SOURCE.with_name("02.mp3")).exists()
+
+
+# --- revert ------------------------------------------------------------------------------
+
+
+def _move(lib: _Lib, *moves: tuple[int, Path]) -> int:
+    _stage(lib, *moves)
+    commit_id = paths.commit_paths(lib.settings).commit_id
+    assert commit_id is not None
+    return commit_id
+
+
+def test_revert_commit_moves_every_file_back_and_a_second_revert_moves_them_forward(
+    lib: _Lib,
+) -> None:
+    new = Path("Artist") / "New"
+    forward = _move(lib, (lib.x, new / "01.mp3"), (lib.y, new / "02.mp3"))
+
+    back = versioning.revert_commit(lib.settings, forward, note="undo")
+
+    assert (back.reverted, back.skipped, back.errors) == (2, 0, 0)
+    assert back.commit_id is not None
+    assert _location(lib, lib.x) == lib.music / _SOURCE
+    assert _location(lib, lib.y) == lib.music / _SOURCE.with_name("02.mp3")
+    assert not (lib.music / new).exists()
+    reverted = paths.history_paths(lib.settings, lib.x)[-1]
+    assert (reverted.origin, reverted.reverted_from, reverted.commit_id) == (
+        "revert",
+        0,
+        back.commit_id,
+    )
+    commit = commits.get_commit(lib.settings, back.commit_id)
+    assert commit is not None
+    assert (commit.origin, commit.reverted_from) == ("revert", forward)
+
+    again = versioning.revert_commit(lib.settings, back.commit_id)
+
+    assert again.reverted == 2
+    assert _location(lib, lib.x) == lib.music / new / "01.mp3"
+    assert [r.version for r in paths.history_paths(lib.settings, lib.x)] == [0, 1, 2, 3]
+
+
+def test_revert_commit_dry_run_changes_nothing(lib: _Lib) -> None:
+    forward = _move(lib, (lib.x, _TARGET))
+
+    preview = versioning.revert_commit(lib.settings, forward, dry_run=True)
+
+    assert (preview.commit_id, preview.reverted, preview.dry_run) == (None, 1, True)
+    assert _location(lib, lib.x) == lib.music / _TARGET
+
+
+def test_revert_commit_skips_a_file_a_later_path_commit_moved(lib: _Lib) -> None:
+    first = _move(lib, (lib.x, _TARGET))
+    _move(lib, (lib.x, _OTHER_TARGET))
+
+    result = versioning.revert_commit(lib.settings, first)
+
+    assert result.commit_id is None
+    assert [o.status for o in result.outcomes] == ["skipped_later_changes"]
+    assert _location(lib, lib.x) == lib.music / _OTHER_TARGET
+
+
+def test_revert_commit_reports_a_source_taken_since(lib: _Lib) -> None:
+    forward = _move(lib, (lib.x, _TARGET))
+    make_track(lib.music / _SOURCE, {"title": ["Newcomer"]})
+
+    result = versioning.revert_commit(lib.settings, forward)
+
+    assert [o.status for o in result.outcomes] == ["error"]
+    assert "already on disk" in str(result.outcomes[0].detail)
+    assert _location(lib, lib.x) == lib.music / _TARGET
+
+
+def test_revert_commit_refuses_a_commit_in_no_log(lib: _Lib) -> None:
+    with _ledger(lib.settings) as conn:
+        empty = commits.create_commit(conn, origin="manual", message=None, now="2026-10-01")
+        commits.set_commit_status(conn, empty, "applied")
+        conn.commit()
+
+    with pytest.raises(ValueError, match="holds no change"):
+        versioning.revert_commit(lib.settings, empty)
+
+
+def test_revert_paths_moves_one_file_to_a_prior_version(lib: _Lib) -> None:
+    _move(lib, (lib.x, _TARGET))
+    _move(lib, (lib.x, _OTHER_TARGET))
+
+    preview = paths.revert_paths(lib.settings, lib.x, 0, dry_run=True)
+    assert (preview.status, preview.commit_id) == ("reverted", None)
+    assert _location(lib, lib.x) == lib.music / _OTHER_TARGET
+
+    result = paths.revert_paths(lib.settings, lib.x, 0, note="home")
+
+    assert (result.status, result.new_version, result.to_path) == ("reverted", 3, str(_SOURCE))
+    assert _location(lib, lib.x) == lib.music / _SOURCE
+    assert result.commit_id is not None
+    assert versioning.commit_logs(lib.settings, result.commit_id) == {"path_revisions": 1}
+
+
+def test_revert_paths_refusals(lib: _Lib) -> None:
+    _move(lib, (lib.x, _TARGET))
+    with pytest.raises(ValueError, match="no path version 7"):
+        paths.revert_paths(lib.settings, lib.x, 7)
+    with pytest.raises(ValueError, match="already on disk"):
+        paths.revert_paths(lib.settings, lib.x, 1)
+    with pytest.raises(ValueError, match="no path history"):
+        paths.revert_paths(lib.settings, lib.y, 0)
+    with pytest.raises(ValueError, match="unknown file_id"):
+        paths.revert_paths(lib.settings, 99999, 0)
+
+
+def test_both_reverts_refuse_while_a_row_is_staged_and_name_commit_paths(
+    lib: _Lib,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    forward = _move(lib, (lib.x, _TARGET))
+    with monkeypatch.context() as patch:
+        _crash_after_the_disk_action(patch)
+        with pytest.raises(_CrashError):
+            versioning.revert_commit(lib.settings, forward)
+    leftover = _staged(lib, lib.x)
+    assert leftover is not None
+    assert (leftover.origin, leftover.to_path) == ("revert", str(_SOURCE))
+
+    with pytest.raises(ValueError, match="commit_paths"):
+        versioning.revert_commit(lib.settings, forward)
+    with pytest.raises(ValueError, match="commit_paths"):
+        paths.revert_paths(lib.settings, lib.x, 0)
+
+    swept = paths.commit_paths(lib.settings)
+
+    assert swept.committed == 1
+    assert _location(lib, lib.x) == lib.music / _SOURCE
+    assert swept.commit_id is not None
+    commit = commits.get_commit(lib.settings, swept.commit_id)
+    assert commit is not None
+    assert commit.origin == "revert"
+
+
+def test_history_paths_lists_every_location(lib: _Lib) -> None:
+    first = _move(lib, (lib.x, _TARGET))
+
+    history = [r.to_dict() for r in paths.history_paths(lib.settings, lib.x)]
+
+    assert [(h["version"], h["origin"], h["commit_id"], h["to_path"]) for h in history] == [
+        (0, "scan", None, str(_SOURCE)),
+        (1, "manual", first, str(_TARGET)),
+    ]
+    assert paths.history_paths(lib.settings, lib.y) == []
+    with pytest.raises(ValueError, match="unknown file_id"):
+        paths.history_paths(lib.settings, 99999)
+
+
+# --- mutual exclusion, health and the tag-side guards -----------------------------------
+
+
+def test_tag_staging_refuses_a_file_with_a_staged_move(lib: _Lib) -> None:
+    _stage(lib, (lib.x, _TARGET))
+
+    with pytest.raises(ValueError, match=r"staged path change.*commit_paths"):
+        staging.stage_tags(lib.settings, file_id=lib.x, tags={"genre": ["Rock"]})
+    with pytest.raises(ValueError, match="staged path change"):
+        staging.stage_tags_batch(lib.settings, entries=[(lib.x, {"genre": ["Rock"]})])
+    with pytest.raises(ValueError, match="commit or unstage pending changes first"):
+        years.resolve_years(lib.settings)
+
+
+def test_revert_tags_refuses_a_file_with_a_staged_move(lib: _Lib) -> None:
+    staging.stage_tags(lib.settings, file_id=lib.x, tags={"genre": ["Rock"]})
+    staging.commit_tags(lib.settings)
+    _stage(lib, (lib.x, _TARGET))
+
+    with pytest.raises(ValueError, match=r"staged path change.*unstage_paths"):
+        versioning.revert_tags(lib.settings, lib.x, 0)
+
+
+def test_check_health_reports_staged_and_landed_moves(lib: _Lib) -> None:
+    _stage(lib, (lib.y, Path("Artist") / "Second" / "02.mp3"))
+    _enter(lib, paths.LANDED)
+
+    check = health._check_path_staging(lib.settings)
+
+    assert check.ok
+    assert "2 staged move(s)" in check.detail
+    assert f"[{lib.x}] already sit at their target. Run commit_paths" in check.detail
+    assert "the volume check passes" in check.detail
+
+
+# --- the component rules -------------------------------------------------------------------
+
+
+def test_check_components_and_check_length() -> None:
+    assert paths.check_components(str(Path("A") / "M.I.A. Song.mp3")) == []
+    assert len(paths.check_components(str(Path("lpt1.txt") / "x?.mp3"))) == 2
+    assert paths.check_length(Path("/m"), "a.mp3") == []
+    assert paths.check_length(Path("/m"), str(Path("b" * 100) / ("c" * 200)))
+
+
+# --- forbidden calls -----------------------------------------------------------------------
+
+_PATH_MODULES = (Path(paths.__file__),)
+_FORBIDDEN_CALLS = frozenset(
+    {"replace", "move", "rmtree", "remove", "removedirs", "unlink", "rmdir"}
+)
+_ALLOWED = {"unlink": {"move_no_clobber", "_finish_half_link"}, "rmdir": {"_prune"}}
+
+
+def _calls_by_function(module: Path) -> list[tuple[str, str]]:
+    """Return ``(enclosing function, called attribute)`` for every forbidden-named call."""
+    found: list[tuple[str, str]] = []
+
+    def visit(node: ast.AST, function: str) -> None:
+        for child in ast.iter_child_nodes(node):
+            inner = child.name if isinstance(child, ast.FunctionDef) else function
+            if (
+                isinstance(child, ast.Call)
+                and isinstance(child.func, ast.Attribute)
+                and child.func.attr in _FORBIDDEN_CALLS
+            ):
+                found.append((function, child.func.attr))
+            visit(child, inner)
+
+    visit(ast.parse(module.read_text(encoding="utf-8")), "<module>")
+    return found
+
+
+def test_the_path_modules_never_delete_or_overwrite() -> None:
+    for module in _PATH_MODULES:
+        calls = _calls_by_function(module)
+        assert {name for _, name in calls} == {"unlink", "rmdir"}
+        for function, name in calls:
+            assert function in _ALLOWED.get(name, set()), f"{module.name}: {name} in {function}"

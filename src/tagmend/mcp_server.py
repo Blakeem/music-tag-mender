@@ -28,6 +28,7 @@ from tagmend.engine import (
     health,
     library,
     mismatch,
+    paths,
     release_disagreements,
     songs,
     staging,
@@ -1058,25 +1059,31 @@ def revert_commit(
     note: str | None = None,
     dry_run: bool = False,  # noqa: FBT001, FBT002 - MCP tool surface, not a Python API
 ) -> dict[str, object]:
-    """Undo an entire commit as a unit: every file it changed goes back to its pre-commit tags.
+    """Undo an entire commit as a unit. Every file it changed goes back to its pre-commit state.
 
-    The group counterpart of ``revert_tags``: all reverts land under ONE new
-    ``origin='revert'`` commit whose ``reverted_from`` records the undone commit, so the
-    rollback is itself a tracked, revertible commit. History stays append-only — nothing
+    Works on both logs. A tag commit restores each file's pre-commit tags. A path commit
+    (from ``commit_paths``) moves each file back to the path it left, and a revert of that
+    revert moves them forward again. ``get_commit`` names the log a commit changed.
+
+    The group counterpart of ``revert_tags`` and ``revert_paths``. All reverts land under ONE
+    new ``origin='revert'`` commit whose ``reverted_from`` records the undone commit, so the
+    rollback is itself a tracked, revertible commit. History stays append-only, so nothing
     after the commit is ever lost. Find commit ids with ``list_commits``.
 
-    Safety rules: files changed again by a LATER commit are skipped and reported
-    (``skipped_later_changes`` — revert those per-file with ``revert_tags`` if really
-    wanted); the staging area must be empty (commit or unstage pending work first);
-    missing files are reported, not fatal. Use ``dry_run=true`` to preview the exact
-    per-file plan without touching anything.
+    Safety rules. A file changed again by a LATER commit is skipped and reported as
+    ``skipped_later_changes``. Revert it per file with ``revert_tags`` or ``revert_paths`` if
+    that is really wanted. The staging area must be empty, tag and path rows alike, so commit
+    or unstage pending work first, and run ``commit_paths`` to finish an interrupted path
+    revert. Missing files are reported, not fatal. A path whose old location is taken now is
+    reported as an ``error``. Use ``dry_run=true`` to preview the exact per-file plan without
+    touching anything.
 
     Args:
         commit_id: The commit to undo (from ``list_commits``).
         note: Optional message stored on the new revert commit and its revisions.
-        dry_run: When true, classify and report only — no disk or ledger changes
-            (``commit_id`` in the result is ``null``; ``status='reverted'`` means
-            "would be reverted", ``status='noop'`` means "would change nothing").
+        dry_run: When true, classify and report only, with no disk or ledger change.
+            ``commit_id`` in the result is ``null``, ``status='reverted'`` means "would be
+            reverted", and ``status='noop'`` means "would change nothing".
 
     Returns:
         ``{"ok": True, "commit_id": ..., "reverted_from": ..., "dry_run": ...,
@@ -1084,7 +1091,8 @@ def revert_commit(
         one outcome per file (``noop`` = the file already held its pre-commit state, so
         the audited revert revision was appended but nothing on disk moved). Returns
         ``{"ok": False, "error": ...}`` if the commit id is unknown, the commit is still
-        ``applying``, or the staging area is not empty.
+        ``applying``, the commit holds no change in either log, or the staging area is not
+        empty.
     """
     result = versioning.revert_commit(
         load_settings(),
@@ -1111,15 +1119,183 @@ def list_commits(limit: int | None = None) -> dict[str, object]:
 @mcp.tool()
 @_error_envelope
 def get_commit(commit_id: int) -> dict[str, object]:
-    """Return one commit by id.
+    """Return one commit by id, and the revision logs that hold its changes.
 
     Returns ``{"ok": True, "commit": {commit_id, created_at, origin, message, reverted_from,
-    status}}``, or ``{"ok": False, "error": ...}`` if the id is unknown.
+    status}, "logs": {"tag_revisions": <count>, "path_revisions": <count>}}``, where ``logs``
+    names only the logs holding rows of this commit (a tag commit or a path commit), or
+    ``{"ok": False, "error": ...}`` if the id is unknown.
     """
-    commit = commits.get_commit(load_settings(), commit_id)
+    settings = load_settings()
+    commit = commits.get_commit(settings, commit_id)
     if commit is None:
         return {"ok": False, "error": f"unknown commit_id={commit_id}"}
-    return {"ok": True, "commit": commit.to_dict()}
+    return {
+        "ok": True,
+        "commit": commit.to_dict(),
+        "logs": versioning.commit_logs(settings, commit_id),
+    }
+
+
+@mcp.tool()
+@_error_envelope
+def stage_paths_batch(
+    entries: list[dict[str, object]],
+    note: str | None = None,
+) -> dict[str, object]:
+    """Stage explicit file moves for MANY files in one atomic, all-or-nothing call (no disk write).
+
+    Each entry names a file and the path it should move to. ``to_path`` is relative to
+    ``music_path`` (or absolute under it) and keeps the file's extension. A folder in
+    ``to_path`` that already exists under another casing keeps its on-disk spelling. A
+    filename casing change is a rename. Nothing moves until ``commit_paths``.
+
+    The whole call is refused, and nothing is staged, while ``detect_mismatches`` does not read
+    ``gate_open: true``, on a volume that ignores case under a case-keeping OS, and when any
+    entry is held. The error lists every held entry with its reason: ``occupied`` (another
+    tracked file or an entry on disk holds the target), ``shared_target`` (another staged move
+    or entry targets it), ``too_long`` (a part over 255 UTF-16 units or a full path over 259
+    characters), ``cue_reference`` (a cue sheet or playlist in the source folder names the
+    file), ``staged_tag`` (run ``commit_tags`` or ``unstage_tags`` first), ``invalid_path`` (a
+    forbidden character, edge whitespace, a trailing dot or space, a reserved device name, a
+    changed extension, or the file's own path), ``unknown_file``, ``missing`` and
+    ``landed_move`` (the file's staged move already landed on disk, run ``commit_paths``).
+
+    Staging a file again replaces its row. A file whose move already landed on disk takes only
+    its staged ``to_path`` again, in the same spelling, which confirms the file found there. A
+    call made only of such confirmations passes while the gate is closed. Staging captures each
+    file's first location as path version 0. Tag staging and path staging exclude each other
+    per file.
+
+    Args:
+        entries: A list of ``{"file_id": <int>, "to_path": <str>}`` objects.
+        note: Optional free-text note stored with each eventual path revision.
+
+    Returns:
+        ``{"ok": True, "staged": <count>, "file_ids": [...]}``, or ``{"ok": False, "error":
+        ...}`` naming every held entry (nothing staged).
+    """
+    pairs = [(entry.get("file_id"), entry.get("to_path")) for entry in entries]
+    staged = paths.stage_paths_batch(load_settings(), entries=pairs, note=note)
+    return {"ok": True, "staged": len(staged), "file_ids": staged}
+
+
+@mcp.tool()
+@_error_envelope
+def unstage_paths(file_id: int | None = None, path: str | None = None) -> dict[str, object]:
+    """Drop staged moves for one file, or for every file under a folder. Moves nothing.
+
+    Pass exactly one of ``file_id`` and ``path``. ``path`` matches where a file sits now,
+    which is its source until its move commits. It is compared as a path: case and ``/`` versus
+    backslash do not matter on Windows, and a relative folder resolves under ``music_path``.
+    The call is refused whole, naming the files, when any matched file already sits at its
+    staged target on disk (a crash after the move): run ``commit_paths`` to finish those moves.
+
+    Returns ``{"ok": True, "removed": <count>}``, or ``{"ok": False, "error": ...}``.
+    """
+    removed = paths.unstage_paths(load_settings(), file_id=file_id, path=path)
+    return {"ok": True, "removed": removed}
+
+
+@mcp.tool()
+@_error_envelope
+def diff_paths(path: str | None = None) -> dict[str, object]:
+    """Show the staged moves, each with where it is on disk now. Read-only.
+
+    ``state`` is one of ``at_source`` (ready to move), ``landed`` (the move reached disk
+    before a crash, ``commit_paths`` records it), ``landed_changed`` (as ``landed``, but the
+    file changed since it was staged: stage the same ``to_path`` again to confirm it),
+    ``half_link`` (a cut POSIX move, ``commit_paths`` finishes it), ``target_taken`` (another
+    file sits at the target: stage another ``to_path`` or unstage) and ``gone`` (neither path
+    is on disk: ``commit_paths`` flags the file missing).
+
+    Args:
+        path: When given, only moves of files sitting at this folder or under it. Compared as a
+            path, like ``unstage_paths``.
+
+    Returns:
+        ``{"ok": True, "changes": [{file_id, from_path, to_path, origin, note, staged_at,
+        state}, ...]}``, both paths relative to ``music_path``.
+    """
+    changes = paths.diff_paths(load_settings(), path=path)
+    return {"ok": True, "changes": [view.to_dict() for view in changes]}
+
+
+@mcp.tool()
+@_error_envelope
+def commit_paths(path: str | None = None, message: str | None = None) -> dict[str, object]:
+    """Move every staged file on disk as one revertible commit, keeping each file's id.
+
+    Before anything moves, each staged file must pass ``detect_mismatches`` at its current
+    path: a file that flags with no decision covering it refuses the whole call. Fix its tags,
+    record a decision with ``set_mismatch_status``, or drop it with ``unstage_paths``. Each
+    move never overwrites a file, appends a ``path_revisions`` row, and repoints the file's
+    row. Folders a move empties are removed up to ``music_path``, and a folder holding any
+    file, a hidden one included, stays. A commit left ``applying`` by a crash is marked
+    interrupted and its leftover rows, a moved file's included, are swept into this commit.
+
+    Args:
+        path: When given, only moves of files sitting at this folder or under it. Compared as a
+            path, like ``unstage_paths``.
+        message: Optional commit message.
+
+    Returns:
+        ``{"ok": True, "commit_id", "committed", "noop", "missing", "changed_since_stage",
+        "errors", "problems": [{file_id, status, to_path, detail}, ...]}``. ``commit_id`` is
+        ``null`` when nothing was staged. Each problem keeps its row, except a ``missing`` one,
+        and its ``detail`` names the next step.
+    """
+    result = paths.commit_paths(load_settings(), path=path, message=message)
+    return {"ok": True, **result.to_dict()}
+
+
+@mcp.tool()
+@_error_envelope
+def history_paths(file_id: int) -> dict[str, object]:
+    """Show every location one file has had, oldest (version 0) first.
+
+    Version 0 is the location the file had when it was first staged for a move. Each later
+    version carries its ``origin`` (manual|auto|revert), its ``commit_id``, ``from_path`` and
+    ``to_path`` relative to ``music_path``, and on a revert ``reverted_from``, the version
+    whose location it restored. Use a ``version`` here with ``revert_paths``.
+
+    Returns ``{"ok": True, "history": [...]}`` (empty for a file never staged for a move), or
+    ``{"ok": False, "error": ...}`` if the file id is unknown.
+    """
+    revisions = paths.history_paths(load_settings(), file_id)
+    return {"ok": True, "history": [revision.to_dict() for revision in revisions]}
+
+
+@mcp.tool()
+@_error_envelope
+def revert_paths(
+    file_id: int,
+    version: int,
+    note: str | None = None,
+    dry_run: bool = False,  # noqa: FBT001, FBT002 - MCP tool surface, not a Python API
+) -> dict[str, object]:
+    """Move one file back to the location of a prior path ``version``, as its own commit.
+
+    The move lands under a single-file ``origin='revert'`` commit, so it shows in
+    ``list_commits`` and can itself be undone with ``revert_commit``. Refused while any tag or
+    path change is staged (run ``commit_paths`` to finish an interrupted revert), for a file
+    missing from disk or moved outside TagMend, for an unknown version, and when the old
+    location is taken. The ``detect_mismatches`` gate does not apply, and the restored path may
+    flag again. Get versions from ``history_paths``.
+
+    Args:
+        file_id: The file to move.
+        version: The path version whose ``to_path`` the file returns to.
+        note: Optional message stored on the revert commit and its path revision.
+        dry_run: When true, apply every refusal and change nothing.
+
+    Returns:
+        ``{"ok": True, "file_id", "target_version", "new_version", "commit_id", "to_path",
+        "status", "detail", "dry_run"}``. ``status`` is ``reverted``, or why the move did not
+        finish (``missing``, ``changed_since_stage``, ``error``) with a ``detail``.
+    """
+    result = paths.revert_paths(load_settings(), file_id, version, note=note, dry_run=dry_run)
+    return {"ok": True, **result.to_dict()}
 
 
 @mcp.tool()

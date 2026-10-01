@@ -396,11 +396,11 @@ def _stage_one(  # noqa: PLR0913 - cohesive keyword-only per-file staging payloa
     :func:`tagmend.engine.versioning.observe_widened_fields` writes), merges
     *tags* onto the file's current managed subset (P0: omitted keys are preserved),
     and upserts the staged row with the file's signature as its base, so the commit can refuse
-    a file edited since, and with the caller's surviving keys as its ``supplied_keys``. A
-    *fill_only* key is dropped when the file on disk already holds a
-    value for it, and when that leaves no caller-supplied key, nothing is staged and ``False``
-    is returned. Raises :class:`ValueError` naming *file_id* on any invalid input. Leaves the
-    transaction for the caller to commit or roll back.
+    a file edited since, and with the caller's surviving keys as its ``supplied_keys``. A file
+    holding a staged path change is refused. A *fill_only* key is dropped when the file on disk
+    already holds a value for it, and when that leaves no caller-supplied key, nothing is staged
+    and ``False`` is returned. Raises :class:`ValueError` naming *file_id* on any invalid input.
+    Leaves the transaction for the caller to commit or roll back.
     """
     unmanaged = sorted(set(tags) - MANAGED_TAGS)
     if unmanaged:
@@ -414,6 +414,12 @@ def _stage_one(  # noqa: PLR0913 - cohesive keyword-only per-file staging payloa
         raise ValueError(message)
     if file_row.is_missing:
         message = f"cannot stage a missing file (file_id={file_id})"
+        raise ValueError(message)
+    # A tag write replaces the file through a temp copy and changes what a move would render.
+    if store.get_staged_path(conn, file_id) is not None:
+        message = (
+            f"file_id={file_id} has a staged path change. Run commit_paths or unstage_paths first"
+        )
         raise ValueError(message)
 
     # Disk, not the snapshot mirror. The mirror can lag the file (an older tag reader wrote

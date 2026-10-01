@@ -118,7 +118,7 @@ Edits apply on the next tool call; every command and MCP tool re-reads `settings
 
 ## Tools
 
-The MCP server exposes 38 tools. All tag edits are staged in memory and only written to disk on `commit_tags`, and everything is revertible.
+The MCP server exposes 44 tools. Tag edits and file moves are staged first and only written to disk on `commit_tags` or `commit_paths`, and everything is revertible.
 
 ### Core & Library
 
@@ -146,7 +146,7 @@ The MCP server exposes 38 tools. All tag edits are staged in memory and only wri
 | `diff_tags` | Show staged-but-uncommitted changes, enriched with the current to target diff |
 | `commit_tags` | Apply all staged tag changes to disk as one revertible commit |
 | `list_commits` | List commits newest first (the revertible units that group tag changes) |
-| `get_commit` | Return one commit by id |
+| `get_commit` | Return one commit by id and the revision logs that hold its changes |
 
 ### History & Revert
 
@@ -154,7 +154,7 @@ The MCP server exposes 38 tools. All tag edits are staged in memory and only wri
 |------|-------------|
 | `history_tags` | Show the append-only tag-revision log for one file, oldest first |
 | `revert_tags` | Restore a file's managed tags to a prior version (append-only, revertible) |
-| `revert_commit` | Undo an entire commit as a unit: every file it changed goes back to its pre-commit tags |
+| `revert_commit` | Undo an entire commit as a unit. Every file it changed goes back to its pre-commit tags or path |
 
 ### Genre (Last.fm)
 
@@ -199,6 +199,19 @@ Use `detect_mismatches` (above) to find files whose path disagrees with their ow
 | `set_mismatch_status` | Record a path decision for one group. `legit_ignore` keeps its folder, and `misfiled_deferred` renders every level from the tags |
 | `reset_mismatch_status` | Delete the path decision of in-scope files |
 | `reopen_axes` | After committing a manual identity fix, re-open the file's genre, artist, year and song outcomes. `manual` rows are kept |
+
+### File Moves
+
+A move is staged with an explicit destination and committed as one revertible commit. Staging needs `detect_mismatches` to read `gate_open: true`. Each file keeps its id across moves.
+
+| Tool | Description |
+|------|-------------|
+| `stage_paths_batch` | Stage explicit destinations for many files in one atomic, all-or-nothing call |
+| `unstage_paths` | Drop the staged moves of one file or of every file under a folder |
+| `diff_paths` | Show the staged moves and where each file sits on disk now |
+| `commit_paths` | Move every staged file as one revertible commit and remove the folders it empties |
+| `history_paths` | Show every location one file has had, oldest first |
+| `revert_paths` | Move one file back to the location of a prior path version |
 
 ## Development
 

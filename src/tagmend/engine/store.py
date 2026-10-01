@@ -1,12 +1,13 @@
-"""Pure data access for the snapshot, tag-revision log, and staged-tag area (M1 + M3).
+"""Pure data access for the snapshot, the revision logs, and the staging areas (M1 + M3).
 
-Covers the ``files`` / ``file_tags`` snapshot, the append-only ``tag_revisions`` history,
-and the ``tag_revisions_staged`` staging area (git's index). Every function takes an open
-:class:`sqlite3.Connection` and does one focused thing: no scanning, no tag reading, no
-commit policy — that orchestration lives in :mod:`tagmend.engine.library`,
-:mod:`tagmend.engine.versioning`, and :mod:`tagmend.engine.staging`. The ``commits``-table
-ops and the shared commit loop live in :mod:`tagmend.engine.commits`. SQLite hands back
-``Any``; this module casts at the boundary so the rest of the engine stays strictly typed.
+Covers the ``files`` / ``file_tags`` snapshot, the append-only ``tag_revisions`` and
+``path_revisions`` histories, and the ``tag_revisions_staged`` and ``path_revisions_staged``
+staging areas (git's index). Every function takes an open :class:`sqlite3.Connection` and
+does one focused thing, with no scanning, tag reading or commit policy. That orchestration
+lives in :mod:`tagmend.engine.library`, :mod:`tagmend.engine.versioning`,
+:mod:`tagmend.engine.staging` and :mod:`tagmend.engine.paths`. The ``commits``-table ops and
+the shared commit loop live in :mod:`tagmend.engine.commits`. SQLite hands back ``Any``, so
+this module casts at the boundary and the rest of the engine stays strictly typed.
 
 All SQL uses ``?`` placeholders (never string-formatted values).
 """
@@ -1056,13 +1057,16 @@ def is_staged(conn: sqlite3.Connection, file_id: int) -> bool:
 
 
 def any_staged(conn: sqlite3.Connection) -> bool:
-    """Return whether ANY file has a pending change in ``tag_revisions_staged``.
+    """Return whether ANY file has a pending tag or path change.
 
-    The clean-staging-area guard for commit-level revert: rolling back with work still
-    staged would interleave a revert with half-staged intent, so the revert refuses
+    The clean-staging-area guard for commit-level revert and the resolvers: rolling back with
+    work still staged would interleave a revert with half-staged intent, so the revert refuses
     (git's "commit or stash first").
     """
-    row = conn.execute("SELECT EXISTS(SELECT 1 FROM tag_revisions_staged)").fetchone()
+    row = conn.execute(
+        "SELECT EXISTS(SELECT 1 FROM tag_revisions_staged) "
+        "OR EXISTS(SELECT 1 FROM path_revisions_staged)",
+    ).fetchone()
     return bool(row[0])
 
 
@@ -1292,16 +1296,98 @@ def insert_path_revision(  # noqa: PLR0913 - cohesive append-only revision paylo
     from_path: str,
     to_path: str,
     now: str,
+    reverted_from: int | None = None,
+    note: str | None = None,
 ) -> None:
     """Append one ``path_revisions`` row. The append-only triggers refuse any rewrite."""
     conn.execute(
         """
         INSERT INTO path_revisions
-          (file_id, version, commit_id, created_at, origin, from_path, to_path)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+          (file_id, version, commit_id, created_at, origin, reverted_from, from_path, to_path,
+           note)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (file_id, version, commit_id, now, origin, from_path, to_path),
+        (file_id, version, commit_id, now, origin, reverted_from, from_path, to_path, note),
     )
+
+
+_PATH_REVISION_COLUMNS = (
+    "file_id, version, commit_id, created_at, origin, reverted_from, from_path, to_path, note"
+)
+
+
+@dataclass(frozen=True, slots=True)
+class PathRevision:
+    """One ``path_revisions`` row. Both paths are relative to ``music_path``."""
+
+    file_id: int
+    version: int
+    commit_id: int | None
+    created_at: str
+    origin: str
+    reverted_from: int | None
+    from_path: str
+    to_path: str
+    note: str | None
+
+    def to_dict(self) -> dict[str, object]:
+        """JSON-serializable form for ``history_paths``."""
+        return {
+            "version": self.version,
+            "created_at": self.created_at,
+            "origin": self.origin,
+            "reverted_from": self.reverted_from,
+            "commit_id": self.commit_id,
+            "from_path": self.from_path,
+            "to_path": self.to_path,
+            "note": self.note,
+        }
+
+
+def _row_to_path_revision(row: tuple[object, ...]) -> PathRevision:
+    """Build a typed :class:`PathRevision` from a raw sqlite tuple."""
+    return PathRevision(
+        file_id=db.as_int(row[0]),
+        version=db.as_int(row[1]),
+        commit_id=None if row[2] is None else db.as_int(row[2]),
+        created_at=str(row[3]),
+        origin=str(row[4]),
+        reverted_from=None if row[5] is None else db.as_int(row[5]),
+        from_path=str(row[6]),
+        to_path=str(row[7]),
+        note=None if row[8] is None else str(row[8]),
+    )
+
+
+def get_path_revisions(conn: sqlite3.Connection, file_id: int) -> list[PathRevision]:
+    """Return *file_id*'s location history, oldest (version 0) first."""
+    cursor = conn.execute(
+        f"SELECT {_PATH_REVISION_COLUMNS} FROM path_revisions "  # noqa: S608
+        "WHERE file_id = ? ORDER BY version",
+        (file_id,),
+    )
+    return [_row_to_path_revision(tuple(row)) for row in cursor.fetchall()]
+
+
+def path_revisions_for_commit(conn: sqlite3.Connection, commit_id: int) -> list[PathRevision]:
+    """Return every ``path_revisions`` row *commit_id* appended, in ``file_id`` order."""
+    cursor = conn.execute(
+        f"SELECT {_PATH_REVISION_COLUMNS} FROM path_revisions "  # noqa: S608
+        "WHERE commit_id = ? ORDER BY file_id",
+        (commit_id,),
+    )
+    return [_row_to_path_revision(tuple(row)) for row in cursor.fetchall()]
+
+
+def commit_log_counts(conn: sqlite3.Connection, commit_id: int) -> dict[str, int]:
+    """Return the rows each revision log holds for *commit_id*, naming only non-empty logs."""
+    row = conn.execute(
+        "SELECT (SELECT COUNT(*) FROM tag_revisions WHERE commit_id = ?), "
+        "(SELECT COUNT(*) FROM path_revisions WHERE commit_id = ?)",
+        (commit_id, commit_id),
+    ).fetchone()
+    counts = {"tag_revisions": db.as_int(row[0]), "path_revisions": db.as_int(row[1])}
+    return {log: count for log, count in counts.items() if count}
 
 
 def path_versions(conn: sqlite3.Connection) -> dict[int, int]:
@@ -1318,11 +1404,147 @@ def relocate_file(
     filename: str,
     now: str,
 ) -> None:
-    """Point *file_id*'s row at a new path, its path key included, and bump ``updated_at``."""
+    """Point *file_id*'s row at a new path, its path key included, and bump ``updated_at``.
+
+    ``idx_files_path_key`` raises :class:`sqlite3.IntegrityError` when another row holds the key.
+    """
     conn.execute(
         "UPDATE files SET folder = ?, filename = ?, path_key = ?, updated_at = ? WHERE id = ?",
         (folder, filename, path_keys.file_path_key(folder, filename), now, file_id),
     )
+
+
+def file_id_at_key(conn: sqlite3.Connection, key: str) -> int | None:
+    """Return the id of the file row whose ``path_key`` is *key*, or ``None``."""
+    row = conn.execute("SELECT id FROM files WHERE path_key = ?", (key,)).fetchone()
+    return None if row is None else db.as_int(row[0])
+
+
+# --- path_revisions_staged (the path staging area) -----------------------------------
+
+_STAGED_PATH_FIELDS: Final = (
+    "file_id",
+    "to_path",
+    "to_key",
+    "origin",
+    "note",
+    "staged_at",
+    "base_size_bytes",
+    "base_mtime_ns",
+    "reverted_from",
+)
+_STAGED_PATH_COLUMNS: Final = ", ".join(_STAGED_PATH_FIELDS)
+
+
+@dataclass(frozen=True, slots=True)
+class StagedPath:
+    """One pending move. ``to_path`` and ``to_key`` are relative to ``music_path``.
+
+    ``base_size_bytes``/``base_mtime_ns`` are the file's signature at stage time. Every write
+    fills them and ``to_key``, so ``None`` appears only on a row an earlier schema held.
+    """
+
+    file_id: int
+    to_path: str
+    to_key: str | None
+    origin: str
+    note: str | None
+    staged_at: str
+    base_size_bytes: int | None
+    base_mtime_ns: int | None
+    reverted_from: int | None
+
+
+def _row_to_staged_path(row: tuple[object, ...]) -> StagedPath:
+    """Build a typed :class:`StagedPath` from a raw sqlite tuple."""
+    return StagedPath(
+        file_id=db.as_int(row[0]),
+        to_path=str(row[1]),
+        to_key=None if row[2] is None else str(row[2]),
+        origin=str(row[3]),
+        note=None if row[4] is None else str(row[4]),
+        staged_at=str(row[5]),
+        base_size_bytes=None if row[6] is None else db.as_int(row[6]),
+        base_mtime_ns=None if row[7] is None else db.as_int(row[7]),
+        reverted_from=None if row[8] is None else db.as_int(row[8]),
+    )
+
+
+def upsert_staged_path(conn: sqlite3.Connection, staged: StagedPath) -> None:
+    """Insert *staged*, or replace the pending move of its file.
+
+    An upsert on ``file_id`` rather than ``INSERT OR REPLACE``, which would silently delete
+    another file's row holding the same ``to_key``. That conflict raises
+    :class:`sqlite3.IntegrityError` instead.
+    """
+    conn.execute(
+        f"""
+        INSERT INTO path_revisions_staged ({_STAGED_PATH_COLUMNS})
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(file_id) DO UPDATE SET
+          to_path = excluded.to_path, to_key = excluded.to_key, origin = excluded.origin,
+          note = excluded.note, staged_at = excluded.staged_at,
+          base_size_bytes = excluded.base_size_bytes, base_mtime_ns = excluded.base_mtime_ns,
+          reverted_from = excluded.reverted_from
+        """,  # noqa: S608
+        (
+            staged.file_id,
+            staged.to_path,
+            staged.to_key,
+            staged.origin,
+            staged.note,
+            staged.staged_at,
+            staged.base_size_bytes,
+            staged.base_mtime_ns,
+            staged.reverted_from,
+        ),
+    )
+
+
+def get_staged_path(conn: sqlite3.Connection, file_id: int) -> StagedPath | None:
+    """Return the pending move for *file_id*, or ``None``."""
+    row = conn.execute(
+        f"SELECT {_STAGED_PATH_COLUMNS} FROM path_revisions_staged WHERE file_id = ?",  # noqa: S608
+        (file_id,),
+    ).fetchone()
+    return None if row is None else _row_to_staged_path(tuple(row))
+
+
+def list_staged_paths(conn: sqlite3.Connection) -> list[StagedPath]:
+    """Return every pending move, in file_id order."""
+    cursor = conn.execute(
+        f"SELECT {_STAGED_PATH_COLUMNS} FROM path_revisions_staged ORDER BY file_id",  # noqa: S608
+    )
+    return [_row_to_staged_path(tuple(row)) for row in cursor.fetchall()]
+
+
+def list_staged_paths_under(conn: sqlite3.Connection, root_key: str) -> list[StagedPath]:
+    """Return pending moves whose file sits in the folder keyed *root_key* or under it.
+
+    The ``files`` row reads the source until the move commits, so this matches the source.
+    """
+    low, high = path_keys.subtree_bounds(root_key)
+    columns = ", ".join(f"s.{name}" for name in _STAGED_PATH_FIELDS)
+    cursor = conn.execute(
+        f"SELECT {columns} FROM path_revisions_staged s JOIN files f ON f.id = s.file_id "  # noqa: S608
+        "WHERE f.path_key >= ? AND f.path_key < ? ORDER BY s.file_id",
+        (low, high),
+    )
+    return [_row_to_staged_path(tuple(row)) for row in cursor.fetchall()]
+
+
+def staged_file_id_at_target(conn: sqlite3.Connection, to_key: str) -> int | None:
+    """Return the file whose pending move targets the relative key *to_key*, or ``None``."""
+    row = conn.execute(
+        "SELECT file_id FROM path_revisions_staged WHERE to_key = ?",
+        (to_key,),
+    ).fetchone()
+    return None if row is None else db.as_int(row[0])
+
+
+def delete_staged_path(conn: sqlite3.Connection, file_id: int) -> None:
+    """Remove the pending move for *file_id* (no-op if none)."""
+    conn.execute("DELETE FROM path_revisions_staged WHERE file_id = ?", (file_id,))
 
 
 def staged_path_file_ids(conn: sqlite3.Connection, file_ids: list[int]) -> list[int]:

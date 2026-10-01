@@ -18,8 +18,8 @@ The change-tracking model mirrors git (PLAN.md §7):
   staged row into a real revision row, then deletes it.
 * ``tag_revisions`` — the managed-tag content history (PLAN.md §7). Logic lives in
   :mod:`tagmend.engine.versioning`.
-* ``path_revisions`` — the location history (PLAN.md §18). DDL is locked here for
-  schema symmetry, but the move/rename logic is deferred to M6.
+* ``path_revisions`` — the location history (PLAN.md §18), written by
+  :mod:`tagmend.engine.paths`. Its paths are relative to ``music_path``.
 
 The two revision logs are append-only, keyed by ``files.id`` with a composite PK
 ``(file_id, version)`` (version 0 = baseline with ``commit_id`` NULL, +1 per change).
@@ -196,6 +196,16 @@ row preserved):
   ``legit_ignore`` row, the key of the folder it keeps. ``source_field`` is dropped.
   :func:`_migrate_mismatch_covers` rewrites each earlier row as a decision on the top-folder
   comparison alone.
+
+The path executor gives the path staging area its commit inputs (schema v25. A v24 ledger
+upgrades in place with every row preserved):
+
+* ``path_revisions_staged.to_key``: the identity key of the target, relative to ``music_path``,
+  with the UNIQUE ``idx_path_revisions_staged_to_key``, so two staged moves never share a target.
+* ``base_size_bytes`` / ``base_mtime_ns``: the file's signature at stage time. A move keeps both,
+  which is how a commit recognises a file that already landed at its target.
+* ``reverted_from``: on a revert row, the version whose location it restores.
+  :func:`_migrate_path_staging` adds the four columns as NULL on earlier rows.
 """
 
 from __future__ import annotations
@@ -213,7 +223,7 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
-SCHEMA_VERSION: Final = 24
+SCHEMA_VERSION: Final = 25
 
 _FILES_DDL: Final = """
 CREATE TABLE IF NOT EXISTS files (
@@ -294,11 +304,9 @@ CREATE TABLE IF NOT EXISTS tag_revisions (
 """
 
 # Append-only location history (file/folder renames + moves), enforced by the same
-# :func:`apply_append_only_triggers` triggers as ``tag_revisions``. DDL is locked now for
-# symmetry with ``tag_revisions``. The move logic is deferred to M6 (PLAN.md §18).
-# No ``kind`` column: folders emerge from per-file paths (rename vs move is derivable
-# from ``from_path``/``to_path``), and empty source folders are pruned on move. The
-# old ``plan_id`` grouping is now ``commit_id`` (shared with ``commits``).
+# :func:`apply_append_only_triggers` triggers as ``tag_revisions``. ``reverted_from`` holds the
+# version whose location a revert restored.
+# No ``kind`` column: rename and move are derivable from ``from_path``/``to_path``.
 _PATH_REVISIONS_DDL: Final = """
 CREATE TABLE IF NOT EXISTS path_revisions (
   file_id       INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
@@ -337,16 +345,28 @@ CREATE TABLE IF NOT EXISTS tag_revisions_staged (
 )
 """
 
+# ``to_path`` and ``to_key`` are relative to ``music_path``, so a staged move survives the
+# library being promoted to another folder. A migration appends the last four columns, so they
+# stay nullable.
 _PATH_REVISIONS_STAGED_DDL: Final = """
 CREATE TABLE IF NOT EXISTS path_revisions_staged (
-  file_id   INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
-  to_path   TEXT NOT NULL,
-  origin    TEXT NOT NULL,
-  note      TEXT,
-  staged_at TEXT NOT NULL,
+  file_id         INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+  to_path         TEXT NOT NULL,
+  origin          TEXT NOT NULL,
+  note            TEXT,
+  staged_at       TEXT NOT NULL,
+  to_key          TEXT,
+  base_size_bytes INTEGER,
+  base_mtime_ns   INTEGER,
+  reverted_from   INTEGER,
   PRIMARY KEY (file_id)
 )
 """
+
+_PATH_REVISIONS_STAGED_TO_KEY_INDEX_DDL: Final = (
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_path_revisions_staged_to_key "
+    "ON path_revisions_staged(to_key)"
+)
 
 # Persistent cache of parsed Last.fm top-tag lists only, keyed by a request hash (so it
 # survives MCP restarts and inspector re-launches). ``found`` is the negative-cache sentinel
@@ -707,6 +727,24 @@ def _migrate_staged_supplied_keys(connection: sqlite3.Connection) -> None:
         return
     connection.execute("ALTER TABLE tag_revisions_staged ADD COLUMN supplied_keys TEXT")
     logger.info("schema v23: added tag_revisions_staged.supplied_keys")
+
+
+def _migrate_path_staging(connection: sqlite3.Connection) -> None:
+    """v25: add the path staging columns ``to_key``, the base signature and ``reverted_from``.
+
+    Runs BEFORE the DDL, so a fresh ledger takes the columns from
+    :data:`_PATH_REVISIONS_STAGED_DDL` instead. Idempotent through ``_column_exists``. The DDL
+    phase adds the unique ``to_key`` index, which several NULL keys do not violate.
+    """
+    if not _table_exists(connection, "path_revisions_staged"):
+        return
+    if _column_exists(connection, "path_revisions_staged", "to_key"):
+        return
+    connection.execute("ALTER TABLE path_revisions_staged ADD COLUMN to_key TEXT")
+    connection.execute("ALTER TABLE path_revisions_staged ADD COLUMN base_size_bytes INTEGER")
+    connection.execute("ALTER TABLE path_revisions_staged ADD COLUMN base_mtime_ns INTEGER")
+    connection.execute("ALTER TABLE path_revisions_staged ADD COLUMN reverted_from INTEGER")
+    logger.info("schema v25: added the path staging columns")
 
 
 # Frozen history like :data:`_MANAGED_SET_WIDENING_DATE`: every pre-v24 row was set on the
@@ -1173,8 +1211,9 @@ def apply_schema(connection: sqlite3.Connection) -> None:
     :func:`_migrate_drop_files_status`, :func:`_migrate_lastfm_correction_cache`) and v21
     snapshots the tag-axis status rows (:func:`_migrate_axis_outcomes`) and adds the staged
     changed fields (:func:`_migrate_staged_changed_fields`), v23 adds the staged supplied
-    keys (:func:`_migrate_staged_supplied_keys`) and v24 rewrites the mismatch rows as covers
-    snapshots (:func:`_migrate_mismatch_covers`). v15, v16 and v22 add cache tables only, and
+    keys (:func:`_migrate_staged_supplied_keys`), v24 rewrites the mismatch rows as covers
+    snapshots (:func:`_migrate_mismatch_covers`) and v25 adds the path staging columns
+    (:func:`_migrate_path_staging`). v15, v16 and v22 add cache tables only, and
     v23 adds ``file_song_status``, which the DDL creates, so they need no migration step. The
     triggers come after every migration, so a migration that updates a log runs before they
     exist.
@@ -1208,6 +1247,7 @@ def apply_schema(connection: sqlite3.Connection) -> None:
     _migrate_staged_changed_fields(connection)
     _migrate_staged_supplied_keys(connection)
     _migrate_mismatch_covers(connection)
+    _migrate_path_staging(connection)
     connection.execute(_FILES_DDL)
     connection.execute(_FILES_PATH_KEY_INDEX_DDL)
     connection.execute(_FILE_TAGS_DDL)
@@ -1217,6 +1257,7 @@ def apply_schema(connection: sqlite3.Connection) -> None:
     connection.execute(_PATH_REVISIONS_DDL)
     connection.execute(_TAG_REVISIONS_STAGED_DDL)
     connection.execute(_PATH_REVISIONS_STAGED_DDL)
+    connection.execute(_PATH_REVISIONS_STAGED_TO_KEY_INDEX_DDL)
     connection.execute(_LASTFM_CACHE_DDL)
     connection.execute(_LASTFM_CORRECTION_CACHE_DDL)
     connection.execute(_FILE_GENRE_STATUS_DDL)

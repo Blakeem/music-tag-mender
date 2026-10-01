@@ -27,7 +27,7 @@ def test_apply_schema_stamps_current_version(db_conn: sqlite3.Connection) -> Non
     # db_conn already applied the schema; the stamp must match the constant the code ships.
     version = db_conn.execute("PRAGMA user_version").fetchone()[0]
     assert version == SCHEMA_VERSION
-    assert SCHEMA_VERSION == 24
+    assert SCHEMA_VERSION == 25
 
 
 def test_apply_schema_creates_genre_tables(db_conn: sqlite3.Connection) -> None:
@@ -1437,5 +1437,69 @@ def test_v24_migration_is_idempotent() -> None:
         apply_schema(conn)  # source_field is gone, so the rewrite does not run again
 
         assert _mismatch_snapshots(conn) == migrated
+    finally:
+        conn.close()
+
+
+# --- v25: the path staging columns ----------------------------------------------------
+
+_PATH_STAGING_COLUMNS = ("to_key", "base_size_bytes", "base_mtime_ns", "reverted_from")
+
+
+def _path_staged_columns(conn: sqlite3.Connection) -> list[str]:
+    return _columns(conn, "path_revisions_staged")
+
+
+def test_fresh_ledger_has_the_path_staging_columns(db_conn: sqlite3.Connection) -> None:
+    assert tuple(_path_staged_columns(db_conn)[-4:]) == _PATH_STAGING_COLUMNS
+    first, second = (_insert_file_at(db_conn, "/lib", name) for name in ("a.mp3", "b.mp3"))
+    insert = (
+        "INSERT INTO path_revisions_staged (file_id, to_path, to_key, origin, staged_at) "
+        "VALUES (?, 'x.mp3', 'x.mp3', 'manual', '2026-10-01T00:00:00+00:00')"
+    )
+    db_conn.execute(insert, (first,))
+
+    # Two staged moves never share a target.
+    with pytest.raises(sqlite3.IntegrityError, match="UNIQUE"):
+        db_conn.execute(insert, (second,))
+
+
+def test_v24_ledger_gains_the_path_staging_columns_in_place() -> None:
+    fresh = sqlite3.connect(":memory:")
+    try:
+        apply_schema(fresh)
+        fresh_columns = _path_staged_columns(fresh)
+    finally:
+        fresh.close()
+
+    conn = sqlite3.connect(":memory:")
+    try:
+        apply_schema(conn)
+        file_id = _insert_file(conn)
+        conn.execute("DROP INDEX idx_path_revisions_staged_to_key")
+        for column in _PATH_STAGING_COLUMNS:
+            conn.execute(f"ALTER TABLE path_revisions_staged DROP COLUMN {column}")
+        conn.execute(
+            "INSERT INTO path_revisions_staged (file_id, to_path, origin, note, staged_at) "
+            "VALUES (?, 'New/a.mp3', 'manual', 'kept', '2026-09-01T00:00:00+00:00')",
+            (file_id,),
+        )
+        conn.execute("PRAGMA user_version = 24")
+        conn.commit()
+
+        apply_schema(conn)  # the in-place upgrade
+        conn.execute("PRAGMA user_version = 24")
+        apply_schema(conn)  # a second application must not re-add the columns
+
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        assert _path_staged_columns(conn) == fresh_columns
+        row = conn.execute(
+            "SELECT to_path, note, to_key, base_size_bytes, base_mtime_ns, reverted_from "
+            "FROM path_revisions_staged WHERE file_id = ?",
+            (file_id,),
+        ).fetchone()
+        assert row == ("New/a.mp3", "kept", None, None, None, None)
+        indexes = {str(r[1]) for r in conn.execute("PRAGMA index_list(path_revisions_staged)")}
+        assert "idx_path_revisions_staged_to_key" in indexes
     finally:
         conn.close()

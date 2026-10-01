@@ -166,7 +166,7 @@ def _staged_target(settings: Settings, file_id: int) -> dict[str, list[str]]:
         conn.close()
 
 
-def _outcome_status(result: versioning.RevertCommitResult, file_id: int) -> str:
+def _outcome_status(result: commits.RevertCommitResult, file_id: int) -> str:
     return next(o.status for o in result.outcomes if o.file_id == file_id)
 
 

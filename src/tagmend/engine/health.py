@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Final
 
 import httpx
 
-from tagmend.engine import commits, db, scan, schema
+from tagmend.engine import commits, db, paths, scan, schema
 from tagmend.engine.acoustid import (
     AcoustidClient,
     AcoustidError,
@@ -95,6 +95,7 @@ def check_health(
         _check_music_path(settings.music_path),
         _check_database(settings.db_path),
         _check_interrupted_commits(settings.db_path),
+        _check_path_staging(settings),
         _check_lastfm(settings, transport=lastfm_transport),
         _check_musicbrainz(settings, transport=musicbrainz_transport),
         _check_fpcalc(settings, runner=fpcalc_runner),
@@ -143,10 +144,10 @@ def _check_database(db_path: Path) -> Check:
 
 
 def _check_interrupted_commits(db_path: Path) -> Check:
-    """Report any commit left ``applying`` by a crash. Informational — never fails the report.
+    """Report any commit left ``applying`` by a crash. Informational, it never fails the report.
 
-    A lingering ``applying`` commit is recovered by simply running ``commit_tags`` again
-    (the resume-free model), so this is a hint, not a readiness blocker — it always reports
+    A lingering ``applying`` commit is recovered by running ``commit_tags`` or ``commit_paths``
+    again (the resume-free model), so this is a hint, not a readiness blocker. It always reports
     ``ok=True``. Real ledger problems are caught by :func:`_check_database`.
     """
     name = "commits"
@@ -166,8 +167,34 @@ def _check_interrupted_commits(db_path: Path) -> Check:
     return Check(
         name=name,
         ok=True,
-        detail=f"{len(interrupted)} interrupted run(s) ({ids}) — run commit_tags to recover",
+        detail=(
+            f"{len(interrupted)} interrupted run(s) ({ids}). Run commit_tags or commit_paths to "
+            "recover"
+        ),
     )
+
+
+def _check_path_staging(settings: Settings) -> Check:
+    """Report the staged moves, those already at their target or gone, and the volume check.
+
+    Informational, it never fails the report: the tag tools work on any volume, and a landed
+    move is finished by running ``commit_paths``.
+    """
+    name = "paths"
+    try:
+        report = paths.staging_report(settings)
+    except (sqlite3.Error, OSError) as exc:
+        return Check(name=name, ok=True, detail=f"(could not check staged moves: {exc})")
+
+    parts = [f"{report.staged} staged move(s)"]
+    if report.landed:
+        parts.append(
+            f"file_id(s) {list(report.landed)} already sit at their target. Run commit_paths",
+        )
+    if report.gone:
+        parts.append(f"file_id(s) {list(report.gone)} are at neither their source nor target")
+    parts.append(report.volume_refusal or "the volume check passes")
+    return Check(name=name, ok=True, detail=". ".join(parts))
 
 
 def _memory_conn() -> sqlite3.Connection:

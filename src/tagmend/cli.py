@@ -100,6 +100,7 @@ def scan_library(
     typer.echo(f"  restored:        {result.restored}")
     typer.echo(f"  missing flagged: {result.missing_flagged}")
     typer.echo(f"  respelled:       {result.respelled}")
+    typer.echo(f"  pending commit:  {result.pending_commit}")
     typer.echo(f"  errors:          {result.errors}")
 
 

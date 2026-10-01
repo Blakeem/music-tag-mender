@@ -108,7 +108,7 @@ compares a file's year tags with the first-release year of its album's MusicBrai
 found by the album identity (album artist else artist, album). `high` means the `originaldate` year
 differs, `medium` means the `date` year is earlier than the first release. `release_limit` (default
 200) caps the uncached lookups one call makes, and cache writes are its only ledger writes.
-38 MCP tools total. Schema is **v24** (additive: v11 adds
+44 MCP tools total. Schema is **v25** (additive: v11 adds
 `musicbrainz_recording_cache`, v12 renames `file_album_status` → `file_year_status` in place —
 dispositions preserved; v13 adds `tag_revisions.managed_set`, stamping which managed-tag set
 governed each revision so a revert can restore emptiness on the widened fields; v14 adds
@@ -131,9 +131,13 @@ keyed to its size and mtime) and `acoustid_cache` (AcoustID lookups keyed by a f
 with a 7-day expiry on an empty answer). v23 adds `file_song_status` and
 `tag_revisions_staged.supplied_keys`, the keys the caller passed that survive a `fill_only` drop,
 which the stale-identity warning in `diff_tags` treats as confirmed. v24 rewrites each
-`file_mismatch_status` row as a JSON decision snapshot and drops `source_field`. A newer
-ledger is refused). M6 organize/paths (`paths.py`)
-is a paper sketch (its DDL ships in v6; logic deferred).
+`file_mismatch_status` row as a JSON decision snapshot and drops `source_field`. v25 adds the
+path staging columns (`to_key`, the stage-time signature, `reverted_from`). A newer ledger is
+refused). The paths domain (`paths.py`) is the second `RevisionDomain`. `stage_paths_batch`,
+`unstage_paths`, `diff_paths`, `commit_paths`, `history_paths` and `revert_paths` move files with one
+`files.id` across every move, never overwrite a target, and prune emptied source folders. A move
+that landed before a crash is finished by the next `commit_paths`. The naming pattern and
+renderer are not built yet.
 
 **The canonical tag namespace is TagMend's, not mutagen's.** mutagen's "easy" layer is an
 incomplete normalizer, so `tags.py` owns the mapping wherever it is wrong: `EasyID3` points
@@ -312,10 +316,10 @@ src/tagmend/
   log.py            shared logger (use everywhere)
   config.py         settings.json (platformdirs) + typed Settings
   cli.py            Typer CLI (thin)
-  mcp_server.py     FastMCP server (thin) — 38 tools
+  mcp_server.py     FastMCP server (thin) — 44 tools
   engine/
     db.py           SQLite connection (WAL)
-    schema.py       all DDL + PRAGMA user_version (v24)
+    schema.py       all DDL + PRAGMA user_version (v25)
     path_keys.py    path identity keys, subtree key ranges, the folder-argument normalizer
     text_keys.py    the shared text fold keys (alnum, display, artist name, loose, title)
     scan.py         filesystem discovery + signatures
@@ -345,7 +349,7 @@ src/tagmend/
     year_disagreements.py  detect_year_disagreements: year tags vs the release group's first-release year, tiered
     album_gaps.py   detect_album_gaps: blank-album files grouped by folder + tiered fill proposals
     parsing.py      pure folder/filename → (artist, album) parsing for the album-gap fills
-    paths.py        STUB + PathDomain paper sketch — M6 (organize/paths)
+    paths.py        PathDomain + the explicit path tools: tracked, revertible, no-clobber moves
 tests/              pytest; conftest isolates config + builds temp libraries (make_track)
 ```
 

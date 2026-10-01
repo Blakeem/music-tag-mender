@@ -37,6 +37,7 @@ from tagmend.engine.acoustid import (
     Fingerprinter,
     FingerprintError,
     FingerprintTimeout,
+    FingerprintUnreadableError,
     FpcalcUnavailableError,
     get_fingerprint,
     get_lookup,
@@ -87,13 +88,30 @@ def test_a_usable_exit_parses_to_a_fingerprint(tmp_path: Path, exit_code: int) -
 
 
 def test_another_exit_raises_a_fingerprint_error_carrying_the_code(tmp_path: Path) -> None:
-    runner = FakeRunner((2, "", "ERROR: could not open the input file"))
+    runner = FakeRunner((2, "", "ERROR: Invalid data found when processing input"))
+    track = tmp_path / "a.mp3"
+    track.write_bytes(b"x")
 
     with pytest.raises(FingerprintError) as caught:
-        Fingerprinter(_FPCALC, runner=runner).fingerprint(tmp_path / "a.mp3")
+        Fingerprinter(_FPCALC, runner=runner).fingerprint(track)
 
     assert caught.value.exit_code == 2
     assert not isinstance(caught.value, FingerprintTimeout)
+    assert not isinstance(caught.value, FingerprintUnreadableError)
+
+
+def test_a_failed_exit_on_a_file_that_cannot_be_opened_is_the_transient_subclass(
+    tmp_path: Path,
+) -> None:
+    # fpcalc exits 2 for a missing file too. A file gone since the scan must not be stored as bad.
+    runner = FakeRunner((2, "", "ERROR: Could not open the input file"))
+    missing = tmp_path / "gone.mp3"
+
+    with pytest.raises(FingerprintUnreadableError) as caught:
+        Fingerprinter(_FPCALC, runner=runner).fingerprint(missing)
+
+    assert caught.value.exit_code == 2
+    assert "Rescan the library" in str(caught.value)
 
 
 def test_a_timeout_raises_the_transient_subclass(tmp_path: Path) -> None:

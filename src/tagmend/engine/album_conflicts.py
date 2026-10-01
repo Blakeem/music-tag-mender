@@ -286,12 +286,12 @@ def _base_title(album: str | None) -> str:
 def _is_compilation_missing_its_album_artist(files: list[_FileInput]) -> bool:
     """Return whether this folder is one album whose files have no album artist between them.
 
-    Three real soundtrack folders take this shape: every file agrees on the album title, none
-    carries an ``albumartist``, and the track artists all differ, so each file falls back to
-    its own artist and the one album shows as one card per track. The ordinary minority rule
-    is actively misleading here. It would name whichever guest artist appears most as the
-    identity to normalize toward, when the real fix is the same on every file: give them all
-    an album artist.
+    Three real soundtrack folders take this shape: every file agrees on the album title (a disc
+    suffix aside), none carries an ``albumartist``, and the track artists all differ, so each
+    file falls back to its own artist and the one album shows as one card per track. The
+    ordinary minority rule is actively misleading here. It would name whichever guest artist
+    appears most as the identity to normalize toward, when the real fix is the same on every
+    file: give them all an album artist.
     """
     minimum = 2
     if len(files) < minimum:
@@ -300,7 +300,7 @@ def _is_compilation_missing_its_album_artist(files: list[_FileInput]) -> bool:
         return False
     if any((f.compilation or "").strip() in _COMPILATION_TRUE for f in files):
         return False
-    if len({display_key(f.album or "") for f in files}) != 1:
+    if len({_base_title(f.album) for f in files}) != 1:
         return False
 
     # A dominant track artist means this is that artist's album with a guest or two, and the
@@ -332,17 +332,17 @@ def _tier_for(minority: _FileInput, majority: _FileInput) -> tuple[Tier, str]:
     """Return the tier and reason for *minority* against its folder's *majority* file."""
     minority_id = (minority.release_mbid or "").strip()
     majority_id = (majority.release_mbid or "").strip()
+    # Fold-level tests, since raw strings differing only cosmetically carry no disc suffix. A
+    # disc suffix is low only as the sole difference, so an album artist or date split stays medium.
+    same_base_title = _base_title(minority.album) == _base_title(majority.album)
+    same_album = display_key(minority.album or "") == display_key(majority.album or "")
+    same_album_artist = display_key(minority.display_album_artist) == display_key(
+        majority.display_album_artist,
+    )
+    same_date = (minority.date or "").strip() == (majority.date or "").strip()
     if minority_id or majority_id:
         return (Tier.HIGH, _REASON_HIGH)
-    # Both tests run at fold level. Comparing the raw strings for inequality made a folder
-    # split by album artist or release date, whose album strings differ only cosmetically,
-    # report a disc suffix that is not there.
-    minority_album = display_key(minority.album or "")
-    majority_album = display_key(majority.album or "")
-    if (
-        _base_title(minority.album) == _base_title(majority.album)
-        and minority_album != majority_album
-    ):
+    if same_base_title and not same_album and same_album_artist and same_date:
         return (Tier.LOW, _REASON_LOW)
     return (Tier.MEDIUM, _REASON_MEDIUM)
 
@@ -383,7 +383,7 @@ def _compilation_rows(files: list[_FileInput]) -> list[AlbumConflictRow]:
     ``majority_identity`` names the identity these files should share once they carry an album
     artist, in the same shape every other row uses, so a consumer parses one form.
     """
-    shared = _VARIOUS_ARTISTS + " - " + (files[0].album or "")
+    shared = _compilation_identity(files)
     return [
         AlbumConflictRow(
             file_id=f.file_id,
@@ -400,6 +400,14 @@ def _compilation_rows(files: list[_FileInput]) -> list[AlbumConflictRow]:
         )
         for f in files
     ]
+
+
+def _compilation_identity(files: list[_FileInput]) -> str:
+    """Return the identity a compilation folder's files share once they carry an album artist.
+
+    The files may differ only in a disc suffix, so the label drops it rather than name one disc.
+    """
+    return _VARIOUS_ARTISTS + " - " + _DISC_SUFFIX.sub("", files[0].album or "").strip()
 
 
 def _first_index(files: list[_FileInput], identity: tuple[str, ...]) -> int:
@@ -422,7 +430,7 @@ def _classify(files: list[_FileInput]) -> AlbumConflictsReport:
             continue
         if _is_compilation_missing_its_album_artist(members):
             folder_rows = _compilation_rows(members)
-            majority_label = _VARIOUS_ARTISTS + " - " + (members[0].album or "")
+            majority_label = _compilation_identity(members)
             majority_files = 0
         else:
             folder_rows, majority, majority_files = _rows_for_folder(members)

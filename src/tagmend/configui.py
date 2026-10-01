@@ -32,7 +32,14 @@ from importlib import resources
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, cast
 
-from tagmend.config import _KNOWN_KEYS, _NONE_TOKENS, Settings, load_settings, set_settings
+from tagmend.config import (
+    _KNOWN_KEYS,
+    _NONE_TOKENS,
+    SECRET_KEYS,
+    Settings,
+    load_settings,
+    set_settings,
+)
 from tagmend.engine.lastfm import LastfmClient, LastfmError
 from tagmend.engine.schema import apply_schema
 from tagmend.log import get_logger
@@ -47,8 +54,6 @@ logger = get_logger(__name__)
 # What the browser shows in place of a real API key. An unchanged field means
 # "leave the stored key alone" (never the literal placeholder, never the real key).
 MASK_PLACEHOLDER: Final = "********"
-
-_SECRET_KEYS: Final[frozenset[str]] = frozenset({"lastfm_api_key", "acoustid_api_key"})
 
 # The per-launch CSRF token travels in this request header on every POST.
 _CSRF_HEADER: Final = "X-TagMend-CSRF"
@@ -141,7 +146,7 @@ def validate_and_normalize(payload: Mapping[str, object]) -> dict[str, str]:
             message = f"unknown setting {key!r}"
             raise ValidationError(HTTPStatus.BAD_REQUEST, message)
         value = "" if raw_value is None else str(raw_value)
-        if key in _SECRET_KEYS:
+        if key in SECRET_KEYS:
             if value and value != MASK_PLACEHOLDER:
                 result[key] = value
             continue
@@ -158,6 +163,11 @@ def _validate_typed(key: str, value: str) -> None:
         _require_float(key, value)
     elif key == "genre_max_count" and value.strip().lower() not in _NONE_TOKENS:
         _require_int(key, value)
+        if int(value) < 0:
+            message = (
+                f"genre_max_count must be 0 (no cap) or a positive whole number (got {value!r})"
+            )
+            raise ValidationError(HTTPStatus.UNPROCESSABLE_ENTITY, message)
     # genre_use_album_tags + free-text keys accept any value (load_settings coerces).
 
 
@@ -171,12 +181,19 @@ def _require_int(key: str, value: str) -> None:
 
 
 def _require_float(key: str, value: str) -> None:
-    """Raise a 422 ``ValidationError`` unless *value* parses as a number."""
+    """Raise a 422 ``ValidationError`` unless *value* parses as a number above 0.
+
+    Every float setting is a request rate, and a rate at or below 0 disables pacing.
+    """
     try:
-        float(value)
+        parsed = float(value)
     except ValueError as exc:
         message = f"{key} must be a number (got {value!r})"
         raise ValidationError(HTTPStatus.UNPROCESSABLE_ENTITY, message) from exc
+    # Written as a negation so NaN, which compares false to everything, is rejected too.
+    if not parsed > 0:
+        message = f"{key} must be a number above 0 (got {value!r})"
+        raise ValidationError(HTTPStatus.UNPROCESSABLE_ENTITY, message)
 
 
 def apply_save(payload: Mapping[str, object]) -> Path:
@@ -368,6 +385,9 @@ class _ConfigHandler(BaseHTTPRequestHandler):
             apply_save(payload)
         except ValidationError as exc:
             self._send_json(exc.status, {"ok": False, "error": exc.message})
+            return
+        except ValueError as exc:
+            self._send_json(HTTPStatus.CONFLICT, {"ok": False, "error": str(exc)})
             return
         self._send_json(HTTPStatus.OK, {"ok": True})
 

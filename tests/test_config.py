@@ -100,9 +100,67 @@ def test_genre_max_count_none_sentinel(token: str) -> None:
     assert config.load_settings().genre_max_count is None
 
 
+@pytest.mark.parametrize("token", ["00", "+0", "-0"])
+def test_a_genre_max_count_spelled_as_another_zero_means_no_cap(token: str) -> None:
+    # A cap of 0 is a slice bound that would drop every genre.
+    config.set_setting("genre_max_count", token)
+    assert config.load_settings().genre_max_count is None
+
+
 def test_genre_max_count_malformed_falls_back_to_default() -> None:
     config.set_setting("genre_max_count", "lots")
     assert config.load_settings().genre_max_count == 4
+
+
+def test_a_negative_genre_max_count_falls_back_to_the_default_cap() -> None:
+    # The cap is a slice bound, where -1 would drop the last matched genre.
+    config.set_setting("genre_max_count", "-1")
+    assert config.load_settings().genre_max_count == 4
+
+
+@pytest.mark.parametrize("key", ["lastfm_rate_per_sec", "musicbrainz_rate_per_sec"])
+@pytest.mark.parametrize("raw", ["0", "-1", "nan"])
+def test_a_rate_that_would_disable_pacing_falls_back_to_the_default(key: str, raw: str) -> None:
+    default = getattr(config.load_settings(), key)
+    config.set_setting(key, raw)
+    assert getattr(config.load_settings(), key) == default
+
+
+@pytest.mark.parametrize(
+    ("key", "cap"),
+    [("lastfm_rate_per_sec", 5.0), ("musicbrainz_rate_per_sec", 1.0)],
+)
+def test_a_rate_above_the_published_limit_is_clamped(key: str, cap: float) -> None:
+    config.set_setting(key, str(cap * 4))
+    assert getattr(config.load_settings(), key) == cap
+
+
+def test_an_unreadable_settings_file_refuses_a_save_and_keeps_its_bytes() -> None:
+    # A hand edit with single backslashes in a Windows path is invalid JSON. Merging over the
+    # empty map the tolerant reader returns would drop every stored key.
+    path = config.settings_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b'{"music_path": "E:\\music", "lastfm_api_key": "keep-me"}')
+    before = path.read_bytes()
+
+    with pytest.raises(ValueError, match="could not be read"):
+        config.set_setting("naming_pattern", "x")
+
+    assert path.read_bytes() == before
+    assert list(config.config_dir().glob(".settings-*")) == []
+    # Loading stays tolerant: it warns and runs on the defaults.
+    assert config.load_settings().music_path is None
+
+
+def test_a_settings_file_holding_a_non_object_refuses_a_save() -> None:
+    path = config.settings_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('["music_path"]', encoding="utf-8")
+
+    with pytest.raises(ValueError, match="not a JSON object"):
+        config.set_setting("naming_pattern", "x")
+
+    assert path.read_text(encoding="utf-8") == '["music_path"]'
 
 
 @pytest.mark.parametrize("token", ["false", "0", "no", "off", "OFF", "No"])

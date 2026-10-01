@@ -8,7 +8,7 @@ import pytest
 from typer.testing import CliRunner
 
 from conftest import make_track
-from tagmend import __version__
+from tagmend import __version__, config
 from tagmend.cli import app
 from tagmend.engine.health import Check, HealthReport
 
@@ -126,3 +126,40 @@ def test_scan_library_without_configured_music_path() -> None:
 
     assert result.exit_code == 1
     assert "music_path" in result.stdout
+
+
+@pytest.mark.parametrize("key", ["lastfm_api_key", "acoustid_api_key"])
+def test_config_set_prompts_for_an_api_key_without_echoing_it(key: str) -> None:
+    # A key on the command line lands in shell history and the process list.
+    secret = "typed-secret-key-123"  # noqa: S105 - test value, not a credential
+
+    result = runner.invoke(app, ["config-set", key], input=f"{secret}\n")
+
+    assert result.exit_code == 0
+    assert secret not in result.output
+    assert getattr(config.load_settings(), key) == secret
+
+
+def test_config_set_without_a_value_for_a_plain_setting_fails() -> None:
+    result = runner.invoke(app, ["config-set", "music_path"])
+
+    assert result.exit_code == 1
+    assert "config-set needs a value for music_path" in result.stdout
+    assert config.load_settings().music_path is None
+
+
+def test_detect_mismatches_lists_the_undecided_exception_files(music_dir: Path) -> None:
+    # The flat view keeps a nested file only in exception_rows, so it must be printed from there.
+    nested = music_dir / "Lusine" / "2002 - Iron City" / "2002 - Iron City_320" / "Iron City"
+    make_track(
+        nested / "01 Song.mp3",
+        {"albumartist": ["Lusine"], "album": ["Iron City"], "title": ["Song"]},
+    )
+    config.set_setting("music_path", str(music_dir))
+    assert runner.invoke(app, ["scan-library"]).exit_code == 0
+
+    result = runner.invoke(app, ["detect-mismatches"])
+
+    assert result.exit_code == 0
+    assert "[NESTED]" in result.stdout
+    assert "01 Song.mp3" in result.stdout

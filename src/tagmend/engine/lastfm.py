@@ -171,7 +171,8 @@ class LastfmClient:
         """
         if not settings.lastfm_api_key:
             message = (
-                "no Last.fm API key configured. Run `tagmend config-set lastfm_api_key <key>`."
+                "no Last.fm API key configured. Run `tagmend config`, or "
+                "`tagmend config-set lastfm_api_key`, which prompts for the key without echoing it."
             )
             raise ValueError(message)
         return cls(settings.lastfm_api_key, conn, rate_per_sec=settings.lastfm_rate_per_sec)

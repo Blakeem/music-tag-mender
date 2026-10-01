@@ -166,13 +166,23 @@ def detect_mismatches(
             f"{group_row.folder}",
         )
     for row in report.rows:
-        differences = "  ".join(
-            f"{d.comparison}: {d.tag_value!r} vs {d.path_value!r}{' (silenced)' * d.silenced}"
-            for d in row.differences
-        )
         typer.echo(
-            f"  [{(row.tier or '').upper():6}] {differences}  {row.folder}\\{row.filename}",
+            f"  [{(row.tier or '').upper():6}] {_format_differences(row)}  "
+            f"{row.folder}\\{row.filename}",
         )
+    for row in report.exception_rows:
+        typer.echo(
+            f"  [{(row.exception or '').upper():6}] {_format_differences(row)}  "
+            f"{row.folder}\\{row.filename}",
+        )
+
+
+def _format_differences(row: mismatch.MismatchRow) -> str:
+    """Return *row*'s differences as one line, each marked when a decision silences it."""
+    return "  ".join(
+        f"{d.comparison}: {d.tag_value!r} vs {d.path_value!r}{' (silenced)' * d.silenced}"
+        for d in row.differences
+    )
 
 
 @app.command(name="config")
@@ -184,9 +194,21 @@ def config_ui() -> None:
 @app.command(name="config-set")
 def config_set(
     key: Annotated[str, typer.Argument(help="Setting name (e.g. music_path).")],
-    value: Annotated[str, typer.Argument(help="New value.")],
+    value: Annotated[
+        str | None,
+        typer.Argument(help="New value. Omit it for an API key to be prompted without echo."),
+    ] = None,
 ) -> None:
-    """Set one value in settings.json. An unknown key fails and lists the known keys."""
+    """Set one value in settings.json. An unknown key fails and lists the known keys.
+
+    An API key may be omitted from the command line, which shell history and the process list
+    would otherwise hold in plain text. It is then read from a prompt that does not echo.
+    """
+    if value is None and key not in config.SECRET_KEYS:
+        typer.echo(f"config-set needs a value for {key}")
+        raise typer.Exit(code=1)
+    if value is None:
+        value = str(typer.prompt(key, hide_input=True))
     try:
         path = config.set_setting(key, value)
     except ValueError as exc:

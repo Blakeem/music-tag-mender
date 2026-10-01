@@ -31,6 +31,7 @@ import urllib.parse
 import zlib
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import TYPE_CHECKING, Final, Self, cast
 
 import httpx
@@ -41,7 +42,6 @@ from tagmend.log import get_logger
 if TYPE_CHECKING:
     import sqlite3
     from collections.abc import Callable, Mapping, Sequence
-    from pathlib import Path
     from types import TracebackType
 
     from tagmend.config import Settings
@@ -179,6 +179,10 @@ class FingerprintTimeout(FingerprintError):  # noqa: N818 - the transient case o
     """fpcalc ran past its timeout. Transient, so callers never store it."""
 
 
+class FingerprintUnreadableError(FingerprintError):
+    """fpcalc failed on a file that could not be opened. Transient, so callers never store it."""
+
+
 class FpcalcUnavailableError(RuntimeError):
     """fpcalc itself cannot run. Says nothing about any one file, so callers never store it."""
 
@@ -264,6 +268,7 @@ class Fingerprinter:
         """Return *path*'s fingerprint and whole-second duration.
 
         Raises :class:`FingerprintError` on an exit other than 0 or 3 or on unusable output,
+        :class:`FingerprintUnreadableError` on such an exit when the file cannot be opened,
         :class:`FingerprintTimeout` past 60 s, and :class:`FpcalcUnavailableError` when the
         executable cannot start.
         """
@@ -279,9 +284,27 @@ class Fingerprinter:
             raise FpcalcUnavailableError(message) from exc
 
         if exit_code not in _FPCALC_OK_EXITS:
+            if not _is_readable(target):
+                message = (
+                    f"fpcalc exited {exit_code} on {path}, which could not be opened: "
+                    f"{stderr.strip()}. Rescan the library, or reconnect its drive, then run again"
+                )
+                raise FingerprintUnreadableError(exit_code, message)
             message = f"fpcalc exited {exit_code} on {path}: {stderr.strip()}"
             raise FingerprintError(exit_code, message)
         return _parse_fpcalc_output(exit_code, stdout, path)
+
+
+def _is_readable(path: str) -> bool:
+    """Return whether *path* opens for reading, which tells a missing file from a bad one.
+
+    fpcalc exits 2 both for a file it cannot open and for undecodable data.
+    """
+    try:
+        with Path(path).open("rb"):
+            return True
+    except OSError:
+        return False
 
 
 def _fpcalc_path_arg(path: Path, *, is_windows: bool) -> str:
@@ -356,7 +379,9 @@ class AcoustidClient:
         """
         if not settings.acoustid_api_key:
             message = (
-                "no AcoustID API key configured. Run `tagmend config-set acoustid_api_key <key>`."
+                "no AcoustID API key configured. Run `tagmend config`, or "
+                "`tagmend config-set acoustid_api_key`, which prompts for the key without "
+                "echoing it."
             )
             raise ValueError(message)
         return cls(settings.acoustid_api_key, rate_per_sec=settings.acoustid_rate_per_sec)

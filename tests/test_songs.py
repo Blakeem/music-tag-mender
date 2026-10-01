@@ -815,6 +815,38 @@ def test_stored_fpcalc_failure_makes_its_folder_warm(
     assert kit.acoustid.requests == []
 
 
+def test_an_fpcalc_failure_on_a_file_gone_since_the_scan_is_never_stored(
+    engine_settings: Settings,
+    music_dir: Path,
+    tmp_path: Path,
+) -> None:
+    # A drive that drops offline mid-run would otherwise mark every remaining file as bad audio.
+    _make_folder(music_dir / "LP", [{}], _NAMES[:1])
+    library.scan_library(engine_settings)
+    track = music_dir / "LP" / _NAMES[0]
+    away = tmp_path / _NAMES[0]
+    kit = Kit(
+        acoustid=FakeAcoustid({}),
+        releases=FakeReleases(),
+        fpcalc=FakeFpcalc(failures={_NAMES[0]: 2}),
+    )
+
+    track.rename(away)
+    offline = _resolve(engine_settings, kit)
+    stored_while_offline = _scalar(engine_settings, "SELECT COUNT(*) FROM fingerprint_cache")
+    away.rename(track)
+    back_kit = Kit(acoustid=FakeAcoustid({}), releases=FakeReleases())
+    back = _resolve(engine_settings, back_kit)
+
+    assert "could not be opened" in offline.error_items[0]["message"]
+    assert kit.fpcalc.calls == [_NAMES[0]]
+    assert stored_while_offline == 0
+    assert back_kit.fpcalc.calls == [_NAMES[0]]
+    assert back.error_items == []
+    assert back.lookup_empty == 1
+    assert _scalar(engine_settings, "SELECT fpcalc_exit FROM fingerprint_cache") == 0
+
+
 def test_limit_counts_cold_folders_and_warm_folders_run_free(
     engine_settings: Settings,
     music_dir: Path,

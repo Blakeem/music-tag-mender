@@ -10,6 +10,7 @@ Precedence: ``TAGMEND_*`` env override  >  ``settings.json``  >  built-in defaul
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import stat
@@ -52,6 +53,9 @@ _KNOWN_KEYS: Final[frozenset[str]] = frozenset(
     },
 )
 
+# The API keys. The config UI masks them and ``config-set`` prompts for them without echoing.
+SECRET_KEYS: Final[frozenset[str]] = frozenset({"lastfm_api_key", "acoustid_api_key"})
+
 # A settings file written before the album axis became the year axis still carries the old key.
 _LEGACY_KEYS: Final[Mapping[str, str]] = {"album_stage_limit": "year_stage_limit"}
 
@@ -59,6 +63,8 @@ _LEGACY_KEYS: Final[Mapping[str, str]] = {"album_stage_limit": "year_stage_limit
 _GENRE_MIN_WEIGHT_DEFAULT: Final = 2
 _GENRE_MAX_COUNT_DEFAULT: Final = 4
 _LASTFM_RATE_PER_SEC_DEFAULT: Final = 1.0
+# Last.fm's API terms allow 5 requests per second per IP, averaged over 5 minutes.
+_LASTFM_RATE_PER_SEC_MAX: Final = 5.0
 _GENRE_STAGE_LIMIT_DEFAULT: Final = 300
 
 # The public project URL, the contact any User-Agent may carry without naming a person.
@@ -70,6 +76,7 @@ PROJECT_URL: Final = "https://github.com/Blakeem/music-tag-mender"
 # request time so the version never drifts; only the contact is user-configurable, and it
 # defaults to the public project URL rather than a personal address.
 _MUSICBRAINZ_RATE_PER_SEC_DEFAULT: Final = 1.0
+_MUSICBRAINZ_RATE_PER_SEC_MAX: Final = 1.0
 _MUSICBRAINZ_CONTACT_DEFAULT: Final = PROJECT_URL
 _YEAR_STAGE_LIMIT_DEFAULT: Final = 300
 
@@ -190,20 +197,22 @@ def load_settings() -> Settings:
             _resolve_raw("genre_use_album_tags", raw),
             default=True,
         ),
-        lastfm_rate_per_sec=_coerce_float(
+        lastfm_rate_per_sec=_coerce_capped_rate(
             "lastfm_rate_per_sec",
             _resolve_raw("lastfm_rate_per_sec", raw),
             _LASTFM_RATE_PER_SEC_DEFAULT,
+            _LASTFM_RATE_PER_SEC_MAX,
         ),
         genre_stage_limit=_coerce_non_negative_int(
             "genre_stage_limit",
             _resolve_raw("genre_stage_limit", raw),
             _GENRE_STAGE_LIMIT_DEFAULT,
         ),
-        musicbrainz_rate_per_sec=_coerce_float(
+        musicbrainz_rate_per_sec=_coerce_capped_rate(
             "musicbrainz_rate_per_sec",
             _resolve_raw("musicbrainz_rate_per_sec", raw),
             _MUSICBRAINZ_RATE_PER_SEC_DEFAULT,
+            _MUSICBRAINZ_RATE_PER_SEC_MAX,
         ),
         musicbrainz_contact=_resolve_raw("musicbrainz_contact", raw)
         or _MUSICBRAINZ_CONTACT_DEFAULT,
@@ -290,22 +299,28 @@ def _coerce_max_count(value: str | None) -> int | None:
 
     Unset (not configured) yields the default cap of ``_GENRE_MAX_COUNT_DEFAULT``. The
     sentinel tokens (empty string, ``0``, ``none``, ``null``; case-insensitive) explicitly
-    mean "no cap" (``None``). Any other value is parsed as ``int``; a malformed one warns
-    and falls back to the default cap.
+    mean "no cap" (``None``). Any other value is parsed as ``int``. A malformed or negative
+    one warns and falls back to the default cap, since the cap is a slice bound where a
+    negative value means "all but the last N". Any spelling that parses to 0 (``00``,
+    ``-0``) also means no cap, since a slice bound of 0 would drop every genre.
     """
+    parsed: int | None = None
     if value is None:
         return _GENRE_MAX_COUNT_DEFAULT
     if value.strip().lower() in _NONE_TOKENS:
         return None
-    try:
-        return int(value)
-    except ValueError:
+    with contextlib.suppress(ValueError):
+        parsed = int(value)
+    if parsed is None or parsed < 0:
         logger.warning(
             "invalid genre_max_count=%r; using default %d",
             value,
             _GENRE_MAX_COUNT_DEFAULT,
         )
         return _GENRE_MAX_COUNT_DEFAULT
+    if parsed == 0:
+        return None
+    return parsed
 
 
 def _coerce_bool(value: str | None, *, default: bool) -> bool:
@@ -340,8 +355,9 @@ def set_settings(mapping: dict[str, str]) -> Path:
 
     Every key must be in ``_KNOWN_KEYS`` (a ``ValueError`` lists any unknowns). The given
     *mapping* is **merged** over the current on-disk values — never a wholesale replace, so
-    keys absent from *mapping* are preserved. The write is serialized by a module-level lock
-    and is atomic (temp file, fsync, restrict permissions, then rename) so a concurrent
+    keys absent from *mapping* are preserved. A file that exists but cannot be read or parsed
+    raises ``ValueError`` before anything is written. The write is serialized by a module-level
+    lock and is atomic (temp file, fsync, restrict permissions, then rename) so a concurrent
     writer or a mid-write crash can never leave a partial file.
     """
     # Input: reject unknown keys before touching disk.
@@ -356,7 +372,7 @@ def set_settings(mapping: dict[str, str]) -> Path:
     # Process + Output: merge under the lock, then write atomically.
     with _WRITE_LOCK:
         path.parent.mkdir(parents=True, exist_ok=True)
-        current = _read_raw_settings()
+        current = _parse_settings_file(path)
         current.update(mapping)
         serialized = json.dumps(current, indent=2, sort_keys=True) + "\n"
         _atomic_write(path, serialized)
@@ -399,19 +415,38 @@ def _read_raw_settings() -> dict[str, str]:
     if not path.exists():
         logger.debug("no settings file at %s; using defaults", path)
         return {}
+    try:
+        return _parse_settings_file(path)
+    except ValueError as exc:
+        logger.warning("%s; using defaults", exc)
+        return {}
 
+
+def _parse_settings_file(path: Path) -> dict[str, str]:
+    """Read *path* into a flat string map, or ``{}`` when it is absent.
+
+    Raises :class:`ValueError` when the file exists but cannot be read or parsed, or holds a
+    non-object, so a writer never merges over a map that dropped every stored key.
+    """
+    if not path.exists():
+        return {}
     try:
         parsed: object = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
-        logger.warning("could not read settings at %s: %s", path, exc)
-        return {}
+        raise ValueError(_unreadable_settings_message(path, exc)) from exc
+    if isinstance(parsed, dict):
+        raw = {str(k): str(v) for k, v in parsed.items() if v is not None}
+        return _rename_legacy_keys(raw)
+    # A parseable file holding the wrong shape is the same unusable settings file to the caller.
+    raise ValueError(_unreadable_settings_message(path, "not a JSON object"))
 
-    if not isinstance(parsed, dict):
-        logger.warning("settings at %s is not a JSON object; ignoring", path)
-        return {}
 
-    raw = {str(k): str(v) for k, v in parsed.items() if v is not None}
-    return _rename_legacy_keys(raw)
+def _unreadable_settings_message(path: Path, reason: object) -> str:
+    """Return the refusal for a settings file that exists but holds no usable map."""
+    return (
+        f"settings file {path} could not be read ({reason}). "
+        "Repair or remove it, then save again. Nothing was saved"
+    )
 
 
 def _rename_legacy_keys(raw: dict[str, str]) -> dict[str, str]:

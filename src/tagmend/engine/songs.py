@@ -63,6 +63,7 @@ from tagmend.engine.acoustid import (
     Fingerprinter,
     FingerprintError,
     FingerprintTimeout,
+    FingerprintUnreadableError,
     StoredFingerprint,
     get_fingerprint,
     get_lookup,
@@ -590,7 +591,7 @@ def _fresh_evidence(
     if fingerprint is None:
         try:
             fingerprint = lookups.fingerprinter().fingerprint(Path(row.folder) / row.filename)
-        except FingerprintTimeout as exc:
+        except (FingerprintTimeout, FingerprintUnreadableError) as exc:
             return _Evidence(error=str(exc))
         except FingerprintError as exc:
             _store_fingerprint(conn, row, exc.exit_code, None, now)

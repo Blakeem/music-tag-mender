@@ -611,6 +611,27 @@ def test_a_compilation_flag_already_set_is_not_the_missing_albumartist_shape() -
     assert report.flagged == 0
 
 
+def test_a_disc_subtitled_soundtrack_with_no_albumartist_is_the_compilation_shape() -> None:
+    # The disc suffix splits the album strings, but the base title is the one album they share.
+    report = _classify(
+        [
+            _f(
+                i,
+                filename=f"{i}.mp3",
+                album="OST (disc 1: A)" if i <= 3 else "OST (disc 2: B)",
+                albumartist=None,
+                artist=f"Artist {i}",
+            )
+            for i in range(1, 7)
+        ],
+    )
+
+    assert report.flagged == 6
+    assert all(r.reason == _REASON_NO_ALBUMARTIST for r in report.rows)
+    assert {r.majority_identity for r in report.rows} == {"Various Artists - OST"}
+    assert report.groups[0].majority_identity == "Various Artists - OST"
+
+
 # --- narrowing must not leak other folders' rows -------------------------------------
 
 
@@ -731,6 +752,59 @@ def test_a_year_split_with_a_stray_space_is_not_a_disc_suffix() -> None:
 
     assert report.medium == 1
     assert report.low == 0
+
+
+def test_an_albumartist_split_under_differing_disc_suffixes_is_medium() -> None:
+    # The missing album artist splits the album card, and a tier=medium filter must see it.
+    report = _classify(
+        [
+            *(
+                _f(
+                    i,
+                    filename=f"{i}.mp3",
+                    album="Hits (disc 1: Pop)",
+                    albumartist="Various Artists",
+                )
+                for i in (1, 2, 3)
+            ),
+            *(
+                _f(i, filename=f"{i}.mp3", album="Hits (disc 2: Rock)", albumartist=None)
+                for i in (4, 5)
+            ),
+        ],
+    )
+
+    assert [r.file_id for r in report.rows] == [4, 5]
+    assert report.medium == 2
+    assert report.low == 0
+    assert all("disc" not in r.reason for r in report.rows)
+
+
+def test_a_date_split_under_differing_disc_suffixes_is_medium() -> None:
+    report = _classify(
+        [
+            _f(1, album="X (disc 1: A)", date="2005"),
+            _f(2, filename="b.mp3", album="X (disc 1: A)", date="2005"),
+            _f(3, filename="c.mp3", album="X (disc 2: B)", date="2006"),
+        ],
+    )
+
+    assert report.medium == 1
+    assert report.low == 0
+
+
+def test_a_disc_suffix_split_with_matching_artist_and_date_is_still_low() -> None:
+    report = _classify(
+        [
+            _f(1, album="X (disc 1: A)", date="2005"),
+            _f(2, filename="b.mp3", album="X (disc 1: A)", date="2005"),
+            _f(3, filename="c.mp3", album="X (disc 2: B)", date="2005"),
+        ],
+    )
+
+    assert report.low == 1
+    assert report.medium == 0
+    assert "disc" in report.rows[0].reason
 
 
 # --- a two-file compilation is still a compilation -----------------------------------

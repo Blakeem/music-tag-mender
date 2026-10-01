@@ -157,7 +157,26 @@ def test_validate_rejects_bad_float() -> None:
     assert excinfo.value.status == HTTPStatus.UNPROCESSABLE_ENTITY
 
 
-@pytest.mark.parametrize("token", ["", "0", "none", "null"])
+def test_validate_rejects_a_negative_genre_max_count() -> None:
+    with pytest.raises(configui.ValidationError) as excinfo:
+        configui.validate_and_normalize({"genre_max_count": "-1"})
+    assert excinfo.value.status == HTTPStatus.UNPROCESSABLE_ENTITY
+    assert "positive whole number" in excinfo.value.message
+
+
+@pytest.mark.parametrize(
+    "key",
+    ["lastfm_rate_per_sec", "musicbrainz_rate_per_sec", "acoustid_rate_per_sec"],
+)
+@pytest.mark.parametrize("raw", ["0", "-1", "nan"])
+def test_validate_rejects_a_rate_that_would_disable_pacing(key: str, raw: str) -> None:
+    with pytest.raises(configui.ValidationError) as excinfo:
+        configui.validate_and_normalize({key: raw})
+    assert excinfo.value.status == HTTPStatus.UNPROCESSABLE_ENTITY
+    assert "above 0" in excinfo.value.message
+
+
+@pytest.mark.parametrize("token", ["", "0", "00", "-0", "none", "null"])
 def test_validate_accepts_genre_max_count_none_tokens(token: str) -> None:
     result = configui.validate_and_normalize({"genre_max_count": token})
     assert result == {"genre_max_count": token}
@@ -276,6 +295,25 @@ def test_server_save_persists(server: tuple[str, str]) -> None:
         )
     assert response.status_code == HTTPStatus.OK
     assert config.load_settings().genre_min_weight == 9
+
+
+def test_server_save_over_an_unreadable_settings_file_is_a_conflict(
+    server: tuple[str, str],
+) -> None:
+    base, token = server
+    path = config.settings_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{not json", encoding="utf-8")
+    with httpx.Client() as client:
+        response = client.post(
+            base + "/api/save",
+            json={"genre_min_weight": "9"},
+            headers={"X-TagMend-CSRF": token},
+        )
+    assert response.status_code == HTTPStatus.CONFLICT
+    assert response.json()["ok"] is False
+    assert "Nothing was saved" in response.json()["error"]
+    assert path.read_text(encoding="utf-8") == "{not json"
 
 
 def test_server_save_rejects_unknown_key(server: tuple[str, str]) -> None:

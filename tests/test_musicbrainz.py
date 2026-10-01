@@ -992,10 +992,9 @@ def test_bumping_the_release_version_changes_the_request_key(
     assert _release_request_key("abc") != before
 
 
-def test_the_release_version_is_four() -> None:
-    # Version 4 added the release group, labels, ASIN, ISRCs and credited names, so every
-    # release cached earlier re-fetches.
-    assert musicbrainz._RELEASE_VERSION == "4"
+def test_the_release_version_is_five() -> None:
+    # Version 5 added each track's length, so every release cached earlier re-fetches.
+    assert musicbrainz._RELEASE_VERSION == "5"
 
 
 def test_release_by_mbid_keeps_the_pregap_and_data_tracks_in_disc_order(
@@ -1076,7 +1075,7 @@ def test_the_sort_credit_round_trips_through_the_cache(db_conn: sqlite3.Connecti
     assert cached.artist_sort == "36 Crazyfists"
 
 
-@pytest.mark.parametrize("old_version", ["1", "3"])
+@pytest.mark.parametrize("old_version", ["1", "3", "4"])
 def test_an_older_release_row_is_a_miss(
     db_conn: sqlite3.Connection,
     monkeypatch: pytest.MonkeyPatch,
@@ -1163,6 +1162,25 @@ def test_a_release_with_no_group_labels_or_isrcs_parses_them_empty(
     assert release.catalog_numbers == ()
     assert release.asin == ""
     assert release.media[0].tracks[0].isrcs == ()
+
+
+def test_release_by_mbid_parses_each_tracks_length_in_whole_seconds(
+    db_conn: sqlite3.Connection,
+) -> None:
+    body = _release_body()
+    media = body["media"]
+    assert isinstance(media, list)
+    media[0]["tracks"][0]["length"] = 241_600
+    media[0]["tracks"][1]["length"] = None
+    client, calls = _client(db_conn, [_json_response(body)])
+    with client:
+        fetched = client.release_by_mbid("rel-1")
+        cached = client.release_by_mbid("rel-1")
+
+    assert len(calls) == 1
+    assert fetched is not None
+    assert [t.length_seconds for t in fetched.media[0].tracks] == [242, None]
+    assert cached == fetched
 
 
 # --- 503 backoff: MusicBrainz's own rate-limit signal ---------------------------------

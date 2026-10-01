@@ -2047,10 +2047,11 @@ def reset_year_status(
 
 @mcp.tool()
 @_error_envelope
-def resolve_songs(
+def resolve_songs(  # noqa: PLR0913 - cohesive scope, release path and run knobs
     folder: str | None = None,
     file_ids: list[int] | None = None,
     release_mbid: str | None = None,
+    assignments: list[dict[str, object]] | None = None,
     limit: int | None = None,
     dry_run: bool = False,  # noqa: FBT001, FBT002 - MCP tool surface, not a Python API
 ) -> dict[str, object]:
@@ -2097,12 +2098,25 @@ def resolve_songs(
     A real run fetches the release fresh, so the stamp carries the track ids MusicBrainz lists
     now. A dry run reads the cache.
 
+    ``assignments`` names the track for a file the audio cannot place, such as an
+    ``ambiguous_slot`` or ``slot_collision`` row in ``unassigned``. Take each track id from the
+    ``release_track_mbid`` values of the dry run's ``release`` block. An assigned file takes that
+    track in place of its audio's tracks and gets the same stamp as every other file. The whole
+    call is refused, naming the file, when the track is not on the release, the file is not in
+    the call's scope, a file is listed twice, another file is assigned that track or its audio
+    sits on it, or the file's fingerprint duration differs from the track's length by more than
+    10 seconds. A file with no stored fingerprint skips only the length check. Each dry-run
+    ``mappings`` row carries ``placed_by``: ``operator`` for an assigned file, ``audio`` for a
+    file its audio placed.
+
     Args:
         folder: Limit to the files directly in this folder. Compared as a path, and a
             relative folder resolves under ``music_path``.
         file_ids: Limit to these file ids (overrides ``folder``). An unknown id is refused.
         release_mbid: Apply this MusicBrainz release to the scope (``folder`` or ``file_ids``
             required).
+        assignments: A list of ``{"file_id": <int>, "release_track_mbid": <str>}`` objects.
+            Accepted only with ``release_mbid``.
         limit: Max cold folders this call (default ``song_stage_limit``). A cold folder needs
             fpcalc or an AcoustID request. Warm folders always run, so ``limit=0`` costs no
             request and no fpcalc run.
@@ -2120,11 +2134,17 @@ def resolve_songs(
         changes, no AcoustID key, fpcalc missing). ``more`` is ``cold_folders_remaining > 0``:
         a held file stays ``pending`` by design, so only a cold folder is new work.
     """
+    pairs = (
+        None
+        if assignments is None
+        else [(entry.get("file_id"), entry.get("release_track_mbid")) for entry in assignments]
+    )
     result = songs.resolve_songs(
         load_settings(),
         folder=folder,
         file_ids=file_ids,
         release_mbid=release_mbid,
+        assignments=pairs,
         limit=limit,
         dry_run=dry_run,
     )

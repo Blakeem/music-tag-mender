@@ -78,7 +78,7 @@ from tagmend.log import get_logger
 
 if TYPE_CHECKING:
     import sqlite3
-    from collections.abc import Iterable
+    from collections.abc import Iterable, Sequence
 
     from tagmend.config import Settings
     from tagmend.engine.musicbrainz import MBMedium, MBRelease, MBReleaseSource, MBTrack
@@ -136,6 +136,8 @@ _KEPT_ON_OWN_RELEASE: Final = (
 )
 # The same rule keyed on the recording, because an ISRC names the recording on every release.
 _KEPT_ON_OWN_RECORDING: Final = ("isrc",)
+
+_ASSIGNMENT_WIDTH: Final = 2
 
 _HELD_KINDS: Final = (
     "disagreement",
@@ -318,11 +320,15 @@ class _Ballot:
 
 @dataclass(frozen=True, slots=True)
 class _Slot:
-    """One track of a release that a file's recording occupies."""
+    """One track of a release a file sits on.
+
+    ``recording`` is the AcoustID recording that places the file there, ``None`` when the
+    operator assigned the track.
+    """
 
     release: MBRelease
     track: MBTrack
-    recording: AcoustidRecording
+    recording: AcoustidRecording | None
 
     @property
     def key(self) -> tuple[str, int, int]:
@@ -441,6 +447,7 @@ def resolve_songs(  # noqa: PLR0913 - cohesive keyword-only scope + injection pa
     folder: str | None = None,
     file_ids: list[int] | None = None,
     release_mbid: str | None = None,
+    assignments: Sequence[object] | None = None,
     limit: int | None = None,
     dry_run: bool = False,
     fingerprinter: Fingerprinter | None = None,
@@ -453,11 +460,14 @@ def resolve_songs(  # noqa: PLR0913 - cohesive keyword-only scope + injection pa
     :func:`tagmend.engine.path_keys.folder_arg_key`), else the whole library. *limit* (default
     ``song_stage_limit``) counts cold folders, and ``0`` processes warm folders only. With
     *release_mbid* the call takes the manual release path over its scope, which must be given.
+    *assignments* holds ``(file_id, release_track_mbid)`` tuples that place those files on the
+    named tracks of that release, in place of their audio.
 
     A dry run writes the fingerprint, AcoustID and release caches and nothing else. A non-dry
     run raises :class:`ValueError` while anything is staged. Any run raises it for a negative
-    *limit*, an unknown file id, a *folder* outside ``music_path`` and *release_mbid* without a
-    scope. :class:`tagmend.engine.acoustid.AcoustidKeyError` and
+    *limit*, an unknown file id, a *folder* outside ``music_path``, *release_mbid* without a
+    scope, *assignments* without *release_mbid* and a malformed or refused assignment.
+    :class:`tagmend.engine.acoustid.AcoustidKeyError` and
     :class:`tagmend.engine.acoustid.FpcalcUnavailableError` stop the call, since they fail every
     file alike. *fingerprinter*, *acoustid_client* (already entered) and *releases* are injection
     seams for tests. Each is built from *settings* on first use when ``None``.
@@ -466,6 +476,10 @@ def resolve_songs(  # noqa: PLR0913 - cohesive keyword-only scope + injection pa
     if release_mbid is not None and folder is None and file_ids is None:
         message = "release_mbid needs folder or file_ids: a release is never applied library-wide"
         raise ValueError(message)
+    if assignments is not None and release_mbid is None:
+        message = "assignments needs release_mbid: each track id names a track of that release"
+        raise ValueError(message)
+    assigned = _assignment_map(assignments or ())
     folder_key = None if folder is None else path_keys.folder_arg_key(settings, folder)
     effective_limit = settings.song_stage_limit if limit is None else limit
     scoped = folder is not None or file_ids is not None
@@ -502,6 +516,7 @@ def resolve_songs(  # noqa: PLR0913 - cohesive keyword-only scope + injection pa
                     tally,
                     scoped_ids=scoped_ids,
                     release_mbid=release_mbid,
+                    assigned=assigned,
                     dry_run=dry_run,
                 )
         pending_remaining = len(store.pending_file_ids(connection, axis.SONG_AXIS, scoped_ids))
@@ -804,13 +819,24 @@ def _row(ballot: _Ballot, reason: str, release_mbid: str) -> dict[str, object]:
     }
 
 
-def _mapping(voter: _Voter, release_mbid: str, tags: dict[str, list[str]]) -> dict[str, object]:
-    """Return one dry-run row: the values a call would stage on one file."""
+def _mapping(
+    voter: _Voter,
+    release_mbid: str,
+    tags: dict[str, list[str]],
+    *,
+    placed_by: str,
+) -> dict[str, object]:
+    """Return one dry-run row: the values a call would stage on one file.
+
+    *placed_by* is ``audio`` when AcoustID placed the file on its track, ``operator`` when the
+    caller assigned the track.
+    """
     return {
         "file_id": voter.file_id,
         "folder": voter.row.folder,
         "filename": voter.row.filename,
         "release_mbid": release_mbid,
+        "placed_by": placed_by,
         "tags": tags,
     }
 
@@ -968,7 +994,7 @@ def _judge(ballot: _Ballot, release: MBRelease, track: MBTrack, *, totals: bool)
         fill=fill,
         fill_only=frozenset(fill_only & set(fill)),
         note=f"acoustid: release {release.mbid}",
-        row=_mapping(ballot.voter, release.mbid, fill),
+        row=_mapping(ballot.voter, release.mbid, fill, placed_by="audio"),
     )
 
 
@@ -1415,13 +1441,15 @@ def _resolve_release(  # noqa: PLR0913 - cohesive keyword-only run inputs
     *,
     scoped_ids: list[int],
     release_mbid: str,
+    assigned: dict[int, str],
     dry_run: bool,
 ) -> tuple[dict[str, object], list[dict[str, object]]]:
     """Assign every file in scope to its track on *release_mbid*, then stage the whole stamp.
 
+    A file in *assigned* sits on the track the operator named instead of its audio's tracks.
     All or nothing: one unassigned file stages nothing. Returns the release block and the
-    unassigned rows. Raises :class:`ValueError` when MusicBrainz holds no such release or a
-    listed file is missing on disk.
+    unassigned rows. Raises :class:`ValueError` when MusicBrainz holds no such release, a
+    listed file is missing on disk or an assignment is refused.
     """
     # A stamp writes the release's track ids, which MusicBrainz replaces over time, so a real
     # run reads the current tracklist and a dry run keeps reading the cache.
@@ -1430,21 +1458,36 @@ def _resolve_release(  # noqa: PLR0913 - cohesive keyword-only run inputs
         message = f"MusicBrainz holds no release {release_mbid}"
         raise ValueError(message)
     rows = _present_rows(conn, scoped_ids)
+    operator_slots = _operator_slots(release, assigned, scoped_ids)
 
     now = datetime.now(UTC)
     ballots: list[_Ballot] = []
+    placements: dict[int, list[_Slot]] = {}
     for row in rows:
         evidence = _fresh_evidence(conn, row, lookups, now)
         voter = _Voter(row=row, tags=store.get_tags(conn, row.id), target=True, unsettled=True)
-        ballots.append(_Ballot(voter=voter, evidence=evidence, gate=_gate(evidence, voter.stem)))
-    placements = {b.voter.file_id: _slots_on(release, b.gate.titled) for b in ballots}
+        ballot = _Ballot(voter=voter, evidence=evidence, gate=_gate(evidence, voter.stem))
+        operator_slot = operator_slots.get(row.id)
+        ballots.append(ballot)
+        placements[row.id] = (
+            _slots_on(release, ballot.gate.titled) if operator_slot is None else [operator_slot]
+        )
+    # Claims are built after the operator's slots replace the audio's, so an assigned track
+    # still collides with a sibling whose audio sits on it.
     claims = _claims(placements)
+    _check_operator_slots(ballots, operator_slots, claims)
 
     unassigned: list[dict[str, object]] = []
-    stamps: list[tuple[_Voter, dict[str, list[str]]]] = []
+    stamps: list[tuple[_Voter, dict[str, list[str]], str]] = []
     for ballot in ballots:
-        slots = placements[ballot.voter.file_id]
-        reason = _evidence_reason(ballot) or _slot_reason(ballot, slots, claims)
+        file_id = ballot.voter.file_id
+        slots = placements[file_id]
+        placed_by = "operator" if file_id in operator_slots else "audio"
+        reason = (
+            None
+            if placed_by == "operator"
+            else _evidence_reason(ballot) or _slot_reason(ballot, slots, claims)
+        )
         if reason == "error":
             tally.add_error(ballot.voter.file_id, ballot.evidence.error or "")
         if reason is not None:
@@ -1456,16 +1499,20 @@ def _resolve_release(  # noqa: PLR0913 - cohesive keyword-only run inputs
                 },
             )
         else:
-            stamps.append((ballot.voter, _stamp(release, slots[0].track, ballot.voter)))
+            stamp = _stamp(release, slots[0].track, ballot.voter)
+            stamps.append((ballot.voter, stamp, placed_by))
 
     block = _release_block(release)
     if unassigned or not stamps:
         return block, unassigned
     tally.staged_files = len(stamps)
     if dry_run:
-        tally.mappings = [_mapping(voter, release.mbid, stamp) for voter, stamp in stamps]
+        tally.mappings = [
+            _mapping(voter, release.mbid, stamp, placed_by=placed_by)
+            for voter, stamp, placed_by in stamps
+        ]
         return block, unassigned
-    entries = [(voter.file_id, stamp) for voter, stamp in stamps]
+    entries = [(voter.file_id, stamp) for voter, stamp, _ in stamps]
     staging.stage_tags_batch(
         settings,
         entries=entries,
@@ -1484,6 +1531,84 @@ def _present_rows(conn: sqlite3.Connection, file_ids: list[int]) -> list[store.F
             raise ValueError(message)
         rows.append(row)
     return rows
+
+
+def _assignment_map(assignments: Sequence[object]) -> dict[int, str]:
+    """Narrow *assignments* to ``{file_id: release_track_mbid}``, or raise :class:`ValueError`.
+
+    Each entry is a ``(file_id, release_track_mbid)`` tuple, and each file is assigned once.
+    """
+    assigned: dict[int, str] = {}
+    for index, entry in enumerate(assignments):
+        if not isinstance(entry, tuple) or len(entry) != _ASSIGNMENT_WIDTH:
+            message = f"assignment {index}: expected a (file_id, release_track_mbid) pair"
+            raise ValueError(message)
+        file_id, track_mbid = entry
+        if not isinstance(file_id, int) or isinstance(file_id, bool):
+            message = f"assignment {index}: file_id must be an integer, got {file_id!r}"
+            raise ValueError(message)  # noqa: TRY004 - every assignment rejection is a ValueError
+        if not isinstance(track_mbid, str) or not track_mbid.strip():
+            message = f"assignment {index} (file_id={file_id}): release_track_mbid must be an id"
+            raise ValueError(message)
+        if file_id in assigned:
+            message = f"file_id={file_id} is assigned more than once"
+            raise ValueError(message)
+        assigned[file_id] = track_mbid.strip()
+    return assigned
+
+
+def _operator_slots(
+    release: MBRelease,
+    assigned: dict[int, str],
+    scoped_ids: list[int],
+) -> dict[int, _Slot]:
+    """Return the slot each assigned file names on *release*.
+
+    Raises :class:`ValueError` for a file outside the call's scope or a track off the release.
+    """
+    in_scope = set(scoped_ids)
+    slots: dict[int, _Slot] = {}
+    for file_id, track_mbid in assigned.items():
+        track = release.track_by_release_track_mbid(track_mbid)
+        if file_id not in in_scope:
+            message = f"file_id={file_id} is assigned a track but is not in the call's scope"
+            raise ValueError(message)
+        if track is None:
+            message = (
+                f"file_id={file_id} is assigned release_track_mbid={track_mbid}, "
+                f"which release {release.mbid} does not list"
+            )
+            raise ValueError(message)
+        slots[file_id] = _Slot(release=release, track=track, recording=None)
+    return slots
+
+
+def _check_operator_slots(
+    ballots: list[_Ballot],
+    operator_slots: dict[int, _Slot],
+    claims: dict[tuple[str, int, int], set[int]],
+) -> None:
+    """Refuse an assigned track another file claims, or one far from the file's audio length.
+
+    A file with no stored fingerprint has no known duration, so it skips only the length check.
+    """
+    durations = {ballot.voter.file_id: ballot.evidence.duration for ballot in ballots}
+    for file_id, slot in operator_slots.items():
+        track = slot.track
+        rivals = sorted(claims[slot.key] - {file_id})
+        if rivals:
+            message = (
+                f"file_id={file_id} is assigned release_track_mbid={track.release_track_mbid}, "
+                f"which file_id(s) {rivals} also claim"
+            )
+            raise ValueError(message)
+        if not _length_fits(track.length_seconds, durations[file_id]):
+            message = (
+                f"file_id={file_id} runs {durations[file_id]}s but its assigned "
+                f"release_track_mbid={track.release_track_mbid} runs {track.length_seconds}s, "
+                f"more than {_LENGTH_GUARD_SECONDS}s apart"
+            )
+            raise ValueError(message)
 
 
 def _evidence_reason(ballot: _Ballot) -> str | None:
@@ -1505,21 +1630,24 @@ def _slot_reason(
     """Return why a placed file is not assigned, or ``None`` when it is.
 
     The auto tier's recording gate is not required here: the caller named the release, so one
-    corroborated slot that no other file claims is enough.
+    corroborated slot that no other file claims is enough. A slot the operator named carries
+    no recording, so only the claim check applies to it.
     """
     if not slots:
         return "not_on_release"
     if len(slots) > 1:
         return "ambiguous_slot"
     slot = slots[0]
-    if not _length_fits(slot.recording.duration, ballot.evidence.duration):
-        return "length_mismatch"
-    corroborated = slot.recording.id in {r.id for r in ballot.gate.group} or _stem_holds(
-        slot.recording.title,
-        ballot.voter.stem,
-    )
-    if not corroborated:
-        return "uncorroborated"
+    recording = slot.recording
+    if recording is not None:
+        if not _length_fits(recording.duration, ballot.evidence.duration):
+            return "length_mismatch"
+        corroborated = recording.id in {r.id for r in ballot.gate.group} or _stem_holds(
+            recording.title,
+            ballot.voter.stem,
+        )
+        if not corroborated:
+            return "uncorroborated"
     return None if claims[slot.key] == {ballot.voter.file_id} else "slot_collision"
 
 

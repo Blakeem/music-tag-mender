@@ -742,6 +742,25 @@ def test_negative_limit_is_rejected_everywhere(tool_name: str, kwargs: dict[str,
     assert "must be >= 0" in payload["error"]
 
 
+@pytest.mark.parametrize(
+    ("release_mbid", "error"),
+    [
+        pytest.param(None, "assignments needs release_mbid", id="no-release"),
+        pytest.param("rel-1", "file_id=1 is assigned more than once", id="file-listed-twice"),
+    ],
+)
+def test_resolve_songs_passes_its_assignments_to_the_engine(
+    release_mbid: str | None,
+    error: str,
+) -> None:
+    entries = [{"file_id": 1, "release_track_mbid": track} for track in ("t-1", "t-2")]
+
+    payload = mcp_server.resolve_songs(folder="LP", release_mbid=release_mbid, assignments=entries)
+
+    assert payload["ok"] is False
+    assert error in payload["error"]
+
+
 # --- the path tools ----------------------------------------------------------------------
 
 

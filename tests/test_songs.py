@@ -936,6 +936,210 @@ def test_release_mbid_without_a_scope_is_rejected(engine_settings: Settings) -> 
         songs.resolve_songs(engine_settings, release_mbid=_LP)
 
 
+# --- operator track assignments on the manual release path ---------------------------
+
+
+def _reprise_kit(fourth_length: int | None = None) -> Kit:
+    """Return a kit whose fourth file's recording sits on two tracks of a five-track LP.
+
+    Track 5 reprises track 4's recording, so the audio alone leaves the fourth file
+    ``ambiguous_slot``. *fourth_length* is track 4's MusicBrainz length in seconds.
+    """
+    release = _release(
+        _LP,
+        (*_TITLES, "Song Four (Reprise)"),
+        recordings=["rec-1", "rec-2", "rec-3", "rec-4", "rec-4"],
+    )
+    medium = release.media[0]
+    tracks = tuple(
+        replace(track, length_seconds=fourth_length) if track.position == 4 else track
+        for track in medium.tracks
+    )
+    bodies = _lp_bodies(_NAMES[:3])
+    bodies[f"fp-{_NAMES[3]}"] = _body(
+        _recording("rec-4", _TITLES[3], Slot(_LP, 4, 5), Slot(_LP, 5, 5)),
+    )
+    return Kit(
+        acoustid=FakeAcoustid(bodies),
+        releases=FakeReleases(replace(release, media=(replace(medium, tracks=tracks),))),
+    )
+
+
+def _reprise_folder(music_dir: Path) -> Path:
+    folder = music_dir / "LP"
+    _make_folder(folder, [{} for _ in _NAMES])
+    return folder
+
+
+def _voter(settings: Settings, file_id: int) -> songs._Voter:
+    conn = connect(settings.db_path)
+    try:
+        apply_schema(conn)
+        row = store.get_file_by_id(conn, file_id)
+        assert row is not None
+        return songs._Voter(
+            row=row, tags=store.get_tags(conn, file_id), target=True, unsettled=True
+        )
+    finally:
+        conn.close()
+
+
+def test_an_assigned_track_places_an_ambiguous_file_and_stages_the_whole_stamp(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    folder = _reprise_folder(music_dir)
+    library.scan_library(engine_settings)
+    ids = _ids(engine_settings)
+    fourth = ids[_NAMES[3]]
+    kit = _reprise_kit()
+    assignments = [(fourth, _track_id(_LP, 4))]
+    scope = {"folder": str(folder), "release_mbid": _LP}
+
+    unaided = _resolve(engine_settings, kit, **scope, dry_run=True)
+    preview = _resolve(engine_settings, kit, **scope, assignments=assignments, dry_run=True)
+    result = _resolve(engine_settings, kit, **scope, assignments=assignments)
+
+    assert unaided.unassigned == [
+        {"file_id": fourth, "filename": _NAMES[3], "reason": "ambiguous_slot"},
+    ]
+    assert {row["file_id"]: row["placed_by"] for row in preview.mappings} == {
+        **{ids[name]: "audio" for name in _NAMES[:3]},
+        fourth: "operator",
+    }
+    release = kit.releases.release_by_mbid(_LP)
+    assert release is not None
+    track = release.track_by_release_track_mbid(_track_id(_LP, 4))
+    assert track is not None
+    expected = songs._stamp(release, track, _voter(engine_settings, fourth))
+    [mapping] = [row for row in preview.mappings if row["file_id"] == fourth]
+    assert mapping["tags"] == expected
+    assert result.unassigned == []
+    assert result.staged_files == 4
+    target = _diffs(engine_settings)[_NAMES[3]].target
+    assert {name: target.get(name, []) for name in expected} == expected
+    assert target["tracknumber"] == ["4/5"]
+
+
+@pytest.mark.parametrize(
+    ("assigned", "scope", "reason"),
+    [
+        pytest.param([(_NAMES[3], "no-such-track")], None, "does not list", id="track-off-release"),
+        pytest.param(
+            [(_NAMES[3], _track_id(_LP, 4))],
+            _NAMES[:3],
+            "not in the call's scope",
+            id="file-out-of-scope",
+        ),
+        pytest.param(
+            [(_NAMES[3], _track_id(_LP, 4)), (_NAMES[2], _track_id(_LP, 4))],
+            None,
+            "also claim",
+            id="track-assigned-twice",
+        ),
+        pytest.param(
+            [(_NAMES[3], _track_id(_LP, 3))],
+            None,
+            "also claim",
+            id="track-the-audio-places-a-sibling-on",
+        ),
+    ],
+)
+def test_a_refused_assignment_names_the_file_and_stages_nothing(
+    engine_settings: Settings,
+    music_dir: Path,
+    assigned: list[tuple[str, str]],
+    scope: tuple[str, ...] | None,
+    reason: str,
+) -> None:
+    folder = _reprise_folder(music_dir)
+    library.scan_library(engine_settings)
+    ids = _ids(engine_settings)
+    assignments = [(ids[name], track) for name, track in assigned]
+    where: dict[str, object] = (
+        {"folder": str(folder)} if scope is None else {"file_ids": [ids[name] for name in scope]}
+    )
+
+    with pytest.raises(ValueError, match=reason) as refused:
+        _resolve(
+            engine_settings, _reprise_kit(), release_mbid=_LP, assignments=assignments, **where
+        )
+
+    assert f"file_id={ids[_NAMES[3]]} " in str(refused.value)
+    assert staging.diff_tags(engine_settings) == []
+
+
+def test_an_assigned_track_far_from_the_files_length_is_refused(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    folder = _reprise_folder(music_dir)
+    library.scan_library(engine_settings)
+    fourth = _ids(engine_settings)[_NAMES[3]]
+    kit = _reprise_kit(fourth_length=_DURATION + 30)
+
+    with pytest.raises(ValueError, match=f"file_id={fourth} runs {_DURATION}s"):
+        _resolve(
+            engine_settings,
+            kit,
+            folder=str(folder),
+            release_mbid=_LP,
+            assignments=[(fourth, _track_id(_LP, 4))],
+        )
+
+    assert staging.diff_tags(engine_settings) == []
+
+
+def test_an_assigned_file_with_no_fingerprint_skips_only_the_length_check(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    folder = _reprise_folder(music_dir)
+    library.scan_library(engine_settings)
+    ids = _ids(engine_settings)
+    fourth = ids[_NAMES[3]]
+    kit = replace(
+        _reprise_kit(fourth_length=_DURATION + 30),
+        fpcalc=FakeFpcalc(failures={_NAMES[3]: 2}),
+    )
+    scope = {"folder": str(folder), "release_mbid": _LP}
+
+    with pytest.raises(ValueError, match=f"file_id={fourth} .* also claim"):
+        _resolve(engine_settings, kit, **scope, assignments=[(fourth, _track_id(_LP, 3))])
+    result = _resolve(engine_settings, kit, **scope, assignments=[(fourth, _track_id(_LP, 4))])
+
+    assert result.unassigned == []
+    assert result.error_items == []
+    assert result.staged_files == 4
+    target = _diffs(engine_settings)[_NAMES[3]].target
+    assert target["musicbrainz_releasetrackid"] == [_track_id(_LP, 4)]
+
+
+@pytest.mark.parametrize(
+    ("release_mbid", "assignments", "error"),
+    [
+        pytest.param(None, [(1, "t-1")], "assignments needs release_mbid", id="no-release"),
+        pytest.param(_LP, [{"file_id": 1}], r"expected a \(file_id", id="not-a-pair"),
+        pytest.param(_LP, [("1", "t-1")], "file_id must be an integer", id="file-id-text"),
+        pytest.param(_LP, [(1, " ")], "release_track_mbid must be an id", id="blank-track"),
+        pytest.param(_LP, [(1, "t-1"), (1, "t-2")], "assigned more than once", id="file-twice"),
+    ],
+)
+def test_malformed_assignments_are_rejected_before_any_lookup(
+    engine_settings: Settings,
+    release_mbid: str | None,
+    assignments: list[object],
+    error: str,
+) -> None:
+    with pytest.raises(ValueError, match=error):
+        songs.resolve_songs(
+            engine_settings,
+            folder="LP",
+            release_mbid=release_mbid,
+            assignments=assignments,
+        )
+
+
 # --- transient errors and the caches -------------------------------------------------
 
 

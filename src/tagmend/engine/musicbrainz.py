@@ -108,7 +108,7 @@ _SELECTION_VERSION: Final = "3"
 _ARTIST_VERSION: Final = "1"
 
 # The release lookup's own version token, for the same reason the artist lookup has one.
-_RELEASE_VERSION: Final = "4"
+_RELEASE_VERSION: Final = "5"
 
 # One trailing parenthetical or bracketed segment: the edition suffix a tag carries and a release
 # group does not (``Fiction (Deluxe Edition)``, ``The Red Album [Deluxe Edition]``).
@@ -173,6 +173,7 @@ class MBTrack:
     identifies the recording, which can appear on many releases. A tagged file carries both,
     so either one finds its track here without matching on title or position.
     ``artist_names`` holds each credited name beside its id in ``artist_mbids``, one to one.
+    ``length_seconds`` is the track's length in whole seconds, ``None`` when MusicBrainz lists none.
     """
 
     position: int
@@ -185,6 +186,7 @@ class MBTrack:
     artist_mbids: tuple[str, ...]
     isrcs: tuple[str, ...] = ()
     artist_names: tuple[str, ...] = ()
+    length_seconds: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -893,6 +895,7 @@ def _parse_track(entry: object, medium_credit: _Credit) -> MBTrack | None:
     position = entry.get("position")
     number = entry.get("number")
     release_track_mbid = entry.get("id")
+    length_ms = _int_or_none(entry.get("length"))
     return MBTrack(
         position=position if isinstance(position, int) else 0,
         number=number if isinstance(number, str) else str(number or ""),
@@ -904,6 +907,7 @@ def _parse_track(entry: object, medium_credit: _Credit) -> MBTrack | None:
         artist_mbids=credit.mbids,
         isrcs=_distinct(_as_list(recording_fields.get("isrcs"))),
         artist_names=credit.names,
+        length_seconds=None if length_ms is None else round(length_ms / 1000),
     )
 
 
@@ -991,6 +995,11 @@ def _int_or_zero(value: object) -> int:
     return value if isinstance(value, int) else 0
 
 
+def _int_or_none(value: object) -> int | None:
+    """Return *value* as an int, or ``None`` when it is absent or not an int."""
+    return value if isinstance(value, int) else None
+
+
 def _as_list(value: object) -> list[object]:
     """Return *value* as a list, or empty when it is absent or not a list."""
     return cast("list[object]", value) if isinstance(value, list) else []
@@ -1036,6 +1045,7 @@ def _release_to_json(release: MBRelease) -> str:
                             "artist_mbids": list(t.artist_mbids),
                             "isrcs": list(t.isrcs),
                             "artist_names": list(t.artist_names),
+                            "length_seconds": t.length_seconds,
                         }
                         for t in m.tracks
                     ],
@@ -1087,6 +1097,7 @@ def _release_from_json(mbid: str, payload: str) -> MBRelease | None:
                         artist_mbids=tuple(t.get("artist_mbids") or ()),
                         isrcs=tuple(t.get("isrcs") or ()),
                         artist_names=tuple(t.get("artist_names") or ()),
+                        length_seconds=_int_or_none(t.get("length_seconds")),
                     )
                     for t in (m.get("tracks") or [])
                 ),

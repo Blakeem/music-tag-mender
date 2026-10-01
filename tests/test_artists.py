@@ -67,7 +67,7 @@ def _file_id(settings: Settings, folder: Path, filename: str) -> int:
         conn.close()
 
 
-# The per-value outcome buckets, which must always sum to ``processed``.
+# The per-value outcome buckets: every value looked up lands in exactly one.
 _BUCKET_NAMES = (
     "corrected_values",
     "already_canonical",
@@ -199,7 +199,9 @@ def test_feat_sentinel_and_empty_values_are_skipped_and_reported(
     )
     result = artists.resolve_artists(engine_settings, client=fake)
 
-    assert result.skipped_sentinel == 3
+    # The blank-artist file has no artist identity, so it is never selected and its value
+    # never reaches the guard count.
+    assert result.skipped_sentinel == 2
     assert result.staged_files == 1
     # The guarded values were never looked up.
     assert fake.lookups == ["Miami Nights '84"]
@@ -248,15 +250,19 @@ def test_already_canonical_stages_nothing_and_rerun_is_noop(
     assert first.staged_files == 0
     assert len(staging.diff_tags(engine_settings)) == 0
 
-    # An already-canonical value is visible (not silently invisible) and the per-value
-    # outcome buckets sum to processed.
-    assert first.processed == 1
+    # An already-canonical value is visible (not silently invisible) and its file settles.
+    assert first.settled == 1
     assert first.corrected_values == 0
     assert first.no_correction == 0
     assert first.already_canonical == 1
     assert first.already_canonical_values == ["Daft Punk"]
-    assert sum(_buckets(first).values()) == first.processed
+    assert sum(_buckets(first).values()) == 1
     assert "1 already canonical" in first.summary
+
+    # The file is done, so a re-run selects nothing and looks nothing up.
+    second = artists.resolve_artists(engine_settings, client=fake)
+    assert second.settled == 0
+    assert fake.lookups == ["Daft Punk"]
 
 
 def test_rerun_after_commit_is_idempotent(
@@ -333,10 +339,13 @@ def test_lookup_error_is_counted_and_itemized(
     assert result.staged_files == 0
 
 
-def test_result_names_its_processed_unit(engine_settings: Settings) -> None:
+def test_result_follows_the_resolver_contract(engine_settings: Settings) -> None:
     result = artists.resolve_artists(engine_settings, client=FakeCorrectionSource({}))
 
-    assert result.to_dict()["processed_unit"] == "values"
+    keys = set(result.to_dict())
+    assert {"settled", "staged_files", "errors", "error_items", "pending_remaining"} <= keys
+    assert {"more", "summary", "mappings"} <= keys
+    assert not keys & {"processed", "processed_unit", "skipped_manual", "skipped_missing"}
 
 
 # --- (7b) MusicBrainz placeholder guard ----------------------------------------------
@@ -455,7 +464,6 @@ def test_correction_gate_routes_each_class_to_exactly_one_bucket(
     expected = dict.fromkeys(_BUCKET_NAMES, 0)
     expected[case.bucket] = 1
     assert _buckets(result) == expected
-    assert sum(_buckets(result).values()) == result.processed
     assert result.staged_files == case.staged
     assert len(staging.diff_tags(engine_settings)) == case.staged
 
@@ -537,7 +545,7 @@ def test_gate_stages_only_the_verified_corrections_from_the_live_data(
         "no_correction": 0,
         "errors": 0,
     }
-    assert sum(_buckets(result).values()) == result.processed
+    assert sum(_buckets(result).values()) == len(_LIVE_CORRECTIONS)
 
 
 def test_gate_dry_run_reports_identical_buckets_and_stages_nothing(
@@ -640,7 +648,7 @@ def test_non_dry_run_requires_empty_staging(
 # --- (10) limit / more loop ----------------------------------------------------------
 
 
-def test_limit_caps_values_and_reports_pending(
+def test_limit_caps_files_and_reports_pending(
     engine_settings: Settings,
     music_dir: Path,
 ) -> None:
@@ -656,8 +664,9 @@ def test_limit_caps_values_and_reports_pending(
             "Charlie '84": ArtistCorrection("Charlie 1984", "mbid-c"),
         },
     )
-    first = artists.resolve_artists(engine_settings, client=fake, limit=2, dry_run=True)
-    assert first.processed == 2
+    first = artists.resolve_artists(engine_settings, client=fake, limit=2)
+    assert first.settled == 2
+    assert first.staged_files == 2
     assert first.pending_remaining == 1
     assert first.more is True
 
@@ -679,16 +688,16 @@ def test_two_identical_dry_runs_reprocess_the_same_values(
     first = artists.resolve_artists(engine_settings, client=fake, limit=1, dry_run=True)
     second = artists.resolve_artists(engine_settings, client=fake, limit=1, dry_run=True)
 
-    # A dry run stages nothing, so the second call sees the identical frontier.
+    # A dry run records nothing, so the second call sees the identical frontier.
     assert first.to_dict() == second.to_dict()
     assert fake.lookups == ["Alpha '84", "Alpha '84"]
-    assert second.pending_remaining == 1
-    assert "call again to continue" not in second.summary
-    assert "Raise limit above 1" in second.summary
-    assert "artist= / file_ids=" in second.summary
+    assert second.pending_remaining == 2
+    assert second.more is False
+    assert "Call again to continue" not in second.summary
+    assert "A dry run records nothing" in second.summary
 
 
-def test_two_non_dry_runs_with_a_commit_between_do_not_advance_the_frontier(
+def test_two_capped_runs_with_a_commit_between_advance_the_frontier(
     engine_settings: Settings,
     music_dir: Path,
 ) -> None:
@@ -715,14 +724,14 @@ def test_two_non_dry_runs_with_a_commit_between_do_not_advance_the_frontier(
 
     second = artists.resolve_artists(engine_settings, client=fake, mb_client=mb, limit=1)
 
-    # The committed value is now canonical, so the limit re-spends itself on that same
-    # value and "Bravo '84" is still out of reach.
-    assert second.already_canonical_values == ["Alpha 1984"]
-    assert second.corrected_values == 0
-    assert second.pending_remaining == 1
-    assert second.staged_files == 0
-    assert "call again to continue" not in second.summary
-    assert "Raise limit above 1" in second.summary
+    # The corrected file is done, so the limit is spent on the next pending file.
+    assert second.mappings == [
+        {"from": "Bravo '84", "to": "Bravo 1984", "mbid": "mbid-b", "source": "lastfm"},
+    ]
+    assert second.settled == 1
+    assert second.pending_remaining == 0
+    assert second.more is False
+    assert mb.lookups == []
 
 
 # --- (11) revert round-trip across all four formats ----------------------------------
@@ -753,9 +762,8 @@ def test_manual_excluded_file_is_skipped_and_reported(
     )
     result = artists.resolve_artists(engine_settings, client=fake)
 
-    assert result.skipped_manual == 1
-    assert result.manual_files == [excluded_id]
-    # The non-excluded file with the same data still stages.
+    # The manual file is never selected and no cascade stages on it.
+    assert result.settled == 1
     assert result.staged_files == 1
     staged_ids = {v.file_id for v in staging.diff_tags(engine_settings)}
     assert staged_ids == {kept_id}
@@ -799,8 +807,9 @@ def test_manual_is_sticky_across_rerun(
     )
     first = artists.resolve_artists(engine_settings, client=fake)
     second = artists.resolve_artists(engine_settings, client=fake)
-    assert first.skipped_manual == 1
-    assert second.skipped_manual == 1
+    assert first.settled == 0
+    assert second.settled == 0
+    assert fake.lookups == []
     assert len(staging.diff_tags(engine_settings)) == 0
 
 
@@ -819,7 +828,7 @@ def test_reset_artist_status_requeues(
         {"Miami Nights '84": ArtistCorrection("Miami Nights 1984", "mbid-1")},
     )
     result = artists.resolve_artists(engine_settings, client=fake)
-    assert result.skipped_manual == 0
+    assert result.settled == 1
     assert result.staged_files == 1
 
 
@@ -840,9 +849,10 @@ def test_reset_artist_status_by_value_matches_albumartist(
     assert view.artist_status == "pending"
 
 
-def test_set_artist_status_rejects_unknown_status(engine_settings: Settings) -> None:
+@pytest.mark.parametrize("status", ["no_match", "pending"])
+def test_set_artist_status_accepts_manual_only(engine_settings: Settings, status: str) -> None:
     with pytest.raises(ValueError, match="unknown status"):
-        artists.set_artist_status(engine_settings, file_ids=[1], status="no_match")
+        artists.set_artist_status(engine_settings, file_ids=[1], status=status)
 
 
 @pytest.mark.parametrize("suffix", _FORMATS)
@@ -1184,7 +1194,7 @@ def test_an_albumartist_only_correction_never_stamps_the_track_artist_id(
     assert "musicbrainz_artistid" not in view.diff
 
 
-def test_mb_tier_buckets_still_sum_to_processed(
+def test_mb_tier_buckets_still_sum_to_the_values_looked_up(
     engine_settings: Settings,
     music_dir: Path,
 ) -> None:
@@ -1209,7 +1219,7 @@ def test_mb_tier_buckets_still_sum_to_processed(
     )
 
     buckets = _buckets(result)
-    assert sum(buckets.values()) == result.processed
+    assert sum(buckets.values()) == 5
     assert buckets["corrected_values"] == 1
     assert buckets["already_canonical"] == 1
     assert buckets["shrinks_credit"] == 1
@@ -1261,7 +1271,7 @@ def test_mb_tier_skips_a_manual_file_like_every_other_tier(
         mb_client=mb,
     )
 
-    assert result.skipped_manual == 1
+    assert result.settled == 0
     assert result.staged_files == 0
     assert mb.lookups == []
 
@@ -1454,8 +1464,8 @@ def test_resolve_artists_skips_missing_files(
     fake = FakeCorrectionSource({"Miami Nights '84": ArtistCorrection("Miami Nights 1984", "m1")})
     result = artists.resolve_artists(engine_settings, client=fake)
 
-    assert result.skipped_missing == 1
-    assert result.to_dict()["skipped_missing"] == 1
-    assert "missing 1" in result.summary
+    # A missing file is never selected, never a cascade carrier and never counted pending.
+    assert result.settled == 1
+    assert result.pending_remaining == 0
     assert result.staged_files == 1
     assert [view.filename for view in staging.diff_tags(engine_settings)] == [kept.name]

@@ -16,34 +16,35 @@ the tags domain (`engine/staging.py` — `stage_tags`/`unstage_tags`/`diff_tags`
 (revert/history) and the full tags MCP family + discovery + commit inspection. M2's
 genre side is live: `lastfm.py` (cached/paced artist+album top-tags), `classify.py`
 (vocab/overlay + the pure `classify.classify_genres`), `genres.py` (the `resolve_genres`
-tool + the `file_genre_status` workflow: `no_match`/`manual`/pending-by-absence). M3.5 shipped
+tool). M3.5 shipped
 too: `revert_commit` group undo (skip+report, empty-staging guard, dry-run; every
 revert — even per-file `revert_tags` — is now its own `origin='revert'` commit) and
 genre-status visibility (`list_files(genre_status=...)` filter + `get_library_stats`
-genre counts via `store.derived_status(conn, GENRE_AXIS, file_id)`, the mirror of `genres._select`).
+genre counts).
 M4 phase 1 shipped too: `artists.py` (`resolve_artists` — cascade-stages the
 `artist.getCorrection` canonical name + MBID across `artist`/`albumartist`, with
 feat/sentinel/empty + per-file multi-value guards, dry-run, and the empty-staging
-precondition; results cache in the existing `lastfm_cache`). M4 phase 2 shipped: the
-artist-axis twin of the genre-status workflow — a sticky per-file `file_artist_status`
-(`manual` exclusion only; **no** `no_match` state) that `resolve_artists` always skips
-(`skipped_manual`/`manual_files`); `set_artist_status`/`reset_artist_status` (scope by
-file or by a value matched across BOTH `artist` and `albumartist`);
-`list_files(artist_status=...)` + a `get_library_stats['artist']` block. Both axes'
-`staged`/`done` are now **field-aware** (`store.has_staged_change_for` /
-`has_auto_change_for`, the latter via SQLite JSON1 `json_extract` on the committed
-`diff`): genre keys on `genre`, artist on `artist`/`albumartist`, so the two columns are
-independent (a genre-only commit no longer reads as artist-`done`, and vice versa).
-The year axis (`years.py`) shipped next (MusicBrainz `originaldate` blank-fill + sticky
-`manual`/engine `no_match`, `list_files(year_status=...)` + a `get_library_stats['year']`
-block). The **mismatch-fix** surface shipped last (decide run `fix-mismatches`, Run 2):
+precondition; results cache in the existing `lastfm_cache`). M4 phase 2 shipped the artist status tools:
+`set_artist_status`/`reset_artist_status` (scope by file or by a value matched across BOTH
+`artist` and `albumartist`), `list_files(artist_status=...)` and a `get_library_stats['artist']`
+block. The year axis (`years.py`) shipped next (MusicBrainz `originaldate` blank-fill,
+`list_files(year_status=...)` and a `get_library_stats['year']` block). **One outcome-row status
+model** covers the three tag axes (genre, artist, year). A `file_<axis>_status` row records
+`done`, `no_match` or `manual` with a snapshot of the axis identity and of the field value it
+settled. `store.derived_status` reads a present file's status, first match wins: `staged` when a
+staged change alters the axis fields, a sticky `manual`, `no_identity`, the row's status while
+both snapshots still match the tags, else `pending`. A revert, a rescan after an external edit, an
+unstage or an identity change therefore re-opens a `done` or `no_match` file with no writer. Resolvers write
+`done`/`no_match`. The commit writer writes `manual` for a human change to an axis field, keyed on
+`tag_revisions_staged.changed_fields` (the fields the stage changed against disk), so a commit
+re-applied after a crash still records it. `axis_status.py` is the one implementation behind
+every `set_/reset_<axis>_status` pair. The **mismatch-fix** surface shipped last (decide run `fix-mismatches`, Run 2):
 `detect_mismatches` gained sticky per-file dispositions (`file_mismatch_status` —
 `legit_ignore`/`misfiled_deferred`, snapshot-and-go-stale), grouped output (`group=True`) +
 exact-folder expansion + a staleness-aware skip-filter; `set_mismatch_status`/
 `reset_mismatch_status`; `stage_tags_batch` (one atomic multi-file stage, always
-`origin="manual"`); and `reopen_axes(commit_id)` — the first caller of
-`store.void_auto_changes`, re-opening a fixed file's derived genre/year axes + clearing its
-stale artist status. `list_files(mismatch_status=...)` + a `get_library_stats['mismatch']` block
+`origin="manual"`); and `reopen_axes(commit_id)`, which deletes the `done`/`no_match` rows of
+the files of a commit holding no `auto` revision, on all three tag axes, and keeps `manual`. `list_files(mismatch_status=...)` + a `get_library_stats['mismatch']` block
 round it out. The `detect_album_gaps` tool (`album_gaps.py` + the pure, standalone
 `parsing.py`) groups blank-`album` files by folder and proposes sibling / folder-parse fills
 plus a review-only MusicBrainz `(artist, title)` recording tier (`mb_recording`, opt-out via
@@ -91,7 +92,7 @@ checked even for a file carrying no track id. Track-level fields (`title`, `trac
 `discnumber`) need a matched track and are skipped without one. A blank field is a **fill**,
 not a disagreement: `flagged` counts only fields where the file says one thing and the release
 says another, while `fill_rows` collects what the release can supply for free.
-34 MCP tools total. Schema is **v20** (additive: v11 adds
+34 MCP tools total. Schema is **v21** (additive: v11 adds
 `musicbrainz_recording_cache`, v12 renames `file_album_status` → `file_year_status` in place —
 dispositions preserved; v13 adds `tag_revisions.managed_set`, stamping which managed-tag set
 governed each revision so a revert can restore emptiness on the widened fields; v14 adds
@@ -107,7 +108,9 @@ rows share a path key and names them. v19 restamps a `manual` commit whose revis
 as `auto`, since a commit's origin is now derived from the rows it sweeps. v20 renames in place
 (`musicbrainz_cache` to `musicbrainz_release_group_cache`, `*_id` MBID columns to `*_mbid`,
 `tag_revisions.reverted_from` to `reverted_to_version`), gives `lastfm_correction_cache` typed
-columns, drops the unused `files.status`, and makes `tag_revisions.managed_set` required. A newer
+columns, drops the unused `files.status`, and makes `tag_revisions.managed_set` required. v21 gives each tag-axis status row a
+`source_value` snapshot, replays manual revisions into `manual` rows, drops `voided_auto`, and adds
+`tag_revisions_staged.changed_fields`. A newer
 ledger is refused). M6 organize/paths (`paths.py`)
 is a paper sketch (its DDL ships in v6; logic deferred).
 
@@ -165,7 +168,7 @@ tool needs no CLI command. Adding one means mirroring the MCP name exactly, with
 CLI-only program commands (`mcp`, `version`, `config*`) sit outside the grammar.
 
 **The verb set is closed.** A tool is **mutating** if it changes any persisted state other than the
-snapshot mirror (`files`/`file_tags`): staged rows, commits, status rows, watermarks, or the music
+snapshot mirror (`files`/`file_tags`): staged rows, commits, status rows, or the music
 files themselves.
 
 - Observing: `check, scan, list, get, detect, diff, history` (`diff`/`history` are git-style nouns
@@ -284,12 +287,12 @@ src/tagmend/
   mcp_server.py     FastMCP server (thin) — 34 tools
   engine/
     db.py           SQLite connection (WAL)
-    schema.py       all DDL + PRAGMA user_version (v20)
+    schema.py       all DDL + PRAGMA user_version (v21)
     path_keys.py    path identity keys, subtree key ranges, the folder-argument normalizer
     text_keys.py    the shared text fold keys (alnum, display, artist name, loose, title)
     scan.py         filesystem discovery + signatures
     health.py       check_health / readiness + interrupted-commit report
-    store.py        pure data access: files/file_tags + tag_revisions[_staged] + genre/artist status
+    store.py        pure data access: files/file_tags + tag_revisions[_staged] + tag-axis derived status + mismatch status
     library.py      scan orchestration (3 modes) + stats + list_files/get_file
     tags.py         mutagen read/write of the managed tag set
     versioning.py   tag-revision baseline/append + revert + history
@@ -297,9 +300,10 @@ src/tagmend/
     staging.py      tags domain (TagDomain) + stage/diff/commit_tags orchestration
     lastfm.py       Last.fm top-tags client: lastfm_cache + pacing (getCorrection → M4)
     musicbrainz.py  MusicBrainz client: release-group year, recording lookup, artist-by-MBID name, release-by-MBID tracklist
-    axis.py         the parameterized Axis: ONE per-file status machine for genre/artist/year/mismatch
+    axis.py         the parameterized Axis: one outcome-row model for genre/artist/year, plus the mismatch disposition model
+    axis_status.py  the one set_/reset_<axis>_status implementation, parameterized by Axis
     classify.py     genre vocab/overlay loader + fold-key index + classify.classify_genres (pure)
-    genres.py       resolve_genres orchestration + file_genre_status workflow
+    genres.py       resolve_genres + set/reset_genre_status
     artists.py      resolve_artists + set/reset_artist_status: MusicBrainz-by-MBID then getCorrection cascade-stage + file_artist_status workflow
     years.py        resolve_years + set/reset_year_status: MusicBrainz originaldate blank-fill + file_year_status workflow
     mismatch.py     detect_mismatches + set/reset_mismatch_status: identity tags vs folder path, tiered

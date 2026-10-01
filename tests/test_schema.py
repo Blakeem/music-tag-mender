@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import sqlite3
 import sys
 from typing import TYPE_CHECKING
@@ -26,7 +27,7 @@ def test_apply_schema_stamps_current_version(db_conn: sqlite3.Connection) -> Non
     # db_conn already applied the schema; the stamp must match the constant the code ships.
     version = db_conn.execute("PRAGMA user_version").fetchone()[0]
     assert version == SCHEMA_VERSION
-    assert SCHEMA_VERSION == 20
+    assert SCHEMA_VERSION == 21
 
 
 def test_apply_schema_creates_genre_tables(db_conn: sqlite3.Connection) -> None:
@@ -61,8 +62,9 @@ def test_musicbrainz_recording_cache_columns(db_conn: sqlite3.Connection) -> Non
     assert columns["fetched_at"] == ("TEXT", True, False)
 
 
-def test_apply_schema_creates_voided_auto_table(db_conn: sqlite3.Connection) -> None:
-    assert "voided_auto" in _table_names(db_conn)
+def test_apply_schema_creates_no_voided_auto_table(db_conn: sqlite3.Connection) -> None:
+    # The tag-axis value snapshots replaced the re-open watermark.
+    assert "voided_auto" not in _table_names(db_conn)
 
 
 def test_apply_schema_creates_mismatch_status_table(db_conn: sqlite3.Connection) -> None:
@@ -495,6 +497,7 @@ def test_v16_ledger_gains_the_staged_base_signature_in_place() -> None:
         file_id = _insert_file(conn)
         conn.execute("ALTER TABLE tag_revisions_staged DROP COLUMN base_size_bytes")
         conn.execute("ALTER TABLE tag_revisions_staged DROP COLUMN base_mtime_ns")
+        conn.execute("ALTER TABLE tag_revisions_staged DROP COLUMN changed_fields")
         conn.execute("PRAGMA user_version = 16")
         conn.execute(
             """
@@ -512,12 +515,12 @@ def test_v16_ledger_gains_the_staged_base_signature_in_place() -> None:
         assert _staged_columns(conn) == fresh_columns
         row = conn.execute(
             """
-            SELECT managed_tags, note, base_size_bytes, base_mtime_ns
+            SELECT managed_tags, note, base_size_bytes, base_mtime_ns, changed_fields
             FROM tag_revisions_staged WHERE file_id = ?
             """,
             (file_id,),
         ).fetchone()
-        assert row == ('{"genre":["Rock"]}', "kept", None, None)
+        assert row == ('{"genre":["Rock"]}', "kept", None, None, None)
     finally:
         conn.close()
 
@@ -935,3 +938,206 @@ def _insert_file(conn: sqlite3.Connection) -> int:
     )
     assert cursor.lastrowid is not None
     return int(cursor.lastrowid)
+
+
+# --- v21: tag-axis outcome rows ------------------------------------------------------
+
+_AXIS_TABLES = ("file_genre_status", "file_artist_status", "file_year_status")
+
+
+def _insert_tagged_file(conn: sqlite3.Connection, filename: str) -> int:
+    cursor = conn.execute(
+        """
+        INSERT INTO files (folder, filename, ext, first_seen_at, updated_at)
+        VALUES ('/lib', ?, '.mp3', '2026-06-08T00:00:00+00:00', '2026-06-08T00:00:00+00:00')
+        """,
+        (filename,),
+    )
+    assert cursor.lastrowid is not None
+    return int(cursor.lastrowid)
+
+
+def _insert_history(  # noqa: PLR0913 - one revision row, every column spelled out
+    conn: sqlite3.Connection,
+    file_id: int,
+    version: int,
+    origin: str,
+    managed_tags: dict[str, list[str]],
+    diff: dict[str, dict[str, list[str]]],
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO tag_revisions (
+            file_id, version, created_at, origin, managed_tags, diff, managed_set
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            file_id,
+            version,
+            f"2026-08-0{version + 1}T00:00:00+00:00",
+            origin,
+            json.dumps(managed_tags),
+            json.dumps(diff),
+            MANAGED_SET_VERSION,
+        ),
+    )
+
+
+def _status_rows(conn: sqlite3.Connection) -> dict[str, list[tuple[object, ...]]]:
+    """Each tag-axis table as (file_id, status, value snapshot parsed, updated_at) rows."""
+    rows: dict[str, list[tuple[object, ...]]] = {}
+    for table in _AXIS_TABLES:
+        cursor = conn.execute(
+            f"SELECT file_id, status, source_value, updated_at FROM {table} ORDER BY file_id",  # noqa: S608
+        )
+        rows[table] = [
+            (row[0], row[1], None if row[2] is None else json.loads(row[2]), row[3])
+            for row in cursor.fetchall()
+        ]
+    return rows
+
+
+def _build_previous_axis_ledger(conn: sqlite3.Connection) -> dict[str, int]:
+    """A previous-version ledger: manual, auto and baseline revisions, old rows, watermarks."""
+    apply_schema(conn)
+    for table in _AXIS_TABLES:
+        conn.execute(f"ALTER TABLE {table} DROP COLUMN source_value")
+    conn.execute("ALTER TABLE tag_revisions_staged DROP COLUMN changed_fields")
+    conn.execute(
+        """
+        CREATE TABLE voided_auto (
+          file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+          field TEXT NOT NULL,
+          voided_through_version INTEGER NOT NULL,
+          voided_at TEXT NOT NULL,
+          PRIMARY KEY (file_id, field)
+        )
+        """,
+    )
+    fixed = _insert_tagged_file(conn, "fixed.mp3")
+    resolved = _insert_tagged_file(conn, "resolved.mp3")
+    excluded = _insert_tagged_file(conn, "excluded.mp3")
+
+    original = {"artist": ["Wrong"], "album": ["LP"], "genre": ["rock"]}
+    renamed = {"artist": ["Right"], "album": ["LP"], "genre": ["rock"]}
+    regenred = {"artist": ["Right"], "album": ["LP"], "genre": ["jazz"]}
+    _insert_history(conn, fixed, 0, "scan", original, {})
+    _insert_history(
+        conn, fixed, 1, "manual", renamed, {"artist": {"from": ["Wrong"], "to": ["Right"]}}
+    )
+    _insert_history(
+        conn, fixed, 2, "manual", regenred, {"genre": {"from": ["rock"], "to": ["jazz"]}}
+    )
+    _insert_history(conn, resolved, 0, "scan", {"artist": ["A"], "album": ["LP"]}, {})
+    _insert_history(
+        conn,
+        resolved,
+        1,
+        "auto",
+        {"artist": ["A"], "album": ["LP"], "originaldate": ["1999"]},
+        {"originaldate": {"from": [], "to": ["1999"]}},
+    )
+    conn.execute(
+        "INSERT INTO voided_auto VALUES (?, 'originaldate', 1, '2026-08-05T00:00:00+00:00')",
+        (resolved,),
+    )
+    conn.execute(
+        """
+        INSERT INTO file_genre_status (file_id, status, source_artist, source_album, updated_at)
+        VALUES (?, 'no_match', 'A', 'LP', '2026-08-03T00:00:00+00:00')
+        """,
+        (resolved,),
+    )
+    conn.execute(
+        """
+        INSERT INTO file_artist_status
+          (file_id, status, source_artist, source_albumartist, updated_at)
+        VALUES (?, 'manual', 'Someone', NULL, '2026-08-03T00:00:00+00:00')
+        """,
+        (excluded,),
+    )
+    conn.execute(
+        """
+        INSERT INTO tag_revisions_staged (file_id, managed_tags, origin, note, staged_at)
+        VALUES (?, '{"genre":["pop"]}', 'manual', NULL, '2026-08-04T00:00:00+00:00')
+        """,
+        (excluded,),
+    )
+    conn.execute(f"PRAGMA user_version = {_PREVIOUS_VERSION}")
+    conn.commit()
+    return {"fixed": fixed, "resolved": resolved, "excluded": excluded}
+
+
+def test_previous_ledger_gains_axis_outcomes_in_place() -> None:
+    conn = sqlite3.connect(":memory:")
+    try:
+        ids = _build_previous_axis_ledger(conn)
+
+        apply_schema(conn)  # the in-place upgrade
+
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        assert "voided_auto" not in _table_names(conn)
+        for table in _AXIS_TABLES:
+            assert "source_value" in _columns(conn, table)
+        rows = _status_rows(conn)
+        # The manual artist fix and the later manual genre edit replay as manual rows, each
+        # snapshotting its own revision's tags. The auto revision writes no done row.
+        artist_values: dict[str, list[str]] = {
+            name: []
+            for name in (
+                "albumartist",
+                "albumartistsort",
+                "artistsort",
+                "musicbrainz_albumartistid",
+                "musicbrainz_artistid",
+            )
+        }
+        assert rows["file_artist_status"] == [
+            (
+                ids["fixed"],
+                "manual",
+                {**artist_values, "artist": ["Right"]},
+                "2026-08-02T00:00:00+00:00",
+            ),
+            (ids["excluded"], "manual", None, "2026-08-03T00:00:00+00:00"),
+        ]
+        assert rows["file_genre_status"] == [
+            (ids["fixed"], "manual", {"genre": ["jazz"]}, "2026-08-03T00:00:00+00:00"),
+            (ids["resolved"], "no_match", None, "2026-08-03T00:00:00+00:00"),
+        ]
+        identities = conn.execute(
+            "SELECT source_artist, source_album FROM file_genre_status ORDER BY file_id",
+        ).fetchall()
+        assert identities == [("Right", "LP"), ("A", "LP")]
+        assert rows["file_year_status"] == []
+        assert conn.execute("SELECT COUNT(*) FROM tag_revisions").fetchone()[0] == 5
+        # A row staged before the column survives with NULL, and its commit falls back to
+        # the diff against disk.
+        staged = conn.execute(
+            "SELECT file_id, managed_tags, changed_fields FROM tag_revisions_staged",
+        ).fetchall()
+        assert staged == [(ids["excluded"], '{"genre":["pop"]}', None)]
+    finally:
+        conn.close()
+
+
+def test_axis_outcome_migration_is_idempotent() -> None:
+    conn = sqlite3.connect(":memory:")
+    try:
+        _build_previous_axis_ledger(conn)
+        apply_schema(conn)
+        upgraded = _status_rows(conn)
+
+        conn.execute(f"PRAGMA user_version = {_PREVIOUS_VERSION}")
+        apply_schema(conn)  # every column exists and voided_auto is gone, so nothing runs
+
+        assert _status_rows(conn) == upgraded
+    finally:
+        conn.close()
+
+
+def test_fresh_ledger_takes_the_v21_columns_from_the_ddl(db_conn: sqlite3.Connection) -> None:
+    for table in _AXIS_TABLES:
+        assert "source_value" in _columns(db_conn, table)
+    assert "changed_fields" in _staged_columns(db_conn)

@@ -121,10 +121,10 @@ def test_commit_then_read_fills_originaldate_and_keeps_date(
     assert on_disk["date"] == ["2015"]  # reissue year preserved on disk
 
 
-# --- (b) skipped_present: already-tagged file is untouched ---------------------------
+# --- (b) present value: already-tagged file is settled, never overwritten ----------
 
 
-def test_existing_originaldate_is_skipped_present(
+def test_existing_originaldate_records_done_without_a_lookup(
     engine_settings: Settings,
     music_dir: Path,
 ) -> None:
@@ -137,11 +137,12 @@ def test_existing_originaldate_is_skipped_present(
     fake = FakeMBReleaseGroupSource({("Black Sabbath", "Paranoid"): _mb("1971")})
     result = years.resolve_years(engine_settings, client=fake)
 
-    assert result.skipped_present == 1
+    assert result.settled == 1
     assert result.staged_files == 0
     # The already-tagged file is never even looked up (no overwrite).
     assert fake.lookups == []
     assert len(staging.diff_tags(engine_settings)) == 0
+    assert [v.year_status for v in library_list(engine_settings)] == ["done"]
 
 
 def test_resolve_years_never_overwrites_a_disk_value_the_mirror_lacks(
@@ -158,7 +159,7 @@ def test_resolve_years_never_overwrites_a_disk_value_the_mirror_lacks(
     result = years.resolve_years(engine_settings, client=fake)
 
     assert result.staged_files == 0
-    assert result.skipped_present == 1
+    assert result.settled == 1
     assert staging.diff_tags(engine_settings) == []
     assert read_tags(track).tags["originaldate"] == ["1969"]
 
@@ -175,8 +176,11 @@ def test_file_without_album_is_skipped(
 
     fake = FakeMBReleaseGroupSource({})
     result = years.resolve_years(engine_settings, client=fake)
-    assert result.skipped_no_album == 1
+    # No album means no year identity, so the file is never selected.
+    assert result.settled == 0
+    assert result.pending_remaining == 0
     assert result.staged_files == 0
+    assert [v.year_status for v in library_list(engine_settings)] == ["no_identity"]
 
 
 def test_file_without_artist_is_skipped(
@@ -188,8 +192,10 @@ def test_file_without_artist_is_skipped(
 
     fake = FakeMBReleaseGroupSource({})
     result = years.resolve_years(engine_settings, client=fake)
-    assert result.skipped_no_identity == 1
+    assert result.settled == 0
+    assert result.pending_remaining == 0
     assert result.staged_files == 0
+    assert [v.year_status for v in library_list(engine_settings)] == ["no_identity"]
 
 
 # --- (e) grouping: one mapping per album --------------------------------------------
@@ -239,7 +245,7 @@ def test_album_scope_narrows_to_that_album(
     engine_settings: Settings,
     music_dir: Path,
 ) -> None:
-    # Two files in different albums; resolve_years(album="Paranoid") must touch only the one.
+    # Two files in different albums; resolve_years(value="Paranoid") must touch only the one.
     make_track(music_dir / "p.mp3", {"artist": ["Black Sabbath"], "album": ["Paranoid"]})
     make_track(music_dir / "a.mp3", {"artist": ["Pink Floyd"], "album": ["Animals"]})
     scan_library(engine_settings)
@@ -251,7 +257,7 @@ def test_album_scope_narrows_to_that_album(
             ("Pink Floyd", "Animals"): _mb("1977"),
         },
     )
-    result = years.resolve_years(engine_settings, album="Paranoid", client=fake)
+    result = years.resolve_years(engine_settings, value="Paranoid", client=fake)
 
     assert result.staged_files == 1
     # Only the requested album is even looked up (no library-wide fan-out).
@@ -314,7 +320,7 @@ def test_a_musicbrainz_error_is_counted_and_itemized(
     assert view.year_status == "pending"
 
 
-def test_held_no_match_is_counted_in_skipped_no_match(
+def test_held_no_match_is_not_reselected(
     engine_settings: Settings,
     music_dir: Path,
 ) -> None:
@@ -325,17 +331,28 @@ def test_held_no_match_is_counted_in_skipped_no_match(
     first = years.resolve_years(engine_settings, client=fake)
     assert first.no_match == 2
 
+    fake.lookups.clear()
     second = years.resolve_years(engine_settings, client=fake)
 
-    assert second.processed == 0
-    assert second.skipped_no_match == 2
-    assert "2 file(s) no_match held" in second.summary
+    assert second.settled == 0
+    assert second.pending_remaining == 0
+    assert fake.lookups == []
 
 
-def test_result_names_its_processed_unit(engine_settings: Settings) -> None:
+def test_result_follows_the_resolver_contract(engine_settings: Settings) -> None:
     result = years.resolve_years(engine_settings, client=FakeMBReleaseGroupSource({}))
 
-    assert result.to_dict()["processed_unit"] == "album_groups"
+    assert set(result.to_dict()) == {
+        "settled",
+        "staged_files",
+        "no_match",
+        "pending_remaining",
+        "more",
+        "mappings",
+        "errors",
+        "error_items",
+        "summary",
+    }
 
 
 def test_no_match_skipped_on_rerun_until_identity_changes(
@@ -417,7 +434,7 @@ def test_manual_excluded_file_is_skipped(
     fake = FakeMBReleaseGroupSource({("Black Sabbath", "Paranoid"): _mb("1970")})
     result = years.resolve_years(engine_settings, client=fake)
 
-    assert result.skipped_manual == 1
+    assert result.settled == 1
     assert result.staged_files == 1
     staged_ids = {v.file_id for v in staging.diff_tags(engine_settings)}
     assert staged_ids == {kept_id}
@@ -448,13 +465,14 @@ def test_reset_year_status_requeues(
     assert years.reset_year_status(engine_settings, file_ids=[file_id]) == 1
     fake = FakeMBReleaseGroupSource({("Black Sabbath", "Paranoid"): _mb("1970")})
     result = years.resolve_years(engine_settings, client=fake)
-    assert result.skipped_manual == 0
+    assert result.settled == 1
     assert result.staged_files == 1
 
 
-def test_set_year_status_rejects_unknown_status(engine_settings: Settings) -> None:
+@pytest.mark.parametrize("status", ["no_match", "pending"])
+def test_set_year_status_accepts_manual_only(engine_settings: Settings, status: str) -> None:
     with pytest.raises(ValueError, match="unknown status"):
-        years.set_year_status(engine_settings, file_ids=[1], status="no_match")
+        years.set_year_status(engine_settings, file_ids=[1], status=status)
 
 
 # --- dry-run + precondition ----------------------------------------------------------
@@ -521,7 +539,7 @@ def test_non_dry_run_requires_empty_staging(
 # --- limit / more loop ---------------------------------------------------------------
 
 
-def test_limit_caps_groups_and_reports_pending(
+def test_limit_caps_files_and_reports_pending(
     engine_settings: Settings,
     music_dir: Path,
 ) -> None:
@@ -537,8 +555,9 @@ def test_limit_caps_groups_and_reports_pending(
             ("C", "Three"): _mb("1993"),
         },
     )
-    first = years.resolve_years(engine_settings, client=fake, limit=2, dry_run=True)
-    assert first.processed == 2
+    first = years.resolve_years(engine_settings, client=fake, limit=2)
+    assert first.settled == 2
+    assert first.staged_files == 2
     assert first.pending_remaining == 1
     assert first.more is True
 
@@ -558,16 +577,17 @@ def test_two_identical_dry_runs_reprocess_the_same_groups(
     # A dry run stages nothing and records no no_match, so the frontier is unchanged.
     assert first.to_dict() == second.to_dict()
     assert fake.lookups == [("A", "One"), ("A", "One")]
-    assert "call again to continue" not in second.summary
-    assert "Raise limit above 1" in second.summary
-    assert "album= / file_ids=" in second.summary
+    assert second.more is False
+    assert "Call again to continue" not in second.summary
+    assert "A dry run records nothing" in second.summary
 
-    # The real path DOES advance (staged then committed), and keeps saying so.
+    # The real path DOES advance, and keeps saying so.
     real = years.resolve_years(engine_settings, client=fake, limit=1)
-    assert "call again to continue" in real.summary
+    assert real.more is True
+    assert "Call again to continue" in real.summary
 
 
-def test_summary_labels_group_and_file_counts(
+def test_summary_counts_files(
     engine_settings: Settings,
     music_dir: Path,
 ) -> None:
@@ -581,17 +601,11 @@ def test_summary_labels_group_and_file_counts(
     fake = FakeMBReleaseGroupSource({("A", "One"): _mb("1991")})
     result = years.resolve_years(engine_settings, client=fake)
 
-    assert result.processed == 2  # album groups
-    assert result.staged_files == 2  # files
-    assert result.no_match == 1  # files
-    assert result.skipped_present == 1  # files
-    assert "Processed 2 album group(s):" in result.summary
-    assert "staged 2 file(s)" in result.summary
-    assert "no_match 1 file(s)" in result.summary
-    assert "Skipped 1 file(s) present" in result.summary
-    assert "0 file(s) no_album" in result.summary
-    assert "0 file(s) no_identity" in result.summary
-    assert "0 file(s) manual" in result.summary
+    # Every count is files: two filled, one no_match, one already carrying a year.
+    assert result.settled == 4
+    assert result.staged_files == 2
+    assert result.no_match == 1
+    assert "Settled 4 file(s): staged 2, no_match 1." in result.summary
 
 
 # --- idempotent re-run after commit --------------------------------------------------
@@ -611,7 +625,8 @@ def test_rerun_after_commit_is_idempotent(
 
     second = years.resolve_years(engine_settings, client=fake)
     assert second.staged_files == 0
-    assert second.skipped_present == 1
+    assert second.settled == 0
+    assert second.pending_remaining == 0
     assert len(staging.diff_tags(engine_settings)) == 0
 
 
@@ -718,8 +733,8 @@ def test_resolve_years_skips_missing_files(
     fake = FakeMBReleaseGroupSource({("Black Sabbath", "Paranoid"): _mb("1970")})
     result = years.resolve_years(engine_settings, client=fake)
 
-    assert result.skipped_missing == 1
-    assert result.to_dict()["skipped_missing"] == 1
-    assert "1 file(s) missing" in result.summary
+    # A missing file is never selected and never counted as pending.
+    assert result.settled == 1
+    assert result.pending_remaining == 0
     assert result.staged_files == 1
     assert [view.filename for view in staging.diff_tags(engine_settings)] == [kept.name]

@@ -47,7 +47,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
-from tagmend.engine import axis, clock, db, path_keys, schema, store
+from tagmend.engine import axis, axis_status, db, path_keys, schema, store
 from tagmend.engine.detector_core import (
     TIER_RANK,
     Tier,
@@ -510,12 +510,12 @@ def _classify_file(
 def _disposition_blocks(disposition: store.MismatchStatusRow, f: _FileInput) -> bool:
     """Whether *f*'s stored disposition is still fresh (its snapshotted tag is unchanged).
 
-    Delegates to :data:`tagmend.engine.axis.MISMATCH_AXIS`'s predicate, so this skip path and
+    Delegates to :func:`tagmend.engine.axis.mismatch_decision_blocks`, so this skip path and
     the user-facing :func:`tagmend.engine.store.derived_mismatch_status` share one rule. The
     identity is built from the SAME cleaned first values the detector already loaded, so no
     per-file query is needed.
     """
-    return axis.MISMATCH_AXIS.decision_blocks(
+    return axis.mismatch_decision_blocks(
         axis.StatusRow(
             status=disposition.status,
             source_primary=disposition.source_field,
@@ -905,27 +905,6 @@ def _first_clean(tags: dict[str, list[str]], name: str) -> str | None:
     return _clean(values[0]) if values else None
 
 
-def _mismatch_scope(
-    conn: sqlite3.Connection,
-    *,
-    file_ids: list[int] | None,
-    value: str | None,
-) -> list[int]:
-    """Resolve the in-scope file ids for the disposition verbs, in ascending id order.
-
-    *file_ids* (when given) win; otherwise *value* matches every file carrying it as
-    ``artist`` OR ``albumartist`` (the union across both name fields, mirroring
-    :func:`tagmend.engine.artists._artist_scope`). With neither given the scope is empty.
-    """
-    if file_ids is not None:
-        return store.files_in_scope(conn, file_ids=file_ids)
-    if value is None:
-        return []
-    matched = set(store.files_by_tag_value(conn, "artist", value))
-    matched.update(store.files_by_tag_value(conn, "albumartist", value))
-    return sorted(matched)
-
-
 def set_mismatch_status(
     settings: Settings,
     *,
@@ -935,40 +914,40 @@ def set_mismatch_status(
 ) -> int:
     """Set a sticky mismatch disposition (or clear it with ``pending``) for every file in scope.
 
-    ``legit_ignore`` silences a false positive; ``misfiled_deferred`` defers a genuinely
-    misfiled file — both snapshot the file's current disagreeing tag (``source_field`` /
+    ``legit_ignore`` silences a false positive. ``misfiled_deferred`` defers a genuinely
+    misfiled file. Both snapshot the file's current disagreeing tag (``source_field`` /
     ``source_value``) so a later tag change makes the disposition stale and the file
-    re-surfaces on the next detect. ``pending`` deletes any row (re-queue). Scope is
-    *file_ids* when given, else every file carrying *value* as ``artist`` OR ``albumartist``.
-    Returns the number of files affected. Raises :class:`ValueError` for an unknown *status*.
-    Owns its transaction; writes only ``file_mismatch_status`` rows.
+    re-surfaces on the next detect. ``pending`` deletes any row (re-queue). Scope follows
+    :func:`tagmend.engine.axis_status.status_scope`: *file_ids* when given, else every file
+    carrying *value* as ``artist`` OR ``albumartist``. Returns the number of files affected.
+    Raises :class:`ValueError` for an unknown *status*. Owns its transaction and writes only
+    ``file_mismatch_status`` rows.
     """
     require_choice("status", status, _USER_MISMATCH_STATUSES)
 
-    connection = db.connect(settings.db_path)
-    try:
-        schema.apply_schema(connection)
-        scoped = _mismatch_scope(connection, file_ids=file_ids, value=value)
-        now = clock.utc_now()
-        for fid in scoped:
-            if status == "pending":
-                store.delete_mismatch_status(connection, fid)
-            else:
-                source_field, source_value = _snapshot_source(store.get_tags(connection, fid))
-                store.set_mismatch_status(
-                    connection,
-                    file_id=fid,
-                    status=status,
-                    source_field=source_field,
-                    source_value=source_value,
-                    now=now,
-                )
-        connection.commit()
-    finally:
-        connection.close()
+    def write(conn: sqlite3.Connection, file_id: int, now: str) -> None:
+        if status == "pending":
+            store.delete_mismatch_status(conn, file_id)
+            return
+        source_field, source_value = _snapshot_source(store.get_tags(conn, file_id))
+        store.set_mismatch_status(
+            conn,
+            file_id=file_id,
+            status=status,
+            source_field=source_field,
+            source_value=source_value,
+            now=now,
+        )
 
-    logger.info("set mismatch status=%s for %d file(s)", status, len(scoped))
-    return len(scoped)
+    affected = axis_status.apply_status(
+        settings,
+        axis.MISMATCH_AXIS,
+        file_ids=file_ids,
+        value=value,
+        write=write,
+    )
+    logger.info("set mismatch status=%s for %d file(s)", status, affected)
+    return affected
 
 
 def reset_mismatch_status(
@@ -979,18 +958,12 @@ def reset_mismatch_status(
 ) -> int:
     """Delete the mismatch disposition for every file in scope (back to ``pending``).
 
-    Same value-across-both-fields scoping as :func:`set_mismatch_status`. Returns the number
-    of files affected. Owns its transaction.
+    Same scoping as :func:`set_mismatch_status`. Returns the number of files affected. Owns
+    its transaction.
     """
-    connection = db.connect(settings.db_path)
-    try:
-        schema.apply_schema(connection)
-        scoped = _mismatch_scope(connection, file_ids=file_ids, value=value)
-        for fid in scoped:
-            store.delete_mismatch_status(connection, fid)
-        connection.commit()
-    finally:
-        connection.close()
-
-    logger.info("reset mismatch status for %d file(s)", len(scoped))
-    return len(scoped)
+    return axis_status.reset_status(
+        settings,
+        axis.MISMATCH_AXIS,
+        file_ids=file_ids,
+        value=value,
+    )

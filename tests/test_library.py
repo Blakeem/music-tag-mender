@@ -14,7 +14,7 @@ import pytest
 
 from conftest import make_track
 from tagmend.config import Settings
-from tagmend.engine import artists, mismatch, staging, store, versioning, years
+from tagmend.engine import artists, axis, mismatch, staging, store, versioning, years
 from tagmend.engine.db import connect
 from tagmend.engine.library import (
     ScanMode,
@@ -33,14 +33,14 @@ _N = 3
 _NTFS_ONLY = pytest.mark.skipif(sys.platform != "win32", reason="NTFS is case-insensitive")
 
 
-def _populate(music_dir: Path, count: int) -> list[Path]:
+def _populate(music_dir: Path, count: int, *, album: str | None = None) -> list[Path]:
     """Create *count* real tagged tracks (track00.mp3 ...) under *music_dir*."""
     tracks: list[Path] = []
     for index in range(count):
-        track = make_track(
-            music_dir / f"track{index:02d}.mp3",
-            {"artist": [f"Artist {index}"], "genre": ["Synthwave"]},
-        )
+        tags = {"artist": [f"Artist {index}"], "genre": ["Synthwave"]}
+        if album is not None:
+            tags["album"] = [album]
+        track = make_track(music_dir / f"track{index:02d}.mp3", tags)
         tracks.append(track)
     return tracks
 
@@ -109,20 +109,18 @@ def _file_row(settings: Settings, folder: Path, filename: str) -> store.FileRow:
 def _set_no_match(
     settings: Settings,
     file_id: int,
-    *,
-    source_artist: str | None,
-    source_album: str | None = None,
+    tag_axis: axis.Axis = axis.GENRE_AXIS,
 ) -> None:
-    """Persist a terminal ``no_match`` genre decision for *file_id*."""
+    """Persist a ``no_match`` outcome on *tag_axis* snapshotting the file's current tags."""
     conn = connect(settings.db_path)
     try:
         apply_schema(conn)
-        store.set_genre_status(
+        axis.put_outcome(
             conn,
+            tag_axis,
             file_id=file_id,
             status="no_match",
-            source_artist=source_artist,
-            source_album=source_album,
+            tags=store.get_tags(conn, file_id),
             now="2026-06-09T00:00:00+00:00",
         )
         conn.commit()
@@ -537,12 +535,7 @@ def test_list_files_filters_to_no_match_with_sources(
 
     # Flag only the middle track as no_match, recorded against its identity.
     target = _file_row(engine_settings, music_dir, tracks[1].name)
-    _set_no_match(
-        engine_settings,
-        target.id,
-        source_artist="Artist 1",
-        source_album="Some Album",
-    )
+    _set_no_match(engine_settings, target.id)
 
     views = list_files(engine_settings, genre_status="no_match")
 
@@ -550,7 +543,7 @@ def test_list_files_filters_to_no_match_with_sources(
     only = views[0]
     assert only.genre_status == "no_match"
     assert only.genre_source_artist == "Artist 1"
-    assert only.genre_source_album == "Some Album"
+    assert only.genre_source_album is None
 
 
 def test_list_files_filter_limit_counts_matching_lowest_ids(
@@ -563,7 +556,7 @@ def test_list_files_filter_limit_counts_matching_lowest_ids(
     matching_ids: list[int] = []
     for index in (0, 2, 3):
         row = _file_row(engine_settings, music_dir, tracks[index].name)
-        _set_no_match(engine_settings, row.id, source_artist=f"Artist {index}")
+        _set_no_match(engine_settings, row.id)
         matching_ids.append(row.id)
 
     # limit=2 returns exactly the two lowest-id MATCHING files; non-matches (track 1)
@@ -591,7 +584,7 @@ def test_get_library_stats_includes_genre_block(
     tracks = _populate(music_dir, _N)
     scan_library(engine_settings)
     row = _file_row(engine_settings, music_dir, tracks[0].name)
-    _set_no_match(engine_settings, row.id, source_artist="Artist 0")
+    _set_no_match(engine_settings, row.id)
 
     stats = get_library_stats(engine_settings)
 
@@ -648,8 +641,8 @@ def test_list_files_composes_both_status_filters(
     row1 = _file_row(engine_settings, music_dir, tracks[1].name)
     row2 = _file_row(engine_settings, music_dir, tracks[2].name)
     artists.set_artist_status(engine_settings, file_ids=[row0.id, row2.id], status="manual")
-    _set_no_match(engine_settings, row1.id, source_artist="Artist 1")
-    _set_no_match(engine_settings, row2.id, source_artist="Artist 2")
+    _set_no_match(engine_settings, row1.id)
+    _set_no_match(engine_settings, row2.id)
 
     # Both filters set → a file must satisfy BOTH; only track 2 qualifies.
     views = list_files(engine_settings, genre_status="no_match", artist_status="manual")
@@ -677,44 +670,20 @@ def test_get_library_stats_includes_artist_block(
 # --- year_status filter + composition + new FileView fields -------------------------
 
 
-def _set_year_no_match(
-    settings: Settings,
-    file_id: int,
-    *,
-    source_artist: str,
-    source_album: str,
-) -> None:
-    """Persist a terminal ``no_match`` year decision in the isolated ledger."""
-    conn = connect(settings.db_path)
-    try:
-        apply_schema(conn)
-        store.set_year_status(
-            conn,
-            file_id=file_id,
-            status="no_match",
-            source_artist=source_artist,
-            source_album=source_album,
-            now="2026-06-17T00:00:00+00:00",
-        )
-        conn.commit()
-    finally:
-        conn.close()
+def _set_year_no_match(settings: Settings, file_id: int) -> None:
+    """Persist a ``no_match`` year outcome snapshotting the file's current tags."""
+    _set_no_match(settings, file_id, axis.YEAR_AXIS)
 
 
 def test_list_files_filters_to_year_no_match_with_sources(
     engine_settings: Settings,
     music_dir: Path,
 ) -> None:
-    tracks = _populate(music_dir, _N)
+    tracks = _populate(music_dir, _N, album="Some Album")
     scan_library(engine_settings)
 
     target = _file_row(engine_settings, music_dir, tracks[1].name)
-    _set_year_no_match(
-        engine_settings,
-        target.id,
-        source_artist="Artist 1",
-        source_album="Some Album",
-    )
+    _set_year_no_match(engine_settings, target.id)
 
     views = list_files(engine_settings, year_status="no_match")
 
@@ -739,14 +708,14 @@ def test_list_files_composes_year_with_other_filters(
     engine_settings: Settings,
     music_dir: Path,
 ) -> None:
-    tracks = _populate(music_dir, _N)
+    tracks = _populate(music_dir, _N, album="LP")
     scan_library(engine_settings)
 
     # Track 0: year-no_match only. Track 2: year-no_match AND artist-manual.
     row0 = _file_row(engine_settings, music_dir, tracks[0].name)
     row2 = _file_row(engine_settings, music_dir, tracks[2].name)
-    _set_year_no_match(engine_settings, row0.id, source_artist="A0", source_album="X")
-    _set_year_no_match(engine_settings, row2.id, source_artist="A2", source_album="Y")
+    _set_year_no_match(engine_settings, row0.id)
+    _set_year_no_match(engine_settings, row2.id)
     artists.set_artist_status(engine_settings, file_ids=[row2.id], status="manual")
 
     # Both filters set → only track 2 satisfies BOTH.
@@ -758,10 +727,10 @@ def test_get_library_stats_includes_year_block(
     engine_settings: Settings,
     music_dir: Path,
 ) -> None:
-    tracks = _populate(music_dir, _N)
+    tracks = _populate(music_dir, _N, album="Alb")
     scan_library(engine_settings)
     row = _file_row(engine_settings, music_dir, tracks[0].name)
-    _set_year_no_match(engine_settings, row.id, source_artist="Artist 0", source_album="Alb")
+    _set_year_no_match(engine_settings, row.id)
 
     stats = get_library_stats(engine_settings)
 
@@ -793,10 +762,11 @@ def test_list_files_filters_to_no_identity_on_each_axis(
     engine_settings: Settings,
     music_dir: Path,
 ) -> None:
-    # orphan (no identity) + one with artist + one with only albumartist (both have identity).
+    # orphan (no identity) + one with artist + one with only albumartist (both have identity,
+    # and an album, which the year identity also needs).
     make_track(music_dir / "orphan.mp3", {"genre": ["Synthwave"]})
-    make_track(music_dir / "byartist.mp3", {"artist": ["Alpha"], "genre": ["Rock"]})
-    make_track(music_dir / "byaa.mp3", {"albumartist": ["Bravo"], "genre": ["Jazz"]})
+    make_track(music_dir / "byartist.mp3", {"artist": ["Alpha"], "album": ["A"]})
+    make_track(music_dir / "byaa.mp3", {"albumartist": ["Bravo"], "album": ["B"]})
     scan_library(engine_settings)
 
     by_genre = list_files(engine_settings, genre_status="no_identity")
@@ -1009,6 +979,23 @@ def test_list_albums_year_status_filter(
 
     pending = list_albums(engine_settings, year_status="pending")
     assert [row.album for row in pending] == ["B1"]
+
+
+def test_list_albums_ignores_a_missing_file(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    gone = make_track(music_dir / "a.mp3", {"artist": ["Alpha"], "album": ["A1"]})
+    kept = make_track(music_dir / "b.mp3", {"artist": ["Alpha"], "album": ["A1"]})
+    scan_library(engine_settings)
+    kept_id = _file_row(engine_settings, music_dir, kept.name).id
+    years.set_year_status(engine_settings, file_ids=[kept_id], status="manual")
+    gone.unlink()
+    scan_library(engine_settings)
+
+    rows = list_albums(engine_settings)
+
+    assert [(row.album, row.file_count, row.year_status) for row in rows] == [("A1", 1, "manual")]
 
 
 def test_list_albums_actionable_keeps_only_groups_with_blanks(

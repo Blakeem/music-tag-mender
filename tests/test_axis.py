@@ -1,8 +1,9 @@
 """Unit tests for :mod:`tagmend.engine.axis` — the parameterised status abstraction.
 
-This module is covered only indirectly by the genre/artist pipeline tests; these
-tests pin the public API and the differences documented in the module docstring
-directly, so a refactor cannot silently change semantics.
+These tests pin each axis's descriptor (fields, identity, scope fields, statuses) and the
+mismatch disposition rule directly, so a refactor cannot silently change semantics. The
+classifier that reads the outcome rows is covered in ``test_store_genre.py`` and
+``test_axis_status.py``.
 
 These are pure-unit tests on frozen dataclasses and module-level constants: no DB,
 no temp library, no audio files.
@@ -10,15 +11,22 @@ no temp library, no audio files.
 
 from __future__ import annotations
 
+import pytest
+
 from tagmend.engine.axis import (
     ARTIST_AXIS,
     GENRE_AXIS,
     MISMATCH_AXIS,
+    RESOLVER_OUTCOMES,
+    TAG_AXES,
     YEAR_AXIS,
     Identity,
     LookupIdentity,
     StatusRow,
+    field_values,
+    identity_of,
     lookup_identity,
+    mismatch_decision_blocks,
 )
 
 # ---------------------------------------------------------------------------
@@ -62,7 +70,15 @@ def test_artist_axis_name() -> None:
 
 
 def test_artist_axis_fields() -> None:
-    assert ARTIST_AXIS.fields == ("artist", "albumartist")
+    # Every field resolve_artists writes, so each is part of the decided value.
+    assert ARTIST_AXIS.fields == (
+        "artist",
+        "albumartist",
+        "musicbrainz_artistid",
+        "musicbrainz_albumartistid",
+        "artistsort",
+        "albumartistsort",
+    )
 
 
 def test_artist_axis_status_table() -> None:
@@ -74,31 +90,17 @@ def test_artist_axis_source_columns() -> None:
 
 
 def test_artist_axis_workflow_statuses_exact_set() -> None:
+    # A held name records no_match, so the artist axis carries the full tag-axis set.
     assert ARTIST_AXIS.workflow_statuses == frozenset(
-        {"pending", "no_identity", "manual", "staged", "done"}
+        {"pending", "no_identity", "no_match", "manual", "staged", "done"}
     )
 
 
-def test_artist_axis_workflow_statuses_cardinality() -> None:
-    assert len(ARTIST_AXIS.workflow_statuses) == 5
-
-
-# ---------------------------------------------------------------------------
-# The asymmetry: no_match present in genre, absent in artist
-# ---------------------------------------------------------------------------
-
-
-def test_no_match_in_genre_workflow_statuses() -> None:
-    assert "no_match" in GENRE_AXIS.workflow_statuses
-
-
-def test_no_match_not_in_artist_workflow_statuses() -> None:
-    assert "no_match" not in ARTIST_AXIS.workflow_statuses
-
-
-def test_genre_has_six_states_artist_has_five() -> None:
-    assert len(GENRE_AXIS.workflow_statuses) == 6
-    assert len(ARTIST_AXIS.workflow_statuses) == 5
+def test_scope_fields_are_each_axis_lookup_names() -> None:
+    assert GENRE_AXIS.scope_fields == ("artist", "albumartist")
+    assert ARTIST_AXIS.scope_fields == ("artist", "albumartist")
+    assert YEAR_AXIS.scope_fields == ("album",)
+    assert MISMATCH_AXIS.scope_fields == ("artist", "albumartist")
 
 
 def test_no_identity_in_genre_artist_year_but_not_mismatch() -> None:
@@ -110,174 +112,66 @@ def test_no_identity_in_genre_artist_year_but_not_mismatch() -> None:
     assert "no_identity" not in MISMATCH_AXIS.workflow_statuses
 
 
-def test_genre_and_year_share_one_identity_rule() -> None:
-    assert GENRE_AXIS.decision_blocks is YEAR_AXIS.decision_blocks
+def test_tag_axes_are_genre_artist_year_in_report_order() -> None:
+    assert TAG_AXES == (GENRE_AXIS, ARTIST_AXIS, YEAR_AXIS)
+
+
+def test_resolver_outcomes_are_done_and_no_match() -> None:
+    assert frozenset({"done", "no_match"}) == RESOLVER_OUTCOMES
 
 
 # ---------------------------------------------------------------------------
-# Genre decision_blocks: manual (sticky, identity-independent)
+# Axis identity: the tuple an outcome is decided against
 # ---------------------------------------------------------------------------
 
 
-def test_genre_manual_blocks_when_identity_matches() -> None:
-    decision = StatusRow(
-        status="manual", source_primary="Radiohead", source_secondary="OK Computer"
+def test_genre_identity_is_albumartist_else_artist_and_album() -> None:
+    tags = {"artist": ["Track"], "albumartist": ["Album Artist"], "album": ["LP"]}
+    assert identity_of(GENRE_AXIS, tags) == Identity(primary="Album Artist", secondary="LP")
+    assert identity_of(GENRE_AXIS, {"artist": ["Solo"]}) == Identity(
+        primary="Solo",
+        secondary=None,
     )
-    identity = Identity(primary="Radiohead", secondary="OK Computer")
-    assert GENRE_AXIS.decision_blocks(decision, identity) is True
 
 
-def test_genre_manual_blocks_when_identity_differs() -> None:
-    # manual is sticky — identity change does NOT un-block it.
-    decision = StatusRow(status="manual", source_primary="Old Artist", source_secondary="Old Album")
-    identity = Identity(primary="New Artist", secondary="New Album")
-    assert GENRE_AXIS.decision_blocks(decision, identity) is True
+def test_genre_identity_is_none_without_either_artist_field() -> None:
+    assert identity_of(GENRE_AXIS, {"album": ["LP"], "artist": ["  "]}) is None
 
 
-def test_genre_manual_blocks_with_null_sources() -> None:
-    decision = StatusRow(status="manual", source_primary=None, source_secondary=None)
-    identity = Identity(primary=None, secondary=None)
-    assert GENRE_AXIS.decision_blocks(decision, identity) is True
-
-
-# ---------------------------------------------------------------------------
-# Genre decision_blocks: no_match (stale when identity changes)
-# ---------------------------------------------------------------------------
-
-
-def test_genre_no_match_blocks_when_identity_unchanged() -> None:
-    # Source matches current identity → decision is still valid → blocks.
-    decision = StatusRow(
-        status="no_match",
-        source_primary="Boards of Canada",
-        source_secondary="Geogaddi",
+def test_year_identity_also_needs_an_album() -> None:
+    assert identity_of(YEAR_AXIS, {"artist": ["Band"]}) is None
+    assert identity_of(YEAR_AXIS, {"artist": ["Band"], "album": ["LP"]}) == Identity(
+        primary="Band",
+        secondary="LP",
     )
-    identity = Identity(primary="Boards of Canada", secondary="Geogaddi")
-    assert GENRE_AXIS.decision_blocks(decision, identity) is True
 
 
-def test_genre_no_match_does_not_block_when_primary_changed() -> None:
-    # Artist changed → stored no_match is stale → does NOT block.
-    decision = StatusRow(
-        status="no_match",
-        source_primary="Old Artist",
-        source_secondary="Same Album",
+def test_artist_identity_is_first_artist_and_first_albumartist() -> None:
+    tags = {"artist": ["", "Track"], "albumartist": ["Album Artist"]}
+    assert identity_of(ARTIST_AXIS, tags) == Identity(primary="Track", secondary="Album Artist")
+    assert identity_of(ARTIST_AXIS, {"albumartist": ["AA"]}) == Identity(
+        primary=None,
+        secondary="AA",
     )
-    identity = Identity(primary="New Artist", secondary="Same Album")
-    assert GENRE_AXIS.decision_blocks(decision, identity) is False
+    assert identity_of(ARTIST_AXIS, {"album": ["LP"]}) is None
 
 
-def test_genre_no_match_does_not_block_when_secondary_changed() -> None:
-    # Album changed → stored no_match is stale → does NOT block.
-    decision = StatusRow(
-        status="no_match",
-        source_primary="Same Artist",
-        source_secondary="Old Album",
-    )
-    identity = Identity(primary="Same Artist", secondary="New Album")
-    assert GENRE_AXIS.decision_blocks(decision, identity) is False
+def test_mismatch_axis_has_no_identity() -> None:
+    with pytest.raises(ValueError, match="mismatch axis keeps no outcome rows"):
+        identity_of(MISMATCH_AXIS, {"artist": ["A"]})
 
 
-def test_genre_no_match_does_not_block_when_both_changed() -> None:
-    decision = StatusRow(
-        status="no_match",
-        source_primary="Old Artist",
-        source_secondary="Old Album",
-    )
-    identity = Identity(primary="New Artist", secondary="New Album")
-    assert GENRE_AXIS.decision_blocks(decision, identity) is False
-
-
-def test_genre_no_match_blocks_when_both_null_and_identity_null() -> None:
-    # Null matches null — not stale.
-    decision = StatusRow(status="no_match", source_primary=None, source_secondary=None)
-    identity = Identity(primary=None, secondary=None)
-    assert GENRE_AXIS.decision_blocks(decision, identity) is True
-
-
-def test_genre_no_match_stale_when_null_source_but_non_null_identity() -> None:
-    decision = StatusRow(status="no_match", source_primary=None, source_secondary=None)
-    identity = Identity(primary="Some Artist", secondary="Some Album")
-    assert GENRE_AXIS.decision_blocks(decision, identity) is False
-
-
-# ---------------------------------------------------------------------------
-# Genre decision_blocks: other statuses do not block
-# ---------------------------------------------------------------------------
-
-
-def test_genre_pending_does_not_block() -> None:
-    decision = StatusRow(status="pending", source_primary="A", source_secondary="B")
-    identity = Identity(primary="A", secondary="B")
-    assert GENRE_AXIS.decision_blocks(decision, identity) is False
-
-
-def test_genre_staged_does_not_block() -> None:
-    decision = StatusRow(status="staged", source_primary="A", source_secondary="B")
-    identity = Identity(primary="A", secondary="B")
-    assert GENRE_AXIS.decision_blocks(decision, identity) is False
-
-
-def test_genre_done_does_not_block() -> None:
-    decision = StatusRow(status="done", source_primary="A", source_secondary="B")
-    identity = Identity(primary="A", secondary="B")
-    assert GENRE_AXIS.decision_blocks(decision, identity) is False
-
-
-# ---------------------------------------------------------------------------
-# Artist decision_blocks: manual is sticky (identity-independent)
-# ---------------------------------------------------------------------------
-
-
-def test_artist_manual_blocks_when_identity_matches() -> None:
-    decision = StatusRow(status="manual", source_primary="Miami Nights 84", source_secondary="VA")
-    identity = Identity(primary="Miami Nights 84", secondary="VA")
-    assert ARTIST_AXIS.decision_blocks(decision, identity) is True
-
-
-def test_artist_manual_blocks_when_identity_differs() -> None:
-    # Artist sticky: identity change does NOT un-block (no staleness re-check).
-    decision = StatusRow(status="manual", source_primary="Old Artist", source_secondary="Old AA")
-    identity = Identity(primary="New Artist", secondary="New AA")
-    assert ARTIST_AXIS.decision_blocks(decision, identity) is True
-
-
-def test_artist_manual_blocks_with_null_sources() -> None:
-    decision = StatusRow(status="manual", source_primary=None, source_secondary=None)
-    identity = Identity(primary=None, secondary=None)
-    assert ARTIST_AXIS.decision_blocks(decision, identity) is True
-
-
-# ---------------------------------------------------------------------------
-# Artist decision_blocks: non-manual statuses do not block
-# ---------------------------------------------------------------------------
-
-
-def test_artist_pending_does_not_block() -> None:
-    decision = StatusRow(status="pending", source_primary="A", source_secondary="B")
-    identity = Identity(primary="A", secondary="B")
-    assert ARTIST_AXIS.decision_blocks(decision, identity) is False
-
-
-def test_artist_staged_does_not_block() -> None:
-    decision = StatusRow(status="staged", source_primary="A", source_secondary="B")
-    identity = Identity(primary="A", secondary="B")
-    assert ARTIST_AXIS.decision_blocks(decision, identity) is False
-
-
-def test_artist_done_does_not_block() -> None:
-    decision = StatusRow(status="done", source_primary="A", source_secondary="B")
-    identity = Identity(primary="A", secondary="B")
-    assert ARTIST_AXIS.decision_blocks(decision, identity) is False
-
-
-def test_artist_non_manual_does_not_block_even_when_identity_unchanged() -> None:
-    # Confirm the identity argument is irrelevant for non-manual statuses.
-    decision = StatusRow(status="staged", source_primary="X", source_secondary="Y")
-    identity_match = Identity(primary="X", secondary="Y")
-    identity_diff = Identity(primary="Z", secondary="W")
-    assert ARTIST_AXIS.decision_blocks(decision, identity_match) is False
-    assert ARTIST_AXIS.decision_blocks(decision, identity_diff) is False
+def test_field_values_lists_every_axis_field_and_absent_as_empty() -> None:
+    tags = {"artist": ["A"], "artistsort": ["A, The"], "genre": ["rock"]}
+    assert field_values(ARTIST_AXIS, tags) == {
+        "artist": ["A"],
+        "albumartist": [],
+        "musicbrainz_artistid": [],
+        "musicbrainz_albumartistid": [],
+        "artistsort": ["A, The"],
+        "albumartistsort": [],
+    }
+    assert field_values(GENRE_AXIS, tags) == {"genre": ["rock"]}
 
 
 # ---------------------------------------------------------------------------
@@ -313,45 +207,6 @@ def test_year_axis_workflow_statuses_cardinality() -> None:
 
 def test_no_match_in_year_workflow_statuses() -> None:
     assert "no_match" in YEAR_AXIS.workflow_statuses
-
-
-# ---------------------------------------------------------------------------
-# Year decision_blocks: manual sticky; no_match stale on either identity field
-# ---------------------------------------------------------------------------
-
-
-def test_year_manual_blocks_regardless_of_identity() -> None:
-    decision = StatusRow(status="manual", source_primary="Old", source_secondary="Old")
-    assert YEAR_AXIS.decision_blocks(decision, Identity(primary="New", secondary="New")) is True
-
-
-def test_year_no_match_blocks_when_identity_unchanged() -> None:
-    decision = StatusRow(
-        status="no_match",
-        source_primary="Black Sabbath",
-        source_secondary="Paranoid",
-    )
-    identity = Identity(primary="Black Sabbath", secondary="Paranoid")
-    assert YEAR_AXIS.decision_blocks(decision, identity) is True
-
-
-def test_year_no_match_stale_when_primary_changed() -> None:
-    # Artist (or album-artist fallback) changed → stale → does NOT block.
-    decision = StatusRow(status="no_match", source_primary="Old Artist", source_secondary="Album")
-    identity = Identity(primary="New Artist", secondary="Album")
-    assert YEAR_AXIS.decision_blocks(decision, identity) is False
-
-
-def test_year_no_match_stale_when_secondary_changed() -> None:
-    # Album changed → stale → does NOT block.
-    decision = StatusRow(status="no_match", source_primary="Artist", source_secondary="Old Album")
-    identity = Identity(primary="Artist", secondary="New Album")
-    assert YEAR_AXIS.decision_blocks(decision, identity) is False
-
-
-def test_year_pending_does_not_block() -> None:
-    decision = StatusRow(status="pending", source_primary="A", source_secondary="B")
-    assert YEAR_AXIS.decision_blocks(decision, Identity(primary="A", secondary="B")) is False
 
 
 # ---------------------------------------------------------------------------
@@ -393,7 +248,7 @@ def test_mismatch_has_no_no_match_or_staged_done_states() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Mismatch decision_blocks: blocks iff the snapshotted value still matches its field
+# mismatch_decision_blocks: blocks iff the snapshotted value still matches its field
 # ---------------------------------------------------------------------------
 # source_primary = the FIELD NAME ('albumartist'|'artist'); source_secondary = its snapshot.
 # identity.primary = current first albumartist; identity.secondary = current first artist.
@@ -404,7 +259,7 @@ def test_mismatch_albumartist_blocks_when_value_unchanged() -> None:
         status="legit_ignore", source_primary="albumartist", source_secondary="Jem"
     )
     identity = Identity(primary="Jem", secondary="Ozzy Osbourne")
-    assert MISMATCH_AXIS.decision_blocks(decision, identity) is True
+    assert mismatch_decision_blocks(decision, identity) is True
 
 
 def test_mismatch_albumartist_stale_when_value_changed() -> None:
@@ -412,7 +267,7 @@ def test_mismatch_albumartist_stale_when_value_changed() -> None:
         status="legit_ignore", source_primary="albumartist", source_secondary="Jem"
     )
     identity = Identity(primary="Ozzy Osbourne", secondary="Ozzy Osbourne")
-    assert MISMATCH_AXIS.decision_blocks(decision, identity) is False
+    assert mismatch_decision_blocks(decision, identity) is False
 
 
 def test_mismatch_albumartist_stale_when_tag_removed() -> None:
@@ -421,36 +276,36 @@ def test_mismatch_albumartist_stale_when_tag_removed() -> None:
         status="misfiled_deferred", source_primary="albumartist", source_secondary="Jem"
     )
     identity = Identity(primary=None, secondary="Ozzy Osbourne")
-    assert MISMATCH_AXIS.decision_blocks(decision, identity) is False
+    assert mismatch_decision_blocks(decision, identity) is False
 
 
 def test_mismatch_artist_field_compares_against_secondary() -> None:
     decision = StatusRow(status="misfiled_deferred", source_primary="artist", source_secondary="X")
     # Its own field (artist) is compared against identity.secondary, not primary.
-    assert MISMATCH_AXIS.decision_blocks(decision, Identity(primary="Y", secondary="X")) is True
-    assert MISMATCH_AXIS.decision_blocks(decision, Identity(primary="X", secondary="Z")) is False
+    assert mismatch_decision_blocks(decision, Identity(primary="Y", secondary="X")) is True
+    assert mismatch_decision_blocks(decision, Identity(primary="X", secondary="Z")) is False
 
 
 def test_mismatch_misfiled_deferred_follows_the_same_rule() -> None:
     fresh = StatusRow(
         status="misfiled_deferred", source_primary="albumartist", source_secondary="Q"
     )
-    assert MISMATCH_AXIS.decision_blocks(fresh, Identity(primary="Q", secondary=None)) is True
-    assert MISMATCH_AXIS.decision_blocks(fresh, Identity(primary="R", secondary=None)) is False
+    assert mismatch_decision_blocks(fresh, Identity(primary="Q", secondary=None)) is True
+    assert mismatch_decision_blocks(fresh, Identity(primary="R", secondary=None)) is False
 
 
 def test_mismatch_null_source_field_blocks_only_when_snapshot_none() -> None:
     # A file that had neither tag: field None, value None -> compares None == None -> blocks.
     both_none = StatusRow(status="legit_ignore", source_primary=None, source_secondary=None)
-    assert MISMATCH_AXIS.decision_blocks(both_none, Identity(primary=None, secondary=None)) is True
-    assert MISMATCH_AXIS.decision_blocks(both_none, Identity(primary="A", secondary="B")) is True
+    assert mismatch_decision_blocks(both_none, Identity(primary=None, secondary=None)) is True
+    assert mismatch_decision_blocks(both_none, Identity(primary="A", secondary="B")) is True
 
 
 def test_mismatch_none_value_on_albumartist_field() -> None:
     # source_field set but snapshot None: blocks only while current is also None.
     decision = StatusRow(status="legit_ignore", source_primary="albumartist", source_secondary=None)
-    assert MISMATCH_AXIS.decision_blocks(decision, Identity(primary=None, secondary="X")) is True
-    assert MISMATCH_AXIS.decision_blocks(decision, Identity(primary="V", secondary="X")) is False
+    assert mismatch_decision_blocks(decision, Identity(primary=None, secondary="X")) is True
+    assert mismatch_decision_blocks(decision, Identity(primary="V", secondary="X")) is False
 
 
 # ---------------------------------------------------------------------------

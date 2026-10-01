@@ -842,18 +842,19 @@ def test_mismatch_fix_flow_end_to_end(
     jem2 = _file_id(engine_settings, poisoned, "02 Facing Hell.mp3")
     fp_id = _file_id(engine_settings, folders["fp"], "remix.mp3")
 
-    # Seed prior auto genre/year work + a sticky artist exclusion on the poisoned files, so
-    # reopen has real derived-axis state to re-open.
+    # Seed prior auto genre work + a sticky artist exclusion on the poisoned files, so
+    # reopen has real axis state to act on. The files carry no album, so year has no identity.
     for fid in (jem1, jem2):
         staging.stage_tags(
             engine_settings,
             file_id=fid,
-            tags={"genre": ["Metal"], "originaldate": ["2001"]},
+            tags={"genre": ["Metal"]},
             origin="auto",
         )
+    _record_genre_done(engine_settings, [jem1, jem2])
     staging.commit_tags(engine_settings)
     artists.set_artist_status(engine_settings, file_ids=[jem1, jem2], status="manual")
-    assert _derived(engine_settings, jem1) == ("done", "done", "manual")
+    assert _derived(engine_settings, jem1) == ("done", "no_identity", "manual")
 
     # 1. detect flags the two Jem files (HIGH) and the container FP.
     report = detect_mismatches(engine_settings)
@@ -884,12 +885,12 @@ def test_mismatch_fix_flow_end_to_end(
     commit_id = result.commit_id
     assert commit_id is not None
 
-    # 5. reopen the derived axes + clear the artist status for the fixed files.
+    # 5. reopen the fixed files' outcomes. A manual row is a human decision and stays.
     reopen = staging.reopen_axes(engine_settings, commit_id=commit_id)
     assert reopen.files == 2
-    assert reopen.artist_status_cleared == 2
-    # genre/year flip done -> pending; the artist status row is gone.
-    assert _derived(engine_settings, jem1) == ("pending", "pending", "pending")
+    assert reopen.to_dict()["genre"] == {"outcomes_reopened": 2, "manual_kept": 0}
+    assert reopen.to_dict()["artist"] == {"outcomes_reopened": 0, "manual_kept": 2}
+    assert _derived(engine_settings, jem1) == ("pending", "no_identity", "manual")
 
     # 6. detect no longer flags the poisoned folder (self-resolving accept, no row needed).
     assert detect_mismatches(engine_settings, folder=str(poisoned)).rows == []
@@ -899,8 +900,25 @@ def test_mismatch_fix_flow_end_to_end(
     assert _read_albumartist(engine_settings, poisoned, "01 Gets Me Through.mp3") == ["Jem"]
 
 
+def _record_genre_done(settings: Settings, file_ids: list[int]) -> None:
+    """Record the resolver's ``done`` genre outcome for each staged file, as resolve_genres does."""
+    conn = connect(settings.db_path)
+    try:
+        for file_id in file_ids:
+            store.record_outcome(
+                conn,
+                axis.GENRE_AXIS,
+                file_id=file_id,
+                status="done",
+                now="2026-09-30T00:00:00+00:00",
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def _derived(settings: Settings, file_id: int) -> tuple[str, str, str]:
-    """Return ``(genre, album, artist)`` derived statuses for *file_id*."""
+    """Return ``(genre, year, artist)`` derived statuses for *file_id*."""
     conn = connect(settings.db_path)
     try:
         return (

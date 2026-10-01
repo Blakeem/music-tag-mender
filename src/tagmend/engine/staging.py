@@ -217,9 +217,10 @@ class TagDomain:
 
         The disk write happens *before* any DB append, so a write failure aborts this
         file's transaction with the staged row intact for a later retry. The revision
-        append and the staged-row delete are left in the open transaction (``run_commit``
-        commits them together), the invariant that prevents double-applying. A target the
-        file already holds is not written, so a no-op commit never rewrites the file.
+        append, the axis status rows (:func:`_record_axis_outcomes`) and the staged-row delete
+        are left in the open transaction (``run_commit`` commits them together), the invariant
+        that prevents double-applying. A target the file already holds is not written, so a
+        no-op commit never rewrites the file.
         """
         staged = _require_staged(conn, file_id)
 
@@ -230,12 +231,16 @@ class TagDomain:
         versioning.ensure_baseline(conn, file_id, managed_tags=current, now=now)
 
         # Disk first, before any DB append.
-        if versioning.compute_diff(versioning.managed_subset(current), staged.managed_tags):
+        disk_diff = versioning.compute_diff(versioning.managed_subset(current), staged.managed_tags)
+        if disk_diff:
             write_managed_tags(path, staged.managed_tags)
 
         # Refresh the live snapshot, append the revision, delete the staged row.
         fresh = read_tags(path).tags
         store.replace_tags(conn, file_id, fresh, now)
+        _record_axis_outcomes(
+            conn, file_id, staged=staged, disk_diff=disk_diff, fresh=fresh, now=now
+        )
         # Re-sync the files-row signature to the just-written bytes (same fields the
         # scanner stats), so the next incremental scan sees this file as unchanged
         # rather than spuriously re-flagging every committed file as updated.
@@ -275,6 +280,60 @@ def _require_staged(conn: sqlite3.Connection, file_id: int) -> store.StagedTag:
         message = f"staged row vanished for file_id={file_id}"
         raise RuntimeError(message)
     return staged
+
+
+def _record_axis_outcomes(  # noqa: PLR0913 - cohesive keyword-only commit-writer inputs
+    conn: sqlite3.Connection,
+    file_id: int,
+    *,
+    staged: store.StagedTag,
+    disk_diff: dict[str, dict[str, list[str]]],
+    fresh: dict[str, list[str]],
+    now: str,
+) -> None:
+    """Keep each tag axis's status row true to the bytes just written (the commit writer).
+
+    A ``manual`` change records ``manual`` on every axis whose fields it changed, replacing any
+    row. The change is the staged row's ``changed_fields``, taken against disk at stage time,
+    because a re-applied commit finds disk already equal to the target. A row staged before
+    that column falls back to *disk_diff*. Neither is the stored revision diff, which would
+    absorb an external edit made since the last revision. An ``auto`` change re-stamps the
+    resolver's own row (:func:`_restamp_outcome`).
+    """
+    changed_fields = disk_diff.keys() if staged.changed_fields is None else staged.changed_fields
+    for tag_axis in axis.TAG_AXES:
+        if staged.origin != "manual":
+            _restamp_outcome(
+                conn, tag_axis, file_id, target=staged.managed_tags, fresh=fresh, now=now
+            )
+        elif any(name in changed_fields for name in tag_axis.fields):
+            axis.put_outcome(conn, tag_axis, file_id=file_id, status="manual", tags=fresh, now=now)
+
+
+def _restamp_outcome(  # noqa: PLR0913 - cohesive keyword-only commit-writer inputs
+    conn: sqlite3.Connection,
+    tag_axis: axis.Axis,
+    file_id: int,
+    *,
+    target: dict[str, list[str]],
+    fresh: dict[str, list[str]],
+    now: str,
+) -> None:
+    """Re-stamp a ``done``/``no_match`` row from the read-back tags, status kept.
+
+    Only the row the resolver wrote for this target qualifies: its identity snapshot equals the
+    read-back identity and its value snapshot equals the target's values. The re-stamp absorbs
+    the writer's value normalisation, and it never carries another axis's row across an
+    identity change, so an auto artist correction re-opens the file's genre and year.
+    """
+    row = axis.get_outcome(conn, tag_axis, file_id)
+    if row is None or row.status not in axis.RESOLVER_OUTCOMES:
+        return
+    if row.identity != axis.identity_of(tag_axis, fresh):
+        return
+    if row.values != axis.field_values(tag_axis, target):
+        return
+    axis.put_outcome(conn, tag_axis, file_id=file_id, status=row.status, tags=fresh, now=now)
 
 
 def _stage_one(  # noqa: PLR0913 - cohesive keyword-only per-file staging payload
@@ -353,6 +412,7 @@ def _stage_one(  # noqa: PLR0913 - cohesive keyword-only per-file staging payloa
     # win; an explicit empty list still deletes a field.
     target = versioning.managed_subset(current)
     target.update(remaining)
+    changed_fields = versioning.compute_diff(versioning.managed_subset(current), target).keys()
 
     store.upsert_staged_tag(
         conn,
@@ -363,6 +423,7 @@ def _stage_one(  # noqa: PLR0913 - cohesive keyword-only per-file staging payloa
         note=note,
         base_size_bytes=base.st_size,
         base_mtime_ns=base.st_mtime_ns,
+        changed_fields=changed_fields,
     )
     return True
 
@@ -720,47 +781,72 @@ def commit_tags(
 
 
 @dataclass(frozen=True, slots=True)
+class AxisReopen:
+    """One tag axis's part of a :func:`reopen_axes` call."""
+
+    outcomes_reopened: int
+    manual_kept: int
+
+    def to_dict(self) -> dict[str, int]:
+        """JSON-serializable form for the MCP tool."""
+        return {"outcomes_reopened": self.outcomes_reopened, "manual_kept": self.manual_kept}
+
+
+@dataclass(frozen=True, slots=True)
 class ReopenResult:
     """Immutable summary of one :func:`reopen_axes` call, JSON-ready for the MCP tool."""
 
     commit_id: int
     files: int
-    artist_status_cleared: int
+    axes: dict[str, AxisReopen]
 
     def to_dict(self) -> dict[str, object]:
-        """JSON-serializable form for the MCP tool."""
+        """JSON-serializable form for the MCP tool: one block per tag axis, keyed by its name."""
         return {
             "commit_id": self.commit_id,
             "files": self.files,
-            "artist_status_cleared": self.artist_status_cleared,
+            **{name: counts.to_dict() for name, counts in self.axes.items()},
         }
 
 
+def _reopen_axis(
+    conn: sqlite3.Connection,
+    tag_axis: axis.Axis,
+    file_ids: list[int],
+) -> AxisReopen:
+    """Delete *tag_axis*'s ``done``/``no_match`` rows of *file_ids*, count ``manual`` kept."""
+    placeholders = ",".join("?" for _ in file_ids)
+    table = tag_axis.status_table
+    deleted = conn.execute(
+        f"DELETE FROM {table} WHERE file_id IN ({placeholders}) "  # noqa: S608 - trusted Axis
+        "AND status IN ('done', 'no_match')",
+        tuple(file_ids),
+    ).rowcount
+    kept = conn.execute(
+        f"SELECT COUNT(*) FROM {table} WHERE file_id IN ({placeholders}) "  # noqa: S608
+        "AND status = 'manual'",
+        tuple(file_ids),
+    ).fetchone()
+    return AxisReopen(outcomes_reopened=deleted, manual_kept=db.as_int(kept[0]))
+
+
 def reopen_axes(settings: Settings, *, commit_id: int) -> ReopenResult:
-    """Re-open the derived axes for every file a manual identity-fix commit changed (NN7).
+    """Re-open every tag axis for the files a manual identity-fix commit changed.
 
-    The explicit post-fix coherence step: after committing a manual identity fix (the
-    mismatch-fix flow), the file's stale auto-resolved genre/year no longer describe its NEW
-    identity, and any sticky ``file_artist_status`` was tied to the OLD name. For every DISTINCT
-    file with a ``tag_revisions`` row in *commit_id* this, in ONE transaction:
+    The post-fix step of the ``stage_tags_batch -> diff_tags -> commit_tags -> reopen_axes``
+    spine. For every DISTINCT file with a ``tag_revisions`` row in *commit_id* it deletes, in
+    ONE transaction, the ``done`` and ``no_match`` rows on the genre, artist and year axes, so
+    each resolver re-derives them against the fixed tags. ``manual`` rows are kept, because
+    ``reset_<axis>_status`` is their only hand-back. Call ``reset_artist_status`` next when a
+    fixed name should be re-checked by the normaliser.
 
-    * voids the derived-axis fields (:data:`tagmend.engine.axis.GENRE_AXIS.fields` +
-      :data:`~tagmend.engine.axis.YEAR_AXIS.fields`) via
-      :func:`tagmend.engine.store.void_auto_changes`, so
-      :func:`tagmend.engine.store.derived_status` on the genre and year axes flips ``done`` →
-      ``pending`` and the axes re-open (a LATER fresh
-      auto commit reads ``done`` again — the Run-1 watermark semantics); and
-    * deletes any :func:`tagmend.engine.store.delete_artist_status` row.
-
-    Noop/missing files have no revision row in the commit and are correctly untouched. Raises
+    Noop/missing files have no revision row in the commit and are untouched. Raises
     :class:`ValueError` for an unknown *commit_id*, for a commit that changed no tags, and for
-    a commit holding any ``auto`` revision, whatever the commit's own origin (voiding fresh
-    auto work is a foot-gun). ``manual`` and ``revert`` changes are allowed. Returns the
-    affected file count and how many artist rows were cleared. Owns its transaction. Never
-    touches the ``commits`` table or the append-only ``tag_revisions`` history.
+    a commit holding any ``auto`` revision, whatever the commit's own origin, since re-opening
+    fresh auto work would only repeat it. ``manual`` and ``revert`` changes are allowed. Returns
+    the affected file count and, per axis, ``outcomes_reopened`` and ``manual_kept``. Owns its
+    transaction. Never touches the ``commits`` table or the append-only history.
     """
-    void_fields = axis.GENRE_AXIS.fields + axis.YEAR_AXIS.fields
-
     connection = db.connect(settings.db_path)
     try:
         schema.apply_schema(connection)
@@ -780,24 +866,21 @@ def reopen_axes(settings: Settings, *, commit_id: int) -> ReopenResult:
             raise ValueError(message)
 
         file_ids = sorted({r.file_id for r in revisions})
-        artist_cleared = 0
-        for fid in file_ids:
-            store.void_auto_changes(connection, fid, void_fields)
-            if store.get_artist_status(connection, fid) is not None:
-                artist_cleared += 1
-                store.delete_artist_status(connection, fid)
+        axes = {
+            tag_axis.name: _reopen_axis(connection, tag_axis, file_ids)
+            for tag_axis in axis.TAG_AXES
+        }
         connection.commit()
     finally:
         connection.close()
 
     logger.info(
-        "reopen commit %d: %d file(s) re-opened, %d artist status row(s) cleared",
+        "reopen commit %d: %d file(s), %s",
         commit_id,
         len(file_ids),
-        artist_cleared,
+        ", ".join(
+            f"{name} reopened={counts.outcomes_reopened} kept={counts.manual_kept}"
+            for name, counts in axes.items()
+        ),
     )
-    return ReopenResult(
-        commit_id=commit_id,
-        files=len(file_ids),
-        artist_status_cleared=artist_cleared,
-    )
+    return ReopenResult(commit_id=commit_id, files=len(file_ids), axes=axes)

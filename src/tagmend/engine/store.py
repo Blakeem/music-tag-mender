@@ -17,12 +17,13 @@ import json
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final, cast
 
-from tagmend.engine import axis, clock, db, path_keys
+from tagmend.engine import axis, db, path_keys
 from tagmend.engine.tags import MANAGED_SET_VERSION, TAG_READER_VERSION
 from tagmend.log import get_logger
 
 if TYPE_CHECKING:
     import sqlite3
+    from collections.abc import Collection
 
 logger = get_logger(__name__)
 
@@ -464,7 +465,7 @@ def max_version(conn: sqlite3.Connection, file_id: int) -> int | None:
 # The ``commits`` table ops and the shared commit loop live in
 # :mod:`tagmend.engine.commits`; staged rows here no longer carry a ``commit_id``.
 _STAGED_TAG_COLUMNS = (
-    "file_id, managed_tags, origin, note, staged_at, base_size_bytes, base_mtime_ns"
+    "file_id, managed_tags, origin, note, staged_at, base_size_bytes, base_mtime_ns, changed_fields"
 )
 
 
@@ -474,6 +475,8 @@ class StagedTag:
 
     ``base_size_bytes``/``base_mtime_ns`` are the file's signature when it was staged, so a
     commit can refuse a file edited since. Both are ``None`` on a row staged before v17.
+    ``changed_fields`` names the fields the target changes against the tags on disk at stage
+    time, ``None`` on a row staged before v21.
     """
 
     file_id: int
@@ -483,6 +486,7 @@ class StagedTag:
     staged_at: str
     base_size_bytes: int | None
     base_mtime_ns: int | None
+    changed_fields: frozenset[str] | None
 
 
 def _row_to_staged_tag(row: tuple[object, ...]) -> StagedTag:
@@ -495,6 +499,9 @@ def _row_to_staged_tag(row: tuple[object, ...]) -> StagedTag:
         staged_at=str(row[4]),
         base_size_bytes=None if row[5] is None else db.as_int(row[5]),
         base_mtime_ns=None if row[6] is None else db.as_int(row[6]),
+        changed_fields=(
+            None if row[7] is None else frozenset(cast("list[str]", json.loads(str(row[7]))))
+        ),
     )
 
 
@@ -508,20 +515,24 @@ def upsert_staged_tag(  # noqa: PLR0913 - cohesive keyword-only staging payload
     note: str | None = None,
     base_size_bytes: int | None = None,
     base_mtime_ns: int | None = None,
+    changed_fields: Collection[str] | None = None,
 ) -> None:
     """Insert or replace the single pending change for *file_id*.
 
     A re-stage overwrites any prior pending change; the ``file_id`` PK keeps exactly one
     pending change per file (the latest staged target wins). *base_size_bytes* and
     *base_mtime_ns* record the file's signature at stage time. A ``None`` pair skips the
-    commit's changed-since-stage check.
+    commit's changed-since-stage check. *changed_fields* names the fields the target changes
+    against the tags on disk at stage time.
     """
+    changed_json = None if changed_fields is None else _dump_json(sorted(changed_fields))
     conn.execute(
         """
         INSERT OR REPLACE INTO tag_revisions_staged (
-            file_id, managed_tags, origin, note, staged_at, base_size_bytes, base_mtime_ns
+            file_id, managed_tags, origin, note, staged_at, base_size_bytes, base_mtime_ns,
+            changed_fields
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             file_id,
@@ -531,6 +542,7 @@ def upsert_staged_tag(  # noqa: PLR0913 - cohesive keyword-only staging payload
             now,
             base_size_bytes,
             base_mtime_ns,
+            changed_json,
         ),
     )
 
@@ -562,7 +574,7 @@ def list_staged_tags_under(conn: sqlite3.Connection, root_key: str) -> list[Stag
     cursor = conn.execute(
         """
         SELECT s.file_id, s.managed_tags, s.origin, s.note, s.staged_at,
-               s.base_size_bytes, s.base_mtime_ns
+               s.base_size_bytes, s.base_mtime_ns, s.changed_fields
         FROM tag_revisions_staged s
         JOIN files f ON f.id = s.file_id
         WHERE f.path_key >= ? AND f.path_key < ?
@@ -991,68 +1003,10 @@ def put_cached_mb_release(
     )
 
 
-# --- file_<axis>_status (per-file workflow decisions; PLAN — Status model) -----------
+# --- file_<axis>_status: the tag-axis classifier (genre, artist, year) ----------------
 #
-# The per-axis status machinery is ONE parameterized concept in :mod:`tagmend.engine.axis`.
-# The row wrappers below serve the genre, artist, year and mismatch axes, and each row type
-# surfaces its own source-column names.
-
-
-@dataclass(frozen=True, slots=True)
-class GenreStatusRow:
-    """One row from ``file_genre_status`` (a ``'no_match'`` / ``'manual'`` decision)."""
-
-    status: str
-    source_artist: str | None
-    source_album: str | None
-
-
-def _genre_row(decision: axis.StatusRow) -> GenreStatusRow:
-    """Adapt a generic axis :class:`~tagmend.engine.axis.StatusRow` to the genre-named row."""
-    return GenreStatusRow(
-        status=decision.status,
-        source_artist=decision.source_primary,
-        source_album=decision.source_secondary,
-    )
-
-
-def get_genre_status(conn: sqlite3.Connection, file_id: int) -> GenreStatusRow | None:
-    """Return *file_id*'s terminal genre decision, or ``None`` if it has none."""
-    decision = axis.get_status(conn, axis.GENRE_AXIS, file_id)
-    return None if decision is None else _genre_row(decision)
-
-
-def set_genre_status(  # noqa: PLR0913 - cohesive keyword-only status payload
-    conn: sqlite3.Connection,
-    *,
-    file_id: int,
-    status: str,
-    source_artist: str | None,
-    source_album: str | None,
-    now: str,
-) -> None:
-    """Insert or replace *file_id*'s terminal genre decision.
-
-    ``source_artist``/``source_album`` record what the decision was computed against, so
-    a later tag change can mark a ``'no_match'`` stale and re-processable.
-    """
-    axis.set_status(
-        conn,
-        axis.GENRE_AXIS,
-        file_id=file_id,
-        status=status,
-        source_primary=source_artist,
-        source_secondary=source_album,
-        now=now,
-    )
-
-
-def delete_genre_status(conn: sqlite3.Connection, file_id: int) -> None:
-    """Remove *file_id*'s terminal genre decision (no-op if none)."""
-    axis.delete_status(conn, axis.GENRE_AXIS, file_id)
-
-
-# --- "done" derivation + scope selection (PLAN — Selection set) ---------------------
+# The row access lives in :mod:`tagmend.engine.axis`. This section derives the user-facing
+# status from a row, the staging area and the current tags of a present file.
 
 
 def is_staged(conn: sqlite3.Connection, file_id: int) -> bool:
@@ -1075,99 +1029,15 @@ def any_staged(conn: sqlite3.Connection) -> bool:
     return bool(row[0])
 
 
-def has_auto_change_for(
-    conn: sqlite3.Connection,
-    file_id: int,
+def _staged_alters(
+    staged: StagedTag | None,
+    current: dict[str, list[str]],
     fields: tuple[str, ...],
 ) -> bool:
-    """Return whether a committed ``origin='auto'`` revision changed any of *fields*.
-
-    Field-aware "done": scans *file_id*'s committed auto revisions and asks SQLite's JSON1
-    ``json_extract`` whether the stored ``diff`` blob carries a ``{from, to}`` entry for
-    any of *fields*. A genre-only auto commit therefore does not read as artist-done, and
-    vice versa. *fields* must be non-empty.
-
-    Each field's predicate is guarded by THAT field's own ``voided_auto`` watermark
-    (correlated per field, since the artist axis passes two fields): an auto revision counts
-    only when its ``version`` is above the field's ``voided_through_version`` (``-1`` when
-    unvoided). So after :func:`void_auto_changes` a stale auto value re-pends, while a fresh
-    auto revision (a higher version) counts as done again.
-    """
-    conditions = " OR ".join(
-        """(
-            json_extract(diff, ?) IS NOT NULL
-            AND version > COALESCE(
-              (SELECT voided_through_version FROM voided_auto
-               WHERE voided_auto.file_id = tag_revisions.file_id AND voided_auto.field = ?),
-              -1
-            )
-        )"""
-        for _ in fields
-    )
-    params: list[object] = []
-    for field_name in fields:
-        params.append(f"$.{field_name}")
-        params.append(field_name)
-    row = conn.execute(
-        f"""
-        SELECT EXISTS(
-          SELECT 1 FROM tag_revisions
-          WHERE file_id = ? AND origin = 'auto' AND ({conditions})
-        )
-        """,  # noqa: S608 - conditions is a fixed OR of literal predicates; values bound
-        (file_id, *params),
-    ).fetchone()
-    return bool(row[0])
-
-
-def void_auto_changes(
-    conn: sqlite3.Connection,
-    file_id: int,
-    fields: tuple[str, ...],
-) -> None:
-    """Void *file_id*'s auto-resolved *fields* at its current ``MAX(version)`` watermark.
-
-    The NN7 re-pend primitive: after a manual identity fix, stamp each of *fields* in
-    ``voided_auto`` with the file's current highest revision, so
-    :func:`has_auto_change_for` stops counting the now-stale auto revisions and the field
-    re-pends — WITHOUT mutating the append-only ``tag_revisions`` history. ``INSERT OR
-    REPLACE`` means a re-void moves the watermark forward. A no-op when the file has no
-    revisions yet (nothing to void). Does not commit.
-    """
-    current = max_version(conn, file_id)
-    if current is None:
-        return
-    now = clock.utc_now()
-    conn.executemany(
-        """
-        INSERT OR REPLACE INTO voided_auto
-          (file_id, field, voided_through_version, voided_at)
-        VALUES (?, ?, ?, ?)
-        """,
-        [(file_id, field_name, current, now) for field_name in fields],
-    )
-
-
-def has_identity(conn: sqlite3.Connection, file_id: int) -> bool:
-    """Return whether *file_id* carries any non-blank ``artist`` or ``albumartist`` value.
-
-    The store-side twin of :func:`tagmend.engine.axis.lookup_identity`'s blankness rule, kept
-    PROVABLY identical: both treat a file as having identity exactly when at least one
-    ``artist`` or ``albumartist`` value is non-blank at ANY ordinal (``lookup_identity`` returns
-    a non-``None`` artist iff its ``first_nonblank`` scan finds one, so a real value at a later
-    ordinal counts even when ordinal 0 is blank — the file is looked up and processed, hence
-    is NOT a no-identity orphan). It fetches every ``artist``/``albumartist`` value in ONE
-    indexed query (the ``file_tags`` PK covers the ``file_id``/``name`` prefix) and decides
-    blankness in Python via ``str.strip()``. SQLite's one-argument ``TRIM`` strips only the
-    ASCII space, so a tab-only or newline-only value would diverge — Python must be the
-    arbiter. A file with neither tag, or only whitespace-only values at every ordinal, has no
-    identity (and derives ``no_identity``).
-    """
-    cursor = conn.execute(
-        "SELECT value FROM file_tags WHERE file_id = ? AND name IN ('artist', 'albumartist')",
-        (file_id,),
-    )
-    return any(str(row[0]).strip() for row in cursor.fetchall())
+    """Whether *staged*'s target differs from *current* on any of *fields*."""
+    if staged is None:
+        return False
+    return any(staged.managed_tags.get(name, []) != current.get(name, []) for name in fields)
 
 
 def has_staged_change_for(
@@ -1177,192 +1047,108 @@ def has_staged_change_for(
 ) -> bool:
     """Return whether *file_id*'s pending staged change actually alters any of *fields*.
 
-    Field-aware "staged": compares the staged target's value list for each of *fields*
-    against the current stored tags. A staged row that touches only ``genre`` is not
-    artist-staged, and vice versa. ``None`` (no staged row) is not staged.
+    Field-aware "staged": a staged row that touches only ``genre`` is not artist-staged, and
+    vice versa. ``None`` (no staged row) is not staged.
     """
-    staged = get_staged_tag(conn, file_id)
-    if staged is None:
-        return False
-    current = get_tags(conn, file_id)
-    return any(staged.managed_tags.get(name, []) != current.get(name, []) for name in fields)
+    return _staged_alters(get_staged_tag(conn, file_id), get_tags(conn, file_id), fields)
 
 
-# The user-facing genre workflow states (re-exported from the genre axis): two are stored
-# (`no_match`/`manual`, rows in file_genre_status), two are derived (`staged`/`done` from
-# the revision tables), `no_identity` = neither artist nor albumartist, `pending` = none of
-# the above. Single source of truth for the ``list_files(genre_status=...)`` filter and the
-# stats counts.
+# The user-facing workflow states of each tag axis. Single source of truth for the
+# ``list_files(<axis>_status=...)`` filters and the stats counts.
 GENRE_WORKFLOW_STATUSES: Final = axis.GENRE_AXIS.workflow_statuses
-
-
-def derived_status(conn: sqlite3.Connection, axis_: axis.Axis, file_id: int) -> str:
-    """Return *file_id*'s workflow status on *axis_*: staged | done | <stored> | pending.
-
-    THE canonical derivation for any axis, composed from the same predicates the skip path
-    (:func:`tagmend.engine.genres._select` / :func:`tagmend.engine.artists._drop_manual_excluded`)
-    uses: a staged change to one of the axis's *fields* wins (``staged``), then a committed
-    ``origin='auto'`` revision whose ``diff`` changed one of those fields (``done``), then a
-    stored ``file_<axis>_status`` decision, else ``pending``. The staged/done checks are
-    FIELD-AWARE (keyed on the axis's ``fields``), so a genre-only change does not read as
-    artist-``done`` and vice versa. Reports the STORED status even when it is stale (genre's
-    ``no_match`` staleness re-check still lets ``resolve_genres`` retry it; the listing surfaces
-    the recorded decision so a human can judge it). A file with no source identity (neither
-    ``artist`` nor ``albumartist``) that every resolver skips derives ``no_identity`` — a
-    distinct worklist bucket, ranked BELOW a stored decision but above ``pending`` (so a
-    manual/no_match a human recorded still wins), unprocessable until tagged.
-    """
-    if has_staged_change_for(conn, file_id, axis_.fields):
-        return "staged"
-    if has_auto_change_for(conn, file_id, axis_.fields):
-        return "done"
-    decision = axis.get_status(conn, axis_, file_id)
-    if decision is not None:
-        return decision.status
-    if not has_identity(conn, file_id):
-        return "no_identity"
-    return "pending"
-
-
-def status_counts(conn: sqlite3.Connection, axis_: axis.Axis) -> dict[str, int]:
-    """Tally :func:`derived_status` over every tracked file id for *axis_*.
-
-    All of the axis's workflow-status keys are always present (zero-filled), so the counts
-    and the per-file status can never drift.
-    """
-    counts = dict.fromkeys(sorted(axis_.workflow_statuses), 0)
-    for row in conn.execute("SELECT id FROM files"):
-        counts[derived_status(conn, axis_, db.as_int(row[0]))] += 1
-    return counts
-
-
-# --- file_artist_status (sticky manual exclusion; artist-axis twin of genre) ---------
-
-# The artist workflow states (re-exported from the artist axis). One is stored
-# (``manual`` — a row in ``file_artist_status``), two are derived (``staged``/``done``
-# field-awarely from the revision tables), ``no_identity`` = neither artist nor albumartist,
-# and ``pending`` = none of the above. There is no ``no_match`` state on this axis. Single
-# source of truth for the ``list_files(artist_status=...)`` filter and the stats counts.
 ARTIST_WORKFLOW_STATUSES: Final = axis.ARTIST_AXIS.workflow_statuses
-
-
-@dataclass(frozen=True, slots=True)
-class ArtistStatusRow:
-    """One row from ``file_artist_status`` (a sticky ``'manual'`` exclusion)."""
-
-    status: str
-    source_artist: str | None
-    source_albumartist: str | None
-
-
-def _artist_row(decision: axis.StatusRow) -> ArtistStatusRow:
-    """Adapt a generic axis :class:`~tagmend.engine.axis.StatusRow` to the artist-named row."""
-    return ArtistStatusRow(
-        status=decision.status,
-        source_artist=decision.source_primary,
-        source_albumartist=decision.source_secondary,
-    )
-
-
-def get_artist_status(conn: sqlite3.Connection, file_id: int) -> ArtistStatusRow | None:
-    """Return *file_id*'s stored artist decision, or ``None`` if it has none."""
-    decision = axis.get_status(conn, axis.ARTIST_AXIS, file_id)
-    return None if decision is None else _artist_row(decision)
-
-
-def set_artist_status(  # noqa: PLR0913 - cohesive keyword-only status payload
-    conn: sqlite3.Connection,
-    *,
-    file_id: int,
-    status: str,
-    source_artist: str | None,
-    source_albumartist: str | None,
-    now: str,
-) -> None:
-    """Insert or replace *file_id*'s stored artist decision.
-
-    ``source_artist``/``source_albumartist`` record the values the exclusion was taken
-    against, for audit.
-    """
-    axis.set_status(
-        conn,
-        axis.ARTIST_AXIS,
-        file_id=file_id,
-        status=status,
-        source_primary=source_artist,
-        source_secondary=source_albumartist,
-        now=now,
-    )
-
-
-def delete_artist_status(conn: sqlite3.Connection, file_id: int) -> None:
-    """Remove *file_id*'s stored artist decision (no-op if none)."""
-    axis.delete_status(conn, axis.ARTIST_AXIS, file_id)
-
-
-# --- file_year_status (terminal year decisions; year-axis twin of genre) -------------
-
-# The year workflow states (re-exported from the year axis). Two are stored
-# (``no_match``/``manual`` — rows in ``file_year_status``), two are derived
-# (``staged``/``done`` field-awarely on ``originaldate``), ``no_identity`` = neither artist
-# nor albumartist, ``pending`` = none of the above. Single source of truth for the
-# ``list_files(year_status=...)`` filter and the stats.
 YEAR_WORKFLOW_STATUSES: Final = axis.YEAR_AXIS.workflow_statuses
 
 
-@dataclass(frozen=True, slots=True)
-class YearStatusRow:
-    """One row from ``file_year_status`` (a ``'no_match'`` / ``'manual'`` decision)."""
-
-    status: str
-    source_artist: str | None
-    source_album: str | None
-
-
-def _year_row(decision: axis.StatusRow) -> YearStatusRow:
-    """Adapt a generic axis :class:`~tagmend.engine.axis.StatusRow` to the year-named row."""
-    return YearStatusRow(
-        status=decision.status,
-        source_artist=decision.source_primary,
-        source_album=decision.source_secondary,
-    )
+def _outcome_holds(
+    axis_: axis.Axis,
+    row: axis.OutcomeRow,
+    identity: axis.Identity,
+    tags: dict[str, list[str]],
+) -> bool:
+    """Whether a resolver outcome still describes the file: both snapshots match its tags."""
+    if row.status not in axis.RESOLVER_OUTCOMES or row.identity != identity:
+        return False
+    return row.values is None or row.values == axis.field_values(axis_, tags)
 
 
-def get_year_status(conn: sqlite3.Connection, file_id: int) -> YearStatusRow | None:
-    """Return *file_id*'s terminal year decision, or ``None`` if it has none."""
-    decision = axis.get_status(conn, axis.YEAR_AXIS, file_id)
-    return None if decision is None else _year_row(decision)
+def derived_status(conn: sqlite3.Connection, axis_: axis.Axis, file_id: int) -> str:
+    """Return *file_id*'s workflow status on the tag *axis_*. First match wins.
+
+    1. A staged change alters one of :attr:`~tagmend.engine.axis.Axis.fields`: ``staged``.
+    2. The row is ``manual``: ``manual``, sticky until ``reset_<axis>_status``.
+    3. The axis has no identity for the current tags: ``no_identity``.
+    4. The row is ``done`` or ``no_match`` and both its snapshots match the current tags (a
+       NULL value snapshot matches): the row's status.
+    5. Otherwise: ``pending``.
+
+    A revert, a rescan after an external edit, an unstage and an identity change therefore
+    re-open a file with no writer. Callers restrict the domain to present files.
+    """
+    tags = get_tags(conn, file_id)
+    if _staged_alters(get_staged_tag(conn, file_id), tags, axis_.fields):
+        return "staged"
+    row = axis.get_outcome(conn, axis_, file_id)
+    if row is not None and row.status == "manual":
+        return "manual"
+    identity = axis.identity_of(axis_, tags)
+    if identity is None:
+        return "no_identity"
+    if row is not None and _outcome_holds(axis_, row, identity, tags):
+        return row.status
+    return "pending"
 
 
-def set_year_status(  # noqa: PLR0913 - cohesive keyword-only status payload
+def present_file_ids(conn: sqlite3.Connection) -> list[int]:
+    """Return the id of every file the last scan found on disk, in ascending id order."""
+    cursor = conn.execute("SELECT id FROM files WHERE is_missing = 0 ORDER BY id")
+    return [db.as_int(row[0]) for row in cursor.fetchall()]
+
+
+def status_counts(conn: sqlite3.Connection, axis_: axis.Axis) -> dict[str, int]:
+    """Tally :func:`derived_status` over every present file for the tag *axis_*.
+
+    Every workflow-status key is present (zero-filled), and the counts sum to the present-file
+    count, because a missing file has no axis status.
+    """
+    counts = dict.fromkeys(sorted(axis_.workflow_statuses), 0)
+    for file_id in present_file_ids(conn):
+        counts[derived_status(conn, axis_, file_id)] += 1
+    return counts
+
+
+def pending_file_ids(
     conn: sqlite3.Connection,
+    axis_: axis.Axis,
+    file_ids: list[int],
+) -> list[int]:
+    """Return the present files of *file_ids* that derive ``pending`` on *axis_*, in id order.
+
+    The one selection every resolver draws from, and its recount of what is left.
+    """
+    missing = missing_file_ids(conn)
+    return [
+        file_id
+        for file_id in sorted(file_ids)
+        if file_id not in missing and derived_status(conn, axis_, file_id) == "pending"
+    ]
+
+
+def record_outcome(
+    conn: sqlite3.Connection,
+    axis_: axis.Axis,
     *,
     file_id: int,
     status: str,
-    source_artist: str | None,
-    source_album: str | None,
     now: str,
 ) -> None:
-    """Insert or replace *file_id*'s terminal year decision.
+    """Write a resolver outcome snapshotting the tags the file holds once its stage commits.
 
-    ``source_artist``/``source_album`` record the resolved identity
-    (``albumartist``-else-``artist`` + ``album``) the decision was computed against, so a
-    later tag change can mark a ``'no_match'`` stale and re-processable.
+    Those are the staged target when one is staged, else the current tags.
     """
-    axis.set_status(
-        conn,
-        axis.YEAR_AXIS,
-        file_id=file_id,
-        status=status,
-        source_primary=source_artist,
-        source_secondary=source_album,
-        now=now,
-    )
-
-
-def delete_year_status(conn: sqlite3.Connection, file_id: int) -> None:
-    """Remove *file_id*'s terminal year decision (no-op if none)."""
-    axis.delete_status(conn, axis.YEAR_AXIS, file_id)
+    staged = get_staged_tag(conn, file_id)
+    tags = staged.managed_tags if staged is not None else get_tags(conn, file_id)
+    axis.put_outcome(conn, axis_, file_id=file_id, status=status, tags=tags, now=now)
 
 
 # --- file_mismatch_status (per-file mismatch dispositions; mismatch-axis twin) --------
@@ -1522,20 +1308,6 @@ def load_tag_values(
     return result
 
 
-def files_by_tag_value(conn: sqlite3.Connection, name: str, value: str) -> list[int]:
-    """Return file ids carrying *value* under the *name* tag, in ascending id order."""
-    cursor = conn.execute(
-        """
-        SELECT DISTINCT file_id
-        FROM file_tags
-        WHERE name = ? AND value = ?
-        ORDER BY file_id
-        """,
-        (name, value),
-    )
-    return [db.as_int(row[0]) for row in cursor.fetchall()]
-
-
 def missing_file_ids(conn: sqlite3.Connection) -> set[int]:
     """Return the ids of every file the last scan flagged missing from disk."""
     cursor = conn.execute("SELECT id FROM files WHERE is_missing = 1")
@@ -1545,25 +1317,30 @@ def missing_file_ids(conn: sqlite3.Connection) -> set[int]:
 def files_in_scope(
     conn: sqlite3.Connection,
     *,
-    artist: str | None = None,
+    value_fields: tuple[str, ...] = (),
+    value: str | None = None,
     album: str | None = None,
     file_ids: list[int] | None = None,
 ) -> list[int]:
     """Return the file ids in scope, in ascending id order.
 
-    Precedence mirrors the ``resolve_genres`` scope rules:
+    * *file_ids* given: those ids. An unknown id raises :class:`ValueError` naming it, so a
+      typo is never a silent no-op. An empty list returns ``[]``.
+    * else *value* given: files carrying *value* exactly in any of *value_fields*, narrowed to
+      files whose ``album`` equals *album* when that is given too.
+    * else: every tracked file.
 
-    * *file_ids* given → those ids, and an unknown id raises :class:`ValueError` so a typo is
-      never a silent no-op (an empty list returns ``[]``);
-    * else *artist* given → files whose ``artist`` tag equals it, narrowed by *album*
-      when given (both via ``file_tags`` joins on ``idx_file_tags_name_value``);
-    * else → every tracked file.
+    *album* without *value* (and no *file_ids*) raises :class:`ValueError`, since it only narrows
+    a value scope.
     """
     if file_ids is not None:
         require_known_file_ids(conn, file_ids)
         return _files_in_scope_by_ids(conn, file_ids)
-    if artist is not None:
-        return _files_in_scope_by_tags(conn, artist=artist, album=album)
+    if album is not None and value is None:
+        message = "album narrows a value scope, so it needs value"
+        raise ValueError(message)
+    if value is not None:
+        return _files_in_scope_by_value(conn, value_fields, value=value, album=album)
     cursor = conn.execute("SELECT id FROM files ORDER BY id")
     return [db.as_int(row[0]) for row in cursor.fetchall()]
 
@@ -1596,33 +1373,31 @@ def _files_in_scope_by_ids(conn: sqlite3.Connection, file_ids: list[int]) -> lis
     return [db.as_int(row[0]) for row in cursor.fetchall()]
 
 
-def _files_in_scope_by_tags(
+def _files_in_scope_by_value(
     conn: sqlite3.Connection,
+    value_fields: tuple[str, ...],
     *,
-    artist: str,
+    value: str,
     album: str | None,
 ) -> list[int]:
-    """Return file ids matching the ``artist`` tag (and ``album`` if given), id order."""
-    if album is None:
-        cursor = conn.execute(
-            """
-            SELECT DISTINCT a.file_id
-            FROM file_tags a
-            WHERE a.name = 'artist' AND a.value = ?
-            ORDER BY a.file_id
-            """,
-            (artist,),
-        )
-        return [db.as_int(row[0]) for row in cursor.fetchall()]
+    """Return file ids carrying *value* in any of *value_fields* (and *album*, if given)."""
+    if not value_fields:
+        message = "a value scope needs at least one tag to match"
+        raise ValueError(message)
+    placeholders = ",".join("?" for _ in value_fields)
+    album_clause = (
+        ""
+        if album is None
+        else "AND EXISTS (SELECT 1 FROM file_tags b "
+        "WHERE b.file_id = a.file_id AND b.name = 'album' AND b.value = ?)"
+    )
+    params: tuple[str, ...] = (*value_fields, value)
+    if album is not None:
+        params = (*params, album)
     cursor = conn.execute(
-        """
-        SELECT DISTINCT a.file_id
-        FROM file_tags a
-        JOIN file_tags b ON b.file_id = a.file_id
-        WHERE a.name = 'artist' AND a.value = ?
-          AND b.name = 'album' AND b.value = ?
-        ORDER BY a.file_id
-        """,
-        (artist, album),
+        "SELECT DISTINCT a.file_id FROM file_tags a "  # noqa: S608 - '?' markers + fixed clause
+        f"WHERE a.name IN ({placeholders}) AND a.value = ? {album_clause} "
+        "ORDER BY a.file_id",
+        params,
     )
     return [db.as_int(row[0]) for row in cursor.fetchall()]

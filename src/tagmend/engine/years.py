@@ -1,29 +1,24 @@
 """Album original-year fill: group → look up MusicBrainz → blank-fill ``originaldate``.
 
-The year-axis orchestrator (a near-clone of :mod:`tagmend.engine.genres`'s identity/status
-model, borrowing :mod:`tagmend.engine.artists`'s dry-run / value-scoped-exclusion / result
-ergonomics). It ties the read path, the cached MusicBrainz client, and the revertible
-staging engine together: it groups in-scope files by ``(albumartist-else-artist, album)``
-— the SAME identity genre uses — looks up each group's original first-release year via
-MusicBrainz, and **blank-fills** ``originaldate`` only on files whose ``originaldate`` is
-currently empty (never overwriting an existing value, and **never** touching ``date``).
+The year-axis orchestrator, a near-clone of :mod:`tagmend.engine.genres`. It selects the
+in-scope files that derive ``pending`` on :data:`tagmend.engine.axis.YEAR_AXIS`, groups the
+blank ones by ``(albumartist-else-artist, album)`` (the SAME identity genre uses), looks up each
+group's original first-release year via MusicBrainz, and **blank-fills** ``originaldate``.
 
 Design notes (the spec):
 
-* **Additive blank-fill only:** ``date`` (the reissue year) is never written; a file that
-  already carries ``originaldate`` is skipped (``skipped_present``). On a correctly-tagged
-  library this is a no-op.
+* **Additive blank-fill only:** ``date`` (the reissue year) is never written, and a present
+  ``originaldate`` is never overwritten. A selected file that already carries one records
+  ``done`` with no lookup, so it never blocks the blank files behind it in file-id order.
 * **No accidental deletion (P0):** the resolver stages only ``originaldate``, the one field
   it decides, and :func:`tagmend.engine.staging._stage_one` merges it onto the tags read from
   disk, so the commit's delete-on-absent write can never drop ``artist``/``genre``/etc.
-* **``no_match`` stores the RESOLVED identity** (``albumartist``-else-``artist`` + ``album``)
-  — exactly as :func:`tagmend.engine.genres._process_one_group` — so a later change to that
-  resolved artist OR the album makes the decision stale and re-processable.
-* **"Done" is derived**, never stored — re-running after commit is a no-op (the files now
-  have ``originaldate`` → ``skipped_present``).
+* **Outcome rows:** a filled file records ``done`` snapshotting the staged target, a miss
+  records ``no_match``, and a transient MusicBrainz error writes nothing. A later change to the
+  resolved artist, the album or ``originaldate`` makes the row stale and the file re-opens.
 
 Like the rest of the conn-owning layer, the public functions here own their connection and
-commit; the building blocks in :mod:`tagmend.engine.store` never commit.
+commit. The building blocks in :mod:`tagmend.engine.store` never commit.
 """
 
 from __future__ import annotations
@@ -31,9 +26,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-from tagmend.engine import axis, clock, db, lookup_clients, schema, staging, store
+from tagmend.engine import axis, axis_status, clock, db, lookup_clients, schema, staging, store
 from tagmend.engine.musicbrainz import MusicBrainzClient, MusicBrainzError
-from tagmend.engine.validation import check_limit, require_choice
+from tagmend.engine.validation import check_limit
 from tagmend.log import get_logger
 
 if TYPE_CHECKING:
@@ -45,11 +40,7 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 # The single managed field the year axis fills (shared with the status derivation).
-_YEAR_FIELD = "originaldate"
-
-# The two states ``set_year_status`` is allowed to drive: ``manual`` writes a sticky
-# exclusion row; ``pending`` deletes it (re-queue). ``no_match`` is engine-owned.
-_USER_STATUSES = frozenset({"manual", "pending"})
+_YEAR_FIELD = axis.YEAR_AXIS.fields[0]
 
 
 # --- result types --------------------------------------------------------------------
@@ -59,16 +50,9 @@ _USER_STATUSES = frozenset({"manual", "pending"})
 class ResolveYearsResult:
     """Immutable summary of one :func:`resolve_years` call, JSON-ready for the MCP tool."""
 
-    processed: int
-    processed_unit: str
+    settled: int
     staged_files: int
     no_match: int
-    skipped_present: int
-    skipped_no_album: int
-    skipped_no_identity: int
-    skipped_manual: int
-    skipped_no_match: int
-    skipped_missing: int
     pending_remaining: int
     more: bool
     mappings: list[dict[str, str | None]]
@@ -79,16 +63,9 @@ class ResolveYearsResult:
     def to_dict(self) -> dict[str, object]:
         """JSON-serializable form for the MCP tool."""
         return {
-            "processed": self.processed,
-            "processed_unit": self.processed_unit,
+            "settled": self.settled,
             "staged_files": self.staged_files,
             "no_match": self.no_match,
-            "skipped_present": self.skipped_present,
-            "skipped_no_album": self.skipped_no_album,
-            "skipped_no_identity": self.skipped_no_identity,
-            "skipped_manual": self.skipped_manual,
-            "skipped_no_match": self.skipped_no_match,
-            "skipped_missing": self.skipped_missing,
             "pending_remaining": self.pending_remaining,
             "more": self.more,
             "mappings": [dict(m) for m in self.mappings],
@@ -102,26 +79,13 @@ class ResolveYearsResult:
 class _Tally:
     """Mutable accumulator for one ``resolve_years`` run, frozen into the result at end."""
 
+    settled: int = 0
     staged_files: int = 0
     no_match: int = 0
-    skipped_present: int = 0
-    skipped_no_album: int = 0
-    skipped_no_identity: int = 0
-    skipped_manual: int = 0
-    skipped_no_match: int = 0
-    skipped_missing: int = 0
     # identity -> original_date (one mapping per resolved album group).
     mappings: dict[tuple[str | None, str | None], str] = field(default_factory=dict)
     # One item per album group whose MusicBrainz lookup failed, so an outage is visible.
     error_items: list[dict[str, str]] = field(default_factory=list)
-
-
-@dataclass(frozen=True, slots=True)
-class _Candidate:
-    """A processable file plus the album identity it will be looked up against."""
-
-    file_id: int
-    identity: axis.LookupIdentity
 
 
 # --- public entry --------------------------------------------------------------------
@@ -130,35 +94,36 @@ class _Candidate:
 def resolve_years(  # noqa: PLR0913 - cohesive keyword-only scope + injection params
     settings: Settings,
     *,
-    album: str | None = None,
+    value: str | None = None,
     file_ids: list[int] | None = None,
     limit: int | None = None,
     dry_run: bool = False,
     client: MBReleaseGroupSource | None = None,
 ) -> ResolveYearsResult:
-    """Blank-fill ``originaldate`` from MusicBrainz for in-scope files (writes no disk).
+    """Blank-fill ``originaldate`` from MusicBrainz for in-scope ``pending`` files (writes no disk).
 
-    Selects the in-scope files that need filling (a blank ``originaldate``, an ``album`` and
-    artist, not sticky ``manual``, no non-stale ``no_match``), groups them by
-    ``(albumartist-else-artist, album)``, and per group looks up the original first-release
-    year on MusicBrainz: on a hit it stages ``originaldate`` (``origin='auto'``, only that
-    field) on the group's blank files; on a miss it records a ``no_match`` against the
-    resolved identity. ``date`` is never written. A transient MusicBrainz error leaves the
-    group pending (no status row) without aborting the call.
+    Scope is *file_ids* when given, else every file whose ``album`` equals *value*, else the
+    whole library. The selection is the first *limit* (default ``year_stage_limit``) present
+    files in scope that derive ``pending``. A selected file that already carries
+    ``originaldate`` records ``done`` with no lookup. The blank ones are grouped by
+    ``(albumartist-else-artist, album)``, and per group MusicBrainz is asked for the original
+    first-release year. A hit stages ``originaldate`` (``origin='auto'``, only that field) and
+    records ``done``. A miss records ``no_match`` against the resolved identity. ``date`` is
+    never written. A transient MusicBrainz error leaves the group ``pending`` without aborting
+    the call.
 
-    *limit* caps the number of groups processed per call; the remainder is reported via
-    ``pending_remaining`` / ``more``. A file the last scan flagged missing is counted under
-    ``skipped_missing``. *dry_run* returns the proposed mappings + would-stage count and
-    stages nothing. Lookups still run. A cached answer costs nothing and a cache miss makes a
+    *dry_run* returns the proposed mappings and the would-settle and would-stage counts and
+    writes nothing. Lookups still run. A cached answer costs nothing and a cache miss makes a
     live request. A dry run skips the empty-staging precondition. A non-dry-run raises
     :class:`ValueError` if anything is already staged, and any run raises it for a negative
-    *limit*. *client* lets callers inject an
+    *limit* or an unknown file id. *client* lets callers inject an
     :class:`tagmend.engine.musicbrainz.MBReleaseGroupSource`, such as a fake in tests. When
     *client* is ``None`` a real :class:`MusicBrainzClient` is built. This function owns its
     connection, and ``stage_tags`` opens its own.
     """
     check_limit(limit)
     effective_limit = limit if limit is not None else settings.year_stage_limit
+    tally = _Tally()
 
     connection = db.connect(settings.db_path)
     try:
@@ -168,125 +133,67 @@ def resolve_years(  # noqa: PLR0913 - cohesive keyword-only scope + injection pa
             message = "commit or unstage pending changes first"
             raise ValueError(message)
 
-        scoped_ids = _candidate_scope(connection, album=album, file_ids=file_ids)
-
-        tally = _Tally()
-        missing = store.missing_file_ids(connection)
-        candidate_ids = [fid for fid in scoped_ids if fid not in missing]
-        tally.skipped_missing = len(scoped_ids) - len(candidate_ids)
-        processable = _select(connection, candidate_ids, tally)
-        groups = _group_by_identity(processable)
-
-        group_items = list(groups.items())
-        to_process = group_items[:effective_limit]
-        pending_remaining = len(group_items) - len(to_process)
-
-        if to_process:
-            _process_groups(settings, connection, to_process, client, tally, dry_run=dry_run)
+        scoped_ids = store.files_in_scope(
+            connection,
+            value_fields=axis.YEAR_AXIS.scope_fields,
+            value=value,
+            file_ids=file_ids,
+        )
+        pending = store.pending_file_ids(connection, axis.YEAR_AXIS, scoped_ids)
+        blanks = _settle_present(connection, pending[:effective_limit], tally, dry_run=dry_run)
+        groups = _group_by_identity(connection, blanks)
+        if groups:
+            _process_groups(settings, connection, groups, client, tally, dry_run=dry_run)
+        pending_remaining = len(store.pending_file_ids(connection, axis.YEAR_AXIS, scoped_ids))
     finally:
         connection.close()
 
-    return _build_result(
-        tally,
-        processed=len(to_process),
-        pending_remaining=pending_remaining,
-        dry_run=dry_run,
-    )
+    return _build_result(tally, pending_remaining=pending_remaining, dry_run=dry_run)
 
 
 # --- selection -----------------------------------------------------------------------
 
 
-def _candidate_scope(
+def _settle_present(
     conn: sqlite3.Connection,
-    *,
-    album: str | None,
-    file_ids: list[int] | None,
-) -> list[int]:
-    """Resolve the candidate file ids for a ``resolve_years`` run, in ascending id order.
-
-    Precedence: *file_ids* (when given) win; else *album* narrows to every file carrying it
-    as its ``album`` tag (``store.files_in_scope`` only honors ``album`` alongside an
-    ``artist``, so the album-only scope is resolved explicitly here); else every tracked
-    file. This is what makes ``resolve_years(album=…)`` actually scope to that album rather
-    than fan MusicBrainz lookups across the whole library.
-    """
-    if file_ids is None and album is not None:
-        return store.files_by_tag_value(conn, "album", album)
-    return store.files_in_scope(conn, file_ids=file_ids)
-
-
-def _select(
-    conn: sqlite3.Connection,
-    candidate_ids: list[int],
+    selected: list[int],
     tally: _Tally,
-) -> list[_Candidate]:
-    """Classify each candidate into a bucket; return only the processable ones.
+    *,
+    dry_run: bool,
+) -> list[int]:
+    """Record ``done`` for each selected file already carrying a year. Return the blank ones.
 
-    Mutates *tally* with the skip counts. A candidate is processable when it has an artist
-    and an album, its ``originaldate`` is currently blank, it is not already done
-    (staged / committed ``originaldate`` revision), and it has no blocking year decision.
+    A present value is never overwritten, so its file needs no lookup, and without a row it
+    would stay ``pending`` at the front of the file-id order forever.
     """
-    year_fields = axis.YEAR_AXIS.fields
-    processable: list[_Candidate] = []
-    for fid in candidate_ids:
-        tags = store.get_tags(conn, fid)
-        identity = axis.lookup_identity(tags)
+    blanks: list[int] = []
+    present: list[int] = []
+    for fid in selected:
+        values = store.get_tags(conn, fid).get(_YEAR_FIELD, [])
+        if any(value.strip() for value in values):
+            present.append(fid)
+        else:
+            blanks.append(fid)
 
-        if identity.artist is None:
-            tally.skipped_no_identity += 1
-            continue
-        if identity.album is None:
-            tally.skipped_no_album += 1
-            continue
-        if tags.get(_YEAR_FIELD):
-            tally.skipped_present += 1
-            continue
-
-        if store.has_staged_change_for(conn, fid, year_fields) or store.has_auto_change_for(
-            conn,
-            fid,
-            year_fields,
-        ):
-            # Already filled by us (staged or committed) — treat as present/done.
-            tally.skipped_present += 1
-            continue
-
-        decision = store.get_year_status(conn, fid)
-        if decision is not None and _decision_blocks(decision, identity):
-            # A stale no_match does not block and falls through to be reprocessed.
-            if decision.status == "manual":
-                tally.skipped_manual += 1
-            else:  # a non-stale 'no_match'
-                tally.skipped_no_match += 1
-            continue
-
-        processable.append(_Candidate(file_id=fid, identity=identity))
-    return processable
+    tally.settled += len(present)
+    if dry_run or not present:
+        return blanks
+    now = clock.utc_now()
+    for fid in present:
+        store.record_outcome(conn, axis.YEAR_AXIS, file_id=fid, status="done", now=now)
+    conn.commit()
+    return blanks
 
 
-def _decision_blocks(decision: store.YearStatusRow, identity: axis.LookupIdentity) -> bool:
-    """Whether a stored year decision still blocks processing for the current identity.
-
-    The shared year staleness/sticky rule (``manual`` always blocks; ``no_match`` blocks
-    only while NOT stale) lives on the axis, so this skip path and the user-facing
-    :func:`tagmend.engine.store.derived_status` on ``axis.YEAR_AXIS`` can never drift.
-    """
-    return axis.YEAR_AXIS.decision_blocks(
-        axis.StatusRow(
-            status=decision.status,
-            source_primary=decision.source_artist,
-            source_secondary=decision.source_album,
-        ),
-        axis.Identity(primary=identity.artist, secondary=identity.album),
-    )
-
-
-def _group_by_identity(candidates: list[_Candidate]) -> dict[axis.LookupIdentity, list[int]]:
+def _group_by_identity(
+    conn: sqlite3.Connection,
+    file_ids: list[int],
+) -> dict[axis.LookupIdentity, list[int]]:
     """Group file ids by their album identity, preserving first-seen group order."""
     groups: dict[axis.LookupIdentity, list[int]] = {}
-    for candidate in candidates:
-        groups.setdefault(candidate.identity, []).append(candidate.file_id)
+    for fid in file_ids:
+        identity = axis.lookup_identity(store.get_tags(conn, fid))
+        groups.setdefault(identity, []).append(fid)
     return groups
 
 
@@ -296,18 +203,18 @@ def _group_by_identity(candidates: list[_Candidate]) -> dict[axis.LookupIdentity
 def _process_groups(  # noqa: PLR0913 - cohesive orchestration inputs
     settings: Settings,
     conn: sqlite3.Connection,
-    groups: list[tuple[axis.LookupIdentity, list[int]]],
+    groups: dict[axis.LookupIdentity, list[int]],
     client: MBReleaseGroupSource | None,
     tally: _Tally,
     *,
     dry_run: bool,
 ) -> None:
-    """Resolve each group via *client* (built if None) and stage / mark its files."""
+    """Resolve each group via *client* (built if None) and settle its files."""
     with lookup_clients.injected_or_owned(
         client,
         lambda: MusicBrainzClient.from_settings(settings, conn),
     ) as source:
-        for identity, fids in groups:
+        for identity, fids in groups.items():
             _process_one_group(settings, conn, identity, fids, source, tally, dry_run=dry_run)
 
 
@@ -323,10 +230,10 @@ def _process_one_group(  # noqa: PLR0913 - cohesive per-group inputs
 ) -> None:
     """Resolve one ``(artist, album)`` group and blank-fill / mark its files accordingly.
 
-    A transient :class:`MusicBrainzError` leaves the group's files pending (no status row),
-    records one error item, and returns without aborting the wider call.
+    A transient :class:`MusicBrainzError` writes nothing, records one error item, and returns
+    without aborting the wider call, so the group's files stay ``pending``.
     """
-    # ``_select`` guarantees non-None artist and album for every processable candidate.
+    # A pending file has a year identity, which needs an artist and an album.
     lookup_artist = identity.artist
     lookup_album = identity.album
     assert lookup_artist is not None  # noqa: S101 - selection invariant
@@ -346,30 +253,29 @@ def _process_one_group(  # noqa: PLR0913 - cohesive per-group inputs
         )
         return
 
-    if resolved is not None:
+    tally.settled += len(file_ids)
+    status = "no_match"
+    if resolved is None:
+        tally.no_match += len(file_ids)
+    else:
+        status = "done"
         tally.mappings[(identity.artist, identity.album)] = resolved.original_date
-        for fid in file_ids:
-            if dry_run or _stage_resolved(settings, fid, resolved.original_date):
-                tally.staged_files += 1
-            else:
-                tally.skipped_present += 1
-        return
 
-    # The lookup already happened, so a preview can and must report the miss; only the
-    # sticky status row is withheld until the real run.
-    tally.no_match += len(file_ids)
+    # The lookup already happened, so a preview can and must report the outcome. Only the
+    # stage and the status rows are withheld until the real run.
     if dry_run:
+        if resolved is not None:
+            tally.staged_files += len(file_ids)
         return
+    # Every stage runs before any row write, because stage_tags needs the write lock this
+    # connection would otherwise hold.
+    if resolved is not None:
+        for fid in file_ids:
+            if _stage_resolved(settings, fid, resolved.original_date):
+                tally.staged_files += 1
     now = clock.utc_now()
     for fid in file_ids:
-        store.set_year_status(
-            conn,
-            file_id=fid,
-            status="no_match",
-            source_artist=identity.artist,
-            source_album=identity.album,
-            now=now,
-        )
+        store.record_outcome(conn, axis.YEAR_AXIS, file_id=fid, status=status, now=now)
     conn.commit()
 
 
@@ -398,7 +304,6 @@ def _stage_resolved(settings: Settings, file_id: int, original_date: str) -> boo
 def _build_result(
     tally: _Tally,
     *,
-    processed: int,
     pending_remaining: int,
     dry_run: bool,
 ) -> ResolveYearsResult:
@@ -407,65 +312,34 @@ def _build_result(
         {"artist": artist, "album": album, "original_date": date}
         for (artist, album), date in tally.mappings.items()
     ]
-    more = pending_remaining > 0
-    summary = _summarize(
-        tally,
-        processed=processed,
-        pending_remaining=pending_remaining,
-        dry_run=dry_run,
-    )
     return ResolveYearsResult(
-        processed=processed,
-        processed_unit="album_groups",
+        settled=tally.settled,
         staged_files=tally.staged_files,
         no_match=tally.no_match,
-        skipped_present=tally.skipped_present,
-        skipped_no_album=tally.skipped_no_album,
-        skipped_no_identity=tally.skipped_no_identity,
-        skipped_manual=tally.skipped_manual,
-        skipped_no_match=tally.skipped_no_match,
-        skipped_missing=tally.skipped_missing,
         pending_remaining=pending_remaining,
-        more=more,
+        more=not dry_run and tally.settled > 0 and pending_remaining > 0,
         mappings=mappings,
-        summary=summary,
+        summary=_summarize(tally, pending_remaining=pending_remaining, dry_run=dry_run),
         errors=len(tally.error_items),
         error_items=list(tally.error_items),
     )
 
 
-def _summarize(
-    tally: _Tally,
-    *,
-    processed: int,
-    pending_remaining: int,
-    dry_run: bool,
-) -> str:
-    """Build a short, plain human summary of what was and was not processed.
+def _summarize(tally: _Tally, *, pending_remaining: int, dry_run: bool) -> str:
+    """Build a short, plain human summary of what settled and what is left.
 
-    Every count carries its unit because the run mixes two: ``processed`` counts album
-    groups, every other count counts files. A dry run records neither a stage nor a
-    ``no_match``, so its remainder is not resumable and is worded accordingly.
+    A dry run records nothing, so its remainder is not resumable and is worded accordingly.
     """
     parts = [
-        f"Processed {processed} album group(s): staged {tally.staged_files} file(s), "
-        f"no_match {tally.no_match} file(s).",
-        f"Skipped {tally.skipped_present} file(s) present, "
-        f"{tally.skipped_no_album} file(s) no_album, "
-        f"{tally.skipped_no_identity} file(s) no_identity, "
-        f"{tally.skipped_manual} file(s) manual, "
-        f"{tally.skipped_no_match} file(s) no_match held, "
-        f"{tally.skipped_missing} file(s) missing.",
+        f"Settled {tally.settled} file(s): staged {tally.staged_files}, no_match {tally.no_match}.",
     ]
-    if pending_remaining > 0 and dry_run:
+    if dry_run:
         parts.append(
-            f"Processed the first {processed} of {processed + pending_remaining} album "
-            f"group(s) in scope. A dry run records nothing, so an identical call "
-            f"re-processes the same groups. Raise limit above {processed}, or scope with "
-            f"album= / file_ids=, to reach the remaining {pending_remaining} group(s).",
+            f"A dry run records nothing, so {pending_remaining} file(s) in scope stay pending "
+            f"and an identical call previews the same files.",
         )
     elif pending_remaining > 0:
-        parts.append(f"{pending_remaining} group(s) still pending — call again to continue.")
+        parts.append(f"{pending_remaining} file(s) still pending. Call again to continue.")
     errors = len(tally.error_items)
     if errors > 0:
         parts.append(f"{errors} album group(s) errored and stay pending. Re-run to retry.")
@@ -475,24 +349,6 @@ def _summarize(
 # --- status tools --------------------------------------------------------------------
 
 
-def _year_scope(
-    conn: sqlite3.Connection,
-    *,
-    file_ids: list[int] | None,
-    value: str | None,
-) -> list[int]:
-    """Resolve the in-scope file ids for the year status tools, in ascending id order.
-
-    *file_ids* (when given) win; otherwise *value* matches every file carrying it as its
-    ``album`` tag. With neither given the scope is empty (the tools require a target).
-    """
-    if file_ids is not None:
-        return store.files_in_scope(conn, file_ids=file_ids)
-    if value is None:
-        return []
-    return store.files_by_tag_value(conn, "album", value)
-
-
 def set_year_status(
     settings: Settings,
     *,
@@ -500,40 +356,20 @@ def set_year_status(
     value: str | None = None,
     status: str,
 ) -> int:
-    """Set ``manual`` (exclude) or ``pending`` (re-queue) for every file in scope.
+    """Record ``manual`` on the year axis for every file in scope.
 
     Scope is *file_ids* when given, else every file carrying *value* as its ``album`` tag.
-    ``manual`` writes a sticky row (recording the file's resolved identity for audit) so
-    :func:`resolve_years` always skips it; ``pending`` deletes any row, re-queuing the
-    file. Returns the number of files affected. Raises :class:`ValueError` for an unknown
-    *status*. Owns its transaction.
+    With neither the call changes nothing and returns 0. A ``manual`` row is sticky until
+    :func:`reset_year_status`. Returns the number of files affected. Raises
+    :class:`ValueError` for any *status* other than ``manual`` or an unknown file id.
     """
-    require_choice("status", status, _USER_STATUSES)
-
-    connection = db.connect(settings.db_path)
-    try:
-        schema.apply_schema(connection)
-        scoped = _year_scope(connection, file_ids=file_ids, value=value)
-        now = clock.utc_now()
-        for fid in scoped:
-            if status == "manual":
-                identity = axis.lookup_identity(store.get_tags(connection, fid))
-                store.set_year_status(
-                    connection,
-                    file_id=fid,
-                    status="manual",
-                    source_artist=identity.artist,
-                    source_album=identity.album,
-                    now=now,
-                )
-            else:
-                store.delete_year_status(connection, fid)
-        connection.commit()
-    finally:
-        connection.close()
-
-    logger.info("set year status=%s for %d file(s)", status, len(scoped))
-    return len(scoped)
+    return axis_status.set_manual_status(
+        settings,
+        axis.YEAR_AXIS,
+        file_ids=file_ids,
+        value=value,
+        status=status,
+    )
 
 
 def reset_year_status(
@@ -542,20 +378,13 @@ def reset_year_status(
     file_ids: list[int] | None = None,
     value: str | None = None,
 ) -> int:
-    """Delete the year status row for every file in scope (back to ``pending``).
+    """Delete the year status row of every file in scope, the one hand-back of ``manual``.
 
-    Same ``album``-value scoping as :func:`set_year_status`. Returns the number of files
-    affected. Owns its transaction.
+    Same scoping as :func:`set_year_status`. Returns the number of files affected.
     """
-    connection = db.connect(settings.db_path)
-    try:
-        schema.apply_schema(connection)
-        scoped = _year_scope(connection, file_ids=file_ids, value=value)
-        for fid in scoped:
-            store.delete_year_status(connection, fid)
-        connection.commit()
-    finally:
-        connection.close()
-
-    logger.info("reset year status for %d file(s)", len(scoped))
-    return len(scoped)
+    return axis_status.reset_status(
+        settings,
+        axis.YEAR_AXIS,
+        file_ids=file_ids,
+        value=value,
+    )

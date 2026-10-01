@@ -333,24 +333,24 @@ def commit_tags(message: str | None = None, path: str | None = None) -> dict[str
 @mcp.tool()
 @_error_envelope
 def reopen_axes(commit_id: int) -> dict[str, object]:
-    """Re-open the derived axes after a manual identity fix (call this AFTER committing one).
+    """Re-open the genre, artist and year axes after a manual identity fix (call it AFTER one).
 
-    The post-fix coherence step for the mismatch-fix flow. When you correct a file's identity
-    (``albumartist``/``artist``/``album``…) and commit it, that file's previously auto-resolved
-    genre and original year now describe the OLD identity, and any sticky artist exclusion was
-    tied to the old name. For every file the given commit actually changed, this voids the
-    stale auto-resolved ``genre``/``originaldate`` (so ``resolve_genres``/``resolve_years`` will
-    re-pend them) and clears any ``file_artist_status`` row — without mutating history.
+    The spine is ``stage_tags_batch`` -> ``diff_tags`` -> ``commit_tags`` -> ``reopen_axes``.
+    For every file the given commit changed, this deletes the ``done`` and ``no_match`` status
+    rows on all three axes, so ``resolve_genres``, ``resolve_artists`` and ``resolve_years``
+    re-derive them against the fixed tags. A ``manual`` row is kept: ``reset_<axis>_status`` is
+    its only hand-back. Call ``reset_artist_status`` next when a fixed name should be
+    re-checked by the normaliser. History is never touched.
 
     Call it with a ``manual`` (or ``revert``) commit id from ``commit_tags`` / ``list_commits``.
-    A commit holding any auto-resolved revision is refused, whatever its own origin, because
-    voiding fresh auto work is a foot-gun. A commit that changed no tags is refused too. A later
-    fresh auto commit reads ``done`` again.
+    A commit holding any auto-resolved revision is refused, whatever its own origin, since
+    re-opening fresh auto work would only repeat it. A commit that changed no tags is refused
+    too.
 
     Returns:
-        ``{"ok": True, "commit_id": ..., "files": <count>, "artist_status_cleared": <count>}``,
-        or ``{"ok": False, "error": ...}`` if the commit id is unknown, holds an auto-resolved
-        revision, or changed no tags.
+        ``{"ok": True, "commit_id": ..., "files": <count>, "genre": {outcomes_reopened,
+        manual_kept}, "artist": {...}, "year": {...}}``, or ``{"ok": False, "error": ...}`` if
+        the commit id is unknown, holds an auto-resolved revision, or changed no tags.
     """
     result = staging.reopen_axes(load_settings(), commit_id=commit_id)
     return {"ok": True, **result.to_dict()}
@@ -363,7 +363,8 @@ def list_files(  # noqa: PLR0913 - cohesive MCP discovery filters
     limit: int | None = None,
     genre_status: Literal["pending", "no_identity", "no_match", "manual", "staged", "done"]
     | None = None,
-    artist_status: Literal["pending", "no_identity", "manual", "staged", "done"] | None = None,
+    artist_status: Literal["pending", "no_identity", "no_match", "manual", "staged", "done"]
+    | None = None,
     year_status: Literal["pending", "no_identity", "no_match", "manual", "staged", "done"]
     | None = None,
     mismatch_status: Literal["pending", "legit_ignore", "misfiled_deferred"] | None = None,
@@ -376,14 +377,15 @@ def list_files(  # noqa: PLR0913 - cohesive MCP discovery filters
     ``scan_library`` first to populate the snapshot.
 
     ``genre_status="no_match"`` is the **fix-by-hand worklist**: files Last.fm had nothing
-    for. Each carries ``genre_source_artist``/``genre_source_album`` — the identity the
-    lookup used — so a misspelled artist/album is visible next to the current tags (fix
-    the tags, rescan, and ``resolve_genres`` retries automatically). ``manual`` lists the
-    sticky exclusions (``set_genre_status``). A stored status is reported even if the
-    file's identity changed since (compare the source fields to spot staleness).
-    ``no_identity`` is the separate worklist of files that carry neither ``artist`` nor
-    ``albumartist`` (whitespace-only counts as blank) — every resolver skips them, and they
-    are reported on the genre/artist/year axes alike (never ``pending``).
+    for. Each carries ``genre_source_artist``/``genre_source_album``, the identity the lookup
+    used, so a misspelled artist/album is visible next to the current tags. Fix the tags,
+    rescan, and the file reads ``pending`` again on its own. ``manual`` lists the sticky human
+    decisions (``set_genre_status`` or a committed hand edit of the field). A ``done`` or
+    ``no_match`` status counts only while the identity and the field values it was decided on
+    still match the file. ``no_identity`` lists the files an axis has nothing to look up for
+    (neither ``artist`` nor ``albumartist``, and on the year axis also no ``album``).
+    Whitespace-only counts as blank, and no resolver selects them. A genre, artist or year
+    filter never returns a missing file.
 
     Args:
         path: When given, only files at this folder or nested under it are returned.
@@ -394,10 +396,12 @@ def list_files(  # noqa: PLR0913 - cohesive MCP discovery filters
         genre_status: Return only files in this genre workflow state
             (``pending`` | ``no_identity`` | ``no_match`` | ``manual`` | ``staged`` | ``done``).
         artist_status: Return only files in this artist workflow state
-            (``pending`` | ``no_identity`` | ``manual`` | ``staged`` | ``done``). Combined with
-            ``genre_status``, a file must match BOTH. The axes are independent:
-            ``staged``/``done`` are field-aware (genre keys on ``genre``; artist on
-            ``artist``/``albumartist``; year on ``originaldate``).
+            (``pending`` | ``no_identity`` | ``no_match`` | ``manual`` | ``staged`` | ``done``).
+            ``no_match`` holds the files whose names were held for review (a ``feat`` credit,
+            no correction, a credit shrink, a name/id disagreement) or are multi-value.
+            Combined with ``genre_status``, a file must match BOTH. The axes are independent and
+            field-aware: genre keys on ``genre``, artist on the name, id and sort-name fields,
+            year on ``originaldate``.
         year_status: Return only files in this year workflow state
             (``pending`` | ``no_identity`` | ``no_match`` | ``manual`` | ``staged`` | ``done``).
             Combined with the other filters, a file must match ALL. ``year_source_artist`` /
@@ -838,7 +842,7 @@ def detect_album_gaps(
     folder with ``folder="<exact folder path>"``, then per source feed the proposals'
     ``{file_id, proposed}`` + ``note`` to ``stage_tags_batch`` (one call per source keeps the
     ``note`` accurate) → review ``diff_tags(path=<folder>)`` → ``commit_tags(path=<folder>)`` →
-    ``reopen_axes(commit_id)`` to re-open the filled files' derived genre/year axes.
+    ``reopen_axes(commit_id)`` to re-open the filled files' genre, artist and year outcomes.
     ``commit_tags(path=<folder>)`` and ``diff_tags(path=<folder>)`` cover that folder AND every
     folder nested under it. Run ``diff_tags(path=<folder>)`` first and ``unstage_tags`` any
     nested change you do not want in this commit.
@@ -996,51 +1000,55 @@ def get_commit(commit_id: int) -> dict[str, object]:
 @mcp.tool()
 @_error_envelope
 def resolve_genres(
-    artist: str | None = None,
+    value: str | None = None,
     album: str | None = None,
     file_ids: list[int] | None = None,
     limit: int | None = None,
     dry_run: bool = False,  # noqa: FBT001, FBT002 - MCP tool surface, not a Python API
 ) -> dict[str, object]:
-    """Look up Last.fm genres for in-scope files and stage the result (writes nothing to disk).
+    """Look up Last.fm genres for in-scope ``pending`` files and stage the result (no disk write).
 
-    For each in-scope file this looks up its artist (``albumartist`` when present, else
+    For each selected file this looks up its artist (``albumartist`` when present, else
     ``artist``) and optionally album on Last.fm, classifies the community tags against the
-    controlled genre vocabulary, and stages the resolved genres as an ``auto`` change
-    (replacing ONLY ``genre`` — other managed tags are preserved). Review with
-    ``diff_tags`` and apply with ``commit_tags``. ``revert_commit`` undoes the whole commit
-    and ``revert_tags`` undoes one file.
+    controlled genre vocabulary, and settles the file. Resolved genres equal to the current
+    ones record ``done``. Differing ones are staged as an ``auto`` change replacing ONLY
+    ``genre`` (other managed tags are preserved) and record ``done``. No usable genre records
+    ``no_match``. Review with ``diff_tags`` and apply with ``commit_tags``. ``revert_commit``
+    undoes the whole commit and ``revert_tags`` undoes one file.
 
-    A real run is refused while anything is staged, since staging would replace that pending
-    change. Commit or unstage it first. It deliberately **skips** files that are already done
-    (a committed ``auto`` genre revision), files marked ``no_match`` (unless the artist or
-    album tag has changed since), files marked ``manual``, files with no artist tag at all,
-    and files the last scan flagged missing. Files whose artist isn't on Last.fm (or yield no
-    usable genre) are recorded ``no_match`` and not re-tried until their tags change. A
-    transient Last.fm error leaves that artist pending, is counted in ``errors`` and itemized
-    in ``error_items`` (``{key, message}``, keyed by the looked-up artist), so a re-run
-    retries it.
+    Each file's status on this axis is ``pending``, ``staged``, ``done``, ``no_match``,
+    ``manual`` or ``no_identity``. A ``done`` or ``no_match`` counts only while the identity and
+    the field values it was decided on still match the file, so a revert, a rescan after an
+    outside edit or an identity fix re-opens the file on its own.
+
+    Only ``pending`` files are selected, so repeated ``limit``-capped calls terminate. A real
+    run is refused while anything is staged, since staging would replace that pending change.
+    A transient Last.fm error writes nothing, leaves that artist's files ``pending``, and is
+    counted in ``errors`` and itemized in ``error_items`` (``{key, message}``, keyed by the
+    looked-up artist), so a re-run retries it.
 
     Args:
-        artist: Limit to files whose ``artist`` tag equals this value.
-        album: Narrow an ``artist`` scope to one album.
-        file_ids: Limit to these specific file ids (overrides ``artist``/``album``).
-        limit: Max files to process this call (default ``genre_stage_limit``). Remaining
-            candidates are reported via ``pending_remaining`` / ``more``. Call again to
-            continue.
-        dry_run: Preview the would-stage and would-no_match counts without staging or
-            recording anything. It reads the lookup cache and fetches on a cache miss.
+        value: Limit to files whose ``artist`` or ``albumartist`` tag equals this value.
+        album: Narrow a ``value`` scope to files whose ``album`` equals this value. Requires
+            ``value``.
+        file_ids: Limit to these specific file ids (overrides ``value``/``album``). An unknown
+            id is refused.
+        limit: Max files to settle this call (default ``genre_stage_limit``). Call again
+            while ``more`` is true.
+        dry_run: Preview the would-settle and would-stage counts without staging or recording
+            anything. It reads the lookup cache and fetches on a cache miss.
 
     Returns:
-        ``{"ok": True, processed, processed_unit, staged, no_match,
-        skipped{done,no_match,manual,no_identity,missing}, pending_remaining, more, errors,
+        ``{"ok": True, settled, staged_files, no_match, pending_remaining, more, errors,
         error_items, no_match_artists, summary}``, or ``{"ok": False, "error": ...}`` (e.g.
-        pending changes, a negative ``limit``, or no API key configured). ``processed_unit``
-        is ``files``, and ``limit`` and ``pending_remaining`` count the same unit.
+        pending changes, a negative ``limit``, or no API key configured). ``settled`` counts
+        the selected files that left ``pending``. ``pending_remaining`` recounts the present
+        ``pending`` files in scope. ``more`` is ``settled > 0 and pending_remaining > 0`` and
+        is false on a dry run.
     """
     result = genres.resolve_genres(
         load_settings(),
-        artist=artist,
+        value=value,
         album=album,
         file_ids=file_ids,
         limit=limit,
@@ -1052,7 +1060,7 @@ def resolve_genres(
 @mcp.tool()
 @_error_envelope
 def resolve_artists(
-    artist: str | None = None,
+    value: str | None = None,
     file_ids: list[int] | None = None,
     limit: int | None = None,
     dry_run: bool = False,  # noqa: FBT001, FBT002 - MCP tool surface, not a Python API
@@ -1074,22 +1082,32 @@ def resolve_artists(
     and values whose MBID MusicBrainz does not know. Its gate is unchanged and stricter,
     because Last.fm has no id to anchor it (``source: lastfm``).
 
-    Where a value resolves, the canonical name cascade-stages across every file carrying it
-    (rewriting ``artist`` and/or ``albumartist``, exact-match only) plus that field's OWN id
-    field, as an ``auto`` change replacing ONLY those fields (every other managed tag, incl.
-    ``genre``, is preserved). Review with ``diff_tags`` and apply with ``commit_tags``;
+    The selection is the first ``limit`` ``pending`` files in scope, and every name value on
+    them is resolved. Where a value resolves, the canonical name cascade-stages across every
+    in-scope file carrying it (rewriting ``artist`` and/or ``albumartist``, exact-match only)
+    plus that field's OWN id field, as an ``auto`` change replacing ONLY those fields (every
+    other managed tag, incl. ``genre``, is preserved). A ``manual`` file and a multi-value file
+    are never staged on. Review with ``diff_tags`` and apply with ``commit_tags``.
     ``revert_commit``/``revert_tags`` undo it.
+
+    Each file's status on this axis is ``pending``, ``staged``, ``done``, ``no_match``,
+    ``manual`` or ``no_identity``. A ``done`` or ``no_match`` counts only while the identity and
+    the field values it was decided on still match the file, so a revert, a rescan after an
+    outside edit or an identity fix re-opens the file on its own.
+
+    Each selected file then records one outcome. A multi-value file, a ``feat`` credit or a
+    held value records ``no_match``, so it stays on the review list. A transient lookup error
+    records nothing, so the file stays ``pending`` and a re-run retries it. Anything else
+    records ``done``. A cascade carrier outside the selection gets no row.
 
     It deliberately **skips** (and reports) values in the ``feat``/``ft``/``featuring``
     family, compilation sentinels (``various artists``/``various``/``va``), and empty
-    values. It also skips any file whose ``artist``/``albumartist`` is multi-value, and any
-    file the last scan flagged missing (counted under ``skipped_missing``). Values already
-    exactly canonical stage nothing but are counted under ``already_canonical``; values with
-    no Last.fm correction are reported under ``no_correction``. A correction to a MusicBrainz
-    special-purpose placeholder (``[unknown]``, ``[no artist]``, …) is treated as no
-    correction. A transient lookup error leaves that value pending, counted in ``errors`` and
-    itemized in ``error_items`` (``{key, message}``, keyed by the value), so a re-run retries
-    it.
+    values. Values already exactly canonical stage nothing but are counted under
+    ``already_canonical``. Values with no Last.fm correction are reported under
+    ``no_correction``. A correction to a MusicBrainz special-purpose placeholder
+    (``[unknown]``, ``[no artist]``, …) is treated as no correction. A transient lookup error
+    is counted in ``errors`` and itemized in ``error_items`` (``{key, message}``, keyed by the
+    value).
 
     Three classes are **held**: reported so you can act on them, never staged.
     ``shrinks_credit_values`` are names whose canonical form is contained in the current
@@ -1101,36 +1119,32 @@ def resolve_artists(
     records — each entry carries ``from``/``to``/``mbid``/``reason``. A value the library
     pairs with more than one MBID lands there too, and neither tier touches it.
 
-    The per-value outcome buckets (``corrected_values`` + ``already_canonical`` +
-    ``no_correction`` + ``shrinks_credit`` + ``needs_review`` + ``name_id_disagreement`` +
-    ``errors``) sum to ``processed``.
-
     Args:
-        artist: Limit to files whose ``artist`` tag equals this value.
-        file_ids: Limit to these specific file ids (overrides ``artist``).
-        limit: Max distinct values to process this call. It is a cap, not a cursor: a
-            value needing no change leaves no trace, so an identical repeat call
-            re-processes the same values. Raise ``limit``, or narrow with ``artist`` /
-            ``file_ids``, to reach the values reported under ``pending_remaining`` /
-            ``more``.
-        dry_run: Preview the ``value → canonical`` mappings + would-stage count without
-            staging anything. Lookups still run. A cached answer costs nothing and a cache miss
-            makes a live request. A dry run skips the empty-staging precondition.
+        value: Limit to files whose ``artist`` or ``albumartist`` tag equals this value.
+        file_ids: Limit to these specific file ids (overrides ``value``). An unknown id is
+            refused.
+        limit: Max files to settle this call (every ``pending`` file in scope when omitted).
+            Call again while ``more`` is true.
+        dry_run: Preview the ``value → canonical`` mappings and the would-settle and
+            would-stage counts without writing anything. Lookups still run. A cached answer
+            costs nothing and a cache miss makes a live request. A dry run skips the
+            empty-staging precondition.
 
     Returns:
-        ``{"ok": True, processed, processed_unit, staged_files, corrected_values,
-        skipped_multi_artist, skipped_sentinel, skipped_missing, no_correction,
-        already_canonical, shrinks_credit, needs_review, name_id_disagreement, errors,
-        pending_remaining, more, mappings (each with ``from``/``to``/``mbid``/``source``),
-        multi_artist_files, no_correction_values, already_canonical_values,
-        shrinks_credit_values, needs_review_values, name_id_disagreement_values, error_items,
-        summary}``, or ``{"ok": False, "error": ...}`` (e.g. pending changes, or no API key
-        configured). ``processed_unit`` is ``values``, and ``limit`` and ``pending_remaining``
-        count the same unit.
+        ``{"ok": True, settled, staged_files, corrected_values, skipped_multi_artist,
+        skipped_sentinel, no_correction, already_canonical, shrinks_credit, needs_review,
+        name_id_disagreement, errors, pending_remaining, more, mappings (each with
+        ``from``/``to``/``mbid``/``source``), multi_artist_files, no_correction_values,
+        already_canonical_values, shrinks_credit_values, needs_review_values,
+        name_id_disagreement_values, error_items, summary}``, or ``{"ok": False, "error":
+        ...}`` (e.g. pending changes, or no API key configured). ``settled`` counts the
+        selected files that left ``pending`` and ``staged_files`` every staged file, cascade
+        included. ``pending_remaining`` recounts the present ``pending`` files in scope.
+        ``more`` is ``settled > 0 and pending_remaining > 0`` and is false on a dry run.
     """
     result = artists.resolve_artists(
         load_settings(),
-        artist=artist,
+        value=value,
         file_ids=file_ids,
         limit=limit,
         dry_run=dry_run,
@@ -1159,23 +1173,22 @@ def list_artists(limit: int | None = None) -> dict[str, object]:
 @mcp.tool()
 @_error_envelope
 def set_genre_status(
-    status: Literal["manual", "pending"],
+    status: Literal["manual"],
     file_ids: list[int] | None = None,
-    artist: str | None = None,
+    value: str | None = None,
 ) -> dict[str, object]:
-    """Exclude files from genre tagging (``manual``) or re-queue them (``pending``).
+    """Record a deliberate human decision on the genre axis (``manual``) for in-scope files.
 
-    ``manual`` marks the in-scope files as a deliberate human/LLM choice: ``resolve_genres``
-    skips them until you reset. ``pending`` removes any status row, re-queuing them. You
-    may exclude or re-include files, but cannot set engine-owned outcomes (e.g.
-    ``no_match``, which the Last.fm lookup decides). With neither ``file_ids`` nor ``artist``
-    the call changes nothing and returns ``affected: 0``.
+    ``resolve_genres`` never selects a ``manual`` file. The row is sticky: an outside edit
+    does not clear it, and ``reset_genre_status`` is its only hand-back. Committing a hand edit
+    of ``genre`` records ``manual`` too. With neither ``file_ids`` nor ``value`` the call changes
+    nothing and returns ``affected: 0``.
 
     Args:
-        status: ``manual`` to exclude, ``pending`` to re-queue.
-        file_ids: Limit to these file ids.
-        artist: Limit to files whose ``artist`` tag equals this value (used when
-            ``file_ids`` is omitted).
+        status: ``manual``, the one state a human sets on this axis.
+        file_ids: Limit to these file ids. An unknown id is refused.
+        value: Limit to files whose ``artist`` or ``albumartist`` tag equals this value (used
+            when ``file_ids`` is omitted).
 
     Returns:
         ``{"ok": True, "affected": <count>}``, or ``{"ok": False, "error": ...}``.
@@ -1183,7 +1196,7 @@ def set_genre_status(
     affected = genres.set_genre_status(
         load_settings(),
         file_ids=file_ids,
-        artist=artist,
+        value=value,
         status=status,
     )
     return {"ok": True, "affected": affected}
@@ -1193,18 +1206,18 @@ def set_genre_status(
 @_error_envelope
 def reset_genre_status(
     file_ids: list[int] | None = None,
-    artist: str | None = None,
+    value: str | None = None,
 ) -> dict[str, object]:
     """Clear any genre status row for in-scope files, returning them to ``pending``.
 
-    Removes both ``no_match`` and ``manual`` decisions so ``resolve_genres`` will reconsider
-    the files on its next run. With neither ``file_ids`` nor ``artist`` the call changes
-    nothing and returns ``affected: 0``.
+    Removes ``done``, ``no_match`` and ``manual`` alike, so ``resolve_genres`` reconsiders the files
+    on its next run. This is the only hand-back of a ``manual`` row. With neither ``file_ids``
+    nor ``value`` the call changes nothing and returns ``affected: 0``.
 
     Args:
-        file_ids: Limit to these file ids.
-        artist: Limit to files whose ``artist`` tag equals this value (used when
-            ``file_ids`` is omitted).
+        file_ids: Limit to these file ids. An unknown id is refused.
+        value: Limit to files whose ``artist`` or ``albumartist`` tag equals this value (used
+            when ``file_ids`` is omitted).
 
     Returns:
         ``{"ok": True, "affected": <count>}``, or ``{"ok": False, "error": ...}`` if a file id
@@ -1213,7 +1226,7 @@ def reset_genre_status(
     affected = genres.reset_genre_status(
         load_settings(),
         file_ids=file_ids,
-        artist=artist,
+        value=value,
     )
     return {"ok": True, "affected": affected}
 
@@ -1221,23 +1234,22 @@ def reset_genre_status(
 @mcp.tool()
 @_error_envelope
 def set_artist_status(
-    status: Literal["manual", "pending"],
+    status: Literal["manual"],
     file_ids: list[int] | None = None,
     value: str | None = None,
 ) -> dict[str, object]:
-    """Exclude files from artist-name normalization (``manual``) or re-queue them (``pending``).
+    """Record a deliberate human decision on the artist axis (``manual``) for in-scope files.
 
-    ``manual`` marks the in-scope files as a deliberate human/LLM choice: ``resolve_artists``
-    always skips them (sticky — no staleness re-check) until you reset. ``pending`` removes
-    any status row, re-queuing them.
-
-    Scope is ``file_ids`` when given, else every file carrying ``value`` as its ``artist``
-    OR ``albumartist`` tag (so excluding ``"Miami Nights 84"`` catches it on either field).
+    ``resolve_artists`` never selects a ``manual`` file, and no cascade stages on it. The row is
+    sticky: an outside edit does not clear it, and ``reset_artist_status`` is its only
+    hand-back. Committing a hand edit of any artist name, id or sort-name field records
+    ``manual`` too. With neither ``file_ids`` nor ``value`` the call changes nothing and returns
+    ``affected: 0``.
 
     Args:
-        status: ``manual`` to exclude, ``pending`` to re-queue.
-        file_ids: Limit to these file ids.
-        value: Limit to files carrying this value as ``artist`` or ``albumartist`` (used
+        status: ``manual``, the one state a human sets on this axis.
+        file_ids: Limit to these file ids. An unknown id is refused.
+        value: Limit to files whose ``artist`` or ``albumartist`` tag equals this value (used
             when ``file_ids`` is omitted).
 
     Returns:
@@ -1260,12 +1272,13 @@ def reset_artist_status(
 ) -> dict[str, object]:
     """Clear any artist status row for in-scope files, returning them to ``pending``.
 
-    Removes the ``manual`` exclusion so ``resolve_artists`` will reconsider the files on
-    its next run.
+    Removes ``done``, ``no_match`` and ``manual`` alike, so ``resolve_artists`` reconsiders the
+    files on its next run. This is the only hand-back of a ``manual`` row. With neither
+    ``file_ids`` nor ``value`` the call changes nothing and returns ``affected: 0``.
 
     Args:
-        file_ids: Limit to these file ids.
-        value: Limit to files carrying this value as ``artist`` or ``albumartist`` (used
+        file_ids: Limit to these file ids. An unknown id is refused.
+        value: Limit to files whose ``artist`` or ``albumartist`` tag equals this value (used
             when ``file_ids`` is omitted).
 
     Returns:
@@ -1349,50 +1362,53 @@ def reset_mismatch_status(
 @mcp.tool()
 @_error_envelope
 def resolve_years(
-    album: str | None = None,
+    value: str | None = None,
     file_ids: list[int] | None = None,
     limit: int | None = None,
     dry_run: bool = False,  # noqa: FBT001, FBT002 - MCP tool surface, not a Python API
 ) -> dict[str, object]:
     """Blank-fill the original release year (``originaldate``) from MusicBrainz (writes no disk).
 
-    For each in-scope album group ``(albumartist-else-artist, album)`` this looks up the
-    original first-release year on MusicBrainz (a release group's ``first-release-date``,
-    e.g. *Paranoid* = 1970 — distinct from the reissue ``date``) and stages it into
-    ``originaldate`` on every group file whose ``originaldate`` is currently **blank**, as an
-    ``auto`` change replacing ONLY that field (every other managed tag preserved). It never
-    overwrites an existing ``originaldate`` and never touches ``date``. Review with
-    ``diff_tags`` and apply with ``commit_tags``; ``revert_commit``/``revert_tags`` undo it.
+    For each selected file with a blank ``originaldate`` this looks up its album group
+    ``(albumartist-else-artist, album)`` on MusicBrainz (a release group's
+    ``first-release-date``, e.g. *Paranoid* = 1970, distinct from the reissue ``date``) and
+    stages it into ``originaldate`` as an ``auto`` change replacing ONLY that field (every other
+    managed tag preserved), recording ``done``. A group MusicBrainz has no usable Album release
+    group for records ``no_match``. A selected file that already carries ``originaldate``
+    records ``done`` with no lookup: an existing value is never overwritten, and ``date`` is
+    never touched. Review with ``diff_tags`` and apply with ``commit_tags``.
+    ``revert_commit``/``revert_tags`` undo it.
 
-    It deliberately **skips** files that already have an ``originaldate``
-    (``skipped_present``), files with no ``album`` (``skipped_no_album``), files with no
-    artist (``skipped_no_identity``), ``manual`` exclusions (``skipped_manual``), files a
-    still-current ``no_match`` holds back (``skipped_no_match``), and files the last scan
-    flagged missing (``skipped_missing``). A group
-    MusicBrainz has no usable Album release group for is recorded ``no_match`` (re-opened if
-    the artist or album changes). A transient MusicBrainz error leaves that group pending and
-    is counted in ``errors`` and itemized in ``error_items`` (``{key, message}``).
+    Each file's status on this axis is ``pending``, ``staged``, ``done``, ``no_match``,
+    ``manual`` or ``no_identity``. A ``done`` or ``no_match`` counts only while the identity and
+    the field values it was decided on still match the file, so a revert, a rescan after an
+    outside edit or an identity fix re-opens the file on its own.
+
+    Only ``pending`` files are selected, so repeated ``limit``-capped calls terminate. A
+    transient MusicBrainz error writes nothing, leaves that group's files ``pending``, and is
+    counted in ``errors`` and itemized in ``error_items`` (``{key, message}``).
 
     Args:
-        album: Limit to files whose ``album`` tag equals this value.
-        file_ids: Limit to these specific file ids (overrides ``album``).
-        limit: Max album groups to process this call (default ``year_stage_limit``).
-            Remaining groups are reported via ``pending_remaining`` / ``more``.
-        dry_run: Preview the album → original-year mappings + would-stage count without
-            staging anything. Lookups still run. A cached answer costs nothing and a cache miss
-            makes a live request. A dry run skips the empty-staging precondition.
+        value: Limit to files whose ``album`` tag equals this value.
+        file_ids: Limit to these specific file ids (overrides ``value``). An unknown id is
+            refused.
+        limit: Max files to settle this call (default ``year_stage_limit``). Call again while
+            ``more`` is true.
+        dry_run: Preview the album → original-year mappings and the would-settle and
+            would-stage counts without writing anything. Lookups still run. A cached answer
+            costs nothing and a cache miss makes a live request. A dry run skips the
+            empty-staging precondition.
 
     Returns:
-        ``{"ok": True, processed, processed_unit, staged_files, no_match, skipped_present,
-        skipped_no_album, skipped_no_identity, skipped_manual, skipped_no_match,
-        skipped_missing, pending_remaining, more, mappings, errors, error_items, summary}``, or
-        ``{"ok": False, "error": ...}`` (e.g. pending changes). ``processed_unit`` is
-        ``album_groups``, and ``limit`` and ``pending_remaining`` count the same unit. Every
-        ``skipped_*`` count is files.
+        ``{"ok": True, settled, staged_files, no_match, pending_remaining, more, mappings,
+        errors, error_items, summary}``, or ``{"ok": False, "error": ...}`` (e.g. pending
+        changes). ``settled`` counts the selected files that left ``pending``.
+        ``pending_remaining`` recounts the present ``pending`` files in scope. ``more`` is
+        ``settled > 0 and pending_remaining > 0`` and is false on a dry run.
     """
     result = years.resolve_years(
         load_settings(),
-        album=album,
+        value=value,
         file_ids=file_ids,
         limit=limit,
         dry_run=dry_run,
@@ -1410,8 +1426,8 @@ def list_albums(
 ) -> dict[str, object]:
     """List distinct album groups with file counts + status (to scope ``resolve_years``).
 
-    Groups files by ``(albumartist-else-artist, album)`` and reports each group's file count,
-    derived year workflow status, and ``blank_originaldate`` — the count of the group's
+    Groups present files by ``(albumartist-else-artist, album)`` and reports each group's file
+    count, derived year workflow status, and ``blank_originaldate`` — the count of the group's
     files whose ``originaldate`` is empty. A group with ``blank_originaldate > 0`` is
     actionable for ``resolve_years`` (it has years to fill); ``year_status: "pending"``
     alone does NOT mean actionable, since every file may already carry ``originaldate``.
@@ -1442,21 +1458,20 @@ def list_albums(
 @mcp.tool()
 @_error_envelope
 def set_year_status(
-    status: Literal["manual", "pending"],
+    status: Literal["manual"],
     file_ids: list[int] | None = None,
     value: str | None = None,
 ) -> dict[str, object]:
-    """Exclude files from the original-year fill (``manual``) or re-queue them (``pending``).
+    """Record a deliberate human decision on the year axis (``manual``) for in-scope files.
 
-    ``manual`` marks the in-scope files as a deliberate human/LLM choice: ``resolve_years``
-    skips them until you reset. ``pending`` removes any status row, re-queuing them.
-
-    Scope is ``file_ids`` when given, else every file carrying ``value`` as its ``album``
-    tag.
+    ``resolve_years`` never selects a ``manual`` file. The row is sticky: an outside edit does
+    not clear it, and ``reset_year_status`` is its only hand-back. Committing a hand edit of
+    ``originaldate`` records ``manual`` too. With neither ``file_ids`` nor ``value`` the call
+    changes nothing and returns ``affected: 0``.
 
     Args:
-        status: ``manual`` to exclude, ``pending`` to re-queue.
-        file_ids: Limit to these file ids.
+        status: ``manual``, the one state a human sets on this axis.
+        file_ids: Limit to these file ids. An unknown id is refused.
         value: Limit to files whose ``album`` tag equals this value (used when ``file_ids``
             is omitted).
 
@@ -1480,11 +1495,12 @@ def reset_year_status(
 ) -> dict[str, object]:
     """Clear any year status row for in-scope files, returning them to ``pending``.
 
-    Removes both ``no_match`` and ``manual`` decisions so ``resolve_years`` will reconsider
-    the files on its next run.
+    Removes ``done``, ``no_match`` and ``manual`` alike, so ``resolve_years`` reconsiders the files
+    on its next run. This is the only hand-back of a ``manual`` row. With neither ``file_ids``
+    nor ``value`` the call changes nothing and returns ``affected: 0``.
 
     Args:
-        file_ids: Limit to these file ids.
+        file_ids: Limit to these file ids. An unknown id is refused.
         value: Limit to files whose ``album`` tag equals this value (used when ``file_ids``
             is omitted).
 

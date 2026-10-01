@@ -87,24 +87,33 @@ class FileView:
         }
 
 
+def _axis_view(
+    conn: sqlite3.Connection,
+    tag_axis: axis.Axis,
+    file_id: int,
+) -> tuple[str, str | None, str | None]:
+    """Return *file_id*'s derived status on *tag_axis* plus the identity a counting row holds.
+
+    The identity rides along only when the derived status IS the stored row's status, so a
+    stale row never shows as the reason for a status it no longer decides.
+    """
+    status = store.derived_status(conn, tag_axis, file_id)
+    row = axis.get_outcome(conn, tag_axis, file_id)
+    if row is None or row.status != status:
+        return status, None, None
+    return status, row.identity.primary, row.identity.secondary
+
+
 def _to_view(conn: sqlite3.Connection, row: store.FileRow) -> FileView:
     """Build a :class:`FileView` from a file row, reading its managed-tag subset.
 
     Also resolves the file's genre, artist, year and mismatch statuses. For a stored decision
     the source values it was recorded against ride along so a reviewer can compare them with
-    the current ``managed_tags`` and judge staleness.
+    the current ``managed_tags``.
     """
-    genre_status = store.derived_status(conn, axis.GENRE_AXIS, row.id)
-    genre_decision = store.get_genre_status(conn, row.id)
-    has_stored_genre = genre_decision is not None and genre_status == genre_decision.status
-
-    artist_status = store.derived_status(conn, axis.ARTIST_AXIS, row.id)
-    artist_decision = store.get_artist_status(conn, row.id)
-    has_stored_artist = artist_decision is not None and artist_status == artist_decision.status
-
-    year_status = store.derived_status(conn, axis.YEAR_AXIS, row.id)
-    year_decision = store.get_year_status(conn, row.id)
-    has_stored_year = year_decision is not None and year_status == year_decision.status
+    genre_status, genre_artist, genre_album = _axis_view(conn, axis.GENRE_AXIS, row.id)
+    artist_status, artist_artist, artist_albumartist = _axis_view(conn, axis.ARTIST_AXIS, row.id)
+    year_status, year_artist, year_album = _axis_view(conn, axis.YEAR_AXIS, row.id)
 
     mismatch_status = store.derived_mismatch_status(conn, row.id)
     mismatch_decision = store.get_mismatch_status(conn, row.id)
@@ -119,24 +128,14 @@ def _to_view(conn: sqlite3.Connection, row: store.FileRow) -> FileView:
         is_missing=row.is_missing,
         managed_tags=versioning.managed_subset(store.get_tags(conn, row.id)),
         genre_status=genre_status,
-        genre_source_artist=genre_decision.source_artist
-        if has_stored_genre and genre_decision
-        else None,
-        genre_source_album=genre_decision.source_album
-        if has_stored_genre and genre_decision
-        else None,
+        genre_source_artist=genre_artist,
+        genre_source_album=genre_album,
         artist_status=artist_status,
-        artist_source_artist=artist_decision.source_artist
-        if has_stored_artist and artist_decision
-        else None,
-        artist_source_albumartist=artist_decision.source_albumartist
-        if has_stored_artist and artist_decision
-        else None,
+        artist_source_artist=artist_artist,
+        artist_source_albumartist=artist_albumartist,
         year_status=year_status,
-        year_source_artist=year_decision.source_artist
-        if has_stored_year and year_decision
-        else None,
-        year_source_album=year_decision.source_album if has_stored_year and year_decision else None,
+        year_source_artist=year_artist,
+        year_source_album=year_album,
         mismatch_status=mismatch_status,
         mismatch_source_field=mismatch_decision.source_field
         if has_stored_mismatch and mismatch_decision
@@ -149,36 +148,32 @@ def _to_view(conn: sqlite3.Connection, row: store.FileRow) -> FileView:
 
 def _row_matches_status(  # noqa: PLR0913 - cohesive keyword-only status filters
     conn: sqlite3.Connection,
-    file_id: int,
+    row: store.FileRow,
     *,
     genre_status: str | None,
     artist_status: str | None,
     year_status: str | None,
     mismatch_status: str | None,
 ) -> bool:
-    """Return whether *file_id* satisfies every requested workflow-status filter.
+    """Return whether *row* satisfies every requested workflow-status filter.
 
     Each non-``None`` filter must match the file's derived status on that axis (the axes are
-    independent and field-aware); a ``None`` filter is ignored.
+    independent and field-aware), and a ``None`` filter is ignored. A missing file has no
+    status on the genre, artist or year axis, so any of those filters excludes it.
     """
-    if (
-        genre_status is not None
-        and store.derived_status(conn, axis.GENRE_AXIS, file_id) != genre_status
-    ):
-        return False
-    if (
-        artist_status is not None
-        and store.derived_status(conn, axis.ARTIST_AXIS, file_id) != artist_status
-    ):
-        return False
-    if (
-        year_status is not None
-        and store.derived_status(conn, axis.YEAR_AXIS, file_id) != year_status
-    ):
-        return False
+    tag_filters = (
+        (axis.GENRE_AXIS, genre_status),
+        (axis.ARTIST_AXIS, artist_status),
+        (axis.YEAR_AXIS, year_status),
+    )
+    for tag_axis, wanted in tag_filters:
+        if wanted is None:
+            continue
+        if row.is_missing or store.derived_status(conn, tag_axis, row.id) != wanted:
+            return False
     return not (
         mismatch_status is not None
-        and store.derived_mismatch_status(conn, file_id) != mismatch_status
+        and store.derived_mismatch_status(conn, row.id) != mismatch_status
     )
 
 
@@ -196,17 +191,14 @@ def list_files(  # noqa: PLR0913 - cohesive keyword-only discovery filters
 
     Optionally limited to files in the folder *path* or under it (resolved by
     :func:`tagmend.engine.path_keys.folder_arg_key`, so case and separators do not matter on
-    Windows and a relative *path* resolves under ``music_path``), filtered to one genre
-    workflow status
-    (``pending`` | ``no_identity`` | ``no_match`` | ``manual`` | ``staged`` | ``done``), one
-    artist workflow status (``pending`` | ``no_identity`` | ``manual`` | ``staged`` |
-    ``done``), one year workflow status (``pending`` | ``no_identity`` | ``no_match`` |
-    ``manual`` | ``staged`` | ``done``), one mismatch disposition
-    (``pending`` | ``legit_ignore`` | ``misfiled_deferred``), and/or capped at *limit* rows.
-    ``genre_status="no_match"`` is the "fix by hand" worklist; ``no_identity`` lists the files
-    that carry neither ``artist`` nor ``albumartist`` (every resolver skips them). With NO
+    Windows and a relative *path* resolves under ``music_path``), filtered to one genre, artist
+    and/or year workflow status (``pending`` | ``no_identity`` | ``no_match`` | ``manual`` |
+    ``staged`` | ``done``), one mismatch disposition (``pending`` | ``legit_ignore`` |
+    ``misfiled_deferred``), and/or capped at *limit* rows. ``genre_status="no_match"`` is the
+    "fix by hand" worklist. ``no_identity`` lists the files the axis has no identity for, which
+    no resolver selects. A genre, artist or year filter never returns a missing file. With NO
     status filter the cap is applied before reading tags, so a large library stays cheap to
-    browse; with any filter, all candidate rows are examined, ALL filters are applied, and the
+    browse. With any filter, all candidate rows are examined, ALL filters are applied, and the
     cap counts the *matching* files. Raises :class:`ValueError` for an unknown status, a
     negative *limit* or a *path* outside ``music_path``. Read-only.
     """
@@ -244,7 +236,7 @@ def list_files(  # noqa: PLR0913 - cohesive keyword-only discovery filters
         for row in rows:
             if not _row_matches_status(
                 connection,
-                row.id,
+                row,
                 genre_status=genre_status,
                 artist_status=artist_status,
                 year_status=year_status,
@@ -332,7 +324,7 @@ def list_albums(
 ) -> list[AlbumRow]:
     """Return each distinct album group with its file count + a representative status.
 
-    Groups in-scope files by ``(albumartist-else-artist, album)`` (the album identity) and
+    Groups present files by ``(albumartist-else-artist, album)`` (the album identity) and
     reports the derived year status of the group's first file plus ``blank_originaldate``,
     the count of the group's files whose ``originaldate`` tag is empty. Those are the files
     :func:`tagmend.engine.years.resolve_years` can fill, and ``> 0`` marks an actionable
@@ -350,7 +342,7 @@ def list_albums(
         schema.apply_schema(connection)
         groups: dict[tuple[str | None, str], list[int]] = {}
         blanks: dict[tuple[str | None, str], int] = {}
-        for fid in store.files_in_scope(connection):
+        for fid in store.present_file_ids(connection):
             tags = store.get_tags(connection, fid)
             identity = axis.lookup_identity(tags)
             if identity.album is None:

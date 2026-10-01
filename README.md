@@ -160,7 +160,7 @@ The MCP server exposes 34 tools. All tag edits are staged in memory and only wri
 | Tool | Description |
 |------|-------------|
 | `resolve_genres` | Look up Last.fm genres for in-scope files and stage the result (writes nothing to disk) |
-| `set_genre_status` | Exclude files from genre tagging (`manual`) or re-queue them (`pending`) |
+| `set_genre_status` | Exclude files from genre tagging (`manual`). The exclusion is sticky until `reset_genre_status` |
 | `reset_genre_status` | Clear any genre status row for in-scope files, returning them to `pending` |
 
 ### Artist Names (MusicBrainz + Last.fm)
@@ -169,7 +169,7 @@ The MCP server exposes 34 tools. All tag edits are staged in memory and only wri
 |------|-------------|
 | `list_artists` | List distinct `artist` values with file counts (to scope a run) |
 | `resolve_artists` | Normalize artist names against MusicBrainz (by the ID the file carries), then Last.fm `getCorrection`, and stage the result (no disk write) |
-| `set_artist_status` | Exclude files from artist-name normalization (`manual`) or re-queue them (`pending`) |
+| `set_artist_status` | Exclude files from artist-name normalization (`manual`). The exclusion is sticky until `reset_artist_status` |
 | `reset_artist_status` | Clear any artist status row for in-scope files, returning them to `pending` |
 
 ### Year (MusicBrainz)
@@ -178,7 +178,7 @@ The MCP server exposes 34 tools. All tag edits are staged in memory and only wri
 |------|-------------|
 | `list_albums` | List distinct album groups with file counts and status (to scope a run) |
 | `resolve_years` | Blank-fill the original release year (`originaldate`) from MusicBrainz (no disk write) |
-| `set_year_status` | Exclude files from the year fill (`manual`) or re-queue them (`pending`) |
+| `set_year_status` | Exclude files from the year fill (`manual`). The exclusion is sticky until `reset_year_status` |
 | `reset_year_status` | Clear any year status row for in-scope files, returning them to `pending` |
 
 ### Mismatch fixing
@@ -189,7 +189,7 @@ Use `detect_mismatches` (above) to find files whose identity tags disagree with 
 |------|-------------|
 | `set_mismatch_status` | Silence a mismatch false positive (`legit_ignore`) or defer a misfiled file (`misfiled_deferred`), or clear with `pending` |
 | `reset_mismatch_status` | Clear any mismatch disposition for in-scope files, returning them to `pending` |
-| `reopen_axes` | After committing a manual identity fix, re-open the file's derived genre/year axes and clear its stale artist status |
+| `reopen_axes` | After committing a manual identity fix, re-open the file's genre, artist and year outcomes. `manual` rows are kept |
 
 ## Development
 

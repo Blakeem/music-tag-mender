@@ -36,23 +36,17 @@ The M2 Last.fm genre path adds two side tables (PLAN — Last.fm genre tagging, 
   hash, surviving MCP restarts. ``found`` is the negative-cache sentinel (0 = the
   artist/album genuinely is not on Last.fm; 1 = found), distinct from ``found=1`` with an
   empty ``tags`` array.
-* ``file_genre_status`` — stores ONLY the terminal/negative per-file decisions
-  (``'no_match'`` / ``'manual'``). "Done" is *derived* elsewhere from the staged/committed
-  revision tables, so there is deliberately no ``'tagged'`` state to desync.
+* ``file_genre_status``: the genre axis's per-file status row. v21 below gives its shape.
 
 The M4 artist normalization path adds one more side table (schema v7, purely additive):
 
-* ``file_artist_status`` — the artist-axis twin of ``file_genre_status``, storing ONLY the
-  sticky ``'manual'`` exclusion (no ``'no_match'`` state on this axis). "Done"/"staged" are
-  *derived* field-awarely from the revision tables (keyed on ``artist``/``albumartist``).
+* ``file_artist_status``: the artist-axis twin of ``file_genre_status``.
 
 The album original-year path adds two more side tables (schema v8, purely additive — a v7
 ledger upgrades in place with no data loss):
 
-* ``file_year_status`` (named ``file_album_status`` until v12) — the year-axis twin of
-  ``file_genre_status`` (same identity: ``(albumartist-else-artist, album)`` →
-  ``source_artist``/``source_album``), storing the ``'no_match'`` / ``'manual'`` decisions;
-  "done"/"staged" are *derived* field-awarely (keyed on ``originaldate``).
+* ``file_year_status`` (named ``file_album_status`` until v12): the year-axis twin of
+  ``file_genre_status``.
 * ``musicbrainz_release_group_cache`` (named ``musicbrainz_cache`` until v20) is a persistent
   cache of MusicBrainz release-group lookups keyed by a request hash. ``found`` is the
   negative-cache sentinel (0 = no usable Album release group), mirroring ``lastfm_cache``.
@@ -60,12 +54,8 @@ ledger upgrades in place with no data loss):
 The mismatch-fix re-pend path adds one more side table (schema v9, purely additive — a v8
 ledger upgrades in place with no data loss):
 
-* ``voided_auto`` — a per-``(file_id, field)`` watermark that "voids" stale auto-resolved
-  values without mutating the append-only history: after a manual identity fix,
-  :func:`tagmend.engine.store.void_auto_changes` stamps the field's current
-  ``MAX(version)`` here, and :func:`~tagmend.engine.store.has_auto_change_for` ignores auto
-  revisions at or below the watermark, so the genre/originaldate re-pend. A LATER auto
-  revision (``version`` above the watermark) counts again, so re-processing is safe.
+* ``voided_auto``: a per-``(file_id, field)`` watermark that re-opened auto-resolved values
+  after a manual identity fix. v21 drops it.
 
 The mismatch-fix review surface adds one more side table (schema v10, purely additive — a v9
 ledger upgrades in place with no data loss):
@@ -173,15 +163,30 @@ upgrades in place with every row preserved):
   ``lastfm_cache``, which now holds top tags only.
 * The ``tag_revisions_managed_set_required`` trigger refuses a revision without a managed set.
   :func:`_migrate_managed_set_required` refuses to upgrade a ledger already holding one.
+
+The axis-status pass adds one column to four tables and drops one table (schema v21. A v20
+ledger upgrades in place with every status and staged row preserved):
+
+* ``file_genre_status``, ``file_artist_status`` and ``file_year_status`` each hold at most one
+  outcome row per file (``done``, ``no_match`` or ``manual``) with two snapshots: the identity
+  it was decided against in the two ``source_*`` columns and the new ``source_value``, the JSON
+  of the axis fields' values. :func:`tagmend.engine.store.derived_status` derives every status
+  from that row (:mod:`tagmend.engine.axis`).
+* :func:`_migrate_axis_outcomes` adds ``source_value`` (NULL on existing rows), writes
+  ``manual`` rows from the manual revisions and drops ``voided_auto``.
+* ``tag_revisions_staged.changed_fields``: the JSON list of fields a staged target changes
+  against the tags on disk at stage time. The commit records ``manual`` on the axes it names.
+  :func:`_migrate_staged_changed_fields` adds it as NULL, and the commit then falls back to
+  the diff against the tags on disk at commit time.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Final, cast
 
-from tagmend.engine import path_keys
+from tagmend.engine import axis, path_keys
 from tagmend.log import get_logger
 
 if TYPE_CHECKING:
@@ -189,7 +194,7 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
-SCHEMA_VERSION: Final = 20
+SCHEMA_VERSION: Final = 21
 
 _FILES_DDL: Final = """
 CREATE TABLE IF NOT EXISTS files (
@@ -295,7 +300,8 @@ CREATE TABLE IF NOT EXISTS path_revisions (
 # commit turns it into a real revision row and deletes it. A crash leaves leftover rows
 # staged, which the next commit sweeps into a new commit. See PLAN.md §7.
 # ``base_size_bytes``/``base_mtime_ns`` are the file's signature at stage time, so a commit can
-# refuse a file edited since. They sit last because the v17 migration appends them there.
+# refuse a file edited since. ``changed_fields`` keeps the stage's own change because a re-applied
+# commit finds disk already equal to the target. Migrations append these, so they sit last.
 _TAG_REVISIONS_STAGED_DDL: Final = """
 CREATE TABLE IF NOT EXISTS tag_revisions_staged (
   file_id         INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
@@ -305,6 +311,7 @@ CREATE TABLE IF NOT EXISTS tag_revisions_staged (
   staged_at       TEXT NOT NULL,
   base_size_bytes INTEGER,
   base_mtime_ns   INTEGER,
+  changed_fields  TEXT,
   PRIMARY KEY (file_id)
 )
 """
@@ -348,53 +355,41 @@ CREATE TABLE IF NOT EXISTS lastfm_correction_cache (
 )
 """
 
-# Per-file terminal/negative genre decisions. Stores ONLY the two outcomes that are not
-# otherwise represented by the revision tables: ``'no_match'`` (nothing usable on
-# Last.fm) and ``'manual'`` (user/LLM excluded it). "Done" is DERIVED elsewhere from the
-# staged/committed revision tables, so there is no ``'tagged'`` state to desync.
-# ``source_artist``/``source_album`` record what the decision was computed against, so a
-# later tag change makes a ``'no_match'`` stale and re-processable. See PLAN —
-# Last.fm genre tagging § "Status model".
+# The three tag-axis status tables share one shape (:mod:`tagmend.engine.axis`). Each row is
+# one outcome (``done``/``no_match``/``manual``), the identity it was decided against in the
+# two ``source_*`` columns, and ``source_value``: the JSON of the axis fields' values it
+# describes, NULL on a row written before v21. A ``done``/``no_match`` row counts only while
+# both snapshots match the file, so no writer is needed to re-open one.
 _FILE_GENRE_STATUS_DDL: Final = """
 CREATE TABLE IF NOT EXISTS file_genre_status (
   file_id       INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
   status        TEXT NOT NULL,
   source_artist TEXT,
   source_album  TEXT,
+  source_value  TEXT,
   updated_at    TEXT NOT NULL
 )
 """
 
-# Per-file sticky artist-name exclusion (the artist-axis twin of ``file_genre_status``).
-# Stores ONLY the ``'manual'`` decision (the artist model has no ``'no_match'`` state):
-# a user/LLM excludes a file so :func:`tagmend.engine.artists.resolve_artists` always
-# skips it. "Done"/"staged" are DERIVED elsewhere from the field-aware revision tables, so
-# there is no state here to desync. ``source_artist``/``source_albumartist`` record the
-# values the exclusion was taken against, for audit. See PLAN — artist normalization.
 _FILE_ARTIST_STATUS_DDL: Final = """
 CREATE TABLE IF NOT EXISTS file_artist_status (
   file_id             INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
   status              TEXT NOT NULL,
   source_artist       TEXT,
   source_albumartist  TEXT,
+  source_value        TEXT,
   updated_at          TEXT NOT NULL
 )
 """
 
-# Per-file terminal/negative year decisions (the year-axis twin of ``file_genre_status``,
-# identical shape). Stores ONLY ``'no_match'`` (no usable MusicBrainz Album release group)
-# and ``'manual'`` (user/LLM excluded it). "Done"/"staged" are DERIVED elsewhere from the
-# field-aware revision tables (keyed on ``originaldate``), so there is no state here to
-# desync. ``source_artist``/``source_album`` record the resolved identity
-# (``albumartist``-else-``artist`` + ``album``) the decision was taken against, so a later
-# tag change makes a ``'no_match'`` stale and re-processable. Named ``file_album_status``
-# before v12. See PLAN — year axis.
+# Named ``file_album_status`` before v12.
 _FILE_YEAR_STATUS_DDL: Final = """
 CREATE TABLE IF NOT EXISTS file_year_status (
   file_id       INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
   status        TEXT NOT NULL,
   source_artist TEXT,
   source_album  TEXT,
+  source_value  TEXT,
   updated_at    TEXT NOT NULL
 )
 """
@@ -463,22 +458,6 @@ CREATE TABLE IF NOT EXISTS musicbrainz_recording_cache (
   release_group_mbid TEXT,
   recording_mbid     TEXT,
   fetched_at         TEXT NOT NULL
-)
-"""
-
-# Per-``(file_id, field)`` watermark that voids stale auto-resolved values WITHOUT touching
-# the append-only ``tag_revisions`` history. ``voided_through_version`` records the field's
-# ``MAX(version)`` at the moment of a manual identity fix; ``has_auto_change_for`` then
-# ignores auto revisions whose ``version`` is at or below it, so the field re-pends. A later
-# auto revision (``version`` above the watermark) counts again — re-processing is safe. See
-# PLAN — mismatch-fix (NN7 re-pend primitive).
-_VOIDED_AUTO_DDL: Final = """
-CREATE TABLE IF NOT EXISTS voided_auto (
-  file_id               INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
-  field                 TEXT NOT NULL,
-  voided_through_version INTEGER NOT NULL,
-  voided_at             TEXT NOT NULL,
-  PRIMARY KEY (file_id, field)
 )
 """
 
@@ -640,6 +619,20 @@ def _migrate_staged_base_signature(connection: sqlite3.Connection) -> None:
     connection.execute("ALTER TABLE tag_revisions_staged ADD COLUMN base_size_bytes INTEGER")
     connection.execute("ALTER TABLE tag_revisions_staged ADD COLUMN base_mtime_ns INTEGER")
     logger.info("schema v17: added tag_revisions_staged base signature columns")
+
+
+def _migrate_staged_changed_fields(connection: sqlite3.Connection) -> None:
+    """v21: add ``tag_revisions_staged.changed_fields`` as NULL.
+
+    Runs BEFORE the DDL, so a fresh ledger takes the column from
+    :data:`_TAG_REVISIONS_STAGED_DDL` instead. Idempotent through ``_column_exists``.
+    """
+    if not _table_exists(connection, "tag_revisions_staged"):
+        return
+    if _column_exists(connection, "tag_revisions_staged", "changed_fields"):
+        return
+    connection.execute("ALTER TABLE tag_revisions_staged ADD COLUMN changed_fields TEXT")
+    logger.info("schema v21: added tag_revisions_staged.changed_fields")
 
 
 def _keyed_file_rows(connection: sqlite3.Connection) -> list[tuple[int, str, str, str]]:
@@ -915,6 +908,88 @@ def _migrate_lastfm_correction_cache(connection: sqlite3.Connection) -> None:
     logger.info("schema v20: moved %d correction row(s) to lastfm_correction_cache", moved)
 
 
+# Each tag-axis status table with the DDL that creates it in its v21 shape.
+_AXIS_STATUS_TABLES: Final = (
+    ("file_genre_status", _FILE_GENRE_STATUS_DDL),
+    ("file_artist_status", _FILE_ARTIST_STATUS_DDL),
+    ("file_year_status", _FILE_YEAR_STATUS_DDL),
+)
+
+
+def _axis_outcomes_migrated(connection: sqlite3.Connection) -> bool:
+    """Whether ``voided_auto`` is gone and every tag-axis status table has ``source_value``."""
+    if _table_exists(connection, "voided_auto"):
+        return False
+    return all(
+        _table_exists(connection, table) and _column_exists(connection, table, "source_value")
+        for table, _ in _AXIS_STATUS_TABLES
+    )
+
+
+def _replay_manual_revisions(connection: sqlite3.Connection) -> int:
+    """Write ``manual`` on each axis a manual revision's diff touched. Returns rows written.
+
+    The commit writer's manual rule applied to history, in ``(file_id, version)`` order so the
+    latest manual revision wins. Snapshots come from the revision's own ``managed_tags`` and
+    the row is stamped with the revision's time, so a second run writes the same rows.
+    """
+    cursor = connection.execute(
+        """
+        SELECT file_id, created_at, managed_tags, diff FROM tag_revisions
+        WHERE origin = 'manual' ORDER BY file_id, version
+        """,
+    )
+    written = 0
+    for row in cursor.fetchall():
+        managed_tags = cast("dict[str, list[str]]", json.loads(str(row[2])))
+        diff = cast("dict[str, object]", json.loads(str(row[3])))
+        for tag_axis in axis.TAG_AXES:
+            if not any(name in diff for name in tag_axis.fields):
+                continue
+            axis.put_outcome(
+                connection,
+                tag_axis,
+                file_id=int(row[0]),
+                status="manual",
+                tags=managed_tags,
+                now=str(row[1]),
+            )
+            written += 1
+    return written
+
+
+def _migrate_axis_outcomes(connection: sqlite3.Connection) -> None:
+    """v21: snapshot tag-axis status values, replay manual revisions, drop ``voided_auto``.
+
+    Runs BEFORE the DDL, so a fresh ledger (no ``tag_revisions``) skips this and takes every
+    table from its DDL. In one transaction it creates any tag-axis status table an older
+    ledger never had, adds ``source_value`` where it is missing (existing rows keep NULL, which
+    the classifier treats as matching), writes ``manual`` from the manual revisions
+    (:func:`_replay_manual_revisions`) and drops ``voided_auto``, whose watermarks the
+    snapshots replace. It writes no ``done`` row, so a file an auto revision settled reads
+    ``pending`` until a resolver re-derives it from cache. Idempotent: it fires only while
+    ``voided_auto`` exists or a status table lacks ``source_value``.
+    """
+    if not _table_exists(connection, "tag_revisions"):
+        return
+    if _axis_outcomes_migrated(connection):
+        return
+
+    connection.execute("BEGIN")
+    try:
+        for table, ddl in _AXIS_STATUS_TABLES:
+            connection.execute(ddl)
+            if not _column_exists(connection, table, "source_value"):
+                connection.execute(f"ALTER TABLE {table} ADD COLUMN source_value TEXT")
+        replayed = _replay_manual_revisions(connection)
+        connection.execute("DROP TABLE IF EXISTS voided_auto")
+    except BaseException:
+        connection.rollback()
+        raise
+    connection.commit()
+    logger.info("schema v21: replayed %d manual status row(s), dropped voided_auto", replayed)
+
+
 def apply_schema(connection: sqlite3.Connection) -> None:
     """Upgrade the ledger to :data:`SCHEMA_VERSION` when its stamp is older, else do nothing.
 
@@ -933,10 +1008,11 @@ def apply_schema(connection: sqlite3.Connection) -> None:
     (:func:`_migrate_commit_origin`) and v20 renames, moves and drops in place
     (:func:`_migrate_reverted_to_version`, :func:`_migrate_managed_set_required`,
     :func:`_migrate_release_group_cache_name`, :func:`_migrate_mbid_columns`,
-    :func:`_migrate_drop_files_status`, :func:`_migrate_lastfm_correction_cache`). v15 and
-    v16 add cache tables only, which the DDL creates, so they need no migration step. The
-    triggers come after every migration, so a migration that updates a log runs before they
-    exist.
+    :func:`_migrate_drop_files_status`, :func:`_migrate_lastfm_correction_cache`) and v21
+    snapshots the tag-axis status rows (:func:`_migrate_axis_outcomes`) and adds the staged
+    changed fields (:func:`_migrate_staged_changed_fields`). v15 and v16 add cache tables
+    only, which the DDL creates, so they need no migration step. The triggers come after
+    every migration, so a migration that updates a log runs before they exist.
 
     ``commits`` is created before the revision/staging tables that reference it.
     """
@@ -963,6 +1039,8 @@ def apply_schema(connection: sqlite3.Connection) -> None:
     _migrate_mbid_columns(connection)
     _migrate_drop_files_status(connection)
     _migrate_lastfm_correction_cache(connection)
+    _migrate_axis_outcomes(connection)
+    _migrate_staged_changed_fields(connection)
     connection.execute(_FILES_DDL)
     connection.execute(_FILES_PATH_KEY_INDEX_DDL)
     connection.execute(_FILE_TAGS_DDL)
@@ -981,7 +1059,6 @@ def apply_schema(connection: sqlite3.Connection) -> None:
     connection.execute(_MUSICBRAINZ_RECORDING_CACHE_DDL)
     connection.execute(_MUSICBRAINZ_ARTIST_CACHE_DDL)
     connection.execute(_MUSICBRAINZ_RELEASE_CACHE_DDL)
-    connection.execute(_VOIDED_AUTO_DDL)
     connection.execute(_FILE_MISMATCH_STATUS_DDL)
     for index_ddl in _REVISIONS_COMMIT_INDEX_DDL:
         connection.execute(index_ddl)

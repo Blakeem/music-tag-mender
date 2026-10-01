@@ -21,7 +21,7 @@ from mcp.types import TextContent
 from conftest import make_track
 from tagmend import mcp_server
 from tagmend.config import load_settings
-from tagmend.engine import commits, genres, health, library, staging, store, versioning
+from tagmend.engine import axis, commits, genres, health, library, staging, store, versioning
 from tagmend.engine.db import connect
 from tagmend.engine.lastfm import LastfmError
 from tagmend.engine.musicbrainz import MusicBrainzError
@@ -293,16 +293,16 @@ def test_list_files_and_get_file(music_dir: Path) -> None:
     assert mcp_server.get_file(9999)["ok"] is False
 
 
-def _set_no_match(file_id: int, *, source_artist: str, source_album: str | None = None) -> None:
-    """Persist a terminal ``no_match`` genre decision in the isolated ledger."""
+def _set_no_match(file_id: int) -> None:
+    """Persist a ``no_match`` genre outcome snapshotting the file's current tags."""
     conn = connect(load_settings().db_path)
     try:
-        store.set_genre_status(
+        axis.put_outcome(
             conn,
+            axis.GENRE_AXIS,
             file_id=file_id,
             status="no_match",
-            source_artist=source_artist,
-            source_album=source_album,
+            tags=store.get_tags(conn, file_id),
             now="2026-06-09T00:00:00+00:00",
         )
         conn.commit()
@@ -312,7 +312,7 @@ def _set_no_match(file_id: int, *, source_artist: str, source_album: str | None 
 
 def test_list_files_genre_status_worklist_has_sources(music_dir: Path) -> None:
     file_id = _scanned_track_id(music_dir)
-    _set_no_match(file_id, source_artist="Obscure Band", source_album="Demos")
+    _set_no_match(file_id)
 
     listed = mcp_server.list_files(genre_status="no_match")
 
@@ -323,8 +323,8 @@ def test_list_files_genre_status_worklist_has_sources(music_dir: Path) -> None:
     entry = files[0]
     assert entry["file_id"] == file_id
     assert entry["genre_status"] == "no_match"
-    assert entry["genre_source_artist"] == "Obscure Band"
-    assert entry["genre_source_album"] == "Demos"
+    assert entry["genre_source_artist"] == "Some Artist"
+    assert entry["genre_source_album"] is None
 
 
 def test_list_files_bad_genre_status_returns_error(music_dir: Path) -> None:
@@ -337,7 +337,7 @@ def test_list_files_bad_genre_status_returns_error(music_dir: Path) -> None:
 
 def test_get_library_stats_includes_genre_block(music_dir: Path) -> None:
     file_id = _scanned_track_id(music_dir)
-    _set_no_match(file_id, source_artist="Obscure Band")
+    _set_no_match(file_id)
 
     stats = mcp_server.get_library_stats()
 

@@ -29,7 +29,7 @@ Design notes (the spec):
 * **Guards (skip + report, never rewrite):** the ``feat``/``ft``/``featuring`` family,
   compilation sentinels (``various artists``/``various``/``va``), and empty values are
   dropped from the distinct-value scan. The multi-value guard is separate and runs per
-  file: any file whose ``artist`` or ``albumartist`` list has ``len > 1`` is skipped.
+  file: a file whose ``artist`` or ``albumartist`` list has ``len > 1`` is never staged on.
 * **Correction gate (post-lookup, held not staged):** Last.fm casing is not trustworthy, so
   a case-only difference is already canonical. A canonical name contained in the source is
   a collapsed multi-artist credit (``Skrillex & The Doors`` → ``Skrillex``) and is held
@@ -39,9 +39,14 @@ Design notes (the spec):
 * **Name/id disagreement (held, not staged):** a name MusicBrainz records under neither its
   canonical form nor an alias for the file's own id, or a value the library pairs with two
   different ids, lands in ``name_id_disagreement`` for review.
-* **"Done" is derived**, never stored. Re-running after commit is a no-op because an
-  already-canonical value yields no change. MusicBrainz results live in
-  ``musicbrainz_artist_cache`` and getCorrection results in ``lastfm_correction_cache``.
+* **The file rule:** the selection is the first ``limit`` files that derive ``pending`` on
+  :data:`tagmend.engine.axis.ARTIST_AXIS`. Every unguarded name value on them is resolved, each
+  correction is cascade-staged on every in-scope carrier (present, not ``manual``, not
+  multi-value), and each selected file records its highest-ranked value outcome: a multi-value
+  file, a ``feat`` credit or a held value records ``no_match``, a transient error records
+  nothing, anything else records ``done``. An unselected carrier gets no row. MusicBrainz
+  results live in ``musicbrainz_artist_cache`` and getCorrection results in
+  ``lastfm_correction_cache``.
 
 Like the rest of the conn-owning layer, the public function here owns its connection and
 commits; the building blocks in :mod:`tagmend.engine.store` never commit.
@@ -53,11 +58,20 @@ import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Final
 
-from tagmend.engine import axis, clock, db, lookup_clients, schema, staging, store
+from tagmend.engine import (
+    axis,
+    axis_status,
+    clock,
+    db,
+    lookup_clients,
+    schema,
+    staging,
+    store,
+)
 from tagmend.engine.lastfm import LastfmClient, LastfmError
 from tagmend.engine.musicbrainz import MusicBrainzClient, MusicBrainzError
 from tagmend.engine.text_keys import artist_name_key
-from tagmend.engine.validation import check_limit, require_choice
+from tagmend.engine.validation import check_limit
 from tagmend.log import get_logger
 
 if TYPE_CHECKING:
@@ -70,11 +84,9 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
-# The two name fields this normalizer rewrites (exact-match only) — the artist axis's
-# field set, the single source of truth shared with the status derivation.
-# ``musicbrainz_artistid`` rides along on a changed file but is never the trigger for a
-# change on its own.
-_NAME_FIELDS: Final = axis.ARTIST_AXIS.fields
+# The two name fields this normalizer looks up and rewrites (exact-match only). Their id and
+# sort fields ride along on a changed file but never trigger a change on their own.
+_NAME_FIELDS: Final = ("artist", "albumartist")
 
 # Compilation sentinels (fold-cased): never a real artist to correct.
 _SENTINELS: Final = frozenset({"various artists", "various", "va"})
@@ -89,11 +101,6 @@ _FEAT_RE: Final = re.compile(r"\b(?:feat|ft|featuring)\b\.?", re.IGNORECASE)
 # to a placeholder is treated exactly like no correction at all. Case-irrelevant by
 # construction — the payload is punctuation-wrapped, not a cased word.
 _MB_PLACEHOLDER_RE: Final = re.compile(r"^\[.*\]$")
-
-# The two states ``set_artist_status`` is allowed to drive: ``manual`` writes a sticky
-# exclusion row; ``pending`` deletes it (re-queue). There is no engine-owned ``no_match``
-# on this axis.
-_USER_STATUSES: Final = frozenset({"manual", "pending"})
 
 # Each name field's own MusicBrainz id field. The pairing is positional in the file, not
 # global: ``artist`` is the per-track credit and ``albumartist`` the per-release one, and the
@@ -166,14 +173,11 @@ def _shrinks_credit(value: str, canonical: str) -> bool:
 class ResolveArtistsResult:
     """Immutable summary of one :func:`resolve_artists` call, JSON-ready for the MCP tool."""
 
-    processed: int
-    processed_unit: str
+    settled: int
     staged_files: int
     corrected_values: int
     skipped_multi_artist: int
     skipped_sentinel: int
-    skipped_manual: int
-    skipped_missing: int
     no_correction: int
     already_canonical: int
     shrinks_credit: int
@@ -184,7 +188,6 @@ class ResolveArtistsResult:
     more: bool
     mappings: list[dict[str, str | None]]
     multi_artist_files: list[int]
-    manual_files: list[int]
     no_correction_values: list[str]
     already_canonical_values: list[str]
     shrinks_credit_values: list[dict[str, str]]
@@ -196,14 +199,11 @@ class ResolveArtistsResult:
     def to_dict(self) -> dict[str, object]:
         """JSON-serializable form for the MCP tool."""
         return {
-            "processed": self.processed,
-            "processed_unit": self.processed_unit,
+            "settled": self.settled,
             "staged_files": self.staged_files,
             "corrected_values": self.corrected_values,
             "skipped_multi_artist": self.skipped_multi_artist,
             "skipped_sentinel": self.skipped_sentinel,
-            "skipped_manual": self.skipped_manual,
-            "skipped_missing": self.skipped_missing,
             "no_correction": self.no_correction,
             "already_canonical": self.already_canonical,
             "shrinks_credit": self.shrinks_credit,
@@ -214,7 +214,6 @@ class ResolveArtistsResult:
             "more": self.more,
             "mappings": [dict(m) for m in self.mappings],
             "multi_artist_files": list(self.multi_artist_files),
-            "manual_files": list(self.manual_files),
             "no_correction_values": list(self.no_correction_values),
             "already_canonical_values": list(self.already_canonical_values),
             "shrinks_credit_values": [dict(h) for h in self.shrinks_credit_values],
@@ -241,13 +240,11 @@ class _Resolution:
 class _Tally:
     """Mutable accumulator for one ``resolve_artists`` run, frozen into the result at end."""
 
+    settled: int = 0
     staged_files: int = 0
     skipped_multi_artist: int = 0
     skipped_sentinel: int = 0
-    skipped_manual: int = 0
-    skipped_missing: int = 0
     multi_artist_files: list[int] = field(default_factory=list)
-    manual_files: list[int] = field(default_factory=list)
     no_correction_values: list[str] = field(default_factory=list)
     already_canonical_values: list[str] = field(default_factory=list)
     shrinks_credit_values: list[dict[str, str]] = field(default_factory=list)
@@ -264,7 +261,7 @@ class _Tally:
 def resolve_artists(  # noqa: PLR0913 - cohesive keyword-only scope + injection params
     settings: Settings,
     *,
-    artist: str | None = None,
+    value: str | None = None,
     file_ids: list[int] | None = None,
     limit: int | None = None,
     dry_run: bool = False,
@@ -273,36 +270,36 @@ def resolve_artists(  # noqa: PLR0913 - cohesive keyword-only scope + injection 
 ) -> ResolveArtistsResult:
     """Normalize artist names: look up canonical forms and cascade-stage the changes.
 
-    Gathers the distinct ``artist`` + ``albumartist`` values in scope and drops the guarded
-    ones (empty / ``feat.`` / compilation sentinels). A value whose files carry its own MBID
-    is looked up by that id on MusicBrainz via *mb_client* first. Every value left over is
-    looked up on Last.fm getCorrection via *client*. Both tiers are cached and paced, and
-    together they build a ``value → correction`` map of the values that actually change. Then
-    per file in scope it skips + reports any file whose ``artist``/``albumartist`` is
-    multi-value, and otherwise stages the corrected name(s) as an ``origin='auto'`` change.
-    Each corrected field writes its own id field, and on the MusicBrainz tier its own sort
-    field. Every other managed tag is preserved.
+    Scope is *file_ids* when given, else every file carrying *value* as ``artist`` or
+    ``albumartist``, else the whole library. The selection is the first *limit* (every one when
+    ``None``) present files in scope that derive ``pending`` on the artist axis. Every distinct
+    ``artist`` + ``albumartist`` value on them is resolved except the guarded ones (empty /
+    ``feat.`` / compilation sentinels). A value whose files carry its own MBID is looked up by
+    that id on MusicBrainz via *mb_client* first. Every value left over is looked up on Last.fm
+    getCorrection via *client*. Both tiers are cached and paced, and together they build a
+    ``value → correction`` map of the values that actually change.
 
-    *limit* caps the number of distinct values processed per call and the remainder is
-    reported via ``pending_remaining`` / ``more``. It is a cap, not a cursor: a value that
-    needs no change leaves no trace, so an identical repeat call re-processes the same
-    values. Raise *limit*, or narrow with *artist* / *file_ids*, to reach the rest. A
-    negative *limit* raises :class:`ValueError`. A file the last scan flagged missing is
-    counted under ``skipped_missing``. A transient lookup error on either tier leaves that
-    value pending (not cached) and is reported, never aborting.
+    Each correction is then staged as an ``origin='auto'`` change on every in-scope carrier: a
+    present file that is not ``manual`` and not multi-value. Each corrected field writes its own
+    id field, and on the MusicBrainz tier its own sort field. Every other managed tag is
+    preserved. Finally each selected file records its outcome: ``no_match`` for a multi-value
+    file, a ``feat`` credit or a held value, nothing for a transient lookup error (the file stays
+    ``pending``), ``done`` otherwise. An unselected carrier gets no row.
 
-    *dry_run* returns the proposed ``value → canonical`` mappings and the would-stage file
-    count and stages nothing. Lookups still run. A cached answer costs nothing and a cache
-    miss makes a live request. A dry run skips the empty-staging precondition. A non-dry-run
-    raises :class:`ValueError` if anything is already staged ("commit or unstage pending
-    changes first"). *client* lets callers inject a
-    :class:`tagmend.engine.lastfm.CorrectionSource` (a fake in tests). When ``None`` a real
-    :class:`LastfmClient` is built and requires ``settings.lastfm_api_key``. *mb_client*
-    injects an :class:`tagmend.engine.musicbrainz.MBArtistSource` the same way, and when
-    ``None`` a real :class:`MusicBrainzClient` is built. Owns its connection, and
-    ``stage_tags`` opens its own.
+    *dry_run* returns the proposed ``value → canonical`` mappings and the would-settle and
+    would-stage counts and writes nothing. Lookups still run. A cached answer costs nothing and
+    a cache miss makes a live request. A dry run skips the empty-staging precondition. A
+    non-dry-run raises :class:`ValueError` if anything is already staged ("commit or unstage
+    pending changes first"), and any run raises it for a negative *limit* or an unknown file
+    id. *client* lets callers inject a :class:`tagmend.engine.lastfm.CorrectionSource` (a fake
+    in tests). When ``None`` a real :class:`LastfmClient` is built and requires
+    ``settings.lastfm_api_key``. *mb_client* injects an
+    :class:`tagmend.engine.musicbrainz.MBArtistSource` the same way, and when ``None`` a real
+    :class:`MusicBrainzClient` is built. Owns its connection, and ``stage_tags`` opens its own.
     """
     check_limit(limit)
+    tally = _Tally()
+
     connection = db.connect(settings.db_path)
     try:
         schema.apply_schema(connection)
@@ -313,85 +310,54 @@ def resolve_artists(  # noqa: PLR0913 - cohesive keyword-only scope + injection 
 
         scoped_ids = store.files_in_scope(
             connection,
-            artist=artist,
+            value_fields=axis.ARTIST_AXIS.scope_fields,
+            value=value,
             file_ids=file_ids,
         )
-
-        tally = _Tally()
-        missing = store.missing_file_ids(connection)
-        present_ids = [fid for fid in scoped_ids if fid not in missing]
-        tally.skipped_missing = len(scoped_ids) - len(present_ids)
-        candidate_ids = _drop_manual_excluded(connection, present_ids, tally)
-        values = _distinct_values(connection, candidate_ids, tally)
-
-        to_process = values[: limit if limit is not None else len(values)]
-        pending_remaining = len(values) - len(to_process)
-
-        if to_process:
-            pairing = _value_mbids(connection, candidate_ids)
-            unresolved = _resolve_by_mbid(
-                settings,
-                connection,
-                to_process,
-                pairing,
-                mb_client,
-                tally,
-            )
-            if unresolved:
-                _resolve_values(settings, connection, unresolved, client, tally)
-
-        _stage_files(settings, connection, candidate_ids, tally, dry_run=dry_run)
+        pending = store.pending_file_ids(connection, axis.ARTIST_AXIS, scoped_ids)
+        selected = pending if limit is None else pending[:limit]
+        if selected:
+            carriers = _carriers(connection, scoped_ids)
+            values = _distinct_values(connection, selected, tally)
+            if values:
+                pairing = _value_mbids(connection, carriers)
+                unresolved = _resolve_by_mbid(
+                    settings,
+                    connection,
+                    values,
+                    pairing,
+                    mb_client,
+                    tally,
+                )
+                if unresolved:
+                    _resolve_values(settings, connection, unresolved, client, tally)
+            _stage_files(settings, connection, carriers, tally, dry_run=dry_run)
+            _settle_selected(connection, selected, tally, dry_run=dry_run)
+        pending_remaining = len(store.pending_file_ids(connection, axis.ARTIST_AXIS, scoped_ids))
     finally:
         connection.close()
 
-    return _build_result(
-        tally,
-        processed=len(to_process),
-        pending_remaining=pending_remaining,
-    )
+    return _build_result(tally, pending_remaining=pending_remaining, dry_run=dry_run)
 
 
-# --- manual-exclusion filter ---------------------------------------------------------
+# --- carriers ------------------------------------------------------------------------
 
 
-def _drop_manual_excluded(
-    conn: sqlite3.Connection,
-    candidate_ids: list[int],
-    tally: _Tally,
-) -> list[int]:
-    """Drop sticky ``manual`` files from scope, recording them in *tally*.
+def _carriers(conn: sqlite3.Connection, scoped_ids: list[int]) -> list[int]:
+    """Return the present, non-``manual`` files in scope: the ones a correction may stage on.
 
-    A ``manual`` file is ALWAYS skipped (no staleness re-check): its values are neither
-    looked up nor staged. The mirror of the user-facing ``manual`` state that
-    :func:`tagmend.engine.store.derived_status` derives on ``axis.ARTIST_AXIS``.
+    A ``manual`` file's values are a human decision, so no cascade rewrites them.
     """
-    kept: list[int] = []
-    for fid in candidate_ids:
-        decision = store.get_artist_status(conn, fid)
-        if decision is not None and _decision_blocks(decision):
-            tally.skipped_manual += 1
-            tally.manual_files.append(fid)
+    missing = store.missing_file_ids(conn)
+    carriers: list[int] = []
+    for fid in scoped_ids:
+        if fid in missing:
             continue
-        kept.append(fid)
-    return kept
-
-
-def _decision_blocks(decision: store.ArtistStatusRow) -> bool:
-    """Whether a stored artist decision still blocks processing (sticky ``manual``).
-
-    The shared sticky rule lives on the axis, so this skip path and the user-facing
-    :func:`tagmend.engine.store.derived_status` on ``axis.ARTIST_AXIS`` can never drift. The
-    artist axis has
-    no staleness re-check, so the current identity is irrelevant.
-    """
-    return axis.ARTIST_AXIS.decision_blocks(
-        axis.StatusRow(
-            status=decision.status,
-            source_primary=decision.source_artist,
-            source_secondary=decision.source_albumartist,
-        ),
-        axis.Identity(primary=None, secondary=None),
-    )
+        row = axis.get_outcome(conn, axis.ARTIST_AXIS, fid)
+        if row is not None and row.status == "manual":
+            continue
+        carriers.append(fid)
+    return carriers
 
 
 # --- distinct-value scan -------------------------------------------------------------
@@ -399,17 +365,16 @@ def _decision_blocks(decision: store.ArtistStatusRow) -> bool:
 
 def _distinct_values(
     conn: sqlite3.Connection,
-    candidate_ids: list[int],
+    selected: list[int],
     tally: _Tally,
 ) -> list[str]:
-    """Return the distinct, non-guarded ``artist`` + ``albumartist`` values in scope.
+    """Return the distinct, non-guarded ``artist`` + ``albumartist`` values on *selected*.
 
-    Mutates *tally* with the sentinel/guard skip count. Order is stable (first-seen) so a
-    ``limit`` chunks deterministically.
+    Mutates *tally* with the sentinel/guard skip count. Order is stable (first-seen).
     """
     seen: set[str] = set()
     ordered: list[str] = []
-    for fid in candidate_ids:
+    for fid in selected:
         tags = store.get_tags(conn, fid)
         for field_name in _NAME_FIELDS:
             for value in tags.get(field_name, []):
@@ -595,10 +560,9 @@ def _resolve_one_value(
     A transient :class:`LastfmError` leaves the value pending (not cached) and is reported,
     never aborting the run. A correction to a MusicBrainz special-purpose placeholder
     (``[unknown]``, ``[no artist]``, …) is not a real name and is treated exactly like no
-    correction. The surviving corrections pass the gate in order — case-only (already
-    canonical), credit shrink (held), no MBID (held) — so a name is only staged when it is a
-    substantive change MusicBrainz corroborates. Every value lands in one bucket, so the
-    buckets sum to ``processed``.
+    correction. The surviving corrections pass the gate in order: case-only (already
+    canonical), credit shrink (held), no MBID (held). A name is therefore only staged when it
+    is a substantive change MusicBrainz corroborates. Every value lands in one bucket.
     """
     try:
         correction = client.artist_correction(value)
@@ -633,18 +597,21 @@ def _resolve_one_value(
 def _stage_files(
     settings: Settings,
     conn: sqlite3.Connection,
-    candidate_ids: list[int],
+    carriers: list[int],
     tally: _Tally,
     *,
     dry_run: bool,
 ) -> None:
-    """Per file in scope: skip multi-value files, else stage the accumulated name change(s)."""
-    for fid in candidate_ids:
-        tags = store.get_tags(conn, fid)
+    """Stage the accumulated name change(s) on every carrier, all in this one staging run.
 
+    A multi-value file is never a carrier, since one corrected value cannot say which of its
+    names it replaces.
+    """
+    if not tally.corrections:
+        return
+    for fid in carriers:
+        tags = store.get_tags(conn, fid)
         if _is_multi_value(tags):
-            tally.skipped_multi_artist += 1
-            tally.multi_artist_files.append(fid)
             continue
 
         target = _build_target(tags, tally.corrections)
@@ -723,14 +690,79 @@ def _stage_target(
     )
 
 
+# --- outcome stage -------------------------------------------------------------------
+
+
+def _held_values(tally: _Tally) -> set[str]:
+    """Return every value this call reported for review instead of staging."""
+    held = set(tally.no_correction_values)
+    for bucket in (
+        tally.needs_review_values,
+        tally.shrinks_credit_values,
+        tally.name_id_disagreement_values,
+    ):
+        held.update(entry["from"] for entry in bucket)
+    return held
+
+
+def _file_outcome(
+    tags: dict[str, list[str]],
+    held: set[str],
+    errored: set[str],
+) -> str | None:
+    """Return a selected file's highest-ranked value outcome, or ``None`` to write nothing.
+
+    Ranked: a multi-value file, then a ``feat`` credit or a held value (``no_match``, so the
+    file stays on the review list), then a transient error (nothing, so it stays ``pending``),
+    then ``done`` for corrected, already canonical or guarded values.
+    """
+    if _is_multi_value(tags):
+        return "no_match"
+    values = [value for field_name in _NAME_FIELDS for value in tags.get(field_name, [])]
+    if any(_is_feat(value) or value in held for value in values):
+        return "no_match"
+    if any(value in errored for value in values):
+        return None
+    return "done"
+
+
+def _settle_selected(
+    conn: sqlite3.Connection,
+    selected: list[int],
+    tally: _Tally,
+    *,
+    dry_run: bool,
+) -> None:
+    """Record each selected file's outcome, snapshotting the tags its staged change commits."""
+    held = _held_values(tally)
+    errored = {item["key"] for item in tally.error_items}
+    outcomes: list[tuple[int, str]] = []
+    for fid in selected:
+        tags = store.get_tags(conn, fid)
+        if _is_multi_value(tags):
+            tally.skipped_multi_artist += 1
+            tally.multi_artist_files.append(fid)
+        status = _file_outcome(tags, held, errored)
+        if status is not None:
+            outcomes.append((fid, status))
+    tally.settled += len(outcomes)
+
+    if dry_run:
+        return
+    now = clock.utc_now()
+    for fid, status in outcomes:
+        store.record_outcome(conn, axis.ARTIST_AXIS, file_id=fid, status=status, now=now)
+    conn.commit()
+
+
 # --- result --------------------------------------------------------------------------
 
 
 def _build_result(
     tally: _Tally,
     *,
-    processed: int,
     pending_remaining: int,
+    dry_run: bool,
 ) -> ResolveArtistsResult:
     """Freeze the run's tally + counts into the public :class:`ResolveArtistsResult`."""
     mappings = [
@@ -742,21 +774,12 @@ def _build_result(
         }
         for value, resolution in tally.corrections.items()
     ]
-    more = pending_remaining > 0
-    summary = _summarize(
-        tally,
-        processed=processed,
-        pending_remaining=pending_remaining,
-    )
     return ResolveArtistsResult(
-        processed=processed,
-        processed_unit="values",
+        settled=tally.settled,
         staged_files=tally.staged_files,
         corrected_values=len(tally.corrections),
         skipped_multi_artist=tally.skipped_multi_artist,
         skipped_sentinel=tally.skipped_sentinel,
-        skipped_manual=tally.skipped_manual,
-        skipped_missing=tally.skipped_missing,
         no_correction=len(tally.no_correction_values),
         already_canonical=len(tally.already_canonical_values),
         shrinks_credit=len(tally.shrinks_credit_values),
@@ -764,82 +787,51 @@ def _build_result(
         name_id_disagreement=len(tally.name_id_disagreement_values),
         errors=len(tally.error_items),
         pending_remaining=pending_remaining,
-        more=more,
+        more=not dry_run and tally.settled > 0 and pending_remaining > 0,
         mappings=mappings,
         multi_artist_files=list(tally.multi_artist_files),
-        manual_files=list(tally.manual_files),
         no_correction_values=list(tally.no_correction_values),
         already_canonical_values=list(tally.already_canonical_values),
         shrinks_credit_values=[dict(h) for h in tally.shrinks_credit_values],
         needs_review_values=[dict(h) for h in tally.needs_review_values],
         name_id_disagreement_values=[dict(d) for d in tally.name_id_disagreement_values],
         error_items=list(tally.error_items),
-        summary=summary,
+        summary=_summarize(tally, pending_remaining=pending_remaining, dry_run=dry_run),
     )
 
 
-def _summarize(
-    tally: _Tally,
-    *,
-    processed: int,
-    pending_remaining: int,
-) -> str:
-    """Build a short, plain human summary of what was and was not processed.
+def _summarize(tally: _Tally, *, pending_remaining: int, dry_run: bool) -> str:
+    """Build a short, plain human summary of what settled and what is left.
 
-    The unprocessed remainder is never described as resumable: no bucket other than an
-    accepted correction writes a row, so nothing shrinks the distinct-value list between
-    two identical calls, on the dry-run path or the real one.
+    A dry run records nothing, so its remainder is not resumable and is worded accordingly.
     """
     parts = [
-        f"Processed {processed} value(s): {len(tally.corrections)} corrected, "
+        f"Settled {tally.settled} file(s): {len(tally.corrections)} value(s) corrected, "
         f"staged {tally.staged_files} file(s).",
-        f"Skipped multi-artist {tally.skipped_multi_artist}, "
-        f"sentinel/feat/empty {tally.skipped_sentinel}, "
-        f"manual {tally.skipped_manual}, "
-        f"missing {tally.skipped_missing}; "
+        f"Multi-artist {tally.skipped_multi_artist} file(s), "
+        f"sentinel/feat/empty {tally.skipped_sentinel} value(s), "
         f"{len(tally.already_canonical_values)} already canonical, "
         f"no correction {len(tally.no_correction_values)}.",
         f"Held (reported, never staged): credit shrink {len(tally.shrinks_credit_values)}, "
         f"needs review {len(tally.needs_review_values)}, "
         f"name/id disagreement {len(tally.name_id_disagreement_values)}.",
     ]
-    if pending_remaining > 0:
+    if dry_run:
         parts.append(
-            f"Processed the first {processed} of {processed + pending_remaining} value(s) "
-            f"in scope. An identical call re-processes the same values instead of "
-            f"advancing, because a value needing no change leaves no trace. "
-            f"Raise limit above {processed}, or scope with artist= / file_ids=, to reach "
-            f"the remaining {pending_remaining} value(s).",
+            f"A dry run records nothing, so {pending_remaining} file(s) in scope stay pending "
+            f"and an identical call previews the same files.",
         )
+    elif pending_remaining > 0:
+        parts.append(f"{pending_remaining} file(s) still pending. Call again to continue.")
     if tally.error_items:
         parts.append(
-            f"{len(tally.error_items)} value(s) errored and stay pending. Re-run to retry.",
+            f"{len(tally.error_items)} value(s) errored and their files stay pending. "
+            f"Re-run to retry.",
         )
     return " ".join(parts)
 
 
 # --- status tools --------------------------------------------------------------------
-
-
-def _artist_scope(
-    conn: sqlite3.Connection,
-    *,
-    file_ids: list[int] | None,
-    value: str | None,
-) -> list[int]:
-    """Resolve the in-scope file ids for the artist status tools, in ascending id order.
-
-    *file_ids* (when given) win; otherwise *value* matches every file carrying it as
-    ``artist`` OR ``albumartist`` (the union across both name fields). With neither given,
-    the scope is empty (the tools require an explicit target).
-    """
-    if file_ids is not None:
-        return store.files_in_scope(conn, file_ids=file_ids)
-    if value is None:
-        return []
-    matched = set(store.files_by_tag_value(conn, "artist", value))
-    matched.update(store.files_by_tag_value(conn, "albumartist", value))
-    return sorted(matched)
 
 
 def set_artist_status(
@@ -849,42 +841,21 @@ def set_artist_status(
     value: str | None = None,
     status: str,
 ) -> int:
-    """Set ``manual`` (exclude) or ``pending`` (re-queue) for every file in scope.
+    """Record ``manual`` on the artist axis for every file in scope.
 
-    Scope is *file_ids* when given, else every file carrying *value* as ``artist`` OR
-    ``albumartist``. ``manual`` writes a sticky row (recording the file's current
-    ``artist``/``albumartist`` for audit) so :func:`resolve_artists` always skips it;
-    ``pending`` deletes any row, re-queuing the file. Returns the number of files affected.
-    Raises :class:`ValueError` for an unknown *status*. Owns its transaction.
+    Scope is *file_ids* when given, else every file carrying *value* as ``artist`` or
+    ``albumartist``. With neither the call changes nothing and returns 0. A ``manual`` file is
+    never selected and no cascade stages on it until :func:`reset_artist_status`. Returns the
+    number of files affected. Raises :class:`ValueError` for any *status* other than
+    ``manual`` or an unknown file id.
     """
-    require_choice("status", status, _USER_STATUSES)
-
-    connection = db.connect(settings.db_path)
-    try:
-        schema.apply_schema(connection)
-        scoped = _artist_scope(connection, file_ids=file_ids, value=value)
-        now = clock.utc_now()
-        for fid in scoped:
-            if status == "manual":
-                tags = store.get_tags(connection, fid)
-                artist_values = tags.get("artist", [])
-                albumartist_values = tags.get("albumartist", [])
-                store.set_artist_status(
-                    connection,
-                    file_id=fid,
-                    status="manual",
-                    source_artist=artist_values[0] if artist_values else None,
-                    source_albumartist=albumartist_values[0] if albumartist_values else None,
-                    now=now,
-                )
-            else:
-                store.delete_artist_status(connection, fid)
-        connection.commit()
-    finally:
-        connection.close()
-
-    logger.info("set artist status=%s for %d file(s)", status, len(scoped))
-    return len(scoped)
+    return axis_status.set_manual_status(
+        settings,
+        axis.ARTIST_AXIS,
+        file_ids=file_ids,
+        value=value,
+        status=status,
+    )
 
 
 def reset_artist_status(
@@ -893,20 +864,13 @@ def reset_artist_status(
     file_ids: list[int] | None = None,
     value: str | None = None,
 ) -> int:
-    """Delete the artist status row for every file in scope (back to ``pending``).
+    """Delete the artist status row of every file in scope, the one hand-back of ``manual``.
 
-    Same value-across-both-fields scoping as :func:`set_artist_status`. Returns the number
-    of files affected. Owns its transaction.
+    Same scoping as :func:`set_artist_status`. Returns the number of files affected.
     """
-    connection = db.connect(settings.db_path)
-    try:
-        schema.apply_schema(connection)
-        scoped = _artist_scope(connection, file_ids=file_ids, value=value)
-        for fid in scoped:
-            store.delete_artist_status(connection, fid)
-        connection.commit()
-    finally:
-        connection.close()
-
-    logger.info("reset artist status for %d file(s)", len(scoped))
-    return len(scoped)
+    return axis_status.reset_status(
+        settings,
+        axis.ARTIST_AXIS,
+        file_ids=file_ids,
+        value=value,
+    )

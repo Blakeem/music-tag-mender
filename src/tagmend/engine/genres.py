@@ -1,38 +1,51 @@
 """Genre-tagging orchestration: select → look up Last.fm → classify → stage (M2 phase 1).
 
 This is the LLM-facing entry point that ties the read path, the cached Last.fm client,
-the classifier, and the revertible staging engine together. It owns the *selection* and
-*status* policy from PLAN — Last.fm genre tagging ("Status model"); the lookups, the
-classification, and the disk writes are delegated to the modules built in chunks 1-3.
+the classifier, and the revertible staging engine together. The lookups, the classification,
+and the disk writes are delegated to the modules built in chunks 1-3.
 
 Design notes (the spec):
 
-* **"Done" is derived**, never stored. A file is done when it has a staged change to
-  ``genre``, or a committed ``origin='auto'`` revision whose diff changed ``genre`` above that
-  field's ``voided_auto`` watermark. Only the two negative outcomes (``no_match`` /
-  ``manual``) live in ``file_genre_status``.
+* **Selection is the classifier's ``pending`` set.** :func:`tagmend.engine.store.derived_status`
+  on :data:`tagmend.engine.axis.GENRE_AXIS` decides it, over present files in scope, in file id
+  order, capped at ``limit`` files. Every selected file leaves ``pending`` unless its lookup
+  errors, so repeated capped calls terminate.
+* **The outcome stage writes one row per selected file.** A resolved genre equal to the
+  current one records ``done``. A differing one is staged and records ``done`` snapshotting the
+  staged target. A lookup with nothing usable records ``no_match``. A transient Last.fm error
+  writes nothing and the file stays ``pending``.
 * **Lookup identity** is ``albumartist`` when present (better for compilations), else
-  ``artist``; ``album`` is used only when ``genre_use_album_tags`` is on.
+  ``artist``. ``album`` is used only when ``genre_use_album_tags`` is on.
 * **No accidental deletion (P0):** the resolver stages only ``genre``, the one field it
   decides, and :func:`tagmend.engine.staging._stage_one` merges it onto the tags read from
   disk, so ``write_managed_tags``'s delete-on-absent behavior can never drop
   ``artist``/``albumartist`` and a lagging snapshot mirror can never overwrite a newer value.
-* **One connection** is owned here for selection, cache, and status writes; the
+* **One connection** is owned here for selection, cache, and status writes. The
   :class:`tagmend.engine.lastfm.LastfmClient` shares it (eager cache commits), while
   :func:`tagmend.engine.staging.stage_tags` opens and owns its own connection per call.
 
 Like the rest of the conn-owning layer, the public functions here own their connection
-and commit; the building blocks in :mod:`tagmend.engine.store` never commit.
+and commit. The building blocks in :mod:`tagmend.engine.store` never commit.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING
 
-from tagmend.engine import axis, classify, clock, db, lookup_clients, schema, staging, store
+from tagmend.engine import (
+    axis,
+    axis_status,
+    classify,
+    clock,
+    db,
+    lookup_clients,
+    schema,
+    staging,
+    store,
+)
 from tagmend.engine.lastfm import LastfmClient, LastfmError
-from tagmend.engine.validation import check_limit, require_choice
+from tagmend.engine.validation import check_limit
 from tagmend.log import get_logger
 
 if TYPE_CHECKING:
@@ -44,10 +57,7 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
-# The two states ``set_genre_status`` is allowed to drive (the LLM may exclude/re-include
-# a file, but never set engine-owned outcomes like ``no_match``). ``manual`` writes a
-# sticky status row; ``pending`` deletes it (re-queue).
-_USER_STATUSES: Final = frozenset({"manual", "pending"})
+_GENRE_FIELD = axis.GENRE_AXIS.fields[0]
 
 
 # --- result types --------------------------------------------------------------------
@@ -57,11 +67,9 @@ _USER_STATUSES: Final = frozenset({"manual", "pending"})
 class ResolveGenresResult:
     """Immutable summary of one :func:`resolve_genres` call, JSON-ready for the MCP tool."""
 
-    processed: int
-    processed_unit: str
-    staged: int
+    settled: int
+    staged_files: int
     no_match: int
-    skipped: dict[str, int]
     pending_remaining: int
     more: bool
     errors: int
@@ -72,11 +80,9 @@ class ResolveGenresResult:
     def to_dict(self) -> dict[str, object]:
         """JSON-serializable form for the MCP tool."""
         return {
-            "processed": self.processed,
-            "processed_unit": self.processed_unit,
-            "staged": self.staged,
+            "settled": self.settled,
+            "staged_files": self.staged_files,
             "no_match": self.no_match,
-            "skipped": dict(self.skipped),
             "pending_remaining": self.pending_remaining,
             "more": self.more,
             "errors": self.errors,
@@ -90,88 +96,11 @@ class ResolveGenresResult:
 class _Tally:
     """Mutable accumulator for one ``resolve_genres`` run, frozen into the result at the end."""
 
-    staged: int = 0
+    settled: int = 0
+    staged_files: int = 0
     no_match: int = 0
-    skipped_done: int = 0
-    skipped_no_match: int = 0
-    skipped_manual: int = 0
-    skipped_no_identity: int = 0
-    skipped_missing: int = 0
     error_items: list[dict[str, str]] = field(default_factory=list)
     no_match_artists: set[str] = field(default_factory=set)
-
-
-@dataclass(frozen=True, slots=True)
-class _Candidate:
-    """A processable file plus the identity it will be looked up against."""
-
-    file_id: int
-    identity: axis.LookupIdentity
-
-
-# --- selection -----------------------------------------------------------------------
-
-
-def _select(
-    conn: sqlite3.Connection,
-    candidate_ids: list[int],
-    tally: _Tally,
-) -> list[_Candidate]:
-    """Classify each candidate into a bucket; return only the processable ones.
-
-    Mutates *tally* with the skip counts. A candidate is processable when it is not
-    already done (staged / committed auto revision), is not sticky ``manual``, and has no
-    non-stale ``no_match`` for its current identity.
-
-    The user-facing mirror of this classification is
-    :func:`tagmend.engine.store.derived_status` on ``axis.GENRE_AXIS`` (the ``list_files``
-    filter and the stats counts). Keep the two in sync when the predicates change.
-    """
-    genre_fields = axis.GENRE_AXIS.fields
-    processable: list[_Candidate] = []
-    for fid in candidate_ids:
-        identity = axis.lookup_identity(store.get_tags(conn, fid))
-
-        if identity.artist is None:
-            tally.skipped_no_identity += 1
-            continue
-
-        if store.has_staged_change_for(conn, fid, genre_fields) or store.has_auto_change_for(
-            conn,
-            fid,
-            genre_fields,
-        ):
-            tally.skipped_done += 1
-            continue
-
-        decision = store.get_genre_status(conn, fid)
-        if decision is not None and _decision_blocks(decision, identity):
-            if decision.status == "manual":
-                tally.skipped_manual += 1
-            else:  # a non-stale 'no_match'
-                tally.skipped_no_match += 1
-            continue
-        # A stale no_match (identity changed) does not block and is reprocessed.
-
-        processable.append(_Candidate(file_id=fid, identity=identity))
-    return processable
-
-
-def _decision_blocks(decision: store.GenreStatusRow, identity: axis.LookupIdentity) -> bool:
-    """Whether a stored genre decision still blocks processing for the current identity.
-
-    The shared genre staleness/sticky rule (``manual`` always blocks; ``no_match`` blocks
-    only while NOT stale) lives on the axis, so this skip path and the user-facing
-    :func:`tagmend.engine.store.derived_status` on ``axis.GENRE_AXIS`` can never drift.
-    """
-    return axis.GENRE_AXIS.decision_blocks(
-        axis.StatusRow(
-            status=decision.status,
-            source_primary=decision.source_artist,
-            source_secondary=decision.source_album,
-        ),
-        axis.Identity(primary=identity.artist, secondary=identity.album),
-    )
 
 
 # --- staging orchestration -----------------------------------------------------------
@@ -180,36 +109,38 @@ def _decision_blocks(decision: store.GenreStatusRow, identity: axis.LookupIdenti
 def resolve_genres(  # noqa: PLR0913 - cohesive keyword-only scope + injection params
     settings: Settings,
     *,
-    artist: str | None = None,
+    value: str | None = None,
     album: str | None = None,
     file_ids: list[int] | None = None,
     limit: int | None = None,
     dry_run: bool = False,
     client: TagSource | None = None,
 ) -> ResolveGenresResult:
-    """Look up Last.fm genres for the in-scope, not-yet-done files and stage the result.
+    """Look up Last.fm genres for the in-scope ``pending`` files and stage the result.
 
-    Selects the files in scope that are present on disk, not already done (a committed
-    ``auto`` genre revision), not sticky ``manual``, and have no non-stale ``no_match``. It caps
-    them at *limit* (default ``genre_stage_limit``) and groups them by ``(artist, album)``.
-    Per group it looks up Last.fm top tags, classifies them, and either stages the resolved
-    genres (``origin='auto'``, only ``genre`` changed) or records a ``no_match``. A file the
-    last scan flagged missing is counted under ``skipped["missing"]``. A transient Last.fm
-    error leaves the group pending and is reported, never aborting the call.
+    Scope is *file_ids* when given, else every file carrying *value* as ``artist`` or
+    ``albumartist`` (narrowed to *album* when given), else the whole library. The selection is
+    the first *limit* (default ``genre_stage_limit``) present files in scope that derive
+    ``pending``. They are grouped by ``(artist, album)``, and per group Last.fm top tags are
+    looked up and classified. Each selected file then settles: ``done`` when the resolved genres
+    equal its current ones, ``done`` and staged (``origin='auto'``, only ``genre`` changed) when
+    they differ, ``no_match`` when nothing usable came back. A transient Last.fm error leaves the
+    group ``pending`` and is reported, never aborting the call.
 
-    *dry_run* counts what would be staged or recorded ``no_match`` without staging or writing
-    any status row. It still reads the lookup cache and fetches on a cache miss.
+    *dry_run* counts what would settle and stage without staging or writing any status row. It
+    still reads the lookup cache and fetches on a cache miss.
 
     *client* lets callers inject a :class:`tagmend.engine.lastfm.TagSource` (a fake in
     tests). When ``None`` a real :class:`LastfmClient` is built and requires
     ``settings.lastfm_api_key``. A non-dry run raises :class:`ValueError` if anything is
     already staged ("commit or unstage pending changes first"). Any run raises it for a
-    negative *limit*, or when a real client is needed but no API key is configured. Owns its
-    connection, and ``stage_tags`` opens its own.
+    negative *limit*, an unknown file id, *album* without *value*, or when a real client is
+    needed but no API key is configured. Owns its connection, and ``stage_tags`` opens its own.
     """
     check_limit(limit)
     effective_limit = limit if limit is not None else settings.genre_stage_limit
     vocab = classify.load_vocabulary()
+    tally = _Tally()
 
     connection = db.connect(settings.db_path)
     try:
@@ -223,53 +154,34 @@ def resolve_genres(  # noqa: PLR0913 - cohesive keyword-only scope + injection p
 
         scoped_ids = store.files_in_scope(
             connection,
-            artist=artist,
+            value_fields=axis.GENRE_AXIS.scope_fields,
+            value=value,
             album=album,
             file_ids=file_ids,
         )
-
-        tally = _Tally()
-        missing = store.missing_file_ids(connection)
-        candidate_ids = [fid for fid in scoped_ids if fid not in missing]
-        tally.skipped_missing = len(scoped_ids) - len(candidate_ids)
-        processable = _select(connection, candidate_ids, tally)
-
-        to_process = processable[:effective_limit]
-        pending_remaining = len(processable) - len(to_process)
-
-        if to_process:
-            _process_groups(
-                settings,
-                connection,
-                to_process,
-                vocab,
-                client,
-                tally,
-                dry_run=dry_run,
-            )
+        pending = store.pending_file_ids(connection, axis.GENRE_AXIS, scoped_ids)
+        selected = pending[:effective_limit]
+        if selected:
+            _process_groups(settings, connection, selected, vocab, client, tally, dry_run=dry_run)
+        pending_remaining = len(store.pending_file_ids(connection, axis.GENRE_AXIS, scoped_ids))
     finally:
         connection.close()
 
-    return _build_result(
-        tally,
-        processed=len(to_process),
-        pending_remaining=pending_remaining,
-        dry_run=dry_run,
-    )
+    return _build_result(tally, pending_remaining=pending_remaining, dry_run=dry_run)
 
 
 def _process_groups(  # noqa: PLR0913 - cohesive orchestration inputs
     settings: Settings,
     conn: sqlite3.Connection,
-    candidates: list[_Candidate],
+    selected: list[int],
     vocab: Vocabulary,
     client: TagSource | None,
     tally: _Tally,
     *,
     dry_run: bool,
 ) -> None:
-    """Group *candidates* by identity and resolve each group via *client* (built if None)."""
-    groups = _group_by_identity(candidates)
+    """Group *selected* by identity and resolve each group via *client* (built if None)."""
+    groups = _group_by_identity(conn, selected)
 
     with lookup_clients.injected_or_owned(
         client,
@@ -288,11 +200,15 @@ def _process_groups(  # noqa: PLR0913 - cohesive orchestration inputs
             )
 
 
-def _group_by_identity(candidates: list[_Candidate]) -> dict[axis.LookupIdentity, list[int]]:
+def _group_by_identity(
+    conn: sqlite3.Connection,
+    file_ids: list[int],
+) -> dict[axis.LookupIdentity, list[int]]:
     """Group file ids by their lookup identity, preserving first-seen group order."""
     groups: dict[axis.LookupIdentity, list[int]] = {}
-    for candidate in candidates:
-        groups.setdefault(candidate.identity, []).append(candidate.file_id)
+    for fid in file_ids:
+        identity = axis.lookup_identity(store.get_tags(conn, fid))
+        groups.setdefault(identity, []).append(fid)
     return groups
 
 
@@ -307,13 +223,13 @@ def _process_one_group(  # noqa: PLR0913 - cohesive per-group inputs
     *,
     dry_run: bool,
 ) -> None:
-    """Resolve one ``(artist, album)`` group and stage / mark its files accordingly.
+    """Resolve one ``(artist, album)`` group and settle its files.
 
-    A transient :class:`LastfmError` leaves the group's files pending (no status row),
-    records the error, and returns without aborting the wider call. The group's status
-    writes are committed together at the end. A dry run counts the outcome and writes nothing.
+    A transient :class:`LastfmError` writes nothing, records the error, and returns without
+    aborting the wider call, so the group's files stay ``pending``. The group's status rows
+    are committed together at the end. A dry run counts the outcome and writes nothing.
     """
-    # ``_select`` guarantees a non-None artist for every processable candidate.
+    # A pending file has a genre identity, which needs an artist.
     lookup_artist = identity.artist
     assert lookup_artist is not None  # noqa: S101 - selection invariant
 
@@ -324,31 +240,30 @@ def _process_one_group(  # noqa: PLR0913 - cohesive per-group inputs
         tally.error_items.append({"key": lookup_artist, "message": str(exc)})
         return
 
+    changed: list[int] = []
+    status = "no_match"
     if resolved:
-        for fid in file_ids:
-            if not dry_run:
-                _stage_resolved(settings, fid, resolved)
-            tally.staged += 1
-        return
-
-    # The lookup already happened, so a preview reports the miss. Only the sticky status row
-    # is withheld until the real run.
-    if dry_run:
+        status = "done"
+        changed = [
+            fid for fid in file_ids if store.get_tags(conn, fid).get(_GENRE_FIELD, []) != resolved
+        ]
+    else:
         tally.no_match += len(file_ids)
         tally.no_match_artists.add(lookup_artist)
+    tally.settled += len(file_ids)
+    tally.staged_files += len(changed)
+
+    # The lookup already happened, so a preview reports the outcome. Only the stage and the
+    # status rows are withheld until the real run.
+    if dry_run:
         return
+    # Every stage runs before any row write, because stage_tags needs the write lock this
+    # connection would otherwise hold.
+    for fid in changed:
+        _stage_resolved(settings, fid, resolved)
     now = clock.utc_now()
     for fid in file_ids:
-        store.set_genre_status(
-            conn,
-            file_id=fid,
-            status="no_match",
-            source_artist=identity.artist,
-            source_album=identity.album,
-            now=now,
-        )
-        tally.no_match += 1
-    tally.no_match_artists.add(lookup_artist)
+        store.record_outcome(conn, axis.GENRE_AXIS, file_id=fid, status=status, now=now)
     conn.commit()
 
 
@@ -396,72 +311,40 @@ def _stage_resolved(settings: Settings, file_id: int, resolved: list[str]) -> No
 def _build_result(
     tally: _Tally,
     *,
-    processed: int,
     pending_remaining: int,
     dry_run: bool,
 ) -> ResolveGenresResult:
     """Freeze the run's tally + counts into the public :class:`ResolveGenresResult`."""
-    skipped = {
-        "done": tally.skipped_done,
-        "no_match": tally.skipped_no_match,
-        "manual": tally.skipped_manual,
-        "no_identity": tally.skipped_no_identity,
-        "missing": tally.skipped_missing,
-    }
-    more = pending_remaining > 0
-    summary = _summarize(
-        tally,
-        processed=processed,
-        pending_remaining=pending_remaining,
-        skipped=skipped,
-        dry_run=dry_run,
-    )
+    more = not dry_run and tally.settled > 0 and pending_remaining > 0
     return ResolveGenresResult(
-        processed=processed,
-        processed_unit="files",
-        staged=tally.staged,
+        settled=tally.settled,
+        staged_files=tally.staged_files,
         no_match=tally.no_match,
-        skipped=skipped,
         pending_remaining=pending_remaining,
         more=more,
         errors=len(tally.error_items),
         error_items=list(tally.error_items),
         no_match_artists=sorted(tally.no_match_artists),
-        summary=summary,
+        summary=_summarize(tally, pending_remaining=pending_remaining, dry_run=dry_run),
     )
 
 
-def _summarize(
-    tally: _Tally,
-    *,
-    processed: int,
-    pending_remaining: int,
-    skipped: dict[str, int],
-    dry_run: bool,
-) -> str:
-    """Build a short, plain human summary of what was and was not processed.
+def _summarize(tally: _Tally, *, pending_remaining: int, dry_run: bool) -> str:
+    """Build a short, plain human summary of what settled and what is left.
 
-    A dry run records neither a stage nor a ``no_match``, so its remainder is not resumable
-    and is worded accordingly.
+    A dry run records nothing, so its remainder is not resumable and is worded accordingly.
     """
-    skipped_total = sum(skipped.values())
     errors = len(tally.error_items)
     parts = [
-        f"Processed {processed} file(s): staged {tally.staged}, no_match {tally.no_match}.",
-        f"Skipped {skipped_total} "
-        f"(done {skipped['done']}, no_match {skipped['no_match']}, "
-        f"manual {skipped['manual']}, no_identity {skipped['no_identity']}, "
-        f"missing {skipped['missing']}).",
+        f"Settled {tally.settled} file(s): staged {tally.staged_files}, no_match {tally.no_match}.",
     ]
-    if pending_remaining > 0 and dry_run:
+    if dry_run:
         parts.append(
-            f"Processed the first {processed} of {processed + pending_remaining} file(s) in "
-            f"scope. A dry run records nothing, so an identical call re-processes the same "
-            f"files. Raise limit above {processed}, or scope with artist= / file_ids=, to "
-            f"reach the remaining {pending_remaining} file(s).",
+            f"A dry run records nothing, so {pending_remaining} file(s) in scope stay pending "
+            f"and an identical call previews the same files.",
         )
     elif pending_remaining > 0:
-        parts.append(f"{pending_remaining} still pending — call again to continue.")
+        parts.append(f"{pending_remaining} file(s) still pending. Call again to continue.")
     if errors > 0:
         parts.append(f"{errors} artist(s) errored and stay pending. Re-run to retry.")
     return " ".join(parts)
@@ -470,88 +353,42 @@ def _summarize(
 # --- status tools --------------------------------------------------------------------
 
 
-def _genre_scope(
-    conn: sqlite3.Connection,
-    *,
-    file_ids: list[int] | None,
-    artist: str | None,
-) -> list[int]:
-    """Resolve the in-scope file ids for the genre status tools, in ascending id order.
-
-    *file_ids* (when given) win, else *artist*. With neither, the scope is empty rather than
-    the whole library, as it is for the artist, year and mismatch status tools.
-    """
-    if file_ids is not None:
-        return store.files_in_scope(conn, file_ids=file_ids)
-    if artist is not None:
-        return store.files_in_scope(conn, artist=artist)
-    return []
-
-
 def set_genre_status(
     settings: Settings,
     *,
     file_ids: list[int] | None = None,
-    artist: str | None = None,
+    value: str | None = None,
     status: str,
 ) -> int:
-    """Set ``manual`` (exclude) or ``pending`` (re-queue) for every file in scope.
+    """Record ``manual`` on the genre axis for every file in scope.
 
-    ``manual`` writes a sticky status row recording the file's current lookup identity, so
-    it is skipped until an explicit reset. ``pending`` deletes any status row, re-queuing
-    the file. With neither *file_ids* nor *artist* the call changes nothing and returns 0.
-    Returns the number of files affected. Raises :class:`ValueError` for an unknown
-    *status*. Owns its transaction.
+    Scope is *file_ids* when given, else every file carrying *value* as ``artist`` or
+    ``albumartist``. With neither the call changes nothing and returns 0. A ``manual`` row is
+    sticky until :func:`reset_genre_status`. Returns the number of files affected. Raises
+    :class:`ValueError` for any *status* other than ``manual`` or an unknown file id.
     """
-    require_choice("status", status, _USER_STATUSES)
-
-    connection = db.connect(settings.db_path)
-    try:
-        schema.apply_schema(connection)
-        scoped = _genre_scope(connection, file_ids=file_ids, artist=artist)
-        now = clock.utc_now()
-        for fid in scoped:
-            if status == "manual":
-                identity = axis.lookup_identity(store.get_tags(connection, fid))
-                store.set_genre_status(
-                    connection,
-                    file_id=fid,
-                    status="manual",
-                    source_artist=identity.artist,
-                    source_album=identity.album,
-                    now=now,
-                )
-            else:
-                store.delete_genre_status(connection, fid)
-        connection.commit()
-    finally:
-        connection.close()
-
-    logger.info("set genre status=%s for %d file(s)", status, len(scoped))
-    return len(scoped)
+    return axis_status.set_manual_status(
+        settings,
+        axis.GENRE_AXIS,
+        file_ids=file_ids,
+        value=value,
+        status=status,
+    )
 
 
 def reset_genre_status(
     settings: Settings,
     *,
     file_ids: list[int] | None = None,
-    artist: str | None = None,
+    value: str | None = None,
 ) -> int:
-    """Delete the genre status row for every file in scope (back to ``pending``).
+    """Delete the genre status row of every file in scope, the one hand-back of ``manual``.
 
-    With neither *file_ids* nor *artist* the call changes nothing and returns 0, because a
-    deleted ``manual`` exclusion has no history to restore it from. Returns the number of
-    files affected. Owns its transaction.
+    Same scoping as :func:`set_genre_status`. Returns the number of files affected.
     """
-    connection = db.connect(settings.db_path)
-    try:
-        schema.apply_schema(connection)
-        scoped = _genre_scope(connection, file_ids=file_ids, artist=artist)
-        for fid in scoped:
-            store.delete_genre_status(connection, fid)
-        connection.commit()
-    finally:
-        connection.close()
-
-    logger.info("reset genre status for %d file(s)", len(scoped))
-    return len(scoped)
+    return axis_status.reset_status(
+        settings,
+        axis.GENRE_AXIS,
+        file_ids=file_ids,
+        value=value,
+    )

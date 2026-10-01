@@ -1077,13 +1077,13 @@ def revert_commit(
     rollback is itself a tracked, revertible commit. History stays append-only, so nothing
     after the commit is ever lost. Find commit ids with ``list_commits``.
 
-    Safety rules. A file changed again by a LATER commit is skipped and reported as
-    ``skipped_later_changes``. Revert it per file with ``revert_tags`` or ``revert_paths`` if
-    that is really wanted. The staging area must be empty, tag and path rows alike, so commit
-    or unstage pending work first, and run ``commit_paths`` to finish an interrupted path
-    revert. Missing files are reported, not fatal. A path whose old location is taken now is
-    reported as an ``error``. Use ``dry_run=true`` to preview the exact per-file plan without
-    touching anything.
+    Safety rules. A file changed again by a LATER commit, or edited outside TagMend, is skipped
+    and reported as ``skipped_later_changes``. Revert it per file with ``revert_tags`` or
+    ``revert_paths`` if that is really wanted. The staging area must be empty, tag and path
+    rows alike, so commit or unstage pending work first, and run ``commit_paths`` to finish an
+    interrupted path revert. Missing files are reported, not fatal. A path whose old location
+    is taken now is reported as an ``error``. Use ``dry_run=true`` to preview the exact
+    per-file plan without touching anything.
 
     Args:
         commit_id: The commit to undo (from ``list_commits``).
@@ -1894,7 +1894,8 @@ def resolve_years(
 
     Only ``pending`` files are selected, so repeated ``limit``-capped calls terminate. A
     transient MusicBrainz error writes nothing, leaves that group's files ``pending``, and is
-    counted in ``errors`` and itemized in ``error_items`` (``{key, message}``).
+    counted in ``errors`` and itemized in ``error_items`` (``{key, message}``). A file staging
+    refuses stays ``pending`` and is itemized under the key ``file_id=<id>``.
 
     Args:
         value: Limit to files whose ``album`` tag equals this value.

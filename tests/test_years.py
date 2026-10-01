@@ -20,7 +20,7 @@ import mutagen
 import pytest
 
 from conftest import make_track
-from tagmend.engine import staging, store, versioning, years
+from tagmend.engine import axis, staging, store, versioning, years
 from tagmend.engine.db import connect
 from tagmend.engine.library import list_files as library_list
 from tagmend.engine.library import scan_library
@@ -738,3 +738,35 @@ def test_resolve_years_skips_missing_files(
     assert result.pending_remaining == 0
     assert result.staged_files == 1
     assert [view.filename for view in staging.diff_tags(engine_settings)] == [kept.name]
+
+
+def test_a_file_staging_refuses_is_itemized_and_its_sibling_still_settles(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    make_track(music_dir / "kept.mp3", {"artist": ["Black Sabbath"], "album": ["Paranoid"]})
+    gone = make_track(music_dir / "gone.mp3", {"artist": ["Black Sabbath"], "album": ["Paranoid"]})
+    scan_library(engine_settings)
+    kept_id = _file_id(engine_settings, music_dir, "kept.mp3")
+    gone_id = _file_id(engine_settings, music_dir, "gone.mp3")
+    gone.unlink()  # after the scan, so the file is still selected
+
+    fake = FakeMBReleaseGroupSource({("Black Sabbath", "Paranoid"): _mb("1970")})
+    result = years.resolve_years(engine_settings, client=fake)
+
+    assert result.staged_files == 1
+    assert result.settled == 1
+    assert [item["key"] for item in result.error_items] == [f"file_id={gone_id}"]
+    assert "errored" in result.summary
+    conn = connect(engine_settings.db_path)
+    try:
+        apply_schema(conn)
+        kept_row = axis.get_outcome(conn, axis.YEAR_AXIS, kept_id)
+        gone_row = axis.get_outcome(conn, axis.YEAR_AXIS, gone_id)
+    finally:
+        conn.close()
+    assert kept_row is not None
+    assert kept_row.status == "done"
+    assert gone_row is None
+    view = next(v for v in library_list(engine_settings) if v.file_id == gone_id)
+    assert view.year_status == "pending"

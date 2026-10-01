@@ -110,6 +110,30 @@ def test_different_titles_sharing_a_slot_is_high() -> None:
     assert row.reason == track_conflicts._REASON_HIGH
 
 
+@pytest.mark.parametrize(
+    ("first", "second"),
+    [
+        ("東京事変", "群青日和"),
+        ("Часть 1", "Глава 1"),
+        ("Love Song (東京)", "Love Song (大阪)"),
+    ],
+)
+def test_different_non_latin_titles_sharing_a_slot_is_high(first: str, second: str) -> None:
+    # Each pair differs only in non-Latin letters, which an ASCII-only key would erase.
+    folder = _MUSIC / "Tokyo Jihen" / "(2004) Kyoiku"
+    files = [
+        _mk(1, folder, "a.mp3", tracknumber="1", title=first, album="Kyoiku"),
+        _mk(2, folder, "b.mp3", tracknumber="1", title=second, album="Kyoiku"),
+    ]
+
+    report = track_conflicts._classify(files)
+
+    assert report.high == 2
+    row = _find(report, 1)
+    assert row is not None
+    assert row.tier == "high"
+
+
 def test_same_title_different_container_is_low() -> None:
     # An .mp3 and a .flac of one song is usually a deliberate duplicate encode.
     folder = _MUSIC / "Pendulum" / "(2008) In Silico"

@@ -2,6 +2,7 @@
 
 * :func:`alnum_key` treats casing and every character outside ``[a-z0-9]`` as cosmetic.
 * :func:`alnum_ascii_key` also treats ligatures and diacritics as cosmetic.
+* :func:`alnum_script_key` is :func:`alnum_ascii_key` that keeps every letter with no ASCII form.
 * :func:`display_key` treats casing, typographic character choice and whitespace runs as cosmetic.
 * :func:`artist_name_key` also treats a dash written for a word break as cosmetic.
 * :func:`loose_key` treats Unicode compatibility forms, casing and whitespace as cosmetic.
@@ -20,6 +21,8 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
 
 _NON_ALNUM: Final = re.compile(r"[^a-z0-9]+")
+_ASCII_ALNUM: Final = re.compile(r"[a-z0-9]+")
+_SCRIPT_CATEGORIES: Final = frozenset({"L", "M", "N"})
 
 # Ligature/eszett map applied after casefold (which already folds ``ß`` → ``ss`` and
 # ``Æ`` → ``æ`` etc.), covering the compatibility cases NFKD does not decompose.
@@ -69,6 +72,35 @@ def alnum_ascii_key(s: str) -> str:
     decomposed = unicodedata.normalize("NFKD", translated)
     without_marks = "".join(ch for ch in decomposed if not unicodedata.combining(ch))
     return _NON_ALNUM.sub("", without_marks)
+
+
+def alnum_script_key(s: str) -> str:
+    """Return :func:`alnum_ascii_key` for *s*, keeping each letter that has no ASCII form.
+
+    A base character folds together with the marks after it. That cluster becomes its ASCII
+    form when the form is all ``[a-z0-9]``. It stays as written when its base is a letter, mark
+    or digit of another script, and drops otherwise. So ``Dååth`` == ``Daath``, while
+    ``Часть 1`` and ``Глава 1`` stay apart and a kana voicing mark survives.
+    """
+    folded = unicodedata.normalize("NFKC", s).casefold().translate(_LIGATURE_TABLE)
+    clusters: list[str] = []
+    for ch in folded:
+        if clusters and unicodedata.category(ch).startswith("M"):
+            clusters[-1] += ch
+        else:
+            clusters.append(ch)
+    return "".join(_fold_cluster(cluster) for cluster in clusters)
+
+
+def _fold_cluster(cluster: str) -> str:
+    """Return *cluster*'s ASCII form, else *cluster* when its base is a letter, else ``""``."""
+    decomposed = unicodedata.normalize("NFKD", cluster)
+    ascii_form = "".join(ch for ch in decomposed if not unicodedata.category(ch).startswith("M"))
+    if _ASCII_ALNUM.fullmatch(ascii_form):
+        return ascii_form
+    if unicodedata.category(cluster[0])[0] in _SCRIPT_CATEGORIES:
+        return cluster
+    return ""
 
 
 def display_key(value: str) -> str:

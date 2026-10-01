@@ -203,6 +203,59 @@ def test_revert_commit_skips_files_changed_later(
     assert read_tags(b).tags["genre"] == ["Rock"]
 
 
+def _edit_title_outside_tagmend(track: Path, title: str) -> None:
+    write_managed_tags(track, versioning.managed_subset(read_tags(track).tags) | {"title": [title]})
+
+
+def test_revert_commit_skips_a_file_edited_outside_tagmend(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    a = make_track(music_dir / "a.mp3", {"genre": ["Electronic"], "title": ["Old"]})
+    b = make_track(music_dir / "b.flac", {"genre": ["Rock"]})
+    scan_library(engine_settings)
+    a_id = _file_id(engine_settings, music_dir, a.name)
+    b_id = _file_id(engine_settings, music_dir, b.name)
+    target = _stage_and_commit(
+        engine_settings,
+        {a_id: {"genre": ["Synthwave"]}, b_id: {"genre": ["Metal"]}},
+    )
+    _edit_title_outside_tagmend(a, "Hand Fixed")
+    scan_library(engine_settings)
+
+    preview = versioning.revert_commit(engine_settings, target, dry_run=True)
+    result = versioning.revert_commit(engine_settings, target)
+
+    assert _outcome(preview, a_id).status == "skipped_later_changes"
+    assert _outcome(result, a_id).status == "skipped_later_changes"
+    assert _outcome(result, b_id).status == "reverted"
+    assert read_tags(a).tags["title"] == ["Hand Fixed"]
+    assert read_tags(a).tags["genre"] == ["Synthwave"]
+    assert read_tags(b).tags["genre"] == ["Rock"]
+
+
+def test_revert_commit_records_and_skips_an_edit_landing_after_its_plan_pass(
+    engine_settings: Settings,
+    music_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    a = make_track(music_dir / "a.mp3", {"genre": ["Electronic"], "title": ["Old"]})
+    scan_library(engine_settings)
+    a_id = _file_id(engine_settings, music_dir, a.name)
+    target = _stage_and_commit(engine_settings, {a_id: {"genre": ["Synthwave"]}})
+    _edit_title_outside_tagmend(a, "Hand Fixed")
+    # The plan pass classified the file before the edit landed.
+    monkeypatch.setattr(versioning, "_preview_kind", lambda *_args: "revertable")
+
+    result = versioning.revert_commit(engine_settings, target)
+
+    assert _outcome(result, a_id).status == "skipped_later_changes"
+    assert read_tags(a).tags["title"] == ["Hand Fixed"]
+    observed = _revisions(engine_settings, a_id)[-1]
+    assert (observed.origin, observed.commit_id) == ("scan", None)
+    assert observed.diff == {"title": {"from": ["Old"], "to": ["Hand Fixed"]}}
+
+
 # --- scenario 3: missing file --------------------------------------------------------
 
 

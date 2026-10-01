@@ -50,6 +50,8 @@ from tagmend.engine.tags import (
 if TYPE_CHECKING:
     from pathlib import Path
 
+    from mutagen._file import FileType
+
 _ALL_FORMATS = [".mp3", ".flac", ".m4a", ".ogg"]
 # Only these templates round-trip to an empty tag set; .flac/.ogg carry an `encoder`
 # Vorbis comment baked into the template, so they cannot assert an exactly-empty map.
@@ -647,9 +649,12 @@ def test_write_refuses_to_drop_a_frame(tmp_path: Path, monkeypatch: pytest.Monke
     real_apply = tags._apply_changes
 
     def lossy(
-        path: Path, container: tags._Container, changes: list[tuple[str, list[str] | None]]
+        path: Path,
+        container: tags._Container,
+        kind: type[FileType],
+        changes: list[tuple[str, list[str] | None]],
     ) -> None:
-        real_apply(path, container, changes)
+        real_apply(path, container, kind, changes)
         frames = ID3(path)  # type: ignore[no-untyped-call]
         frames.delall("TXXX:Foo")  # type: ignore[no-untyped-call]
         frames.save()
@@ -711,9 +716,10 @@ def test_write_refuses_when_audio_payload_changes(
     def corrupting(
         path: Path,
         container: tags._Container,
+        kind: type[FileType],
         changes: list[tuple[str, list[str] | None]],
     ) -> None:
-        real_apply(path, container, changes)
+        real_apply(path, container, kind, changes)
         data = bytearray(path.read_bytes())
         with path.open("rb") as handle:
             start = tags._id3v2_end(handle)
@@ -727,6 +733,22 @@ def test_write_refuses_when_audio_payload_changes(
         write_managed_tags(track, {**_managed(track), "genre": ["Jazz"]})
 
     assert track.read_bytes() == before
+    assert not list(tmp_path.glob("*.tagmend.tmp"))
+
+
+def test_write_opens_the_temp_copy_as_the_original_class(tmp_path: Path) -> None:
+    # An ID3-prefixed FLAC sniffs as FLAC only by its extension, which the temp copy lacks.
+    track = make_track(tmp_path / "prefixed.flac", {"genre": ["Rock"]})
+    prefix = io.BytesIO()
+    frames = ID3()  # type: ignore[no-untyped-call]
+    frames.add(TIT2(encoding=3, text=["Prefix"]))  # type: ignore[no-untyped-call]
+    frames.save(prefix)
+    track.write_bytes(prefix.getvalue() + track.read_bytes())
+
+    assert write_managed_tags(track, {**_managed(track), "genre": ["Jazz"]}) is True
+
+    assert read_tags(track).tags["genre"] == ["Jazz"]
+    assert track.read_bytes().startswith(b"ID3")
     assert not list(tmp_path.glob("*.tagmend.tmp"))
 
 

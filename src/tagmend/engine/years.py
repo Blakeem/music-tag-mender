@@ -84,7 +84,8 @@ class _Tally:
     no_match: int = 0
     # identity -> original_date (one mapping per resolved album group).
     mappings: dict[tuple[str | None, str | None], str] = field(default_factory=dict)
-    # One item per album group whose MusicBrainz lookup failed, so an outage is visible.
+    # One item per album group whose MusicBrainz lookup failed and per file staging refused, so
+    # an outage or an unstageable file is visible.
     error_items: list[dict[str, str]] = field(default_factory=list)
 
 
@@ -231,8 +232,11 @@ def _process_one_group(  # noqa: PLR0913 - cohesive per-group inputs
     """Resolve one ``(artist, album)`` group and blank-fill / mark its files accordingly.
 
     A transient :class:`MusicBrainzError` writes nothing, records one error item, and returns
-    without aborting the wider call, so the group's files stay ``pending``.
+    without aborting the wider call, so the group's files stay ``pending``. A file staging
+    refuses records its own error item and stays ``pending`` while its siblings settle.
     """
+    failed: set[int] = set()
+
     # A pending file has a year identity, which needs an artist and an album.
     lookup_artist = identity.artist
     lookup_album = identity.album
@@ -270,13 +274,38 @@ def _process_one_group(  # noqa: PLR0913 - cohesive per-group inputs
     # Every stage runs before any row write, because stage_tags needs the write lock this
     # connection would otherwise hold.
     if resolved is not None:
-        for fid in file_ids:
-            if _stage_resolved(settings, fid, resolved.original_date):
-                tally.staged_files += 1
+        failed = _stage_group(settings, file_ids, resolved.original_date, tally)
     now = clock.utc_now()
     for fid in file_ids:
-        store.record_outcome(conn, axis.YEAR_AXIS, file_id=fid, status=status, now=now)
+        if fid not in failed:
+            store.record_outcome(conn, axis.YEAR_AXIS, file_id=fid, status=status, now=now)
     conn.commit()
+
+
+def _stage_group(
+    settings: Settings,
+    file_ids: list[int],
+    original_date: str,
+    tally: _Tally,
+) -> set[int]:
+    """Stage *original_date* on each of *file_ids* and return the ids staging refused.
+
+    A refused file (vanished, unreadable or unwritable since the scan) is itemized and taken
+    back out of ``settled``, so it stays ``pending`` without aborting its siblings or the call.
+    """
+    failed: set[int] = set()
+    for fid in file_ids:
+        try:
+            staged = _stage_resolved(settings, fid, original_date)
+        except ValueError as exc:
+            logger.warning("resolve_years: file_id=%d not staged: %s", fid, exc)
+            tally.error_items.append({"key": f"file_id={fid}", "message": str(exc)})
+            tally.settled -= 1
+            failed.add(fid)
+            continue
+        if staged:
+            tally.staged_files += 1
+    return failed
 
 
 def _stage_resolved(settings: Settings, file_id: int, original_date: str) -> bool:
@@ -342,7 +371,7 @@ def _summarize(tally: _Tally, *, pending_remaining: int, dry_run: bool) -> str:
         parts.append(f"{pending_remaining} file(s) still pending. Call again to continue.")
     errors = len(tally.error_items)
     if errors > 0:
-        parts.append(f"{errors} album group(s) errored and stay pending. Re-run to retry.")
+        parts.append(f"{errors} item(s) errored and stay pending. Re-run to retry.")
     return " ".join(parts)
 
 

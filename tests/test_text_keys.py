@@ -24,6 +24,16 @@ def test_alnum_ascii_key_strips_case_space_punctuation() -> None:
     assert text_keys.alnum_ascii_key("A.B. & C") == "abc"
 
 
+def test_alnum_script_key_folds_latin_and_keeps_other_scripts() -> None:
+    assert text_keys.alnum_script_key("Dååth") == text_keys.alnum_script_key("Daath")
+    assert text_keys.alnum_script_key("Leæther Strip") == "leaetherstrip"
+    assert text_keys.alnum_script_key("Love Song (Live)") == "lovesonglive"
+    assert text_keys.alnum_script_key("Часть 1") != text_keys.alnum_script_key("Глава 1")
+    assert text_keys.alnum_script_key("か") != text_keys.alnum_script_key("が")
+    assert text_keys.alnum_script_key("ｶﾞ") == text_keys.alnum_script_key("ガ")
+    assert text_keys.alnum_script_key("+") == ""
+
+
 def test_keys_disagree_where_documented() -> None:
     assert text_keys.alnum_key("Röyksopp") != text_keys.alnum_ascii_key("Röyksopp")
     assert text_keys.display_key("The Crow: City") != text_keys.display_key("The Crow- City")

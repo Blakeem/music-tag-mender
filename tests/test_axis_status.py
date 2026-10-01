@@ -336,8 +336,8 @@ def test_human_album_commit_after_an_external_genre_edit_never_reads_manual(
     staging.stage_tags(engine_settings, file_id=file_id, tags={"album": ["Discovery (Live)"]})
     result = staging.commit_tags(engine_settings)
 
-    # The stored revision diff absorbs the external genre edit. The commit writer keys on
-    # the diff against disk, which holds only the album.
+    # Staging records the external genre edit in its own scan revision, so the commit revision
+    # holds only the album, and the commit writer never reads the genre as a human change.
     assert result.commit_id is not None
     conn = connect(engine_settings.db_path)
     try:
@@ -345,7 +345,7 @@ def test_human_album_commit_after_an_external_genre_edit_never_reads_manual(
         (revision,) = store.revisions_for_commit(conn, result.commit_id)
     finally:
         conn.close()
-    assert set(revision.diff) == {"album", "genre"}
+    assert set(revision.diff) == {"album"}
     assert _status(engine_settings, file_id) == "pending"
 
 

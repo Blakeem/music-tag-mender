@@ -410,6 +410,60 @@ def test_revert_dry_run_reports_noop(engine_settings: Settings, music_dir: Path)
     assert result.status == "noop"
 
 
+def test_revert_records_an_external_edit_before_writing_over_it(
+    engine_settings: Settings, music_dir: Path
+) -> None:
+    track, file_id = _committed_track(engine_settings, music_dir)
+    on_disk = versioning.managed_subset(read_tags(track).tags)
+    write_managed_tags(track, on_disk | {"title": ["Hand Fixed"]})
+    scan_library(engine_settings)
+
+    result = versioning.revert_tags(engine_settings, file_id, 0)
+
+    assert result.status == "reverted"
+    assert "title" not in read_tags(track).tags
+    observed, reverted = _revisions(engine_settings, file_id)[-2:]
+    assert (observed.origin, observed.commit_id) == ("scan", None)
+    assert observed.managed_tags["title"] == ["Hand Fixed"]
+    assert observed.diff == {"title": {"from": [], "to": ["Hand Fixed"]}}
+    assert reverted.origin == "revert"
+    assert reverted.diff["title"] == {"from": ["Hand Fixed"], "to": []}
+
+
+class _Crash(BaseException):
+    """A process death: no ``except`` clause in the engine catches it."""
+
+
+@pytest.mark.parametrize("entry_point", ["revert_commit", "revert_tags"])
+def test_a_revert_crashed_after_its_write_is_not_drift_on_rerun(
+    engine_settings: Settings,
+    music_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    entry_point: str,
+) -> None:
+    track, file_id = _committed_track(engine_settings, music_dir)
+    commit_id = _revisions(engine_settings, file_id)[-1].commit_id
+    assert commit_id is not None
+
+    def revert() -> str:
+        if entry_point == "revert_commit":
+            return versioning.revert_commit(engine_settings, commit_id).outcomes[0].status
+        return versioning.revert_tags(engine_settings, file_id, 0).status
+
+    def write_then_die(path: Path, tags: dict[str, list[str]]) -> None:
+        write_managed_tags(path, tags)
+        raise _Crash
+
+    with monkeypatch.context() as patch:
+        patch.setattr(versioning, "write_managed_tags", write_then_die)
+        with pytest.raises(_Crash):
+            revert()
+    assert read_tags(track).tags["genre"] == ["Electronic"]  # the write landed, the row did not
+
+    assert revert() == "reverted"
+    assert [r.origin for r in _revisions(engine_settings, file_id)] == ["scan", "manual", "revert"]
+
+
 def test_revert_dry_run_refuses_a_staged_file(engine_settings: Settings, music_dir: Path) -> None:
     from tagmend.engine import staging  # noqa: PLC0415 - local import keeps module imports lean
 

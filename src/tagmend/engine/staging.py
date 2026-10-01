@@ -338,9 +338,8 @@ def _record_axis_outcomes(  # noqa: PLR0913 - cohesive keyword-only commit-write
     A ``manual`` change records ``manual`` on every axis whose fields it changed, replacing any
     row. The change is the staged row's ``changed_fields``, taken against disk at stage time,
     because a re-applied commit finds disk already equal to the target. A row staged before
-    that column falls back to *disk_diff*. Neither is the stored revision diff, which would
-    absorb an external edit made since the last revision. An ``auto`` change re-stamps the
-    resolver's own row (:func:`_restamp_outcome`).
+    that column falls back to *disk_diff*. An ``auto`` change re-stamps the resolver's own row
+    (:func:`_restamp_outcome`).
     """
     changed_fields = disk_diff.keys() if staged.changed_fields is None else staged.changed_fields
     for tag_axis in axis.TAG_AXES:
@@ -393,7 +392,8 @@ def _stage_one(  # noqa: PLR0913 - cohesive keyword-only per-file staging payloa
     The shared per-file core of :func:`stage_tags` and :func:`stage_tags_batch`: rejects
     unmanaged keys, cleans every caller-supplied value (:func:`_clean_values`), rejects an
     unknown or missing *file_id*, lazily captures the version-0 baseline (or the re-baseline
-    :func:`tagmend.engine.versioning.observe_widened_fields` writes), merges
+    :func:`tagmend.engine.versioning.observe_widened_fields` writes), records an external edit
+    as a ``scan`` revision (:func:`tagmend.engine.versioning.observe_drift`), merges
     *tags* onto the file's current managed subset (P0: omitted keys are preserved),
     and upserts the staged row with the file's signature as its base, so the commit can refuse
     a file edited since, and with the caller's surviving keys as its ``supplied_keys``. A file
@@ -455,8 +455,11 @@ def _stage_one(  # noqa: PLR0913 - cohesive keyword-only per-file staging payloa
 
     # Capture v0 now (resume-free model): freeze the true original before any commit. A file
     # whose latest revision predates the current managed set is re-baselined for the same reason.
+    # An external edit since the latest revision is observed here, never at commit time, where a
+    # re-applied crashed write would read as drift. The commit revision then diffs from it.
     versioning.ensure_baseline(conn, file_id, managed_tags=current, now=now)
     versioning.observe_widened_fields(conn, file_id, managed_tags=current, now=now)
+    versioning.observe_drift(conn, file_id, managed_tags=current, now=now)
 
     # No accidental deletion (P0): merge onto the current managed subset so omitted managed
     # keys are preserved through the commit's delete-on-absent write. The caller's values

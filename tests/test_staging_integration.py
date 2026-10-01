@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING
 import mutagen
 import pytest
 from mutagen.flac import FLAC
-from mutagen.id3 import ID3, TYER, MakeID3v1  # type: ignore[attr-defined]
+from mutagen.id3 import ID3, RVAD, TIT2, TYER, MakeID3v1  # type: ignore[attr-defined]
 
 from conftest import make_track
 from tagmend import mcp_server
@@ -419,6 +419,38 @@ def test_commit_completes_a_write_that_landed_before_a_crash(
     assert _staged(engine_settings, file_id) is None
 
 
+def test_stage_records_an_external_edit_before_the_commit_writes_over_it(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    track = make_track(music_dir / "t.flac", {"genre": ["Rock"]})
+    scan_library(engine_settings)
+    file_id = _file_id(engine_settings, music_dir, track.name)
+    staging.stage_tags(engine_settings, file_id=file_id, tags={"genre": ["Pop"]})
+    first = staging.commit_tags(engine_settings)
+    on_disk = versioning.managed_subset(read_tags(track).tags)
+    write_managed_tags(track, on_disk | {"genre": ["Jazz"]})
+    scan_library(engine_settings)
+
+    staging.stage_tags(engine_settings, file_id=file_id, tags={"genre": ["Pop"]})
+    second = staging.commit_tags(engine_settings)
+
+    assert second.committed == 1
+    assert second.noop == 0
+    *_, observed, committed = _revisions(engine_settings, file_id)
+    assert (observed.origin, observed.commit_id) == ("scan", None)
+    assert observed.managed_tags["genre"] == ["Jazz"]
+    assert observed.diff == {"genre": {"from": ["Pop"], "to": ["Jazz"]}}
+    assert committed.commit_id == second.commit_id
+    assert committed.diff == {"genre": {"from": ["Jazz"], "to": ["Pop"]}}
+    assert first.commit_id is not None
+    assert second.commit_id is not None
+    undo_first = versioning.revert_commit(engine_settings, first.commit_id)
+    assert [o.status for o in undo_first.outcomes] == ["skipped_later_changes"]
+    versioning.revert_commit(engine_settings, second.commit_id)
+    assert read_tags(track).tags["genre"] == ["Jazz"]
+
+
 def test_commit_skips_the_check_for_a_legacy_staged_row(
     engine_settings: Settings,
     music_dir: Path,
@@ -634,6 +666,61 @@ def test_stage_refuses_a_file_whose_audio_payload_cannot_be_located(
         staging.stage_tags(engine_settings, file_id=file_id, tags={"title": ["Found"]})
 
     assert _staged(engine_settings, file_id) is None
+
+
+def _with_raw_v23_tag(track: Path, frames: dict[bytes, bytes]) -> None:
+    """Replace *track*'s ID3v2 tag with a v2.3 tag holding *frames* (frame id to frame body)."""
+    ID3(track).delete()  # type: ignore[no-untyped-call]
+    body = b"".join(
+        frame_id + len(data).to_bytes(4, "big") + b"\x00\x00" + data
+        for frame_id, data in frames.items()
+    )
+    size = bytes((len(body) >> shift) & 0x7F for shift in (21, 14, 7, 0))
+    track.write_bytes(b"ID3\x03\x00\x00" + size + body + track.read_bytes())
+
+
+def test_stage_refuses_a_v23_file_whose_rvad_frame_every_write_drops(
+    engine_settings: Settings, music_dir: Path
+) -> None:
+    track = make_track(music_dir / "rvad.mp3")
+    frames = ID3()  # type: ignore[no-untyped-call]
+    frames.add(TIT2(encoding=3, text=["Loud"]))  # type: ignore[no-untyped-call]
+    frames.add(RVAD(adjustments=[1, 1], peaks=[1, 1]))  # type: ignore[no-untyped-call]
+    frames.save(track, v2_version=3)
+    scan_library(engine_settings)
+    file_id = _file_id(engine_settings, music_dir, track.name)
+
+    with pytest.raises(ValueError, match="dropped RVAD"):
+        staging.stage_tags(engine_settings, file_id=file_id, tags={"genre": ["Rock"]})
+
+    assert _staged(engine_settings, file_id) is None
+
+
+def test_stage_refuses_a_v23_file_whose_unknown_frame_every_write_drops(
+    engine_settings: Settings, music_dir: Path
+) -> None:
+    track = make_track(music_dir / "ncon.mp3")
+    _with_raw_v23_tag(track, {b"TIT2": b"\x00Odd", b"NCON": b"\x00\x01\x02\x03"})
+    scan_library(engine_settings)
+    file_id = _file_id(engine_settings, music_dir, track.name)
+
+    with pytest.raises(ValueError, match="dropped unknown frame NCON"):
+        staging.stage_tags(engine_settings, file_id=file_id, tags={"genre": ["Rock"]})
+
+    assert _staged(engine_settings, file_id) is None
+
+
+def test_stage_accepts_a_v23_file_whose_date_frames_the_upgrade_folds(
+    engine_settings: Settings, music_dir: Path
+) -> None:
+    track = make_track(music_dir / "dated.mp3")
+    _with_raw_v23_tag(track, {b"TIT2": b"\x00Dated", b"TYER": b"\x002001", b"TDAT": b"\x000304"})
+    scan_library(engine_settings)
+    file_id = _file_id(engine_settings, music_dir, track.name)
+
+    assert staging.stage_tags(engine_settings, file_id=file_id, tags={"genre": ["Rock"]})
+    assert staging.commit_tags(engine_settings).committed == 1
+    assert read_tags(track).tags["genre"] == ["Rock"]
 
 
 def test_diff_tags_enrichment(engine_settings: Settings, music_dir: Path) -> None:

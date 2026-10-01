@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import io
 import os
 import re
 import shutil
@@ -31,7 +32,7 @@ import mutagen
 # concrete subclasses instead would silently miss the ones not listed.
 from mutagen._vorbis import VCommentDict
 from mutagen.easyid3 import EasyID3
-from mutagen.easymp4 import EasyMP4Tags
+from mutagen.easymp4 import EasyMP4, EasyMP4Tags
 from mutagen.flac import FLAC
 from mutagen.id3 import (  # type: ignore[attr-defined]
     ID3,
@@ -323,9 +324,18 @@ def read_tags(path: Path) -> TrackTags:
     decide how to record a read failure. An ID3v2.3 ``TYER`` that starts with a full
     ``YYYY-MM-DD`` date mutagen cannot convert reads as that ``date`` when no other date exists.
     """
+    return _normalized_tags(path, mutagen.File(path, easy=True))  # type: ignore[attr-defined]
+
+
+def _normalized_tags(path: Path, audio: FileType | None) -> TrackTags:
+    """Normalize the tags of *audio*, opened in easy mode from *path*, as :func:`read_tags` does.
+
+    A write's temp copy is opened by the class identified from the original, because mutagen
+    weighs the file name when it sniffs and the temp name carries no audio extension.
+    """
     # Input
-    audio = mutagen.File(path, easy=True)  # type: ignore[attr-defined]
-    if audio is None or audio.tags is None:
+    tags: Any = None if audio is None else audio.tags
+    if tags is None:
         return TrackTags({})
 
     # Process — a file can carry both spellings of one concept (a tagger wrote the Vorbis name,
@@ -333,7 +343,7 @@ def read_tags(path: Path) -> TrackTags:
     # looks at, so it wins regardless of iteration order.
     normalized: dict[str, list[str]] = {}
     from_vorbis_spelling: set[str] = set()
-    for raw_key, raw_values in audio.tags.items():
+    for raw_key, raw_values in tags.items():
         lowered = str(raw_key).lower()
         key = _VORBIS_TO_CANONICAL.get(lowered, lowered)
         native = lowered in _VORBIS_TO_CANONICAL
@@ -342,7 +352,7 @@ def read_tags(path: Path) -> TrackTags:
         normalized[key] = [str(value) for value in raw_values]
         if native:
             from_vorbis_spelling.add(key)
-    if isinstance(audio.tags, EasyID3) and "date" not in normalized:
+    if isinstance(tags, EasyID3) and "date" not in normalized:
         fallback = _unconverted_tyer_date(path)
         if fallback:
             normalized["date"] = fallback
@@ -565,8 +575,10 @@ def _upgrade_keeps(frame_id: str, value: str, successors: _Successors) -> bool:
     return False
 
 
-def _id3_entries(path: Path) -> dict[str, list[str]]:
-    """Return the unmanaged ID3v2 frames as ``frame key -> value digests``.
+def _id3_entries(source: Path | BinaryIO) -> dict[str, list[str]]:
+    """Return the unmanaged ID3v2 frames of *source* as ``frame key -> value digests``.
+
+    *source* is a path or a file object, so :func:`ensure_writable` can read an in-memory save.
 
     Loaded untranslated so a frame the v2.4 upgrade removes is still seen, then upgraded so a
     v2.3 frame compares equal to the v2.4 successor a save writes in its place. An older frame
@@ -575,7 +587,7 @@ def _id3_entries(path: Path) -> dict[str, list[str]]:
     only its presence.
     """
     try:
-        frames: Any = ID3(path, translate=False, load_v1=False)  # type: ignore[no-untyped-call]
+        frames: Any = ID3(source, translate=False, load_v1=False)  # type: ignore[no-untyped-call]
     except ID3NoHeaderError:
         return {}
     entries: dict[str, list[str]] = {}
@@ -613,12 +625,19 @@ def _id3_entries(path: Path) -> dict[str, list[str]]:
     return entries
 
 
-def _mutagen_entries(path: Path, container: _Container) -> dict[str, list[str]]:
-    """Return the unmanaged Vorbis comments or MP4 atoms (plus FLAC pictures) of *path*."""
+def _mutagen_entries(
+    path: Path,
+    container: _Container,
+    kind: type[FileType],
+) -> dict[str, list[str]]:
+    """Return the unmanaged Vorbis comments or MP4 atoms (plus FLAC pictures) of *path*.
+
+    *kind* is the easy class the original opened as. MP4 swaps in the raw class, because the
+    easy layer renames the atoms.
+    """
     entries: dict[str, list[str]] = {}
-    audio = mutagen.File(path)  # type: ignore[attr-defined]
-    if audio is None:
-        return entries
+    raw_kind = MP4 if issubclass(kind, EasyMP4) else kind
+    audio: Any = raw_kind(path)
     is_mp4 = container is _Container.MP4
     if audio.tags is not None:
         pairs = audio.tags.items() if is_mp4 else audio.tags
@@ -634,17 +653,21 @@ def _mutagen_entries(path: Path, container: _Container) -> dict[str, list[str]]:
     return entries
 
 
-def _unmanaged_entries(path: Path, container: _Container) -> dict[str, tuple[str, ...]]:
+def _unmanaged_entries(
+    path: Path,
+    container: _Container,
+    kind: type[FileType],
+) -> dict[str, tuple[str, ...]]:
     """Return every tag entry outside the managed set's raw spellings, as value digests."""
     if container is _Container.ID3:
         entries = _id3_entries(path)
     else:
-        entries = _mutagen_entries(path, container)
+        entries = _mutagen_entries(path, container, kind)
     return {key: tuple(values) for key, values in entries.items()}
 
 
-def _snapshot(path: Path, container: _Container) -> _ContainerSnapshot:
-    """Capture what a tag write on *path* must preserve."""
+def _snapshot(path: Path, container: _Container, kind: type[FileType]) -> _ContainerSnapshot:
+    """Capture what a tag write on *path*, opened as the easy class *kind*, must preserve."""
     size = path.stat().st_size
     with path.open("rb") as handle:
         trailer = _read_trailer(handle, size)
@@ -652,7 +675,7 @@ def _snapshot(path: Path, container: _Container) -> _ContainerSnapshot:
         audio_digest = None if ranges is None else _hash_ranges(handle, ranges)
     return _ContainerSnapshot(
         audio_digest=audio_digest,
-        entries=_unmanaged_entries(path, container),
+        entries=_unmanaged_entries(path, container, kind),
         has_id3v1=trailer.has_id3v1,
         has_apev2=trailer.has_apev2,
     )
@@ -679,9 +702,13 @@ def _snapshot_violations(before: _ContainerSnapshot, after: _ContainerSnapshot) 
     return violations
 
 
-def _readback_violations(path: Path, managed: Mapping[str, list[str]]) -> list[str]:
-    """Describe every managed key on *path* that does not read back as *managed* targets."""
-    read_back = read_tags(path).tags
+def _readback_violations(
+    path: Path,
+    kind: type[FileType],
+    managed: Mapping[str, list[str]],
+) -> list[str]:
+    """Describe every managed key on *path*, opened as *kind*, not reading back as *managed*."""
+    read_back = _normalized_tags(path, kind(path)).tags
     violations: list[str] = []
     for key in sorted(MANAGED_TAGS):
         wanted = list(managed.get(key) or [])
@@ -789,16 +816,14 @@ def _apply_id3(path: Path, changes: list[tuple[str, list[str] | None]]) -> None:
 def _apply_changes(
     path: Path,
     container: _Container,
+    kind: type[FileType],
     changes: list[tuple[str, list[str] | None]],
 ) -> None:
-    """Apply the planned *changes* to *path* and save it."""
+    """Apply the planned *changes* to *path*, opened as the easy class *kind*, and save it."""
     if container is _Container.ID3:
         _apply_id3(path, changes)
         return
-    audio = mutagen.File(path, easy=True)  # type: ignore[attr-defined]
-    if audio is None:
-        message = f"mutagen could not identify {path} for writing"
-        raise ValueError(message)
+    audio: Any = kind(path)
     for written, values in changes:
         if values is None:
             del audio[written]
@@ -824,6 +849,30 @@ def _require_verifiable(path: Path, audio: FileType) -> _Container:
     return container
 
 
+def _require_lossless_id3_save(path: Path) -> None:
+    """Raise :class:`TagWriteError` when saving *path*'s ID3 tag as v2.4 drops an unmanaged frame.
+
+    Every ID3 write saves v2.4, which discards v2.3-only frames such as ``RVAD`` and unknown
+    frames, so the verifier refuses every write of such a file whatever its changes.
+    """
+    try:
+        frames: Any = ID3(path, load_v1=False)  # type: ignore[no-untyped-call]
+    except ID3NoHeaderError:
+        return
+    saved = io.BytesIO()
+    frames.save(saved)
+    saved.seek(0)
+    violations = _snapshot_violations(_id3_entries_snapshot(path), _id3_entries_snapshot(saved))
+    if violations:
+        raise TagWriteError(path, violations)
+
+
+def _id3_entries_snapshot(source: Path | BinaryIO) -> _ContainerSnapshot:
+    """Snapshot only the unmanaged ID3 frames of *source*, every other part held equal."""
+    entries = {key: tuple(values) for key, values in _id3_entries(source).items()}
+    return _ContainerSnapshot(audio_digest=None, entries=entries, has_id3v1=False, has_apev2=False)
+
+
 def ensure_writable(path: Path) -> None:
     """Raise when :func:`write_managed_tags` would refuse *path* before reading its changes.
 
@@ -834,7 +883,8 @@ def ensure_writable(path: Path) -> None:
     if audio is None:
         message = f"mutagen could not identify {path} for writing"
         raise ValueError(message)
-    _require_verifiable(path, audio)
+    if _require_verifiable(path, audio) is _Container.ID3:
+        _require_lossless_id3_save(path)
 
 
 def write_managed_tags(path: Path, managed: dict[str, list[str]]) -> bool:
@@ -878,16 +928,17 @@ def write_managed_tags(path: Path, managed: dict[str, list[str]]) -> bool:
     if not changes:
         return False
     container = _require_verifiable(path, original)
-    before = _snapshot(path, container)
+    kind = type(original)
+    before = _snapshot(path, container, kind)
 
     # Output: apply the plan to a temp copy, verify it, then atomically swap it in.
     tmp = path.with_name(f"{path.name}.tagmend.tmp")
     shutil.copy2(path, tmp)
     replaced = False
     try:
-        _apply_changes(tmp, container, changes)
-        violations = _snapshot_violations(before, _snapshot(tmp, container))
-        violations += _readback_violations(tmp, managed)
+        _apply_changes(tmp, container, kind, changes)
+        violations = _snapshot_violations(before, _snapshot(tmp, container, kind))
+        violations += _readback_violations(tmp, kind, managed)
         if violations:
             raise TagWriteError(path, violations)
         tmp.replace(path)

@@ -89,9 +89,20 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
 from tagmend import config
-from tagmend.engine import clock, commits, db, mismatch, naming, path_keys, scan, schema, store
+from tagmend.engine import (
+    clock,
+    commits,
+    db,
+    mismatch,
+    naming,
+    path_keys,
+    scan,
+    schema,
+    store,
+    text_keys,
+)
 from tagmend.engine.detector_core import parse_position
-from tagmend.engine.path_text import part_problems
+from tagmend.engine.path_text import clean_value, part_problems
 from tagmend.log import get_logger
 
 if TYPE_CHECKING:
@@ -1755,12 +1766,18 @@ def _target_key(work: _Work) -> str | None:
     return None if work.to_path is None else path_keys.path_key(work.to_path)
 
 
-def _slot(work: _Work) -> tuple[str, int | None, int] | None:
-    """Return the destination folder and ``[disc-]NN`` slot of *work*, ``None`` with no track."""
+def _slot(work: _Work) -> tuple[str, str, int | None, int] | None:
+    """Return the destination folder, album title and ``[disc-]NN`` slot of *work*, or ``None``.
+
+    ``None`` means the file has no track number. A kept folder may hold several albums, each
+    with its own track 1, so a slot counts per album title. The title is folded as a folder name
+    spells it, so two spellings that render alike still share their slots.
+    """
     track = parse_position(work.values.get("tracknumber"))
     if work.to_path is None or work.render is None or track is None:
         return None
-    return path_keys.path_key(Path(work.to_path).parent), work.render.disc, track
+    album = text_keys.display_key(clean_value(work.values.get("album", "")).rstrip(". "))
+    return path_keys.path_key(Path(work.to_path).parent), album, work.render.disc, track
 
 
 def _hold_shared_renders(works: list[_Work]) -> None:

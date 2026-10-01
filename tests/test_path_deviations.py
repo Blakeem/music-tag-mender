@@ -64,6 +64,15 @@ def _report(settings: Settings, **kwargs: object) -> path_deviations.DeviationsR
     return path_deviations.detect_path_deviations(settings, **kwargs)  # type: ignore[arg-type]
 
 
+def _keep_folder(settings: Settings, ids: dict[Path, int]) -> None:
+    mismatch.set_mismatch_status(
+        settings,
+        status=mismatch.LEGIT_IGNORE,
+        covers=[mismatch.RELEASE_FOLDER_ALBUM],
+        file_ids=list(ids.values()),
+    )
+
+
 def _reasons(plans: tuple[paths.FilePlan, ...] | list[paths.FilePlan], file_id: int) -> set[str]:
     plan = next(plan for plan in plans if plan.file_id == file_id)
     return {reason for reason, _ in plan.reasons}
@@ -157,12 +166,7 @@ def test_a_kept_folder_renders_only_the_filename(
 ) -> None:
     relative = Path("Artist") / "Odd Folder" / "01 Song.flac"
     ids = _build(engine_settings, music_dir, {relative: _tags()})
-    mismatch.set_mismatch_status(
-        engine_settings,
-        status=mismatch.LEGIT_IGNORE,
-        covers=[mismatch.RELEASE_FOLDER_ALBUM],
-        file_ids=[ids[relative]],
-    )
+    _keep_folder(engine_settings, ids)
 
     plan = _report(engine_settings, group=False).rows[0]
 
@@ -177,17 +181,76 @@ def test_a_keep_lifts_the_blank_year_and_disc_holds(
     ids = _build(engine_settings, music_dir, {relative: _tags(date="")})
     plan = _report(engine_settings, group=False).rows[0]
     assert {paths.MISSING_YEAR, paths.MISSING_DISC} <= _reasons([plan], ids[relative])
-    mismatch.set_mismatch_status(
-        engine_settings,
-        status=mismatch.LEGIT_IGNORE,
-        covers=[mismatch.RELEASE_FOLDER_ALBUM],
-        file_ids=[ids[relative]],
-    )
+    _keep_folder(engine_settings, ids)
 
     kept = _report(engine_settings, group=False).rows[0]
 
     assert (kept.status, kept.reasons) == (paths.STATUS_WILL_MOVE, ())
     assert kept.to_path == str(relative.parent / "Artist - Album - 01 - Song.flac")
+
+
+def test_a_kept_folder_counts_track_slots_per_album(
+    engine_settings: Settings, music_dir: Path
+) -> None:
+    folder = Path("Artist") / "Odd Folder"
+    one, two = folder / "01 One.flac", folder / "01 Two.flac"
+    ids = _build(
+        engine_settings,
+        music_dir,
+        {one: _tags(album="First", title="One"), two: _tags(album="Second", title="Two")},
+    )
+    _keep_folder(engine_settings, ids)
+
+    plans = _report(engine_settings, group=False).rows
+
+    assert [plan.status for plan in plans] == [paths.STATUS_WILL_MOVE] * 2
+    assert {plan.to_path for plan in plans} == {
+        str(folder / "Artist - First - 01 - One.flac"),
+        str(folder / "Artist - Second - 01 - Two.flac"),
+    }
+
+
+def test_a_kept_folder_still_holds_one_album_sharing_a_slot(
+    engine_settings: Settings, music_dir: Path
+) -> None:
+    folder = Path("Artist") / "Odd Folder"
+    one, two = folder / "01 One.flac", folder / "01 Two.flac"
+    ids = _build(engine_settings, music_dir, {one: _tags(title="One"), two: _tags(title="Two")})
+    _keep_folder(engine_settings, ids)
+
+    plans = _report(engine_settings, group=False).rows
+
+    assert all(paths.TRACK_CONFLICT in _reasons(plans, file_id) for file_id in ids.values())
+
+
+def test_a_kept_folder_holds_two_spellings_of_one_album_at_one_slot(
+    engine_settings: Settings, music_dir: Path
+) -> None:
+    folder = Path("Artist") / "Odd Folder"
+    one, two = folder / "01 One.flac", folder / "01 Two.flac"
+    ids = _build(
+        engine_settings,
+        music_dir,
+        {one: _tags(album="Live: 2001", title="One"), two: _tags(album="LIVE 2001", title="Two")},
+    )
+    _keep_folder(engine_settings, ids)
+
+    plans = _report(engine_settings, group=False).rows
+
+    assert all(paths.TRACK_CONFLICT in _reasons(plans, file_id) for file_id in ids.values())
+
+
+def test_a_file_rendered_into_a_kept_folder_shares_its_album_slots(
+    engine_settings: Settings, music_dir: Path
+) -> None:
+    kept = _DOMINANT / "01 Song.flac"
+    incoming = Path("Artist") / "Elsewhere" / "01 Other.flac"
+    ids = _build(engine_settings, music_dir, {kept: _tags(), incoming: _tags(title="Other")})
+    _keep_folder(engine_settings, {kept: ids[kept]})
+
+    plans = _report(engine_settings, group=False).rows
+
+    assert all(paths.TRACK_CONFLICT in _reasons(plans, file_id) for file_id in ids.values())
 
 
 # --- holds ---------------------------------------------------------------------------

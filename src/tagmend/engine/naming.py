@@ -52,7 +52,7 @@ COMPUTED_NAMES: Final = frozenset({YEAR, DISC, CONTAINER})
 FIELD_NAMES: Final = MANAGED_TAGS | COMPUTED_NAMES
 
 # The tags the computed names and the planner's holds read, whatever the pattern names.
-BASE_TAGS: Final = ("date", "originaldate", "discnumber", "tracknumber")
+BASE_TAGS: Final = ("album", "date", "originaldate", "discnumber", "tracknumber")
 
 _SEPARATOR: Final = "/"
 _SPECIAL: Final = frozenset("{}[]/")

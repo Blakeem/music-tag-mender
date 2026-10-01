@@ -1191,12 +1191,22 @@ def record_outcome(
     status: str,
     now: str,
 ) -> None:
-    """Write a resolver outcome snapshotting the tags the file holds once its stage commits.
+    """Write a resolver outcome snapshotting the tags the resolver judged plus what it staged.
 
-    Those are the staged target when one is staged, else the current tags.
+    The snapshot is the mirror tags overlaid with the staged row's ``supplied_keys`` values. A
+    field or identity the file changed on disk since the scan then differs from the commit's
+    read-back, so the commit does not re-stamp the row and the next rescan re-opens the file. A
+    row staged before v23 names no supplied keys, so its whole staged target is the snapshot.
     """
+    mirror = get_tags(conn, file_id)
     staged = get_staged_tag(conn, file_id)
-    tags = staged.managed_tags if staged is not None else get_tags(conn, file_id)
+    supplied_keys = None if staged is None else staged.supplied_keys
+    tags = mirror
+    if staged is not None and supplied_keys is None:
+        tags = staged.managed_tags
+    elif staged is not None and supplied_keys is not None:
+        supplied = {key: staged.managed_tags.get(key, []) for key in supplied_keys}
+        tags = mirror | supplied
     axis.put_outcome(conn, axis_, file_id=file_id, status=status, tags=tags, now=now)
 
 

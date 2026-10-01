@@ -282,6 +282,63 @@ def test_rescan_after_an_external_edit_of_the_field_reopens(
     assert _status(engine_settings, file_id) == "pending"
 
 
+def test_genre_stage_over_an_album_edited_on_disk_since_the_scan_reopens(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    track = make_track(
+        music_dir / "t.flac",
+        {"artist": ["Daft Punk"], "album": ["Discovery"], "genre": ["Old"]},
+    )
+    library.scan_library(engine_settings)
+    file_id = _ids(engine_settings)["t.flac"]
+    _edit_on_disk(track, album=["Homework"])
+
+    assert _resolve_genres(engine_settings).staged_files == 1
+    staging.commit_tags(engine_settings)
+    library.scan_library(engine_settings)
+
+    assert _status(engine_settings, file_id) == "pending"
+
+
+def test_year_fill_over_an_album_edited_on_disk_since_the_scan_reopens(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    track = make_track(music_dir / "t.flac", {"artist": ["Black Sabbath"], "album": ["Paranoid"]})
+    library.scan_library(engine_settings)
+    file_id = _ids(engine_settings)["t.flac"]
+    _edit_on_disk(track, album=["Vol. 4"])
+    source = FakeMBReleaseGroupSource(
+        {("Black Sabbath", "Paranoid"): _release("Paranoid", "1970")},
+    )
+
+    assert years.resolve_years(engine_settings, client=source).staged_files == 1
+    staging.commit_tags(engine_settings)
+    library.scan_library(engine_settings)
+
+    assert _status(engine_settings, file_id, axis.YEAR_AXIS) == "pending"
+
+
+def test_artist_stage_over_an_albumartist_added_on_disk_since_the_scan_reopens(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    track = make_track(music_dir / "t.flac", {"artist": ["Miami Nights '84"]})
+    library.scan_library(engine_settings)
+    file_id = _ids(engine_settings)["t.flac"]
+    _edit_on_disk(track, albumartist=["Someone Else"])
+    source = FakeCorrectionSource(
+        {"Miami Nights '84": ArtistCorrection("Miami Nights 1984", "mbid-mn")},
+    )
+
+    assert artists.resolve_artists(engine_settings, client=source).staged_files == 1
+    staging.commit_tags(engine_settings)
+    library.scan_library(engine_settings)
+
+    assert _status(engine_settings, file_id, axis.ARTIST_AXIS) == "pending"
+
+
 def test_unstage_after_a_resolver_stage_reopens(
     engine_settings: Settings,
     music_dir: Path,

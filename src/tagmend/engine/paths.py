@@ -1176,6 +1176,22 @@ def _left_behind(conn: sqlite3.Connection, music_path: Path, folders: set[Path])
     return list(left.values())
 
 
+def _emptied_release_folders(settings: Settings, folders: set[Path]) -> set[Path]:
+    """Return the release folder above each disc folder of *folders* once no audio sits under it.
+
+    Only a folder holding audio is a sidecar unit, so a release folder's own cover and scans
+    above its disc folders follow no move. They are reported rather than left behind silently.
+    """
+    releases: set[Path] = set()
+    for folder in folders:
+        if mismatch.layout_of(settings, str(folder), "").disc_folder is None:
+            continue
+        _, holds_audio = _sidecar_files(folder.parent)
+        if not holds_audio:
+            releases.add(folder.parent)
+    return releases
+
+
 def _vacated_by(conn: sqlite3.Connection, music_path: Path, commit_id: int) -> set[Path]:
     """Return the folders the audio moves of *commit_id* left."""
     return {
@@ -1450,12 +1466,30 @@ def _require_open_gate(settings: Settings) -> None:
     raise ValueError(message)
 
 
+@dataclass(frozen=True, slots=True)
+class StagePathsBatchResult:
+    """What one :func:`stage_paths_batch` call staged: its files and its sidecars."""
+
+    file_ids: tuple[int, ...]
+    sidecars_staged: int
+    sidecars_held: tuple[SidecarHold, ...]
+
+    def to_dict(self) -> dict[str, object]:
+        """JSON-serializable form for the MCP tool."""
+        return {
+            "staged": len(self.file_ids),
+            "file_ids": list(self.file_ids),
+            "sidecars_staged": self.sidecars_staged,
+            "sidecars_held": [hold.to_dict() for hold in self.sidecars_held],
+        }
+
+
 def stage_paths_batch(
     settings: Settings,
     *,
     entries: Sequence[object],
     note: str | None = None,
-) -> list[int]:
+) -> StagePathsBatchResult:
     """Stage explicit moves for many files in ONE transaction, all or nothing, origin ``manual``.
 
     *entries* is a sequence of ``(file_id, to_path)`` pairs, *to_path* relative to
@@ -1468,7 +1502,8 @@ def stage_paths_batch(
     its reasons: ``occupied``, ``shared_target``, ``too_long``, ``cue_reference``,
     ``staged_tag``, ``invalid_path``, ``unknown_file``, ``missing`` and ``landed_move``. A file
     staged before keeps its version-0 location, captured at its first stage. Returns the staged
-    file ids in input order. Raises :class:`ValueError` on any refusal, and nothing is staged.
+    file ids in input order, the count of sidecar moves staged and the sidecars held in place.
+    Raises :class:`ValueError` on any refusal, and nothing is staged.
     """
     validated = _validate_batch_entries(entries)
     music_path = _require_music_path(settings)
@@ -1526,9 +1561,18 @@ def stage_paths_batch(
     finally:
         connection.close()
 
-    staged_ids = [file_id for file_id, _ in validated]
-    logger.info("staged %d path move(s)", len(staged_ids))
-    return staged_ids
+    result = StagePathsBatchResult(
+        file_ids=tuple(file_id for file_id, _ in validated),
+        sidecars_staged=len(sidecars.inserts),
+        sidecars_held=sidecars.held,
+    )
+    logger.info(
+        "staged %d path move(s), %d sidecar move(s), %d sidecar(s) held",
+        len(result.file_ids),
+        result.sidecars_staged,
+        len(result.sidecars_held),
+    )
+    return result
 
 
 # --- the planner: render every file, then hold what must not move ----------------------
@@ -2479,6 +2523,66 @@ def diff_paths(
         connection.close()
 
 
+@dataclass(frozen=True, slots=True)
+class SidecarDiffView:
+    """One staged sidecar move as ``diff_paths`` shows it. Paths are relative to ``music_path``.
+
+    ``state`` is the row's disk state, one of the module docstring's six.
+    """
+
+    from_path: str
+    to_path: str
+    origin: str
+    note: str | None
+    staged_at: str
+    state: str
+
+    def to_dict(self) -> dict[str, object]:
+        """JSON-serializable form for the MCP tool."""
+        return {
+            "from_path": self.from_path,
+            "to_path": self.to_path,
+            "origin": self.origin,
+            "note": self.note,
+            "staged_at": self.staged_at,
+            "state": self.state,
+        }
+
+
+def diff_sidecars(
+    settings: Settings,
+    *,
+    path: str | os.PathLike[str] | None = None,
+) -> list[SidecarDiffView]:
+    """Return every staged sidecar move, or those under the folder *path*, with its disk state.
+
+    Read-only. A row whose target was taken, or that changed after it landed, stays staged after
+    its album's audio commits, and it keeps the staging area non-empty until a commit or an
+    unstage clears it.
+    """
+    music_path = _require_music_path(settings)
+    root_key = None if path is None else path_keys.folder_arg_key(settings, path)
+
+    connection = db.connect(settings.db_path)
+    try:
+        schema.apply_schema(connection)
+        rows = store.list_staged_sidecars(connection)
+    finally:
+        connection.close()
+    return [
+        SidecarDiffView(
+            from_path=row.from_path,
+            to_path=row.to_path,
+            origin=row.origin,
+            note=row.note,
+            staged_at=row.staged_at,
+            state=_locate_sidecar(music_path, row),
+        )
+        for row in rows
+        if _in_scope(music_path, row.from_path, root_key)
+    ]
+
+
 # --- commit ---------------------------------------------------------------------------
 
 
@@ -2508,7 +2612,8 @@ class PathCommitResult:
     ``sidecars_moved`` counts the sidecars moved and logged, ``sidecars_waiting`` those whose
     album audio still sits in their folder, and ``sidecar_problems`` every other sidecar row.
     ``sidecars_held`` lists the sidecars left with no staged move in a folder the commit's
-    audio all left: their target was taken, or the folder's files went to different folders.
+    audio all left: their target was taken, the folder's files went to different folders, or
+    they sit in the release folder above disc folders the commit emptied of audio.
     ``folders_pruned`` counts the emptied folders removed.
     """
 
@@ -2708,6 +2813,7 @@ def commit_paths(
         )
         step = _sidecar_step(connection, music_path, commit_id=commit_id, root_key=root_key)
         vacated = _vacated_by(connection, music_path, commit_id) | set(step.vacated)
+        vacated |= _emptied_release_folders(settings, vacated)
         sidecars = _CommitSidecars(
             step=step,
             held=tuple(_left_behind(connection, music_path, vacated)),
@@ -3023,22 +3129,63 @@ def _with_sidecars(
     return PathRevertCommitResult(**values, sidecars=tuple(sidecars))
 
 
+# The revert kinds that leave an audio file where the reverted commit put it.
+_AUDIO_STAYS: Final = frozenset({"skipped_later_changes", "error"})
+
+
+def _audio_staying(
+    conn: sqlite3.Connection,
+    planned: Sequence[tuple[store.PathRevision, str, str | None, Path | None]],
+) -> dict[tuple[str, str], list[tuple[str, int]]]:
+    """Map ``(unit key, folder key)`` to the ``(kind, file_id)`` of audio the revert leaves.
+
+    The unit key is the folder the file left, which names its sidecars' unit, so a unit merged
+    into a shared destination never holds another unit's sidecars. The folder key is where the
+    file sits now, since a later commit may have moved it away from those sidecars. A file gone
+    from disk leaves no audio for a sidecar to stay with.
+    """
+    staying: dict[tuple[str, str], list[tuple[str, int]]] = {}
+    row: store.FileRow | None = None
+    unit_key = ""
+    for revision, kind, _, _ in planned:
+        row = store.get_file_by_id(conn, revision.file_id) if kind in _AUDIO_STAYS else None
+        if row is None or row.is_missing or not _present(Path(row.folder) / row.filename):
+            continue
+        unit_key = path_keys.path_key(Path(revision.from_path).parent)
+        staying.setdefault((unit_key, path_keys.path_key(row.folder)), []).append(
+            (kind, revision.file_id)
+        )
+    return staying
+
+
 def _classify_sidecar_revert(
     conn: sqlite3.Connection,
     music_path: Path,
     move: store.SidecarMove,
+    staying: dict[tuple[str, str], list[tuple[str, int]]],
 ) -> tuple[str, str | None]:
     """Classify one sidecar move of the reverted commit, with a detail.
 
     The kind is ``revertable``, ``skipped_later_changes`` (a later move left or reached its
-    target), ``missing`` (it is not at its target) or ``error`` (its source is taken now).
+    target), ``missing`` (it is not at its target) or ``error`` (its source is taken now). A
+    sidecar whose own unit's audio in *staying* still sits in its album folder takes that
+    audio's kind, so the cover stays with its album.
     """
+    album_key: str | None = None
     if store.sidecar_moved_later(conn, move.id, move.to_key):
         return "skipped_later_changes", None
     if not _present(music_path / move.to_path):
         return MISSING, None
     if _listing_holds_key(music_path / move.from_path):
         return "error", f"{move.from_path} is taken on disk"
+    album_key = path_keys.path_key(
+        music_path / _unit_folder_of(move.to_path, _unit_depth(move.from_key, move.unit_key))
+    )
+    held_audio = staying.get((move.unit_key, album_key))
+    if held_audio:
+        kind = held_audio[0][0]
+        ids = [file_id for _, file_id in held_audio]
+        return kind, f"its album's file_id(s) {ids} do not revert, so it stays with them"
     return "revertable", None
 
 
@@ -3108,7 +3255,8 @@ def revert_commit_moves(  # noqa: PLR0913 - the revert_commit surface plus its o
     at or under it now, so one album folder, or one sidecar alone, reverts. A file a later
     path commit moved again is ``skipped_later_changes``, a file gone from disk is ``missing``,
     and a source now taken is an ``error``. A sidecar a later move left or reached is
-    ``skipped_later_changes``. The rest are staged as revert rows and run through the commit
+    ``skipped_later_changes``, and one whose album audio in scope does not revert takes that
+    audio's kind and stays with it. The rest are staged as revert rows and run through the commit
     loop, then the sidecar step, so a crash leaves rows :func:`commit_paths` finishes.
     *dry_run* returns the classification only.
     """
@@ -3122,8 +3270,9 @@ def revert_commit_moves(  # noqa: PLR0913 - the revert_commit surface plus its o
         if root_key is None
         or path_keys.is_within(path_keys.path_key(_source_of(conn, revision.file_id)), root_key)
     ]
+    staying = _audio_staying(conn, planned)
     sidecars = [
-        (move, *_classify_sidecar_revert(conn, music_path, move))
+        (move, *_classify_sidecar_revert(conn, music_path, move, staying))
         for move in store.sidecar_moves_for_commit(conn, commit_id)
         if _in_scope(music_path, move.to_path, root_key)
     ]
@@ -3203,23 +3352,36 @@ def revert_commit_moves(  # noqa: PLR0913 - the revert_commit surface plus its o
 
 @dataclass(frozen=True, slots=True)
 class StagingReport:
-    """What ``check_health`` reports about the path staging area and the volume."""
+    """What ``check_health`` reports about the path staging area and the volume.
+
+    ``sidecars_landed`` names the source of each staged sidecar already at its target.
+    """
 
     staged: int
     landed: tuple[int, ...]
     gone: tuple[int, ...]
+    sidecars: int
+    sidecars_landed: tuple[str, ...]
     volume_refusal: str | None
 
 
 def staging_report(settings: Settings) -> StagingReport:
-    """Count the staged moves and name the ones already at their target or gone. Read-only."""
+    """Count the staged moves and sidecar moves, naming those at their target or gone. Read-only."""
     music_path = settings.music_path
     connection = db.connect(settings.db_path)
     try:
         schema.apply_schema(connection)
         rows = store.list_staged_paths(connection)
+        sidecar_rows = store.list_staged_sidecars(connection)
         if music_path is None:
-            return StagingReport(staged=len(rows), landed=(), gone=(), volume_refusal=None)
+            return StagingReport(
+                staged=len(rows),
+                landed=(),
+                gone=(),
+                sidecars=len(sidecar_rows),
+                sidecars_landed=(),
+                volume_refusal=None,
+            )
         states = {
             row.file_id: _locate(_source_of(connection, row.file_id), music_path / row.to_path, row)
             for row in rows
@@ -3230,5 +3392,9 @@ def staging_report(settings: Settings) -> StagingReport:
         staged=len(rows),
         landed=tuple(file_id for file_id, state in states.items() if state in _AT_TARGET),
         gone=tuple(file_id for file_id, state in states.items() if state == GONE),
+        sidecars=len(sidecar_rows),
+        sidecars_landed=tuple(
+            row.from_path for row in sidecar_rows if _locate_sidecar(music_path, row) in _AT_TARGET
+        ),
         volume_refusal=volume_refusal(music_path),
     )

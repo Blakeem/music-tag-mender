@@ -20,7 +20,16 @@ import pytest
 
 from conftest import make_track
 from tagmend import config, mcp_server
-from tagmend.engine import commits, mismatch, path_keys, paths, staging, store, versioning
+from tagmend.engine import (
+    commits,
+    health,
+    mismatch,
+    path_keys,
+    paths,
+    staging,
+    store,
+    versioning,
+)
 from tagmend.engine.db import connect
 from tagmend.engine.library import scan_library
 from tagmend.engine.schema import apply_schema
@@ -125,9 +134,10 @@ def album(engine_settings: Settings, music_dir: Path) -> _Album:
 
 
 def _stage(settings: Settings, *moves: tuple[int, Path]) -> list[int]:
-    return paths.stage_paths_batch(
+    result = paths.stage_paths_batch(
         settings, entries=[(file_id, str(target)) for file_id, target in moves]
     )
+    return list(result.file_ids)
 
 
 def _stage_album(album: _Album, folder: Path = _NEW) -> None:
@@ -318,6 +328,52 @@ def test_a_held_sidecar_under_two_vacated_folders_is_listed_once(
     assert result.sidecars_held == (str(_CD2 / "Folder.jpg"),)
 
 
+def test_the_release_folders_own_sidecars_above_emptied_disc_folders_are_reported(
+    engine_settings: Settings, music_dir: Path
+) -> None:
+    _library(engine_settings, music_dir, _CD1 / "01.mp3", _CD2 / "01.mp3")
+    (music_dir / _ALBUM / "Folder.jpg").write_bytes(b"cover")
+    (music_dir / _ALBUM / "Scans").mkdir()
+    (music_dir / _ALBUM / "Scans" / "Back.jpg").write_bytes(b"back")
+    moves = [
+        (_id_at(engine_settings, music_dir / _CD1 / "01.mp3"), _MERGED / "101.mp3"),
+        (_id_at(engine_settings, music_dir / _CD2 / "01.mp3"), _MERGED / "201.mp3"),
+    ]
+    _stage(engine_settings, *moves)
+
+    result = paths.commit_paths(engine_settings)
+
+    assert (result.committed, result.sidecars_moved) == (2, 0)
+    assert result.sidecars_held == (
+        str(_ALBUM / "Folder.jpg"),
+        str(_ALBUM / "Scans" / "Back.jpg"),
+    )
+    assert (music_dir / _ALBUM / "Folder.jpg").read_bytes() == b"cover"
+
+
+def test_a_batch_into_a_folder_whose_cover_is_taken_reports_the_held_sidecar(
+    album: _Album,
+) -> None:
+    (album.music / _NEW).mkdir(parents=True)
+    (album.music / _NEW / "Folder.jpg").write_bytes(b"theirs")
+
+    result = paths.stage_paths_batch(
+        album.settings,
+        entries=[(album.x, str(_NEW / "01.mp3")), (album.y, str(_NEW / "02.mp3"))],
+    )
+
+    assert (result.file_ids, result.sidecars_staged) == ((album.x, album.y), len(_SIDECARS) - 1)
+    (hold,) = result.sidecars_held
+    assert (Path(hold.from_path), Path(hold.to_path)) == (
+        _ALBUM / "Folder.jpg",
+        _NEW / "Folder.jpg",
+    )
+    assert "taken on disk" in hold.detail
+    payload = result.to_dict()
+    assert (payload["staged"], payload["sidecars_staged"]) == (2, len(_SIDECARS) - 1)
+    assert payload["sidecars_held"] == [hold.to_dict()]
+
+
 @pytest.mark.skipif(path_keys.path_key("A") == "A", reason="keys fold case only on Windows")
 def test_a_target_taken_under_another_casing_holds_the_sidecar(album: _Album) -> None:
     (album.music / _NEW).mkdir(parents=True)
@@ -382,6 +438,26 @@ def test_a_sidecar_whose_target_is_taken_at_commit_keeps_its_row(album: _Album) 
     assert (album.music / _ALBUM / "Folder.jpg").exists()
 
 
+def test_a_sidecar_row_left_by_a_taken_target_shows_in_diff_and_health(album: _Album) -> None:
+    _stage_album(album)
+    (album.music / _NEW).mkdir(parents=True)
+    (album.music / _NEW / "Folder.jpg").write_bytes(b"raced")
+    paths.commit_paths(album.settings)
+
+    (view,) = paths.diff_sidecars(album.settings)
+    check = health._check_path_staging(album.settings)
+
+    assert paths.diff_paths(album.settings) == []
+    assert (Path(view.from_path), Path(view.to_path)) == (
+        _ALBUM / "Folder.jpg",
+        _NEW / "Folder.jpg",
+    )
+    assert view.state == paths.TARGET_TAKEN
+    assert paths.diff_sidecars(album.settings, path=str(_NEW)) == []
+    assert "0 staged move(s)" in check.detail
+    assert "1 staged sidecar move(s)" in check.detail
+
+
 def test_a_gone_sidecar_drops_its_row_and_logs_nothing(album: _Album) -> None:
     _stage_album(album)
     (album.music / _ALBUM / "Album.log").unlink()
@@ -435,6 +511,24 @@ def test_a_crash_after_a_sidecar_move_is_logged_by_the_next_commit(
     assert not (album.music / _ALBUM).exists()
     with _ledger(album.settings) as conn:
         assert [c.status for c in commits.list_commits_in(conn)] == ["applied", "interrupted"]
+
+
+def test_check_health_names_a_sidecar_landed_before_a_crash(
+    album: _Album, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _stage_album(album)
+    with monkeypatch.context() as patch:
+        _crash_after_moving("Folder.jpg", patch)
+        with pytest.raises(_CrashError):
+            paths.commit_paths(album.settings)
+
+    check = health._check_path_staging(album.settings)
+
+    landed = [str(_ALBUM / "Folder.jpg")]
+    assert f"sidecar(s) {landed} already sit at their target. Run commit_paths" in check.detail
+    assert [v.state for v in paths.diff_sidecars(album.settings, path=str(_ALBUM))].count(
+        paths.LANDED
+    ) == 1
 
 
 def test_a_sidecar_changed_at_its_landed_target_waits_for_a_confirming_stage(
@@ -552,6 +646,85 @@ def test_revert_commit_of_one_sidecar_reverts_it_alone(album: _Album) -> None:
     assert not (album.music / _NEW).exists()
 
 
+def test_revert_commit_keeps_the_sidecars_with_audio_a_later_commit_renamed(
+    album: _Album,
+) -> None:
+    _stage_album(album)
+    forward = paths.commit_paths(album.settings)
+    assert forward.commit_id is not None
+    _stage(album.settings, (album.x, _NEW / "01b.mp3"))
+    assert paths.commit_paths(album.settings).committed == 1
+
+    preview = versioning.revert_commit(album.settings, forward.commit_id, dry_run=True)
+    back = versioning.revert_commit(album.settings, forward.commit_id)
+
+    for result in (preview, back):
+        assert isinstance(result, paths.PathRevertCommitResult)
+        assert [o.status for o in result.sidecars] == ["skipped_later_changes"] * len(_SIDECARS)
+    assert isinstance(back, paths.PathRevertCommitResult)
+    (detail,) = {o.detail for o in back.sidecars}
+    assert detail is not None
+    assert f"[{album.x}]" in detail
+    for relative in _SIDECARS:
+        assert (album.music / _NEW / relative).exists()
+    assert _at(album.settings, album.x) == album.music / _NEW / "01b.mp3"
+    assert _at(album.settings, album.y) == album.music / _ALBUM / "02.mp3"
+
+
+def test_revert_commit_moves_the_sidecars_back_when_the_staying_audio_left_their_folder(
+    album: _Album,
+) -> None:
+    away = Path("Other") / "Away" / "01.mp3"
+    _stage_album(album)
+    forward = paths.commit_paths(album.settings)
+    assert forward.commit_id is not None
+    _stage(album.settings, (album.x, away))
+    assert paths.commit_paths(album.settings).committed == 1
+
+    preview = versioning.revert_commit(album.settings, forward.commit_id, dry_run=True)
+    back = versioning.revert_commit(album.settings, forward.commit_id)
+
+    for result in (preview, back):
+        assert isinstance(result, paths.PathRevertCommitResult)
+        assert [o.status for o in result.sidecars] == ["reverted"] * len(_SIDECARS)
+    for relative in _SIDECARS:
+        assert (album.music / _ALBUM / relative).exists()
+    assert _at(album.settings, album.x) == album.music / away
+    assert _at(album.settings, album.y) == album.music / _ALBUM / "02.mp3"
+    assert not (album.music / _NEW).exists()
+
+
+def test_revert_commit_holds_only_the_sidecars_of_the_disc_whose_audio_stays(
+    engine_settings: Settings, music_dir: Path
+) -> None:
+    _library(engine_settings, music_dir, _CD1 / "01.mp3", _CD2 / "01.mp3")
+    (music_dir / _CD1 / "Disc1.log").write_bytes(b"one")
+    (music_dir / _CD2 / "Disc2.log").write_bytes(b"two")
+    disc1 = _id_at(engine_settings, music_dir / _CD1 / "01.mp3")
+    disc2 = _id_at(engine_settings, music_dir / _CD2 / "01.mp3")
+    _stage(engine_settings, (disc1, _MERGED / "101.mp3"), (disc2, _MERGED / "201.mp3"))
+    forward = paths.commit_paths(engine_settings)
+    assert forward.commit_id is not None
+    assert forward.sidecars_moved == 2
+    _stage(engine_settings, (disc2, _MERGED / "201b.mp3"))
+    assert paths.commit_paths(engine_settings).committed == 1
+
+    preview = versioning.revert_commit(engine_settings, forward.commit_id, dry_run=True)
+    back = versioning.revert_commit(engine_settings, forward.commit_id)
+
+    for result in (preview, back):
+        assert isinstance(result, paths.PathRevertCommitResult)
+        statuses = {Path(o.from_path).name: (o.status, o.detail) for o in result.sidecars}
+        assert statuses["Disc1.log"] == ("reverted", None)
+        assert statuses["Disc2.log"][0] == "skipped_later_changes"
+        assert f"[{disc2}]" in str(statuses["Disc2.log"][1])
+    assert _at(engine_settings, disc1) == music_dir / _CD1 / "01.mp3"
+    assert (music_dir / _CD1 / "Disc1.log").read_bytes() == b"one"
+    assert _at(engine_settings, disc2) == music_dir / _MERGED / "201b.mp3"
+    assert (music_dir / _MERGED / "Disc2.log").read_bytes() == b"two"
+    assert not (music_dir / _MERGED / "Disc1.log").exists()
+
+
 def test_revert_commit_refuses_a_path_scope_on_a_tag_commit(album: _Album) -> None:
     staging.stage_tags(album.settings, file_id=album.x, tags={"title": ["Renamed"]})
     tagged = staging.commit_tags(album.settings)
@@ -573,7 +746,13 @@ def test_the_mcp_path_tools_report_sidecars(music_dir: Path) -> None:
     mcp_server.scan_library()
     settings = config.load_settings()
     file_id = _id_at(settings, music_dir / _ALBUM / "01.mp3")
-    mcp_server.stage_paths_batch([{"file_id": file_id, "to_path": str(_NEW / "01.mp3")}])
+    staged = mcp_server.stage_paths_batch([{"file_id": file_id, "to_path": str(_NEW / "01.mp3")}])
+    assert (staged["sidecars_staged"], staged["sidecars_held"]) == (1, [])
+    sidecars = mcp_server.diff_paths()["sidecars"]
+    assert isinstance(sidecars, list)
+    assert [(Path(row["from_path"]), row["state"]) for row in sidecars] == [
+        (_ALBUM / "Folder.jpg", "at_source")
+    ]
 
     committed = mcp_server.commit_paths()
 

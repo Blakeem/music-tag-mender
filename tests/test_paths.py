@@ -109,10 +109,11 @@ def lib(engine_settings: Settings, music_dir: Path) -> _Lib:
 
 
 def _stage(lib: _Lib, *moves: tuple[int, Path | str]) -> list[int]:
-    return paths.stage_paths_batch(
+    result = paths.stage_paths_batch(
         lib.settings,
         entries=[(file_id, str(target)) for file_id, target in moves],
     )
+    return list(result.file_ids)
 
 
 def _row(lib: _Lib, file_id: int) -> store.FileRow:

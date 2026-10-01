@@ -138,7 +138,13 @@ _KEPT_ON_OWN_RELEASE: Final = (
     "media",
 )
 
-_HELD_KINDS: Final = ("disagreement", "slot_collision", "release_mismatch", "unconverged")
+_HELD_KINDS: Final = (
+    "disagreement",
+    "slot_collision",
+    "release_mismatch",
+    "unconverged",
+    "no_contribution",
+)
 
 
 # --- result --------------------------------------------------------------------------
@@ -164,6 +170,7 @@ class ResolveSongsResult:
     held_slot_collision: int
     held_release_mismatch: int
     held_unconverged: int
+    held_no_contribution: int
     review_files: int
     lookup_empty: int
     skipped_manual: int
@@ -189,6 +196,7 @@ class ResolveSongsResult:
             "held_slot_collision": self.held_slot_collision,
             "held_release_mismatch": self.held_release_mismatch,
             "held_unconverged": self.held_unconverged,
+            "held_no_contribution": self.held_no_contribution,
             "review_files": self.review_files,
             "lookup_empty": self.lookup_empty,
             "skipped_manual": self.skipped_manual,
@@ -858,13 +866,17 @@ def _artist_review(ballot: _Ballot) -> dict[str, object] | None:
 
 
 def _ungated(ballot: _Ballot) -> _Outcome:
-    """Return the outcome of a target the recording gate did not pass."""
+    """Return the outcome of a target the recording gate did not pass.
+
+    A lookup with results that fail the gate is held as ``no_contribution`` with the gate's reason.
+    """
     file_id = ballot.voter.file_id
     if ballot.evidence.error is not None:
         return _Outcome(file_id=file_id, kind="error", message=ballot.evidence.error)
     if ballot.evidence.empty:
         return _Outcome(file_id=file_id, kind="lookup_empty")
-    return _Outcome(file_id=file_id, kind="none")
+    reason = ballot.gate.failure or "no_titled_recording"
+    return _held(ballot, "no_contribution", reason, ballot.voter.value(_ALBUM_ID))
 
 
 # --- verified rule and fill ----------------------------------------------------------
@@ -1309,12 +1321,14 @@ class _AutoRun:
     def _settle(self, ballots: list[_Ballot]) -> None:
         """Route one folder, apply its outcomes and add its artist review rows.
 
-        A MusicBrainz error leaves the folder pending. A rebind folder adds only its report.
+        A MusicBrainz error leaves the folder pending. A rebind folder adds its report plus each
+        ungated target's error, empty lookup or gate failure.
         """
         try:
             route = _route(ballots)
             if route == "rebind":
                 self._tally.rebind_folders.append(_rebind_report(ballots, self._lookups))
+                self._apply([_ungated(b) for b in ballots if b.voter.target and not b.gate.passed])
                 return
             outcomes = (
                 _anchored(ballots, self._lookups)
@@ -1620,6 +1634,7 @@ def _build_result(
         held_slot_collision=tally.held["slot_collision"],
         held_release_mismatch=tally.held["release_mismatch"],
         held_unconverged=tally.held["unconverged"],
+        held_no_contribution=tally.held["no_contribution"],
         review_files=len({row["file_id"] for row in tally.review_values}),
         lookup_empty=tally.lookup_empty,
         skipped_manual=tally.skipped_manual,

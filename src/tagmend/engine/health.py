@@ -184,10 +184,11 @@ def _check_interrupted_commits(db_path: Path) -> Check:
 
 
 def _check_path_staging(settings: Settings) -> Check:
-    """Report the staged moves, those already at their target or gone, and the volume check.
+    """Report the staged moves and sidecar moves, those at their target or gone, and the volume.
 
     Informational, it never fails the report: the tag tools work on any volume, and a landed
-    move is finished by running ``commit_paths``.
+    move is finished by running ``commit_paths``. A staged sidecar row blocks every revert and
+    resolver, so it is counted even after its album's audio has committed.
     """
     name = "paths"
     try:
@@ -195,10 +196,15 @@ def _check_path_staging(settings: Settings) -> Check:
     except (sqlite3.Error, OSError, RuntimeError) as exc:
         return Check(name=name, ok=True, detail=f"(could not check staged moves: {exc})")
 
-    parts = [f"{report.staged} staged move(s)"]
+    parts = [f"{report.staged} staged move(s)", f"{report.sidecars} staged sidecar move(s)"]
     if report.landed:
         parts.append(
             f"file_id(s) {list(report.landed)} already sit at their target. Run commit_paths",
+        )
+    if report.sidecars_landed:
+        parts.append(
+            f"sidecar(s) {list(report.sidecars_landed)} already sit at their target. "
+            "Run commit_paths",
         )
     if report.gone:
         parts.append(f"file_id(s) {list(report.gone)} are at neither their source nor target")

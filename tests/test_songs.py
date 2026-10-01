@@ -27,6 +27,7 @@ from tagmend.engine.db import connect
 from tagmend.engine.musicbrainz import MBMedium, MBRelease, MBTrack, MusicBrainzError
 from tagmend.engine.schema import apply_schema
 from tagmend.engine.tags import read_tags
+from test_axis_status import _edit_on_disk
 from test_health import _run_ok
 
 if TYPE_CHECKING:
@@ -551,6 +552,49 @@ def test_stamp_check_reports_a_rebind_with_ranked_candidates(
         ("rel-boot", "bootleg"),
     ]
     assert staging.diff_tags(engine_settings) == []
+
+
+def test_a_rebind_folder_reports_an_ungated_targets_fpcalc_error(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    _wrong_stamp_folder(music_dir)
+    library.scan_library(engine_settings)
+    ids = _ids(engine_settings)
+    kit = replace(_wrong_stamp_kit(), fpcalc=FakeFpcalc(failures={_NAMES[3]: 2}))
+
+    result = _resolve(engine_settings, kit)
+
+    [rebind] = result.rebind_folders
+    assert rebind["flagged_file_ids"] == [ids[name] for name in _NAMES[:3]]
+    [item] = result.error_items
+    assert item["key"] == str(ids[_NAMES[3]])
+    assert "exited 2" in item["message"]
+    assert result.held_values == []
+
+
+def test_a_gate_failure_is_held_as_no_contribution_with_its_reason(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    _make_folder(music_dir / "LP", _blank_tracknumbers())
+    library.scan_library(engine_settings)
+    ids = _ids(engine_settings)
+    kit = _converging_kit()
+    # The only recording heard is a live take the filename does not name.
+    kit.acoustid.bodies[f"fp-{_NAMES[3]}"] = _body(
+        _recording("rec-4", "Song Four (Live)", Slot(_LP, 4)),
+    )
+
+    result = _resolve(engine_settings, kit)
+
+    assert result.staged_files == 3
+    assert result.held_no_contribution == 1
+    assert result.to_dict()["held_no_contribution"] == 1
+    [held] = result.held_values
+    assert held["file_id"] == ids[_NAMES[3]]
+    assert held["reason"] == "qualifier_mismatch"
+    assert _status(engine_settings, ids[_NAMES[3]]) == "pending"
 
 
 def test_manual_release_path_stages_the_whole_stamp_in_one_batch(
@@ -1109,6 +1153,27 @@ def test_revert_of_a_committed_fill_reads_pending(
 
     versioning.revert_commit(engine_settings, commit.commit_id)
 
+    assert _status(engine_settings, file_id) == "pending"
+
+
+def test_a_fill_over_a_title_written_on_disk_since_the_scan_reopens(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    _make_folder(music_dir / "LP", _blank_tracknumbers())
+    library.scan_library(engine_settings)
+    file_id = _ids(engine_settings)[_NAMES[1]]
+    track = music_dir / "LP" / _NAMES[1]
+    _edit_on_disk(track, title=["Edited In Picard"])
+
+    _resolve(engine_settings, _converging_kit())
+    assert _diffs(engine_settings)[_NAMES[1]].diff == {
+        "tracknumber": {"from": [], "to": ["2/4"]},
+    }
+    staging.commit_tags(engine_settings)
+    library.scan_library(engine_settings)
+
+    assert read_tags(track).tags["title"] == ["Edited In Picard"]
     assert _status(engine_settings, file_id) == "pending"
 
 

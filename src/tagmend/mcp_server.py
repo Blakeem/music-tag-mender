@@ -1325,19 +1325,22 @@ def stage_paths_batch(
     call made only of such confirmations passes while the gate is closed. Staging captures each
     file's first location as path version 0. Tag staging and path staging exclude each other
     per file. A folder whose every file the call moves to one other folder takes its sidecars
-    along, as in ``stage_paths``.
+    along, as in ``stage_paths``. ``sidecars_staged`` counts the sidecar moves staged.
+    ``sidecars_held`` lists each sidecar left in place, with its ``from_path``, ``to_path`` and
+    ``detail`` (its target is taken or too long), so the target can be cleared before the commit.
 
     Args:
         entries: A list of ``{"file_id": <int>, "to_path": <str>}`` objects.
         note: Optional free-text note stored with each eventual path revision.
 
     Returns:
-        ``{"ok": True, "staged": <count>, "file_ids": [...]}``, or ``{"ok": False, "error":
-        ...}`` naming every held entry (nothing staged).
+        ``{"ok": True, "staged": <count>, "file_ids": [...], "sidecars_staged": <count>,
+        "sidecars_held": [...]}``, or ``{"ok": False, "error": ...}`` naming every held entry
+        (nothing staged).
     """
     pairs = [(entry.get("file_id"), entry.get("to_path")) for entry in entries]
-    staged = paths.stage_paths_batch(load_settings(), entries=pairs, note=note)
-    return {"ok": True, "staged": len(staged), "file_ids": staged}
+    result = paths.stage_paths_batch(load_settings(), entries=pairs, note=note)
+    return {"ok": True, **result.to_dict()}
 
 
 @mcp.tool()
@@ -1375,16 +1378,29 @@ def diff_paths(path: str | None = None) -> dict[str, object]:
     file the saved naming settings now render elsewhere. The commit still applies the staged
     target, so run ``stage_paths`` again to follow the new render.
 
+    ``sidecars`` lists each staged sidecar move with the same ``state`` values. A sidecar row
+    stays staged after its album's audio commits when its target was taken (``target_taken``:
+    move that file away and run ``commit_paths``, or ``unstage_paths(path=<from_path>)``) or it
+    changed after landing (``landed_changed``: run ``stage_paths`` on its album folder). Such a
+    row blocks ``revert_commit``, ``revert_paths`` and every resolver until it clears.
+
     Args:
-        path: When given, only moves of files sitting at this folder or under it. Compared as a
-            path, like ``unstage_paths``.
+        path: When given, only moves of files and sidecars sitting at this folder or under it.
+            Compared as a path, like ``unstage_paths``.
 
     Returns:
         ``{"ok": True, "changes": [{file_id, from_path, to_path, origin, note, staged_at,
-        state, stale}, ...]}``, both paths relative to ``music_path``.
+        state, stale}, ...], "sidecars": [{from_path, to_path, origin, note, staged_at,
+        state}, ...]}``, every path relative to ``music_path``.
     """
-    changes = paths.diff_paths(load_settings(), path=path)
-    return {"ok": True, "changes": [view.to_dict() for view in changes]}
+    settings = load_settings()
+    changes = paths.diff_paths(settings, path=path)
+    sidecars = paths.diff_sidecars(settings, path=path)
+    return {
+        "ok": True,
+        "changes": [view.to_dict() for view in changes],
+        "sidecars": [view.to_dict() for view in sidecars],
+    }
 
 
 @mcp.tool()
@@ -1414,9 +1430,10 @@ def commit_paths(path: str | None = None, message: str | None = None) -> dict[st
         "sidecars_waiting", "sidecars_held": [<path>, ...], "folders_pruned",
         "sidecar_problems": [{from_path, to_path, status, detail}, ...]}``. ``commit_id`` is
         ``null`` when nothing was staged. ``sidecars_held`` lists the non-audio files left in
-        a folder whose audio all moved, because their target was taken or the folder's files
-        went to different folders. Each problem keeps its row, except a ``missing`` one, and
-        its ``detail`` names the next step.
+        a folder whose audio all moved, because their target was taken, the folder's files
+        went to different folders, or they sit in the release folder above disc folders the
+        commit emptied of audio, which no move carries. Each problem keeps its row, except a
+        ``missing`` one, and its ``detail`` names the next step.
     """
     result = paths.commit_paths(load_settings(), path=path, message=message)
     return {"ok": True, **result.to_dict()}
@@ -2050,9 +2067,10 @@ def resolve_songs(
     A file that agrees with its release records ``done``. A fill records ``done`` once staged.
     A disagreement, a slot two files claim, a file its release does not hold and a folder that
     does not converge are held (``held_values``, with ``have``/``want`` on a disagreement) and
-    stay ``pending``. An empty AcoustID answer (``lookup_empty``) and a transient error
-    (``error_items``, naming the fpcalc exit code, the HTTP status or the timeout) store
-    nothing either. An empty answer is asked again after 7 days.
+    stay ``pending``. A file whose recordings fail the recording gate is held as
+    ``no_contribution`` with the gate's reason. An empty AcoustID answer (``lookup_empty``) and a
+    transient error (``error_items``, naming the fpcalc exit code, the HTTP status or the
+    timeout) store nothing either. An empty answer is asked again after 7 days.
 
     ``review_values`` rows are proposals and are never staged. A held gated file with a blank
     title gets one with the audio's recording title (``field: "title"``). A gated file with no
@@ -2094,8 +2112,9 @@ def resolve_songs(
     Returns:
         ``{"ok": True, settled, staged_files, errors, error_items, pending_remaining,
         cold_folders_remaining, more, verified_files, held_disagreement, held_slot_collision,
-        held_release_mismatch, held_unconverged, review_files, lookup_empty, skipped_manual,
-        mappings, rebind_folders, held_values, review_values, summary}`` plus ``release`` and
+        held_release_mismatch, held_unconverged, held_no_contribution, review_files,
+        lookup_empty, skipped_manual, mappings, rebind_folders, held_values, review_values,
+        summary}`` plus ``release`` and
         ``unassigned`` on the manual release path, or ``{"ok": False, "error": ...}`` (pending
         changes, no AcoustID key, fpcalc missing). ``more`` is ``cold_folders_remaining > 0``:
         a held file stays ``pending`` by design, so only a cold folder is new work.

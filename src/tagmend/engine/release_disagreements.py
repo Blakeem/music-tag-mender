@@ -37,18 +37,16 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Final
 
-from tagmend.engine import db, lookup_clients, path_keys, schema, store
+from tagmend.engine import db, lookup_clients, path_keys, release_match, schema, store
 from tagmend.engine.detector_core import (
     TIER_RANK,
     Tier,
     group_by_folder,
-    parse_position,
     regroup,
     rows_in_tier,
     validate_tier,
 )
 from tagmend.engine.musicbrainz import MusicBrainzClient, MusicBrainzError
-from tagmend.engine.text_keys import display_key
 from tagmend.engine.validation import check_limit
 from tagmend.log import get_logger
 
@@ -79,8 +77,6 @@ _DETECT_FIELDS: Final = (
 # How many distinct releases one call fetches when the caller names no limit. At the one
 # request per second MusicBrainz asks for, this is about three minutes of wall clock.
 _DEFAULT_RELEASE_LIMIT: Final = 200
-
-_SLASH: Final = "/"
 
 # MusicBrainz dates are ``YYYY`` / ``YYYY-MM`` / ``YYYY-MM-DD``.
 _DATE_SEPARATOR: Final = "-"
@@ -251,46 +247,6 @@ class ReleaseDisagreementsReport:
 # --- comparison helpers --------------------------------------------------------------
 
 
-def _text_key(value: str) -> str:
-    """Return the comparison key for a free-text tag.
-
-    Shares :func:`tagmend.engine.text_keys.display_key` with the album-conflict detector, so
-    the two agree on what is cosmetic: casing, typographic character choice and whitespace
-    runs. MusicBrainz
-    writes typographic punctuation and taggers write ASCII, and no consumer distinguishes the
-    two, so a curly apostrophe against a straight one is not a finding. Other punctuation
-    stays significant: a colon against a hyphen is a real difference.
-    """
-    return display_key(value)
-
-
-def _position(value: str | None) -> str:
-    """Return the position part of an ``n`` / ``n/total`` tag value, without leading zeros.
-
-    A non-decimal head such as the vinyl ``A1`` comes back verbatim, so a side designation
-    still compares.
-    """
-    number = parse_position(value)
-    if number is not None:
-        return str(number)
-    if not value:
-        return ""
-    return value.split(_SLASH, 1)[0].strip()
-
-
-def _track_number_agrees(have: str, track: MBTrack) -> bool:
-    """Return whether the file's track number names this track, in either spelling.
-
-    A vinyl medium numbers its tracks by side (``A1``, ``B7``) while Picard writes the
-    sequential position, so the two strings differ on every file of such a release without
-    anything being wrong. Either spelling is a defensible reading, so either is accepted.
-    """
-    return _text_key(have) in {
-        _text_key(_position(track.number)),
-        _text_key(_position(str(track.position))),
-    }
-
-
 def _date_agrees(have: str, want: str) -> bool:
     """Return whether two dates agree, allowing the TAG to be the more precise of the two.
 
@@ -381,7 +337,9 @@ def _compare_one(
             continue
         have = (getattr(file, field_name) or "").strip()
         agrees = (
-            _date_agrees(have, want) if field_name == "date" else _text_key(have) == _text_key(want)
+            _date_agrees(have, want)
+            if field_name == "date"
+            else release_match.text_key(have) == release_match.text_key(want)
         )
         if not agrees:
             add(
@@ -423,55 +381,33 @@ def _compare_track(
             ),
         )
 
-    have_number = _position(file.tracknumber)
-    if have_number and not _track_number_agrees(have_number, track):
+    have_number = release_match.position(file.tracknumber)
+    if have_number and not release_match.track_number_agrees(have_number, track):
         add(
             "tracknumber",
             have_number,
-            _position(track.number),
+            release_match.position(track.number),
             f"the release says {track.number!r}",
         )
     elif not have_number and track.number:
-        add("tracknumber", "", _position(track.number), "")
+        add("tracknumber", "", release_match.position(track.number), "")
 
     for field_name, have_raw, want in (
         ("title", file.title, track.title),
         # The credit is per track, not per release: a guest track carries its own, and that
         # is the one the file should name.
         ("artist", file.artist, track.artist_credit),
-        ("discnumber", _position(file.discnumber), _disc_expectation(release, track)),
+        (
+            "discnumber",
+            release_match.position(file.discnumber),
+            release_match.disc_expectation(release, track),
+        ),
     ):
         have = (have_raw or "").strip()
-        if want and _text_key(have) != _text_key(want):
+        if want and release_match.text_key(have) != release_match.text_key(want):
             add(field_name, have, want, f"the release says {want!r}")
 
     return rows
-
-
-def _medium_of(release: MBRelease, track: MBTrack) -> int:
-    """Return the 1-based disc position of the medium holding *track*, or 0 if unknown.
-
-    Identity, not equality: :class:`MBTrack` is a frozen dataclass, so two equal-valued tracks
-    on different media would otherwise resolve to whichever medium came first.
-    """
-    return next(
-        (m.position for m in release.media if any(t is track for t in m.tracks)),
-        0,
-    )
-
-
-def _disc_expectation(release: MBRelease, track: MBTrack) -> str:
-    """Return the disc number this track should carry, or empty when there is nothing to say.
-
-    A single-medium release says nothing: Picard routinely omits ``discnumber`` there, and
-    proposing 1 on every such file would bury the report. A medium whose position did not
-    parse says nothing either, because disc zero is not an answer.
-    """
-    single_medium = 1
-    if len(release.media) <= single_medium:
-        return ""
-    position = _medium_of(release, track)
-    return str(position) if position > 0 else ""
 
 
 def _classify(

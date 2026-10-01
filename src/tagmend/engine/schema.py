@@ -178,6 +178,14 @@ ledger upgrades in place with every status and staged row preserved):
   against the tags on disk at stage time. The commit records ``manual`` on the axes it names.
   :func:`_migrate_staged_changed_fields` adds it as NULL, and the commit then falls back to
   the diff against the tags on disk at commit time.
+
+The audio-identification layer adds two caches (schema v22, purely additive, created by its DDL
+with no migration):
+
+* ``fingerprint_cache`` holds one fpcalc outcome per file at the files-row signature it was
+  taken at: the fingerprint and duration, or the failing exit code with both NULL.
+* ``acoustid_cache`` holds one AcoustID lookup per request hash, the parsed result as
+  zlib-compressed JSON. ``found`` is the negative-cache sentinel (0 = no match).
 """
 
 from __future__ import annotations
@@ -195,7 +203,7 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
-SCHEMA_VERSION: Final = 21
+SCHEMA_VERSION: Final = 22
 
 _FILES_DDL: Final = """
 CREATE TABLE IF NOT EXISTS files (
@@ -459,6 +467,33 @@ CREATE TABLE IF NOT EXISTS musicbrainz_recording_cache (
   release_group_mbid TEXT,
   recording_mbid     TEXT,
   fetched_at         TEXT NOT NULL
+)
+"""
+
+# One fpcalc outcome per file, reused while ``size_bytes`` and ``mtime_ns`` equal the files row.
+# The raw fingerprint is kept so an expired or failed lookup re-queries without re-running fpcalc,
+# and a stored failure (NULL fingerprint and duration) keeps an undecodable file from re-running.
+_FINGERPRINT_CACHE_DDL: Final = """
+CREATE TABLE IF NOT EXISTS fingerprint_cache (
+  file_id          INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
+  size_bytes       INTEGER NOT NULL,
+  mtime_ns         INTEGER NOT NULL,
+  fpcalc_exit      INTEGER NOT NULL,
+  fingerprint      TEXT,
+  duration         INTEGER,
+  fingerprinted_at TEXT NOT NULL
+)
+"""
+
+# Persistent cache of AcoustID lookups, keyed by a hash of the fingerprint, the duration, the
+# requested meta and a parse version. ``found`` is the negative-cache sentinel (0 = no match),
+# served only while young because AcoustID learns new fingerprints over time.
+_ACOUSTID_CACHE_DDL: Final = """
+CREATE TABLE IF NOT EXISTS acoustid_cache (
+  request_key TEXT PRIMARY KEY,
+  found       INTEGER NOT NULL,
+  payload     BLOB,
+  fetched_at  TEXT NOT NULL
 )
 """
 
@@ -1017,7 +1052,7 @@ def apply_schema(connection: sqlite3.Connection) -> None:
     :func:`_migrate_release_group_cache_name`, :func:`_migrate_mbid_columns`,
     :func:`_migrate_drop_files_status`, :func:`_migrate_lastfm_correction_cache`) and v21
     snapshots the tag-axis status rows (:func:`_migrate_axis_outcomes`) and adds the staged
-    changed fields (:func:`_migrate_staged_changed_fields`). v15 and v16 add cache tables
+    changed fields (:func:`_migrate_staged_changed_fields`). v15, v16 and v22 add cache tables
     only, which the DDL creates, so they need no migration step. The triggers come after
     every migration, so a migration that updates a log runs before they exist.
 
@@ -1067,6 +1102,8 @@ def apply_schema(connection: sqlite3.Connection) -> None:
     connection.execute(_MUSICBRAINZ_ARTIST_CACHE_DDL)
     connection.execute(_MUSICBRAINZ_RELEASE_CACHE_DDL)
     connection.execute(_FILE_MISMATCH_STATUS_DDL)
+    connection.execute(_FINGERPRINT_CACHE_DDL)
+    connection.execute(_ACOUSTID_CACHE_DDL)
     for index_ddl in _REVISIONS_COMMIT_INDEX_DDL:
         connection.execute(index_ddl)
     apply_append_only_triggers(connection)

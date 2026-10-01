@@ -106,7 +106,7 @@ _SELECTION_VERSION: Final = "2"
 _ARTIST_VERSION: Final = "1"
 
 # The release lookup's own version token, for the same reason the artist lookup has one.
-_RELEASE_VERSION: Final = "1"
+_RELEASE_VERSION: Final = "2"
 
 # One trailing parenthetical/bracketed segment — the edition suffix a tag carries and a release
 # group does not (``Fiction (Deluxe Edition)``, ``The Red Album [Deluxe Edition]``).
@@ -181,6 +181,7 @@ class MBTrack:
     release_track_mbid: str
     recording_mbid: str
     artist_credit: str
+    artist_sort: str
     artist_mbids: tuple[str, ...]
 
 
@@ -201,11 +202,13 @@ class MBRelease:
 
     The authority for what a folder's tags SHOULD say: the album title, the album artist
     credit, the per-track titles and numbers, and how many tracks each disc holds.
+    ``artist_sort`` is the credit in Picard's sort form, as :class:`MBTrack` carries its own.
     """
 
     mbid: str
     title: str
     artist_credit: str
+    artist_sort: str
     artist_mbids: tuple[str, ...]
     date: str
     country: str
@@ -811,35 +814,46 @@ def _release_request_key(mbid: str) -> str:
     return hashlib.sha1(payload.encode("utf-8")).hexdigest()  # noqa: S324 - cache key, not security
 
 
-def _credit(entries: object) -> tuple[str, tuple[str, ...]]:
-    """Return an artist credit's display string and its artist MBIDs, in credit order.
+@dataclass(frozen=True, slots=True)
+class _Credit:
+    """One artist credit: its display string, its sort string and its artist MBIDs."""
+
+    display: str
+    sort: str
+    mbids: tuple[str, ...]
+
+
+def _credit(entries: object) -> _Credit:
+    """Return an artist credit's display and sort strings and its artist MBIDs, in credit order.
 
     MusicBrainz splits a credit into named parts each carrying the phrase that joins it to
     the next (``Kruder`` + ``" & "`` then ``Dorfmeister``), which is how the display string
-    keeps the collaboration visible while the ids stay separable.
+    keeps the collaboration visible while the ids stay separable. The sort string joins each
+    part's artist sort name the same way, which is Picard's ``artistsort`` form
+    (``Perry, Linda feat. Slick, Grace``).
     """
     if not isinstance(entries, list):
-        return ("", ())
+        return _Credit(display="", sort="", mbids=())
     display: list[str] = []
+    sort: list[str] = []
     mbids: list[str] = []
     for entry in entries:
         if not isinstance(entry, dict):
             continue
-        name = entry.get("name")
-        if isinstance(name, str):
-            display.append(name)
-        join = entry.get("joinphrase")
-        if isinstance(join, str):
-            display.append(join)
+        name = _as_str(entry.get("name"))
+        join = _as_str(entry.get("joinphrase"))
         artist = entry.get("artist")
-        if isinstance(artist, dict):
-            artist_id = artist.get("id")
-            if isinstance(artist_id, str):
-                mbids.append(artist_id)
-    return ("".join(display), tuple(mbids))
+        artist_fields = artist if isinstance(artist, dict) else {}
+        sort_name = _as_str(artist_fields.get("sort-name")) or name
+        artist_id = artist_fields.get("id")
+        display.extend((name, join))
+        sort.extend((sort_name, join))
+        if isinstance(artist_id, str):
+            mbids.append(artist_id)
+    return _Credit(display="".join(display), sort="".join(sort), mbids=tuple(mbids))
 
 
-def _parse_track(entry: object, medium_credit: tuple[str, tuple[str, ...]]) -> MBTrack | None:
+def _parse_track(entry: object, medium_credit: _Credit) -> MBTrack | None:
     """Pull one track out of a medium's track list, or ``None`` when it carries no title."""
     if not isinstance(entry, dict):
         return None
@@ -854,7 +868,7 @@ def _parse_track(entry: object, medium_credit: tuple[str, tuple[str, ...]]) -> M
         recording_mbid = found if isinstance(found, str) else ""
 
     credit = _credit(entry.get("artist-credit"))
-    if not credit[0]:
+    if not credit.display:
         credit = medium_credit
 
     position = entry.get("position")
@@ -866,8 +880,9 @@ def _parse_track(entry: object, medium_credit: tuple[str, tuple[str, ...]]) -> M
         title=title,
         release_track_mbid=release_track_mbid if isinstance(release_track_mbid, str) else "",
         recording_mbid=recording_mbid,
-        artist_credit=credit[0],
-        artist_mbids=credit[1],
+        artist_credit=credit.display,
+        artist_sort=credit.sort,
+        artist_mbids=credit.mbids,
     )
 
 
@@ -908,8 +923,9 @@ def _parse_release(mbid: str, body: dict[str, object]) -> MBRelease | None:
     return MBRelease(
         mbid=mbid,
         title=title,
-        artist_credit=release_credit[0],
-        artist_mbids=release_credit[1],
+        artist_credit=release_credit.display,
+        artist_sort=release_credit.sort,
+        artist_mbids=release_credit.mbids,
         date=_as_str(body.get("date")),
         country=_as_str(body.get("country")),
         status=_as_str(body.get("status")),
@@ -934,6 +950,7 @@ def _release_to_json(release: MBRelease) -> str:
         {
             "title": release.title,
             "artist_credit": release.artist_credit,
+            "artist_sort": release.artist_sort,
             "artist_mbids": list(release.artist_mbids),
             "date": release.date,
             "country": release.country,
@@ -953,6 +970,7 @@ def _release_to_json(release: MBRelease) -> str:
                             "release_track_mbid": t.release_track_mbid,
                             "recording_mbid": t.recording_mbid,
                             "artist_credit": t.artist_credit,
+                            "artist_sort": t.artist_sort,
                             "artist_mbids": list(t.artist_mbids),
                         }
                         for t in m.tracks
@@ -976,6 +994,7 @@ def _release_from_json(mbid: str, payload: str) -> MBRelease | None:
         mbid=mbid,
         title=str(data.get("title", "")),
         artist_credit=str(data.get("artist_credit", "")),
+        artist_sort=str(data.get("artist_sort", "")),
         artist_mbids=tuple(data.get("artist_mbids") or ()),
         date=str(data.get("date", "")),
         country=str(data.get("country", "")),
@@ -995,6 +1014,7 @@ def _release_from_json(mbid: str, payload: str) -> MBRelease | None:
                         release_track_mbid=str(t.get("release_track_mbid", "")),
                         recording_mbid=str(t.get("recording_mbid", "")),
                         artist_credit=str(t.get("artist_credit", "")),
+                        artist_sort=str(t.get("artist_sort", "")),
                         artist_mbids=tuple(t.get("artist_mbids") or ()),
                     )
                     for t in (m.get("tracks") or [])

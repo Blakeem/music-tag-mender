@@ -27,7 +27,7 @@ def test_apply_schema_stamps_current_version(db_conn: sqlite3.Connection) -> Non
     # db_conn already applied the schema; the stamp must match the constant the code ships.
     version = db_conn.execute("PRAGMA user_version").fetchone()[0]
     assert version == SCHEMA_VERSION
-    assert SCHEMA_VERSION == 21
+    assert SCHEMA_VERSION == 22
 
 
 def test_apply_schema_creates_genre_tables(db_conn: sqlite3.Connection) -> None:
@@ -1189,3 +1189,68 @@ def test_fresh_ledger_takes_the_v21_columns_from_the_ddl(db_conn: sqlite3.Connec
     for table in _AXIS_TABLES:
         assert "source_value" in _columns(db_conn, table)
     assert "changed_fields" in _staged_columns(db_conn)
+
+
+# --- v22: the audio-identification caches ----------------------------------------------
+
+_FINGERPRINT_CACHE_COLUMNS = [
+    "file_id",
+    "size_bytes",
+    "mtime_ns",
+    "fpcalc_exit",
+    "fingerprint",
+    "duration",
+    "fingerprinted_at",
+]
+_ACOUSTID_CACHE_COLUMNS = ["request_key", "found", "payload", "fetched_at"]
+
+
+def test_fresh_ledger_has_the_audio_identification_caches(db_conn: sqlite3.Connection) -> None:
+    assert _columns(db_conn, "fingerprint_cache") == _FINGERPRINT_CACHE_COLUMNS
+    assert _columns(db_conn, "acoustid_cache") == _ACOUSTID_CACHE_COLUMNS
+
+
+def test_v21_ledger_gains_the_audio_identification_caches_in_place() -> None:
+    conn = sqlite3.connect(":memory:")
+    try:
+        apply_schema(conn)
+        conn.execute("DROP TABLE fingerprint_cache")
+        conn.execute("DROP TABLE acoustid_cache")
+        conn.execute(
+            """
+            INSERT INTO musicbrainz_release_cache (request_key, found, fetched_at)
+            VALUES ('k', 0, '2026-09-01T00:00:00+00:00')
+            """,
+        )
+        conn.execute("PRAGMA user_version = 21")
+        conn.commit()
+
+        apply_schema(conn)  # the in-place upgrade
+
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        assert _columns(conn, "fingerprint_cache") == _FINGERPRINT_CACHE_COLUMNS
+        assert _columns(conn, "acoustid_cache") == _ACOUSTID_CACHE_COLUMNS
+        kept = conn.execute("SELECT COUNT(*) FROM musicbrainz_release_cache").fetchone()[0]
+        assert kept == 1
+    finally:
+        conn.close()
+
+
+def test_fingerprint_cache_cascades_on_file_delete(db_conn: sqlite3.Connection) -> None:
+    file_id = _insert_file(db_conn)
+    db_conn.execute(
+        """
+        INSERT INTO fingerprint_cache
+          (file_id, size_bytes, mtime_ns, fpcalc_exit, fingerprint, duration, fingerprinted_at)
+        VALUES (?, 10, 20, 0, 'AQAB', 200, '2026-09-01T00:00:00+00:00')
+        """,
+        (file_id,),
+    )
+
+    db_conn.execute("DELETE FROM files WHERE id = ?", (file_id,))
+
+    remaining = db_conn.execute(
+        "SELECT COUNT(*) FROM fingerprint_cache WHERE file_id = ?",
+        (file_id,),
+    ).fetchone()
+    assert remaining[0] == 0

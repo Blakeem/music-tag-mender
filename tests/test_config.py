@@ -216,3 +216,50 @@ def test_container_folders_env_override(monkeypatch: pytest.MonkeyPatch) -> None
     config.set_setting("container_folders", "FromFile")
     monkeypatch.setenv("TAGMEND_CONTAINER_FOLDERS", "FromEnv;Other")
     assert config.load_settings().container_folders == ("FromEnv", "Other")
+
+
+# --- song-axis settings --------------------------------------------------------------
+
+
+def test_song_settings_default_when_unset() -> None:
+    settings = config.load_settings()
+    assert settings.acoustid_api_key is None
+    assert settings.fpcalc_path is None
+    assert settings.acoustid_rate_per_sec == 2.0
+    assert settings.song_stage_limit == 25
+
+
+def test_acoustid_api_key_env_override_wins_over_the_file(monkeypatch: pytest.MonkeyPatch) -> None:
+    config.set_setting("acoustid_api_key", "from-file")
+    assert config.load_settings().acoustid_api_key == "from-file"
+    monkeypatch.setenv("TAGMEND_ACOUSTID_API_KEY", "from-env")
+    assert config.load_settings().acoustid_api_key == "from-env"
+
+
+def test_an_empty_fpcalc_path_means_path_lookup() -> None:
+    config.set_setting("fpcalc_path", "")
+    assert config.load_settings().fpcalc_path is None
+    config.set_setting("fpcalc_path", "C:/tools/fpcalc.exe")
+    assert config.load_settings().fpcalc_path == "C:/tools/fpcalc.exe"
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [("5.0", 3.0), ("3", 3.0), ("2.5", 2.5), ("0", 2.0), ("-1", 2.0), ("nan", 2.0), ("x", 2.0)],
+)
+def test_acoustid_rate_is_held_inside_the_published_limit(raw: str, expected: float) -> None:
+    config.set_setting("acoustid_rate_per_sec", raw)
+    assert config.load_settings().acoustid_rate_per_sec == expected
+
+
+@pytest.mark.parametrize(("raw", "expected"), [("10", 10), ("0", 0), ("-3", 25), ("abc", 25)])
+def test_song_stage_limit_is_coerced_like_the_other_limits(raw: str, expected: int) -> None:
+    config.set_setting("song_stage_limit", raw)
+    assert config.load_settings().song_stage_limit == expected
+
+
+def test_the_acoustid_key_is_redacted_from_the_settings_repr() -> None:
+    config.set_setting("acoustid_api_key", "secret-acoustid-key")
+    settings = config.load_settings()
+    assert settings.acoustid_api_key == "secret-acoustid-key"
+    assert "secret-acoustid-key" not in repr(settings)

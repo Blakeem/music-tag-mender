@@ -967,6 +967,88 @@ def test_bumping_the_release_version_changes_the_request_key(
     assert _release_request_key("abc") != before
 
 
+def test_the_release_version_is_two() -> None:
+    # Version 2 added the sort credits, so every release cached under version 1 re-fetches.
+    assert musicbrainz._RELEASE_VERSION == "2"
+
+
+def _sorted_part(name: str, sort_name: str, join: str, mbid: str) -> dict[str, object]:
+    return {"name": name, "joinphrase": join, "artist": {"id": mbid, "sort-name": sort_name}}
+
+
+def test_release_by_mbid_carries_the_sort_credit_in_picards_form(
+    db_conn: sqlite3.Connection,
+) -> None:
+    body = _release_body(
+        **{"artist-credit": [_sorted_part("Jefferson Starship", "Jefferson Starship", "", "a0")]},
+    )
+    media = body["media"]
+    assert isinstance(media, list)
+    media[0]["tracks"][1]["artist-credit"] = [
+        _sorted_part("Linda Perry", "Perry, Linda", " feat. ", "a1"),
+        _sorted_part("Grace Slick", "Slick, Grace", "", "a2"),
+    ]
+    client, _ = _client(db_conn, [_json_response(body)])
+    with client:
+        release = client.release_by_mbid("rel-1")
+
+    assert release is not None
+    assert release.artist_sort == "Jefferson Starship"
+    guest = release.media[0].tracks[1]
+    assert guest.artist_credit == "Linda Perry feat. Grace Slick"
+    assert guest.artist_sort == "Perry, Linda feat. Slick, Grace"
+
+
+def test_a_credit_part_with_no_sort_name_falls_back_to_its_display_name(
+    db_conn: sqlite3.Connection,
+) -> None:
+    client, _ = _client(db_conn, [_json_response(_release_body())])
+    with client:
+        release = client.release_by_mbid("rel-1")
+
+    assert release is not None
+    assert release.artist_sort == "36 Crazyfists"
+    assert release.media[0].tracks[0].artist_sort == "36 Crazyfists"
+
+
+def test_the_sort_credit_round_trips_through_the_cache(db_conn: sqlite3.Connection) -> None:
+    body = _release_body()
+    media = body["media"]
+    assert isinstance(media, list)
+    media[0]["tracks"][0]["artist-credit"] = [
+        _sorted_part("Linda Perry", "Perry, Linda", " feat. ", "a1"),
+        _sorted_part("Grace Slick", "Slick, Grace", "", "a2"),
+    ]
+    client, calls = _client(db_conn, [_json_response(body)])
+    with client:
+        fetched = client.release_by_mbid("rel-1")
+        cached = client.release_by_mbid("rel-1")
+
+    assert len(calls) == 1
+    assert cached == fetched
+    assert cached is not None
+    assert cached.media[0].tracks[0].artist_sort == "Perry, Linda feat. Slick, Grace"
+    assert cached.artist_sort == "36 Crazyfists"
+
+
+def test_a_version_one_release_row_is_a_miss(
+    db_conn: sqlite3.Connection,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with monkeypatch.context() as patch:
+        patch.setattr(musicbrainz, "_RELEASE_VERSION", "1")
+        old_client, _ = _client(db_conn, [_json_response(_release_body())])
+        with old_client:
+            old_client.release_by_mbid("rel-1")
+
+    client, calls = _client(db_conn, [_json_response(_release_body())])
+    with client:
+        release = client.release_by_mbid("rel-1")
+
+    assert release is not None
+    assert len(calls) == 1  # the version-1 row did not answer, so the release re-fetched
+
+
 # --- 503 backoff: MusicBrainz's own rate-limit signal ---------------------------------
 
 

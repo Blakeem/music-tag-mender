@@ -61,6 +61,7 @@ def _track(  # noqa: PLR0913 - one keyword per track field, cohesive by design
         release_track_mbid=rt or f"rt-{resolved}",
         recording_mbid=rec or f"rec-{resolved}",
         artist_credit=credit,
+        artist_sort=credit,
         artist_mbids=("artist-1",),
     )
 
@@ -70,6 +71,7 @@ def _release(*tracks: MBTrack, **overrides: object) -> MBRelease:
         "mbid": _RELEASE_ID,
         "title": "Real Album",
         "artist_credit": "Band",
+        "artist_sort": "Band",
         "artist_mbids": ("artist-1",),
         "date": "1997",
         "country": "US",

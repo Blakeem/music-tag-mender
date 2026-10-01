@@ -89,6 +89,23 @@ def test_build_seed_names_the_year_stage_limit() -> None:
     assert "album_stage_limit" not in values
 
 
+def test_build_seed_masks_the_acoustid_key() -> None:
+    seed = configui.build_seed(_settings(acoustid_api_key="acoustid-secret"))
+    values = seed["values"]
+    assert isinstance(values, dict)
+    assert values["acoustid_api_key"] == configui.MASK_PLACEHOLDER
+    assert "acoustid-secret" not in str(seed)
+
+
+def test_build_seed_names_the_song_settings() -> None:
+    values = configui.build_seed(_settings())["values"]
+    assert isinstance(values, dict)
+    assert values["acoustid_api_key"] == ""
+    assert values["fpcalc_path"] == ""
+    assert values["acoustid_rate_per_sec"] == "2.0"
+    assert values["song_stage_limit"] == "25"
+
+
 # --- validate_and_normalize ----------------------------------------------------------
 
 
@@ -105,6 +122,21 @@ def test_validate_drops_empty_key() -> None:
 def test_validate_keeps_new_key() -> None:
     result = configui.validate_and_normalize({"lastfm_api_key": "fresh"})
     assert result == {"lastfm_api_key": "fresh"}
+
+
+def test_validate_drops_a_masked_acoustid_key_and_keeps_a_new_one() -> None:
+    masked = configui.validate_and_normalize({"acoustid_api_key": configui.MASK_PLACEHOLDER})
+    assert "acoustid_api_key" not in masked
+    assert configui.validate_and_normalize({"acoustid_api_key": "fresh"}) == {
+        "acoustid_api_key": "fresh",
+    }
+
+
+def test_validate_rejects_a_non_numeric_song_setting() -> None:
+    with pytest.raises(configui.ValidationError):
+        configui.validate_and_normalize({"acoustid_rate_per_sec": "fast"})
+    with pytest.raises(configui.ValidationError):
+        configui.validate_and_normalize({"song_stage_limit": "many"})
 
 
 def test_validate_rejects_unknown_key() -> None:

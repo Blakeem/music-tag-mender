@@ -96,7 +96,7 @@ compares a file's year tags with the first-release year of its album's MusicBrai
 found by the album identity (album artist else artist, album). `high` means the `originaldate` year
 differs, `medium` means the `date` year is earlier than the first release. `release_limit` (default
 200) caps the uncached lookups one call makes, and cache writes are its only ledger writes.
-35 MCP tools total. Schema is **v21** (additive: v11 adds
+35 MCP tools total. Schema is **v22** (additive: v11 adds
 `musicbrainz_recording_cache`, v12 renames `file_album_status` → `file_year_status` in place —
 dispositions preserved; v13 adds `tag_revisions.managed_set`, stamping which managed-tag set
 governed each revision so a revert can restore emptiness on the widened fields; v14 adds
@@ -114,7 +114,9 @@ as `auto`, since a commit's origin is now derived from the rows it sweeps. v20 r
 `tag_revisions.reverted_from` to `reverted_to_version`), gives `lastfm_correction_cache` typed
 columns, drops the unused `files.status`, and makes `tag_revisions.managed_set` required. v21 gives each tag-axis status row a
 `source_value` snapshot, replays manual revisions into `manual` rows, drops `voided_auto`, and adds
-`tag_revisions_staged.changed_fields`. A newer
+`tag_revisions_staged.changed_fields`. v22 adds `fingerprint_cache` (one fpcalc result per file,
+keyed to its size and mtime) and `acoustid_cache` (AcoustID lookups keyed by a fingerprint hash,
+with a 7-day expiry on an empty answer). A newer
 ledger is refused). M6 organize/paths (`paths.py`)
 is a paper sketch (its DDL ships in v6; logic deferred).
 
@@ -298,7 +300,7 @@ src/tagmend/
   mcp_server.py     FastMCP server (thin) — 35 tools
   engine/
     db.py           SQLite connection (WAL)
-    schema.py       all DDL + PRAGMA user_version (v21)
+    schema.py       all DDL + PRAGMA user_version (v22)
     path_keys.py    path identity keys, subtree key ranges, the folder-argument normalizer
     text_keys.py    the shared text fold keys (alnum, display, artist name, loose, title)
     scan.py         filesystem discovery + signatures
@@ -310,6 +312,8 @@ src/tagmend/
     commits.py      domain-neutral commit core: commits table + RevisionDomain + run_commit
     staging.py      tags domain (TagDomain) + stage/diff/commit_tags orchestration
     lastfm.py       Last.fm top-tags client: lastfm_cache + pacing (getCorrection → M4)
+    acoustid.py     fpcalc Fingerprinter + AcoustidClient (gzip POST lookup, paced) + their caches
+    release_match.py  pure release-matching helpers (track text keys, positions, disc expectation)
     musicbrainz.py  MusicBrainz client: release-group year, recording lookup, artist-by-MBID name, release-by-MBID tracklist
     axis.py         the parameterized Axis: one outcome-row model for genre/artist/year, plus the mismatch disposition model
     axis_status.py  the one set_/reset_<axis>_status implementation, parameterized by Axis

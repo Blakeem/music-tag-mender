@@ -13,6 +13,10 @@ const FIELDS = [
   { key: "musicbrainz_rate_per_sec", label: "MusicBrainz requests/sec", group: "advanced", type: "text" },
   { key: "musicbrainz_contact", label: "MusicBrainz contact (email or URL)", group: "advanced", type: "text" },
   { key: "year_stage_limit", label: "Year stage limit", group: "advanced", type: "text" },
+  { key: "acoustid_api_key", label: "AcoustID API key", group: "advanced", type: "text" },
+  { key: "fpcalc_path", label: "fpcalc path (blank = PATH)", group: "advanced", type: "text" },
+  { key: "acoustid_rate_per_sec", label: "AcoustID requests/sec (max 3)", group: "advanced", type: "text" },
+  { key: "song_stage_limit", label: "Song stage limit", group: "advanced", type: "text" },
 ];
 
 const csrfToken = document.querySelector('meta[name="csrf-token"]').content;

@@ -15,6 +15,16 @@ from typing import TYPE_CHECKING, Final
 import httpx
 
 from tagmend.engine import commits, db, scan, schema
+from tagmend.engine.acoustid import (
+    AcoustidClient,
+    AcoustidError,
+    AcoustidKeyError,
+    Fingerprint,
+    Fingerprinter,
+    FpcalcRunner,
+    FpcalcUnavailableError,
+    run_fpcalc,
+)
 from tagmend.engine.lastfm import LastfmClient, LastfmError
 from tagmend.engine.musicbrainz import MusicBrainzClient, MusicBrainzError
 from tagmend.log import get_logger
@@ -31,6 +41,12 @@ logger = get_logger(__name__)
 _LASTFM_PING_ARTIST: Final = "Radiohead"
 _MB_PING_ARTIST: Final = "Black Sabbath"
 _MB_PING_ALBUM: Final = "Paranoid"
+# A fingerprint AcoustID cannot decode. It answers "invalid fingerprint" (code 3) only after
+# accepting the key, so the probe tests the key without looking anything up.
+_ACOUSTID_PROBE: Final = Fingerprint(fingerprint="AQAB", duration=1)
+_FPCALC_HINT: Final = (
+    "install fpcalc from https://acoustid.org/chromaprint and put it on PATH, or set fpcalc_path"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,12 +82,14 @@ def check_health(
     *,
     lastfm_transport: httpx.BaseTransport | None = None,
     musicbrainz_transport: httpx.BaseTransport | None = None,
+    acoustid_transport: httpx.BaseTransport | None = None,
+    fpcalc_runner: FpcalcRunner = run_fpcalc,
 ) -> HealthReport:
     """Run every readiness check against *settings* and return the aggregate report.
 
-    The two ``*_transport`` kwargs are test-only injection seams (default: the real httpx
-    transport); production callers (CLI, MCP) never pass them, so both authorities are
-    pinged live.
+    The three ``*_transport`` kwargs and *fpcalc_runner* are test-only injection seams
+    (default: the real httpx transport and subprocess). Production callers (CLI, MCP) never
+    pass them, so every authority is pinged live and fpcalc really runs.
     """
     checks = [
         _check_music_path(settings.music_path),
@@ -79,6 +97,8 @@ def check_health(
         _check_interrupted_commits(settings.db_path),
         _check_lastfm(settings, transport=lastfm_transport),
         _check_musicbrainz(settings, transport=musicbrainz_transport),
+        _check_fpcalc(settings, runner=fpcalc_runner),
+        _check_acoustid(settings, transport=acoustid_transport),
     ]
     report = HealthReport(checks=checks)
     logger.info("health check complete: ready=%s", report.ready)
@@ -232,3 +252,47 @@ def _check_musicbrainz(
         conn.close()
 
     return Check(name=name, ok=True, detail="reachable")
+
+
+def _check_fpcalc(settings: Settings, *, runner: FpcalcRunner = run_fpcalc) -> Check:
+    """Confirm fpcalc resolves and runs (``fpcalc -version``), reporting its version string."""
+    name = "fpcalc"
+    try:
+        version = Fingerprinter.from_settings(settings, runner=runner).version()
+    except FpcalcUnavailableError as exc:
+        return Check(name=name, ok=False, detail=f"{exc}. {_FPCALC_HINT}")
+    return Check(name=name, ok=True, detail=version)
+
+
+def _check_acoustid(
+    settings: Settings,
+    *,
+    transport: httpx.BaseTransport | None = None,
+) -> Check:
+    """Confirm AcoustID accepts the configured key (one probe lookup, one attempt).
+
+    A missing key fails with no HTTP attempted. An unreachable AcoustID says nothing about the
+    key, so it passes with a warning rather than failing readiness on a network blip.
+    """
+    name = "acoustid"
+
+    if not settings.acoustid_api_key:
+        return Check(
+            name=name,
+            ok=False,
+            detail="not configured: set acoustid_api_key (needed by the song axis)",
+        )
+
+    try:
+        with AcoustidClient(
+            settings.acoustid_api_key,
+            transport=transport,
+            max_attempts=1,
+        ) as client:
+            client.lookup(_ACOUSTID_PROBE)
+    except AcoustidKeyError as exc:
+        return Check(name=name, ok=False, detail=f"key rejected: {exc}")
+    except AcoustidError as exc:
+        return Check(name=name, ok=True, detail=f"warning: key not verified, {exc}")
+
+    return Check(name=name, ok=True, detail="key accepted")

@@ -15,7 +15,7 @@ import os
 import stat
 import tempfile
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
@@ -44,6 +44,10 @@ _KNOWN_KEYS: Final[frozenset[str]] = frozenset(
         "musicbrainz_contact",
         "year_stage_limit",
         "container_folders",
+        "acoustid_api_key",
+        "fpcalc_path",
+        "acoustid_rate_per_sec",
+        "song_stage_limit",
     },
 )
 
@@ -56,14 +60,23 @@ _GENRE_MAX_COUNT_DEFAULT: Final = 4
 _LASTFM_RATE_PER_SEC_DEFAULT: Final = 1.0
 _GENRE_STAGE_LIMIT_DEFAULT: Final = 300
 
+# The public project URL, the contact any User-Agent may carry without naming a person.
+PROJECT_URL: Final = "https://github.com/Blakeem/music-tag-mender"
+
 # Defaults for the year-axis MusicBrainz settings. MusicBrainz's published rate limit is
 # ~1 request/second and it REQUIRES a descriptive User-Agent identifying the application
 # plus a contact (an email or URL). We compose ``TagMend/<live-version> ( <contact> )`` at
 # request time so the version never drifts; only the contact is user-configurable, and it
 # defaults to the public project URL rather than a personal address.
 _MUSICBRAINZ_RATE_PER_SEC_DEFAULT: Final = 1.0
-_MUSICBRAINZ_CONTACT_DEFAULT: Final = "https://github.com/Blakeem/music-tag-mender"
+_MUSICBRAINZ_CONTACT_DEFAULT: Final = PROJECT_URL
 _YEAR_STAGE_LIMIT_DEFAULT: Final = 300
+
+# Defaults for the song-axis AcoustID settings. AcoustID publishes a limit of 3 requests per
+# second, so a configured rate above it is clamped rather than trusted.
+_ACOUSTID_RATE_PER_SEC_DEFAULT: Final = 2.0
+_ACOUSTID_RATE_PER_SEC_MAX: Final = 3.0
+_SONG_STAGE_LIMIT_DEFAULT: Final = 25
 
 # Tokens (case-insensitive) that mean "no limit" for ``genre_max_count``.
 _NONE_TOKENS: Final[frozenset[str]] = frozenset({"", "0", "none", "null"})
@@ -131,6 +144,11 @@ class Settings:
     # Top-level container folders whose path signal the mismatch detector suppresses; a
     # semicolon-delimited string on disk, coerced to a tuple here.
     container_folders: tuple[str, ...] = ()
+    # Song-axis settings. The key stays out of the repr so a logged Settings never leaks it.
+    acoustid_api_key: str | None = field(default=None, repr=False)
+    fpcalc_path: str | None = None
+    acoustid_rate_per_sec: float = _ACOUSTID_RATE_PER_SEC_DEFAULT
+    song_stage_limit: int = _SONG_STAGE_LIMIT_DEFAULT
 
     @property
     def musicbrainz_user_agent(self) -> str:
@@ -192,6 +210,19 @@ def load_settings() -> Settings:
             _YEAR_STAGE_LIMIT_DEFAULT,
         ),
         container_folders=_coerce_folder_list(_resolve_raw("container_folders", raw)),
+        acoustid_api_key=_resolve_raw("acoustid_api_key", raw) or None,
+        fpcalc_path=_resolve_raw("fpcalc_path", raw) or None,
+        acoustid_rate_per_sec=_coerce_capped_rate(
+            "acoustid_rate_per_sec",
+            _resolve_raw("acoustid_rate_per_sec", raw),
+            _ACOUSTID_RATE_PER_SEC_DEFAULT,
+            _ACOUSTID_RATE_PER_SEC_MAX,
+        ),
+        song_stage_limit=_coerce_non_negative_int(
+            "song_stage_limit",
+            _resolve_raw("song_stage_limit", raw),
+            _SONG_STAGE_LIMIT_DEFAULT,
+        ),
     )
 
 
@@ -232,6 +263,22 @@ def _coerce_float(key: str, value: str | None, default: float) -> float:
     except ValueError:
         logger.warning("invalid %s=%r; using default %s", key, value, default)
         return default
+
+
+def _coerce_capped_rate(key: str, value: str | None, default: float, cap: float) -> float:
+    """Parse *value* like :func:`_coerce_float`, then hold it inside ``(0, cap]``.
+
+    A rate at or below zero would disable pacing entirely, so it falls back to *default*.
+    """
+    parsed = _coerce_float(key, value, default)
+    # Written as a negation so NaN, which compares false to everything, is rejected too.
+    if not parsed > 0:
+        logger.warning("invalid %s=%r; using default %s", key, value, default)
+        return default
+    if parsed > cap:
+        logger.warning("%s=%r exceeds the published limit; using %s", key, value, cap)
+        return cap
+    return parsed
 
 
 def _coerce_max_count(value: str | None) -> int | None:

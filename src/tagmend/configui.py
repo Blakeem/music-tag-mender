@@ -13,7 +13,7 @@ Everything is engine-first and dependency-free: pure helpers (:func:`decide_laun
 while a thin :class:`http.server` handler wires them to HTTP. The handler is locked down for
 a single local user: loopback-only source IP, a loopback ``Host`` header, a per-launch CSRF
 token on every POST, an exact-filename static allowlist (no path traversal), and a JSON body
-cap. The real Last.fm key is never sent to the browser — the seed masks it.
+cap. No real API key is ever sent to the browser. The seed masks each one.
 """
 
 from __future__ import annotations
@@ -44,9 +44,11 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
-# What the browser shows in place of the real Last.fm key; an unchanged field means
+# What the browser shows in place of a real API key. An unchanged field means
 # "leave the stored key alone" (never the literal placeholder, never the real key).
 MASK_PLACEHOLDER: Final = "********"
+
+_SECRET_KEYS: Final[frozenset[str]] = frozenset({"lastfm_api_key", "acoustid_api_key"})
 
 # The per-launch CSRF token travels in this request header on every POST.
 _CSRF_HEADER: Final = "X-TagMend-CSRF"
@@ -55,10 +57,10 @@ _CSRF_PLACEHOLDER: Final = "__CSRF_TOKEN__"
 
 # Numeric field families (light save-time validation only; ``load_settings`` still coerces).
 _INT_KEYS: Final[frozenset[str]] = frozenset(
-    {"genre_min_weight", "genre_stage_limit", "year_stage_limit"},
+    {"genre_min_weight", "genre_stage_limit", "year_stage_limit", "song_stage_limit"},
 )
 _FLOAT_KEYS: Final[frozenset[str]] = frozenset(
-    {"lastfm_rate_per_sec", "musicbrainz_rate_per_sec"},
+    {"lastfm_rate_per_sec", "musicbrainz_rate_per_sec", "acoustid_rate_per_sec"},
 )
 
 # Exact-filename static allowlist — no directory listing, no path traversal.
@@ -97,10 +99,11 @@ def decide_launch(settings: Settings) -> bool:
 
 
 def build_seed(settings: Settings) -> dict[str, object]:
-    """Build the ``/api/seed`` payload: every key as a string, the Last.fm key masked.
+    """Build the ``/api/seed`` payload: every key as a string, each API key masked.
 
-    The real key is never included — ``lastfm_api_key`` is the mask placeholder when a key
-    is set (empty otherwise), alongside a ``has_lastfm_api_key`` boolean for the UI.
+    No real key is ever included. ``lastfm_api_key`` and ``acoustid_api_key`` are the mask
+    placeholder when a key is set (empty otherwise), alongside a ``has_lastfm_api_key``
+    boolean for the UI.
     """
     values: dict[str, str] = {
         "music_path": str(settings.music_path) if settings.music_path else "",
@@ -115,6 +118,10 @@ def build_seed(settings: Settings) -> dict[str, object]:
         "musicbrainz_rate_per_sec": str(settings.musicbrainz_rate_per_sec),
         "musicbrainz_contact": settings.musicbrainz_contact,
         "year_stage_limit": str(settings.year_stage_limit),
+        "fpcalc_path": settings.fpcalc_path or "",
+        "acoustid_rate_per_sec": str(settings.acoustid_rate_per_sec),
+        "song_stage_limit": str(settings.song_stage_limit),
+        "acoustid_api_key": MASK_PLACEHOLDER if settings.acoustid_api_key is not None else "",
     }
     has_key = settings.lastfm_api_key is not None
     values["lastfm_api_key"] = MASK_PLACEHOLDER if has_key else ""
@@ -125,8 +132,8 @@ def validate_and_normalize(payload: Mapping[str, object]) -> dict[str, str]:
     """Validate a posted form payload and return the subset of keys to persist.
 
     Unknown keys raise a 400 ``ValidationError``; numeric/none-token fields that don't parse
-    raise a 422. An unchanged ``lastfm_api_key`` (the mask placeholder or an empty field) is
-    dropped so the stored key is preserved — clearing a key stays a ``config-set`` action.
+    raise a 422. An unchanged API key (the mask placeholder or an empty field) is dropped so
+    the stored key is preserved. Clearing a key stays a ``config-set`` action.
     """
     result: dict[str, str] = {}
     for key, raw_value in payload.items():
@@ -134,7 +141,7 @@ def validate_and_normalize(payload: Mapping[str, object]) -> dict[str, str]:
             message = f"unknown setting {key!r}"
             raise ValidationError(HTTPStatus.BAD_REQUEST, message)
         value = "" if raw_value is None else str(raw_value)
-        if key == "lastfm_api_key":
+        if key in _SECRET_KEYS:
             if value and value != MASK_PLACEHOLDER:
                 result[key] = value
             continue

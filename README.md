@@ -121,7 +121,7 @@ Edits apply on the next tool call; every command and MCP tool re-reads `settings
 
 ## Tools
 
-The MCP server exposes 47 tools. Tag edits and file moves are staged first and only written to disk on `commit_tags` or `commit_paths`, and everything is revertible.
+The MCP server exposes 46 tools. Tag edits and file moves are staged first and only written to disk on `commit_tags` or `commit_paths`, and everything is revertible.
 
 ### Core & Library
 
@@ -195,13 +195,12 @@ The MCP server exposes 47 tools. Tag edits and file moves are staged first and o
 
 ### Mismatch fixing
 
-Use `detect_mismatches` (above) to find files whose path disagrees with their own tags. Fix a wrong tag through the staging engine (`stage_tags_batch` → `commit_tags` → `reopen_axes`), or record a path decision for the group. `legit_ignore` keeps the folder. `misfiled_deferred` lets the tags render every level of the path. No decision keeps a filename, so write a wording you want to keep into the tag. A decision covers the names its group flags. The file flags again when a covered tag changes or a committed move changes its path. The report reads `gate_open: true` once every group is fixed or decided. Set the container folders with `set_naming_pattern` before the first decision, since `detect_mismatches` reads that list.
+Use `detect_mismatches` (above) to find files whose path disagrees with their own tags. Fix a wrong tag through the staging engine (`stage_tags_batch` → `commit_tags`), or record a path decision for the group. `legit_ignore` keeps the folder. `misfiled_deferred` lets the tags render every level of the path. No decision keeps a filename, so write a wording you want to keep into the tag. A decision covers the names its group flags. The file flags again when a covered tag changes or a committed move changes its path. The report reads `gate_open: true` once every group is fixed or decided. Set the container folders with `set_naming_pattern` before the first decision, since `detect_mismatches` reads that list.
 
 | Tool | Description |
 |------|-------------|
 | `set_mismatch_status` | Record a path decision for one group. `legit_ignore` keeps its folder, and `misfiled_deferred` renders every level from the tags |
 | `reset_mismatch_status` | Delete the path decision of in-scope files |
-| `reopen_axes` | After committing a manual identity fix, re-open the file's genre, artist, year and song outcomes. `manual` rows are kept |
 
 ### File Moves
 

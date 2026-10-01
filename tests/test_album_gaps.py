@@ -7,7 +7,7 @@ proposes, uncorroborated stays blank, partial fractions bracketing the 0.6 thres
 binding blank-only safety guarantee (a non-blank file — including one non-blank only at a
 later ordinal — is never proposed), the limit/folder narrowing, and ``to_dict`` shape; plus
 an integration pass through ``scan_library`` asserting read-only behaviour and one
-end-to-end stage -> diff -> commit -> reopen flow, and the MCP wiring smoke check.
+end-to-end stage -> diff -> commit flow, and the MCP wiring smoke check.
 """
 
 from __future__ import annotations
@@ -730,7 +730,7 @@ def test_detect_integration_read_only_then_fix_flow(
         conn.close()
     assert _read_album(engine_settings, folder, "03.mp3") == []
 
-    # End-to-end: stage the green proposal -> diff shows it -> commit -> reopen re-opens.
+    # End-to-end: stage the green proposal -> diff shows it -> commit.
     staging.stage_tags_batch(
         engine_settings,
         entries=[(blank_id, {"album": ["Stand By Your Van"]})],
@@ -743,9 +743,6 @@ def test_detect_integration_read_only_then_fix_flow(
     assert result.committed == 1
     assert result.commit_id is not None
     assert _read_album(engine_settings, folder, "03.mp3") == ["Stand By Your Van"]
-
-    reopen = staging.reopen_axes(engine_settings, commit_id=result.commit_id)
-    assert reopen.files == 1
 
 
 def test_a_folder_of_only_unwritable_blank_files_proposes_nothing() -> None:

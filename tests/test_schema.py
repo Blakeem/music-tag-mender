@@ -673,8 +673,8 @@ def _insert_commit_revision(
 
 
 def test_migrate_commit_origin_restamps_all_auto_commits() -> None:
-    # Earlier builds stamped every MCP commit manual, so a resolver commit read as manual and
-    # reopen_axes could void the work it had just written.
+    # Earlier builds stamped every MCP commit manual, so a resolver commit misreported its
+    # origin as manual.
     conn = sqlite3.connect(":memory:")
     try:
         apply_schema(conn)

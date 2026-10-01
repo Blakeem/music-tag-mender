@@ -22,7 +22,7 @@ from mutagen.id3 import ID3, RVAD, TIT2, TYER, MakeID3v1  # type: ignore[attr-de
 from conftest import make_track
 from tagmend import mcp_server
 from tagmend.config import load_settings
-from tagmend.engine import artists, axis, commits, staging, store, tags, versioning
+from tagmend.engine import axis, commits, staging, store, tags, versioning
 from tagmend.engine.db import connect
 from tagmend.engine.library import ScanMode, scan_library
 from tagmend.engine.schema import apply_schema
@@ -988,21 +988,15 @@ def test_stage_tags_batch_rejects_duplicate_file_id(
     assert _staged(engine_settings, a_id) is None
 
 
-# --- reopen_axes (NN7: re-open derived axes after a manual identity fix) -------------
+# --- derived status after a manual fix ----------------------------------------------
 
 
-def _auto_genre_year(
-    engine_settings: Settings,
-    file_id: int,
-    *,
-    genre: str = "Metal",
-    year: str = "2001",
-) -> None:
+def _auto_genre_year(engine_settings: Settings, file_id: int) -> None:
     """Stage, record ``done`` and commit an auto genre+year change, as the resolvers do."""
     staging.stage_tags(
         engine_settings,
         file_id=file_id,
-        tags={"genre": [genre], "originaldate": [year]},
+        tags={"genre": ["Metal"], "originaldate": ["2001"]},
         origin="auto",
     )
     conn = connect(engine_settings.db_path)
@@ -1035,7 +1029,7 @@ def _derived(engine_settings: Settings, file_id: int) -> tuple[str, str]:
 _IDENTIFIED = {"genre": ["Pop"], "albumartist": ["Jem"], "album": ["LP"]}
 
 
-def test_reopen_axes_flips_done_to_pending_and_stays_reopen_safe(
+def test_manual_fix_settles_only_the_axes_whose_fields_it_changed(
     engine_settings: Settings,
     music_dir: Path,
 ) -> None:
@@ -1046,66 +1040,14 @@ def test_reopen_axes_flips_done_to_pending_and_stays_reopen_safe(
     _auto_genre_year(engine_settings, file_id)
     assert _derived(engine_settings, file_id) == ("done", "done")
 
-    # A manual fix outside every axis's identity leaves both outcomes matching the file.
+    # A title sits outside the genre and year identities and fields, so both snapshots hold.
     staging.stage_tags(engine_settings, file_id=file_id, tags={"title": ["Fixed Title"]})
-    fix = staging.commit_tags(engine_settings)
-    assert fix.commit_id is not None
+    staging.commit_tags(engine_settings)
     assert _derived(engine_settings, file_id) == ("done", "done")
 
-    reopen = staging.reopen_axes(engine_settings, commit_id=fix.commit_id)
-    assert reopen.files == 1
-    assert reopen.to_dict()["genre"] == {"outcomes_reopened": 1, "manual_kept": 0}
-    assert reopen.to_dict()["year"] == {"outcomes_reopened": 1, "manual_kept": 0}
-    assert _derived(engine_settings, file_id) == ("pending", "pending")
-
-    # Reopen-safe: a LATER fresh resolver outcome reads done again.
-    _auto_genre_year(engine_settings, file_id, genre="Ambient", year="2002")
-    assert _derived(engine_settings, file_id) == ("done", "done")
-
-
-def test_reopen_axes_keeps_manual_rows(
-    engine_settings: Settings,
-    music_dir: Path,
-) -> None:
-    track = make_track(music_dir / "t.mp3", _IDENTIFIED)
-    scan_library(engine_settings)
-    file_id = _file_id(engine_settings, music_dir, track.name)
-
-    artists.set_artist_status(engine_settings, file_ids=[file_id], status="manual")
-    staging.stage_tags(engine_settings, file_id=file_id, tags={"albumartist": ["Ozzy"]})
-    fix = staging.commit_tags(engine_settings)
-    assert fix.commit_id is not None
-
-    reopen = staging.reopen_axes(engine_settings, commit_id=fix.commit_id)
-    assert reopen.to_dict()["artist"] == {"outcomes_reopened": 0, "manual_kept": 1}
-    conn = connect(engine_settings.db_path)
-    try:
-        assert store.derived_status(conn, axis.ARTIST_AXIS, file_id) == "manual"
-    finally:
-        conn.close()
-
-
-def test_reopen_axes_rejects_auto_and_unknown_commit(
-    engine_settings: Settings,
-    music_dir: Path,
-) -> None:
-    track = make_track(music_dir / "t.mp3", {"genre": ["Pop"]})
-    scan_library(engine_settings)
-    file_id = _file_id(engine_settings, music_dir, track.name)
-
-    staging.stage_tags(
-        engine_settings,
-        file_id=file_id,
-        tags={"genre": ["Rock"]},
-        origin="auto",
-    )
-    auto = staging.commit_tags(engine_settings)
-    assert auto.commit_id is not None
-
-    with pytest.raises(ValueError, match="auto-resolved"):
-        staging.reopen_axes(engine_settings, commit_id=auto.commit_id)
-    with pytest.raises(ValueError, match="unknown commit_id"):
-        staging.reopen_axes(engine_settings, commit_id=9999)
+    staging.stage_tags(engine_settings, file_id=file_id, tags={"genre": ["Jazz"]})
+    staging.commit_tags(engine_settings)
+    assert _derived(engine_settings, file_id) == ("manual", "done")
 
 
 def _stage_mixed_sweep(engine_settings: Settings, music_dir: Path) -> None:
@@ -1168,23 +1110,10 @@ def test_commit_origin_is_manual_for_a_mixed_sweep(
     assert _commit_origin(engine_settings, result.commit_id) == "manual"
 
 
-def test_reopen_axes_refuses_a_manual_commit_holding_an_auto_revision(
+def test_a_noop_manual_commit_records_no_manual_row(
     engine_settings: Settings,
     music_dir: Path,
 ) -> None:
-    _stage_mixed_sweep(engine_settings, music_dir)
-    mixed = staging.commit_tags(engine_settings)
-    assert mixed.commit_id is not None
-
-    with pytest.raises(ValueError, match="auto-resolved"):
-        staging.reopen_axes(engine_settings, commit_id=mixed.commit_id)
-
-
-def test_reopen_axes_refuses_a_commit_with_no_tag_revisions(
-    engine_settings: Settings,
-    music_dir: Path,
-) -> None:
-    # A no-op commit (target == current) leaves no revision row, so there is nothing to reopen.
     track = make_track(music_dir / "t.mp3", _IDENTIFIED)
     scan_library(engine_settings)
     file_id = _file_id(engine_settings, music_dir, track.name)
@@ -1195,9 +1124,7 @@ def test_reopen_axes_refuses_a_commit_with_no_tag_revisions(
     assert noop.commit_id is not None
     assert noop.noop == 1
 
-    with pytest.raises(ValueError, match="changed no tags"):
-        staging.reopen_axes(engine_settings, commit_id=noop.commit_id)
-    # Both stay done: nothing was deleted, and a no-op manual commit records no manual row.
+    # The manual target equals the file, so the commit changed no axis field.
     assert _derived(engine_settings, file_id) == ("done", "done")
 
 

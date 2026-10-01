@@ -43,7 +43,9 @@ class Identity:
 class Axis:
     """Everything that differs between the metadata axes.
 
-    A new axis slots in as one of these values plus a resolver, never a copied module.
+    A new axis slots in as one of these values plus a resolver, never a copied module. A
+    resolver's outcome reads only the axis's identity and fields, which is what lets a snapshot
+    mismatch alone re-open a file.
     """
 
     name: str

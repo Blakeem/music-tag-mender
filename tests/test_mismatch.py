@@ -1519,8 +1519,8 @@ def test_mismatch_fix_flow_end_to_end(
     jem2 = _file_id(engine_settings, poisoned, "02 Facing Hell.mp3")
     fp_id = _file_id(engine_settings, folders["fp"], "remix.mp3")
 
-    # Seed prior auto genre work + a sticky artist exclusion on the poisoned files, so
-    # reopen has real axis state to act on. The files carry no album, so year has no identity.
+    # Seed prior auto genre work + a sticky artist exclusion on the poisoned files, so the
+    # fix has real axis state to re-open. The files carry no album, so year has no identity.
     for fid in (jem1, jem2):
         staging.stage_tags(
             engine_settings,
@@ -1568,11 +1568,7 @@ def test_mismatch_fix_flow_end_to_end(
     commit_id = result.commit_id
     assert commit_id is not None
 
-    # 5. reopen the fixed files' outcomes. A manual row is a human decision and stays.
-    reopen = staging.reopen_axes(engine_settings, commit_id=commit_id)
-    assert reopen.files == 2
-    assert reopen.to_dict()["genre"] == {"outcomes_reopened": 2, "manual_kept": 0}
-    assert reopen.to_dict()["artist"] == {"outcomes_reopened": 0, "manual_kept": 2}
+    # 5. the new album artist re-opens the genre outcome. The manual artist row stays.
     assert _derived(engine_settings, jem1) == ("pending", "no_identity", "manual")
 
     # 6. detect no longer flags the poisoned folder (self-resolving accept, no row needed).
@@ -1621,7 +1617,6 @@ def test_mcp_new_mismatch_tools_listed() -> None:
     names = {tool.name for tool in tools}
     assert {
         "stage_tags_batch",
-        "reopen_axes",
         "set_mismatch_status",
         "reset_mismatch_status",
     } <= names
@@ -1774,34 +1769,6 @@ def test_mcp_stage_tags_batch_rejects_non_dict_tags(music_dir: Path) -> None:
     assert payload["ok"] is False
     assert "tags must be a dict" in str(payload["error"])
     assert mcp_server.commit_tags()["committed"] == 0
-
-
-def test_mcp_reopen_axes_rejects_auto_commit(music_dir: Path) -> None:
-    config.set_setting("music_path", str(music_dir))
-    track = make_track(music_dir / "a.mp3", {"genre": ["Pop"]})
-    mcp_server.scan_library(path=str(music_dir))
-    conn = connect(config.load_settings().db_path)
-    try:
-        file_id = store.get_file(conn, str(music_dir), track.name).id  # type: ignore[union-attr]
-    finally:
-        conn.close()
-
-    staging.stage_tags(
-        config.load_settings(),
-        file_id=file_id,
-        tags={"genre": ["Rock"]},
-        origin="auto",
-    )
-    committed = mcp_server.commit_tags()
-    auto_commit = committed["commit_id"]
-    assert isinstance(auto_commit, int)
-    assert mcp_server.get_commit(auto_commit)["commit"]["origin"] == "auto"
-
-    payload = mcp_server.reopen_axes(auto_commit)
-    assert payload["ok"] is False
-    assert "auto-resolved" in str(payload["error"])
-
-    assert mcp_server.reopen_axes(9999)["ok"] is False  # unknown commit id
 
 
 # --- container folders ---------------------------------------------------------------

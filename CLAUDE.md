@@ -57,12 +57,11 @@ keep that leaves a group member out. The report's `gate_open` holds when nothing
 exception is undecided. `mismatch.gate_state`, `check_files` and `planner_keep` are the gate the
 path domain reads. `list_files(mismatch_status=...)` and `get_library_stats['mismatch']` read the
 same classifier. `stage_tags_batch` stages several files atomically, always as
-`origin="manual"`. `reopen_axes(commit_id)` deletes the `done`/`no_match` rows of the files of a
-commit holding no `auto` revision, on all four tag axes, and keeps `manual`. The `detect_album_gaps` tool (`album_gaps.py` + the pure, standalone
+`origin="manual"`. The `detect_album_gaps` tool (`album_gaps.py` + the pure, standalone
 `parsing.py`) groups blank-`album` files by folder and proposes sibling / folder-parse fills
 plus a review-only MusicBrainz `(artist, title)` recording tier (`mb_recording`, opt-out via
 `use_musicbrainz=False`, cached in `musicbrainz_recording_cache`) for the `stage_tags_batch →
-diff → commit → reopen_axes` spine. `resolve_artists` then gained a **MusicBrainz name tier**
+diff → commit` spine. `resolve_artists` then gained a **MusicBrainz name tier**
 ahead of the Last.fm one. `musicbrainz.py`'s `artist_by_mbid` looks an artist up directly by
 the `musicbrainz_artistid` (or `musicbrainz_albumartistid`) the file already carries, a lookup
 by id and never a search, cached in `musicbrainz_artist_cache`. A fold over casing, typography
@@ -112,7 +111,7 @@ compares a file's year tags with the first-release year of its album's MusicBrai
 found by the album identity (album artist else artist, album). `high` means the `originaldate` year
 differs, `medium` means the `date` year is earlier than the first release. `release_limit` (default
 200) caps the uncached lookups one call makes, and cache writes are its only ledger writes.
-47 MCP tools total. Schema is **v27** (additive: v11 adds
+46 MCP tools total. Schema is **v27** (additive: v11 adds
 `musicbrainz_recording_cache`, v12 renames `file_album_status` → `file_year_status` in place —
 dispositions preserved; v13 adds `tag_revisions.managed_set`, stamping which managed-tag set
 governed each revision so a revert can restore emptiness on the widened fields; v14 adds
@@ -220,7 +219,7 @@ files themselves.
 
 - Observing: `check, scan, list, get, detect, diff, history` (`diff`/`history` are git-style nouns
   in the verb slot; `scan` refreshes only the snapshot mirror)
-- Mutating: `stage, unstage, commit, revert, resolve, set, reset, reopen`
+- Mutating: `stage, unstage, commit, revert, resolve, set, reset`
 
 A verb may span two call/return shapes when the object disambiguates (`get_file` vs
 `get_library_stats`; `revert_tags` vs `revert_commit` — the commit ledger is domain-neutral). A new
@@ -236,7 +235,6 @@ verb requires an operation no existing verb covers.
 | commit ledger | `list_commits` · `get_commit` · `revert_commit` (bare — one `commits` table, no domain column) |
 | lookup → stage | `resolve_<axis>s` |
 | axis status | `set_<axis>_status` / `reset_<axis>_status` |
-| post-commit reopen | `reopen_axes` (keyed by `commit_id`) |
 | setting write | `set_<setting>` (`set_naming_pattern`) |
 
 Rules, in order:
@@ -333,7 +331,7 @@ src/tagmend/
   config.py         settings.json (platformdirs) + typed Settings
   cli.py            Typer CLI (thin)
   configui.py       loopback config web UI that edits settings.json
-  mcp_server.py     FastMCP server (thin) — 47 tools
+  mcp_server.py     FastMCP server (thin) — 46 tools
   engine/
     db.py           SQLite connection (WAL)
     schema.py       all DDL + PRAGMA user_version (v27)

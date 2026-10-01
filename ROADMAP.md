@@ -22,8 +22,7 @@
 - [ ] Drive the fix flow over the **19 flagged folders / 130 files** (re-measured 2026-08-29,
       unchanged on disk: the `folder_context` bucket moved 14 of the original 144 out of
       `flagged`): grouped detect → research the correct release per folder → `stage_tags_batch`
-      → review `diff_tags` → `commit_tags(path=folder)` (one revertible commit per release) →
-      `reopen_axes`.
+      → review `diff_tags` → `commit_tags(path=folder)` (one revertible commit per release).
       **Do this BEFORE the full resolve run (B2)** — identity fixes re-pend derived genre/year,
       so fixing identity first avoids resolving axes against wrong artists.
 - New tooling for the research step, shipped since 2026-08-02, replacing the out-of-band script:
@@ -51,7 +50,7 @@
 ### B1. Live album-gap fill pass (92 blank-`album` files, measured 2026-07-05)
 - [ ] Drive `detect_album_gaps` over the library: bulk-stage the `green` sibling proposals,
       confirm each `confirm`/`review` proposal per folder, then the usual
-      `stage_tags_batch → diff_tags → commit_tags → reopen_axes` spine (one commit per folder).
+      `stage_tags_batch → diff_tags → commit_tags` spine (one commit per folder).
       Do this before/alongside B2 so `resolve_years` (originaldate) can see the filled albums.
 
 ### B2. First full-library resolve run over all metadata axes

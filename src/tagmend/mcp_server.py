@@ -341,33 +341,6 @@ def commit_tags(message: str | None = None, path: str | None = None) -> dict[str
 
 @mcp.tool()
 @_error_envelope
-def reopen_axes(commit_id: int) -> dict[str, object]:
-    """Re-open every tag axis after a manual identity fix (call it AFTER one).
-
-    The spine is ``stage_tags_batch`` -> ``diff_tags`` -> ``commit_tags`` -> ``reopen_axes``.
-    For every file the given commit changed, this deletes the ``done`` and ``no_match`` status
-    rows on the genre, artist, year and song axes, so ``resolve_genres``, ``resolve_artists``,
-    ``resolve_years`` and ``resolve_songs`` re-derive them against the fixed tags. A ``manual``
-    row is kept: ``reset_<axis>_status`` is its only hand-back. Call ``reset_artist_status``
-    next when a fixed name should be re-checked by the normaliser. History is never touched.
-
-    Call it with a ``manual`` (or ``revert``) commit id from ``commit_tags`` / ``list_commits``.
-    A commit holding any auto-resolved revision is refused, whatever its own origin, since
-    re-opening fresh auto work would only repeat it. A commit that changed no tags is refused
-    too.
-
-    Returns:
-        ``{"ok": True, "commit_id": ..., "files": <count>, "genre": {outcomes_reopened,
-        manual_kept}, "artist": {...}, "year": {...}, "song": {...}}``, or ``{"ok": False,
-        "error": ...}`` if the commit id is unknown, holds an auto-resolved revision, or changed
-        no tags.
-    """
-    result = staging.reopen_axes(load_settings(), commit_id=commit_id)
-    return {"ok": True, **result.to_dict()}
-
-
-@mcp.tool()
-@_error_envelope
 def list_files(  # noqa: PLR0913 - cohesive MCP discovery filters
     path: str | None = None,
     limit: int | None = None,
@@ -519,7 +492,7 @@ def detect_mismatches(
     2. Set ``container_folders`` for a top folder that holds several artists
        (``Soundtracks``).
     3. Call ``detect_mismatches(group=true)``. For each group, either fix the tags
-       (``stage_tags_batch`` -> ``commit_tags`` -> ``reopen_axes``) and re-read the group, or
+       (``stage_tags_batch`` -> ``diff_tags`` -> ``commit_tags``) and re-read the group, or
        call ``set_mismatch_status(file_ids=<file_ids>, status="misfiled_deferred",
        covers=<comparisons + exception>)``, or call ``set_mismatch_status(file_ids=<file_ids +
        unflagged_ids>, status="legit_ignore", covers=<same>)``.
@@ -595,8 +568,8 @@ def detect_track_conflicts(
 
     Recommended workflow: start with ``group=true`` for one line per folder, then expand a
     single folder with ``folder="<exact folder path>"`` to see its rows, research the correct
-    tracklist, and fix with ``stage_tags_batch`` -> ``diff_tags`` -> ``commit_tags(path=<folder>)``
-    -> ``reopen_axes``. Read ``diff_tags``' ``stale_identity`` before committing.
+    tracklist, and fix with ``stage_tags_batch`` -> ``diff_tags`` -> ``commit_tags(path=<folder>)``.
+    Read ``diff_tags``' ``stale_identity`` before committing.
     ``commit_tags(path=<folder>)`` and ``diff_tags(path=<folder>)`` cover that folder AND every
     folder nested under it. Run ``diff_tags(path=<folder>)`` first and ``unstage_tags`` any
     nested change you do not want in this commit.
@@ -702,7 +675,7 @@ def detect_release_disagreements(  # noqa: PLR0913 - one parameter per scope/vie
 
     Recommended workflow: ``group=true`` for one line per folder, then ``path="<folder>"`` to
     expand one folder (nested disc folders included), then fix with ``stage_tags_batch`` ->
-    ``diff_tags`` -> ``commit_tags(path=<folder>)`` -> ``reopen_axes``.
+    ``diff_tags`` -> ``commit_tags(path=<folder>)``.
     ``commit_tags(path=<folder>)`` and ``diff_tags(path=<folder>)`` cover that folder AND every
     folder nested under it. Run ``diff_tags(path=<folder>)`` first and ``unstage_tags`` any
     nested change you do not want in this commit.
@@ -885,7 +858,7 @@ def detect_album_conflicts(
 
     Recommended workflow: start with ``group=true`` for one line per folder, then expand a
     single folder with ``folder="<exact folder path>"``, then fix with ``stage_tags_batch`` ->
-    ``diff_tags`` -> ``commit_tags(path=<folder>)`` -> ``reopen_axes``. Read ``diff_tags``'
+    ``diff_tags`` -> ``commit_tags(path=<folder>)``. Read ``diff_tags``'
     ``stale_identity`` before committing. ``commit_tags(path=<folder>)`` and
     ``diff_tags(path=<folder>)`` cover that folder AND every folder nested under it. Run
     ``diff_tags(path=<folder>)`` first and ``unstage_tags`` any nested change you do not want in
@@ -972,8 +945,7 @@ def detect_album_gaps(
     Recommended fix flow (the human is the diff-gate for every value): start here, expand one
     folder with ``folder="<exact folder path>"``, then per source feed the proposals'
     ``{file_id, proposed}`` + ``note`` to ``stage_tags_batch`` (one call per source keeps the
-    ``note`` accurate) → review ``diff_tags(path=<folder>)`` → ``commit_tags(path=<folder>)`` →
-    ``reopen_axes(commit_id)`` to re-open the filled files' genre, artist and year outcomes.
+    ``note`` accurate) → review ``diff_tags(path=<folder>)`` → ``commit_tags(path=<folder>)``.
     ``commit_tags(path=<folder>)`` and ``diff_tags(path=<folder>)`` cover that folder AND every
     folder nested under it. Run ``diff_tags(path=<folder>)`` first and ``unstage_tags`` any
     nested change you do not want in this commit.
@@ -2094,7 +2066,7 @@ def resolve_songs(  # noqa: PLR0913 - cohesive scope, release path and run knobs
     calls and apply each with ``diff_tags`` and ``commit_tags``. For each ``rebind_folders``
     entry pick a candidate R, preferring one with ``unassigned`` empty, and call
     ``resolve_songs(folder=F, release_mbid=R, dry_run=True)``, then the real call,
-    ``diff_tags``, ``commit_tags(path=F)`` and ``reopen_axes(commit_id)``.
+    ``diff_tags`` and ``commit_tags(path=F)``.
 
     With ``release_mbid`` the call takes the manual release path. Every file in scope must sit
     on exactly one track of that release, or nothing is staged and the files come back in

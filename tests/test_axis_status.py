@@ -247,7 +247,7 @@ def test_revert_of_a_resolver_commit_reopens_and_its_revert_settles_again(
     assert _status(engine_settings, file_id) == "done"
 
 
-def test_album_identity_fix_reopens_without_reopen_axes(
+def test_album_identity_fix_reopens(
     engine_settings: Settings,
     music_dir: Path,
 ) -> None:
@@ -543,53 +543,6 @@ def test_multi_value_file_records_no_match_and_stages_nothing(
     assert (result.settled, result.staged_files, result.skipped_multi_artist) == (1, 0, 1)
     file_id = _ids(engine_settings)["t.flac"]
     assert _status(engine_settings, file_id, axis.ARTIST_AXIS) == "no_match"
-
-
-# --- reopen_axes ---------------------------------------------------------------------
-
-
-def test_reopen_axes_deletes_outcomes_and_keeps_manual(
-    engine_settings: Settings,
-    music_dir: Path,
-) -> None:
-    make_track(
-        music_dir / "fixed.flac",
-        {"artist": ["Daft Punk"], "album": ["Discovery"], "genre": _GENRES},
-    )
-    make_track(music_dir / "other.flac", {"artist": ["Daft Punk"], "genre": _GENRES})
-    library.scan_library(engine_settings)
-    ids = _ids(engine_settings)
-    _resolve_genres(engine_settings)
-    years.resolve_years(engine_settings, client=FakeMBReleaseGroupSource({}))
-    artists.set_artist_status(engine_settings, file_ids=[ids["fixed.flac"]], status="manual")
-    staging.stage_tags(engine_settings, file_id=ids["fixed.flac"], tags={"title": ["Fixed"]})
-    fix = staging.commit_tags(engine_settings)
-    assert fix.commit_id is not None
-
-    reopen = staging.reopen_axes(engine_settings, commit_id=fix.commit_id).to_dict()
-
-    assert reopen["genre"] == {"outcomes_reopened": 1, "manual_kept": 0}
-    assert reopen["year"] == {"outcomes_reopened": 1, "manual_kept": 0}
-    assert reopen["artist"] == {"outcomes_reopened": 0, "manual_kept": 1}
-    # The hand-staged title is a human decision on the song axis.
-    assert reopen["song"] == {"outcomes_reopened": 0, "manual_kept": 1}
-    assert _status(engine_settings, ids["fixed.flac"]) == "pending"
-    assert _status(engine_settings, ids["fixed.flac"], axis.ARTIST_AXIS) == "manual"
-    assert _status(engine_settings, ids["other.flac"]) == "done"
-
-
-def test_reopen_axes_still_refuses_an_auto_commit(
-    engine_settings: Settings,
-    music_dir: Path,
-) -> None:
-    make_track(music_dir / "t.flac", {"artist": ["Daft Punk"], "genre": ["Old"]})
-    library.scan_library(engine_settings)
-    _resolve_genres(engine_settings)
-    auto = staging.commit_tags(engine_settings)
-    assert auto.commit_id is not None
-
-    with pytest.raises(ValueError, match="auto-resolved"):
-        staging.reopen_axes(engine_settings, commit_id=auto.commit_id)
 
 
 # --- the present-file domain ---------------------------------------------------------

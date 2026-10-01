@@ -137,7 +137,6 @@ def test_list_tools_exposes_expected_tools_and_schema() -> None:
         "unstage_tags",
         "diff_tags",
         "commit_tags",
-        "reopen_axes",
         "history_tags",
         "revert_tags",
         "revert_commit",
@@ -653,7 +652,7 @@ def test_error_envelope_lets_a_bug_raise(monkeypatch: pytest.MonkeyPatch) -> Non
 def test_every_tool_is_enveloped() -> None:
     tools = mcp_server.mcp._tool_manager.list_tools()
 
-    assert len(tools) == 47
+    assert len(tools) == 46
     assert [tool.name for tool in tools if not hasattr(tool.fn, "__wrapped__")] == []
 
 

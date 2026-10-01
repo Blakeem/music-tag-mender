@@ -387,7 +387,7 @@ def test_anchored_route_verifies_and_holds_a_disagreement(
     assert held["file_id"] == ids[_NAMES[3]]
     assert held["have"] == {"tracknumber": "9/4"}
     assert held["want"] == {"tracknumber": "4/4"}
-    assert held["release_id"] == _LP
+    assert held["release_mbid"] == _LP
     assert [_status(engine_settings, ids[name]) for name in _NAMES] == [
         "done",
         "done",
@@ -542,12 +542,12 @@ def test_stamp_check_reports_a_rebind_with_ranked_candidates(
     assert rebind["folder"] == str(folder)
     assert rebind["flagged_file_ids"] == [ids[name] for name in _NAMES]
     assert rebind["tagged_releases"] == [
-        {"release_id": "rel-wrong", "title": "LP", "status": "official"},
+        {"release_mbid": "rel-wrong", "title": "LP", "status": "official"},
     ]
     candidates = rebind["candidates"]
     assert isinstance(candidates, list)
     # The bootleg is earlier, so it is fetched first, but the Official release ranks first.
-    assert [(c["release_id"], c["status"]) for c in candidates] == [
+    assert [(c["release_mbid"], c["status"]) for c in candidates] == [
         (_LP, "official"),
         ("rel-boot", "bootleg"),
     ]
@@ -605,12 +605,12 @@ def test_manual_release_path_stages_the_whole_stamp_in_one_batch(
     library.scan_library(engine_settings)
     ids = _ids(engine_settings)
 
-    result = _resolve(engine_settings, _wrong_stamp_kit(), folder=str(folder), release_id=_LP)
+    result = _resolve(engine_settings, _wrong_stamp_kit(), folder=str(folder), release_mbid=_LP)
 
     assert result.staged_files == 4
     assert result.unassigned == []
     assert result.release is not None
-    assert result.release["release_id"] == _LP
+    assert result.release["release_mbid"] == _LP
     diffs = _diffs(engine_settings)
     assert {view.origin for view in diffs.values()} == {"manual"}
     target = diffs[_NAMES[1]].target
@@ -667,7 +667,7 @@ def test_manual_release_path_keeps_a_date_only_on_the_files_own_dateless_release
     dateless = replace(_release(_LP), date="")
     kit = Kit(acoustid=FakeAcoustid(_lp_bodies(_NAMES)), releases=FakeReleases(dateless))
 
-    result = _resolve(engine_settings, kit, folder=str(folder), release_id=_LP)
+    result = _resolve(engine_settings, kit, folder=str(folder), release_mbid=_LP)
 
     assert result.staged_files == 4
     assert _diffs(engine_settings)[_NAMES[1]].target.get("date", []) == date
@@ -689,8 +689,8 @@ def test_manual_release_path_stamps_the_track_ids_musicbrainz_lists_now(
     kit.releases = FakeReleases(replace(current, media=(replace(medium, tracks=retired),)))
     kit.releases.upstream[_LP] = current
 
-    preview = _resolve(engine_settings, kit, folder=str(folder), release_id=_LP, dry_run=True)
-    result = _resolve(engine_settings, kit, folder=str(folder), release_id=_LP)
+    preview = _resolve(engine_settings, kit, folder=str(folder), release_mbid=_LP, dry_run=True)
+    result = _resolve(engine_settings, kit, folder=str(folder), release_mbid=_LP)
 
     # The dry run reads the cached tracklist, whose retired ids AcoustID no longer names.
     assert preview.unassigned is not None
@@ -721,7 +721,7 @@ def test_manual_release_path_stages_nothing_when_a_file_is_not_on_the_release(
         for n, name in enumerate(_NAMES, 1)
     }
 
-    result = _resolve(engine_settings, kit, folder=str(folder), release_id="rel-three")
+    result = _resolve(engine_settings, kit, folder=str(folder), release_mbid="rel-three")
 
     assert result.staged_files == 0
     assert result.unassigned == [
@@ -746,7 +746,7 @@ def test_manual_release_path_assigns_a_gate_failure_corroborated_by_its_stem(
     kit = Kit(acoustid=FakeAcoustid(bodies), releases=FakeReleases(_release(_LP)))
 
     auto = _resolve(engine_settings, kit, dry_run=True)
-    manual = _resolve(engine_settings, kit, file_ids=list(ids.values()), release_id=_LP)
+    manual = _resolve(engine_settings, kit, file_ids=list(ids.values()), release_mbid=_LP)
 
     # Only the first file passes the gate, so the auto tier holds it and stages nothing.
     assert auto.held_unconverged == 1
@@ -766,7 +766,7 @@ def test_manual_release_path_reports_a_lookup_error_in_error_items(
     kit = _wrong_stamp_kit()
     kit.acoustid.statuses[f"fp-{_NAMES[3]}"] = 503
 
-    result = _resolve(engine_settings, kit, folder=str(folder), release_id=_LP)
+    result = _resolve(engine_settings, kit, folder=str(folder), release_mbid=_LP)
 
     assert result.unassigned == [{"file_id": file_id, "filename": _NAMES[3], "reason": "error"}]
     assert result.errors == 1
@@ -776,9 +776,9 @@ def test_manual_release_path_reports_a_lookup_error_in_error_items(
     assert result.staged_files == 0
 
 
-def test_release_id_without_a_scope_is_rejected(engine_settings: Settings) -> None:
-    with pytest.raises(ValueError, match="release_id needs folder or file_ids"):
-        songs.resolve_songs(engine_settings, release_id=_LP)
+def test_release_mbid_without_a_scope_is_rejected(engine_settings: Settings) -> None:
+    with pytest.raises(ValueError, match="release_mbid needs folder or file_ids"):
+        songs.resolve_songs(engine_settings, release_mbid=_LP)
 
 
 # --- transient errors and the caches -------------------------------------------------

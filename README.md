@@ -1,6 +1,6 @@
 # TagMend
 
-TagMend cleans up the **genre** and **artist-name** tags in your music library using **Last.fm** and **MusicBrainz**, and fills in album original-release years. Every change is staged first and committed as a revertible unit, so nothing touches your files until you say so, and any change can be rolled back. It ships as both a command-line tool and an MCP server, so you can drive it yourself or hand it to an AI assistant like Claude. Built to make [Navidrome MCP](https://github.com/Blakeem/Navidrome-MCP) more useful by giving it accurate names and genres.
+TagMend cleans up the **genre** and **artist-name** tags in your music library using **Last.fm**, **MusicBrainz**, and **AcoustID**, and fills in album original-release years. Every change is staged first and committed as a revertible unit, so nothing touches your files until you say so, and any change can be rolled back. It ships as both a command-line tool and an MCP server, so you can drive it yourself or hand it to an AI assistant like Claude. Built to make [Navidrome MCP](https://github.com/Blakeem/Navidrome-MCP) more useful by giving it accurate names and genres.
 
 ## Table of Contents
 
@@ -38,7 +38,7 @@ A git-like flow: stage → commit → revert. Files are only written on commit, 
 
 ### 🗂️ Per-file status workflow
 
-Mark files as `manual` to exclude them from an axis (genre, artist, or year), or re-queue them as `pending`. Status is sticky and respected on every run.
+Mark files as `manual` to exclude them from an axis (genre, artist, year, or song), or re-queue them as `pending`. Status is sticky and respected on every run.
 
 ### 🎚️ Multi-format and engine-first
 
@@ -50,6 +50,9 @@ Reads and writes MP3, FLAC, M4A, and OGG through mutagen. All logic lives in one
 
 - **Python 3.12+**
 - **A free Last.fm API key** ([create one](https://www.last.fm/api/account/create))
+- **Optional, for the song axis (`resolve_songs`) only:**
+  - **A free AcoustID application API key** ([register an application](https://acoustid.org/new-application))
+  - **fpcalc** from [Chromaprint](https://acoustid.org/chromaprint), on `PATH` or set in `fpcalc_path`
 - **Optional: an MCP client** (Claude Desktop, Claude Code, Cursor, or another client with local stdio support) to use the MCP server
 
 ### Install

@@ -1446,7 +1446,7 @@ def history_paths(file_id: int) -> dict[str, object]:
 
     Version 0 is the location the file had when it was first staged for a move. Each later
     version carries its ``origin`` (manual|auto|revert), its ``commit_id``, ``from_path`` and
-    ``to_path`` relative to ``music_path``, and on a revert ``reverted_from``, the version
+    ``to_path`` relative to ``music_path``, and on a revert ``reverted_to_version``, the version
     whose location it restored. Use a ``version`` here with ``revert_paths``.
 
     Returns ``{"ok": True, "history": [...]}`` (empty for a file never staged for a move), or
@@ -2050,7 +2050,7 @@ def reset_year_status(
 def resolve_songs(
     folder: str | None = None,
     file_ids: list[int] | None = None,
-    release_id: str | None = None,
+    release_mbid: str | None = None,
     limit: int | None = None,
     dry_run: bool = False,  # noqa: FBT001, FBT002 - MCP tool surface, not a Python API
 ) -> dict[str, object]:
@@ -2083,12 +2083,12 @@ def resolve_songs(
     Workflow: run ``dry_run=True`` over the whole library first, repeating while ``more`` is
     true, then ``limit=0`` for the free whole-library tally. Review it, then make the real
     calls and apply each with ``diff_tags`` and ``commit_tags``. For each ``rebind_folders``
-    entry call ``resolve_songs(folder=F, release_id=R, dry_run=True)`` per candidate R, then
+    entry call ``resolve_songs(folder=F, release_mbid=R, dry_run=True)`` per candidate R, then
     the real call, ``diff_tags``, ``commit_tags(path=F)``, ``reopen_axes(commit_id)``,
     ``reset_year_status(file_ids=<the rebound files>)`` (the manual commit recorded year
     ``manual`` when it cleared ``originaldate``), then ``resolve_years``.
 
-    With ``release_id`` the call takes the manual release path. Every file in scope must sit
+    With ``release_mbid`` the call takes the manual release path. Every file in scope must sit
     on exactly one track of that release, or nothing is staged and the files come back in
     ``unassigned`` with a reason. Otherwise the whole release stamp (names, sort names, ids,
     date, numbers, release fields, ``artists`` cleared) is staged as one ``manual`` batch.
@@ -2100,7 +2100,7 @@ def resolve_songs(
         folder: Limit to the files directly in this folder. Compared as a path, and a
             relative folder resolves under ``music_path``.
         file_ids: Limit to these file ids (overrides ``folder``). An unknown id is refused.
-        release_id: Apply this MusicBrainz release to the scope (``folder`` or ``file_ids``
+        release_mbid: Apply this MusicBrainz release to the scope (``folder`` or ``file_ids``
             required).
         limit: Max cold folders this call (default ``song_stage_limit``). A cold folder needs
             fpcalc or an AcoustID request. Warm folders always run, so ``limit=0`` costs no
@@ -2123,7 +2123,7 @@ def resolve_songs(
         load_settings(),
         folder=folder,
         file_ids=file_ids,
-        release_id=release_id,
+        release_mbid=release_mbid,
         limit=limit,
         dry_run=dry_run,
     )

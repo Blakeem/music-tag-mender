@@ -216,6 +216,14 @@ migration):
   under. A revert reads ``unit_key`` to find the folder the album occupies after the move.
 * ``sidecar_moves_staged``: one pending sidecar move per source key, its target key unique, so
   two sidecars never share a target.
+
+The revert-term pass renames two columns in place (schema v27. A v26 ledger upgrades in place
+with every row preserved):
+
+* ``path_revisions.reverted_from`` and ``path_revisions_staged.reverted_from`` become
+  ``reverted_to_version``, the name ``tag_revisions`` uses, since each holds the version a revert
+  restores. :func:`_migrate_path_reverted_to_version` renames them. ``commits.reverted_from`` and
+  ``sidecar_moves.reverted_from`` keep their name, since each holds the undone row.
 """
 
 from __future__ import annotations
@@ -233,7 +241,7 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
-SCHEMA_VERSION: Final = 26
+SCHEMA_VERSION: Final = 27
 
 _FILES_DDL: Final = """
 CREATE TABLE IF NOT EXISTS files (
@@ -314,8 +322,8 @@ CREATE TABLE IF NOT EXISTS tag_revisions (
 """
 
 # Append-only location history (file/folder renames + moves), enforced by the same
-# :func:`apply_append_only_triggers` triggers as ``tag_revisions``. ``reverted_from`` holds the
-# version whose location a revert restored.
+# :func:`apply_append_only_triggers` triggers as ``tag_revisions``. ``reverted_to_version`` holds
+# the version whose location a revert restored.
 # No ``kind`` column: rename and move are derivable from ``from_path``/``to_path``.
 _PATH_REVISIONS_DDL: Final = """
 CREATE TABLE IF NOT EXISTS path_revisions (
@@ -324,7 +332,7 @@ CREATE TABLE IF NOT EXISTS path_revisions (
   commit_id     INTEGER REFERENCES commits(id),
   created_at    TEXT NOT NULL,
   origin        TEXT NOT NULL,
-  reverted_from INTEGER,
+  reverted_to_version INTEGER,
   from_path     TEXT NOT NULL,
   to_path       TEXT NOT NULL,
   note          TEXT,
@@ -368,7 +376,7 @@ CREATE TABLE IF NOT EXISTS path_revisions_staged (
   to_key          TEXT,
   base_size_bytes INTEGER,
   base_mtime_ns   INTEGER,
-  reverted_from   INTEGER,
+  reverted_to_version INTEGER,
   PRIMARY KEY (file_id)
 )
 """
@@ -824,6 +832,26 @@ def _migrate_path_staging(connection: sqlite3.Connection) -> None:
     logger.info("schema v25: added the path staging columns")
 
 
+def _migrate_path_reverted_to_version(connection: sqlite3.Connection) -> None:
+    """v27: rename ``reverted_from`` to ``reverted_to_version`` on both path tables, keeping rows.
+
+    Runs BEFORE the DDL and after :func:`_migrate_path_staging`, which adds the old name to a
+    pre-v25 staging table. Idempotent per table: it fires only while the old column exists and
+    the new one does not. A rename fires no UPDATE trigger, so the append-only triggers stay.
+    """
+    for table in ("path_revisions", "path_revisions_staged"):
+        if not _table_exists(connection, table):
+            continue
+        if _column_exists(connection, table, "reverted_to_version"):
+            continue
+        if not _column_exists(connection, table, "reverted_from"):
+            continue
+        connection.execute(
+            f"ALTER TABLE {table} RENAME COLUMN reverted_from TO reverted_to_version",
+        )
+        logger.info("schema v27: renamed %s.reverted_from to reverted_to_version", table)
+
+
 # Frozen history like :data:`_MANAGED_SET_WIDENING_DATE`: every pre-v24 row was set on the
 # top-folder comparison, whatever that comparison is later named.
 _LEGACY_MISMATCH_COVERS: Final = ("top_folder_artist",)
@@ -1267,6 +1295,28 @@ def _migrate_axis_outcomes(connection: sqlite3.Connection) -> None:
     logger.info("schema v21: replayed %d manual status row(s), dropped voided_auto", replayed)
 
 
+def _apply_migrations(connection: sqlite3.Connection) -> None:
+    """Run every in-place migration of :func:`apply_schema`, oldest first."""
+    _migrate_v12_year_status(connection)
+    _migrate_v13_managed_set(connection)
+    _migrate_v14_reader_version(connection)
+    _migrate_staged_base_signature(connection)
+    _migrate_files_path_key(connection)
+    _migrate_commit_origin(connection)
+    _migrate_reverted_to_version(connection)
+    _migrate_managed_set_required(connection)
+    _migrate_release_group_cache_name(connection)
+    _migrate_mbid_columns(connection)
+    _migrate_drop_files_status(connection)
+    _migrate_lastfm_correction_cache(connection)
+    _migrate_axis_outcomes(connection)
+    _migrate_staged_changed_fields(connection)
+    _migrate_staged_supplied_keys(connection)
+    _migrate_mismatch_covers(connection)
+    _migrate_path_staging(connection)
+    _migrate_path_reverted_to_version(connection)
+
+
 def apply_schema(connection: sqlite3.Connection) -> None:
     """Upgrade the ledger to :data:`SCHEMA_VERSION` when its stamp is older, else do nothing.
 
@@ -1289,8 +1339,10 @@ def apply_schema(connection: sqlite3.Connection) -> None:
     snapshots the tag-axis status rows (:func:`_migrate_axis_outcomes`) and adds the staged
     changed fields (:func:`_migrate_staged_changed_fields`), v23 adds the staged supplied
     keys (:func:`_migrate_staged_supplied_keys`), v24 rewrites the mismatch rows as covers
-    snapshots (:func:`_migrate_mismatch_covers`) and v25 adds the path staging columns
-    (:func:`_migrate_path_staging`). v15, v16 and v22 add cache tables only, v23 adds
+    snapshots (:func:`_migrate_mismatch_covers`), v25 adds the path staging columns
+    (:func:`_migrate_path_staging`) and v27 renames the path tables' ``reverted_from`` to
+    ``reverted_to_version`` (:func:`_migrate_path_reverted_to_version`). v15, v16 and v22 add
+    cache tables only, v23 adds
     ``file_song_status`` and v26 adds the two sidecar tables, which the DDL creates, so they
     need no migration step. The triggers come after every migration, so a migration that
     updates a log runs before they exist.
@@ -1308,23 +1360,7 @@ def apply_schema(connection: sqlite3.Connection) -> None:
         raise RuntimeError(message)
 
     _log_schema_change(connection, current)
-    _migrate_v12_year_status(connection)
-    _migrate_v13_managed_set(connection)
-    _migrate_v14_reader_version(connection)
-    _migrate_staged_base_signature(connection)
-    _migrate_files_path_key(connection)
-    _migrate_commit_origin(connection)
-    _migrate_reverted_to_version(connection)
-    _migrate_managed_set_required(connection)
-    _migrate_release_group_cache_name(connection)
-    _migrate_mbid_columns(connection)
-    _migrate_drop_files_status(connection)
-    _migrate_lastfm_correction_cache(connection)
-    _migrate_axis_outcomes(connection)
-    _migrate_staged_changed_fields(connection)
-    _migrate_staged_supplied_keys(connection)
-    _migrate_mismatch_covers(connection)
-    _migrate_path_staging(connection)
+    _apply_migrations(connection)
     connection.execute(_FILES_DDL)
     connection.execute(_FILES_PATH_KEY_INDEX_DDL)
     connection.execute(_FILE_TAGS_DDL)

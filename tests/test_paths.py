@@ -709,7 +709,7 @@ def test_a_target_naming_the_files_own_entry_in_another_folder_spelling(lib: _Li
                 staged_at="2026-10-01",
                 base_size_bytes=size,
                 base_mtime_ns=mtime_ns,
-                reverted_from=None,
+                reverted_to_version=None,
             ),
         )
         conn.commit()
@@ -815,7 +815,7 @@ def test_revert_commit_moves_every_file_back_and_a_second_revert_moves_them_forw
     assert _location(lib, lib.y) == lib.music / _SOURCE.with_name("02.mp3")
     assert not (lib.music / new).exists()
     reverted = paths.history_paths(lib.settings, lib.x)[-1]
-    assert (reverted.origin, reverted.reverted_from, reverted.commit_id) == (
+    assert (reverted.origin, reverted.reverted_to_version, reverted.commit_id) == (
         "revert",
         0,
         back.commit_id,

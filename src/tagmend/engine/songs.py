@@ -20,7 +20,7 @@ its tags. One :func:`resolve_songs` call runs these stages, top to bottom:
    reported and store nothing. A gated target with no ``artist`` and no ``albumartist`` whose
    dominant recordings credit one artist also gets a review row naming it, never a stage.
 
-The manual release path (``release_id``) skips the stamp check and the route selector. It
+The manual release path (``release_mbid``) skips the stamp check and the route selector. It
 assigns every file in scope to its track on that release, all or nothing, and stages the whole
 release stamp through :func:`tagmend.engine.staging.stage_tags_batch` (``origin='manual'``).
 
@@ -441,7 +441,7 @@ def resolve_songs(  # noqa: PLR0913 - cohesive keyword-only scope + injection pa
     *,
     folder: str | None = None,
     file_ids: list[int] | None = None,
-    release_id: str | None = None,
+    release_mbid: str | None = None,
     limit: int | None = None,
     dry_run: bool = False,
     fingerprinter: Fingerprinter | None = None,
@@ -453,19 +453,19 @@ def resolve_songs(  # noqa: PLR0913 - cohesive keyword-only scope + injection pa
     Scope is *file_ids* when given, else the files directly in *folder* (resolved by
     :func:`tagmend.engine.path_keys.folder_arg_key`), else the whole library. *limit* (default
     ``song_stage_limit``) counts cold folders, and ``0`` processes warm folders only. With
-    *release_id* the call takes the manual release path over its scope, which must be given.
+    *release_mbid* the call takes the manual release path over its scope, which must be given.
 
     A dry run writes the fingerprint, AcoustID and release caches and nothing else. A non-dry
     run raises :class:`ValueError` while anything is staged. Any run raises it for a negative
-    *limit*, an unknown file id, a *folder* outside ``music_path`` and *release_id* without a
+    *limit*, an unknown file id, a *folder* outside ``music_path`` and *release_mbid* without a
     scope. :class:`tagmend.engine.acoustid.AcoustidKeyError` and
     :class:`tagmend.engine.acoustid.FpcalcUnavailableError` stop the call, since they fail every
     file alike. *fingerprinter*, *acoustid_client* (already entered) and *releases* are injection
     seams for tests. Each is built from *settings* on first use when ``None``.
     """
     check_limit(limit)
-    if release_id is not None and folder is None and file_ids is None:
-        message = "release_id needs folder or file_ids: a release is never applied library-wide"
+    if release_mbid is not None and folder is None and file_ids is None:
+        message = "release_mbid needs folder or file_ids: a release is never applied library-wide"
         raise ValueError(message)
     folder_key = None if folder is None else path_keys.folder_arg_key(settings, folder)
     effective_limit = settings.song_stage_limit if limit is None else limit
@@ -492,7 +492,7 @@ def resolve_songs(  # noqa: PLR0913 - cohesive keyword-only scope + injection pa
                 acoustid_client=acoustid_client,
                 releases=releases,
             )
-            if release_id is None:
+            if release_mbid is None:
                 run = _AutoRun(settings, connection, lookups, tally, dry_run=dry_run, scoped=scoped)
                 run.resolve(index, scoped_ids, limit=effective_limit)
             else:
@@ -502,7 +502,7 @@ def resolve_songs(  # noqa: PLR0913 - cohesive keyword-only scope + injection pa
                     lookups,
                     tally,
                     scoped_ids=scoped_ids,
-                    release_id=release_id,
+                    release_mbid=release_mbid,
                     dry_run=dry_run,
                 )
         pending_remaining = len(store.pending_file_ids(connection, axis.SONG_AXIS, scoped_ids))
@@ -794,24 +794,24 @@ def _claims(placements: dict[int, list[_Slot]]) -> dict[tuple[str, int, int], se
 # --- outcome rows --------------------------------------------------------------------
 
 
-def _row(ballot: _Ballot, reason: str, release_id: str) -> dict[str, object]:
+def _row(ballot: _Ballot, reason: str, release_mbid: str) -> dict[str, object]:
     """Return the base of a held row."""
     return {
         "file_id": ballot.voter.file_id,
         "folder": ballot.voter.row.folder,
         "filename": ballot.voter.row.filename,
         "reason": reason,
-        "release_id": release_id,
+        "release_mbid": release_mbid,
     }
 
 
-def _mapping(voter: _Voter, release_id: str, tags: dict[str, list[str]]) -> dict[str, object]:
+def _mapping(voter: _Voter, release_mbid: str, tags: dict[str, list[str]]) -> dict[str, object]:
     """Return one dry-run row: the values a call would stage on one file."""
     return {
         "file_id": voter.file_id,
         "folder": voter.row.folder,
         "filename": voter.row.filename,
-        "release_id": release_id,
+        "release_mbid": release_mbid,
         "tags": tags,
     }
 
@@ -820,7 +820,7 @@ def _held(
     ballot: _Ballot,
     kind: str,
     reason: str,
-    release_id: str,
+    release_mbid: str,
     **extra: object,
 ) -> _Outcome:
     """Hold one target. A gated blank-title file also gets a review row with the audio's title."""
@@ -833,7 +833,7 @@ def _held(
             "field": _TITLE,
             "proposal": ballot.gate.title,
         }
-    row = _row(ballot, reason, release_id) | extra
+    row = _row(ballot, reason, release_mbid) | extra
     return _Outcome(file_id=ballot.voter.file_id, kind="held", held=kind, row=row, review=review)
 
 
@@ -1049,7 +1049,7 @@ def _status_of(release: MBRelease | None) -> str:
 
 
 def _confirm(
-    release_ids: tuple[str, ...],
+    release_mbids: tuple[str, ...],
     refs: dict[str, list[AcoustidReleaseRef]],
     carried: frozenset[str],
     lookups: _Lookups,
@@ -1061,7 +1061,7 @@ def _confirm(
     Official, then unfetched, then any other status, each in pre-rank order.
     """
     order = sorted(
-        release_ids,
+        release_mbids,
         key=lambda rid: (rid not in carried, refs[rid][0].date or "~", rid),
     )
     statuses: dict[str, str] = {}
@@ -1083,7 +1083,7 @@ def _confirm(
         first = refs[rid][0]
         rows.append(
             {
-                "release_id": rid,
+                "release_mbid": rid,
                 "title": first.title,
                 "date": first.date,
                 "country": first.country,
@@ -1122,16 +1122,16 @@ def _anchored(ballots: list[_Ballot], lookups: _Lookups) -> list[_Outcome]:
         if not ballot.gate.passed:
             outcomes.append(_ungated(ballot))
             continue
-        release_id = ballot.voter.value(_ALBUM_ID)
+        release_mbid = ballot.voter.value(_ALBUM_ID)
         slots = placements[ballot.voter.file_id]
         if not slots:
-            outcomes.append(_held(ballot, "release_mismatch", "not_on_release", release_id))
+            outcomes.append(_held(ballot, "release_mismatch", "not_on_release", release_mbid))
         elif len(slots) > 1:
-            outcomes.append(_held(ballot, "unconverged", "two_slots", release_id))
+            outcomes.append(_held(ballot, "unconverged", "two_slots", release_mbid))
         elif others := sorted(claims[slots[0].key] - {ballot.voter.file_id}):
             outcomes.append(
                 _held(
-                    ballot, "slot_collision", "slot_collision", release_id, other_file_ids=others
+                    ballot, "slot_collision", "slot_collision", release_mbid, other_file_ids=others
                 ),
             )
         else:
@@ -1174,9 +1174,9 @@ def _converged(ballots: list[_Ballot], lookups: _Lookups) -> list[_Outcome]:
     return outcomes
 
 
-def _held_or_ungated(ballot: _Ballot, kind: str, reason: str, release_id: str) -> _Outcome:
+def _held_or_ungated(ballot: _Ballot, kind: str, reason: str, release_mbid: str) -> _Outcome:
     """Hold a gated target, or report an ungated one by its evidence."""
-    return _held(ballot, kind, reason, release_id) if ballot.gate.passed else _ungated(ballot)
+    return _held(ballot, kind, reason, release_mbid) if ballot.gate.passed else _ungated(ballot)
 
 
 def _track_at(
@@ -1199,11 +1199,11 @@ def _rebind_report(ballots: list[_Ballot], lookups: _Lookups) -> dict[str, objec
     """
     carried = _carried(ballots)
     tagged: list[dict[str, object]] = []
-    for release_id in sorted(carried):
-        release = lookups.release(release_id)
+    for release_mbid in sorted(carried):
+        release = lookups.release(release_mbid)
         tagged.append(
             {
-                "release_id": release_id,
+                "release_mbid": release_mbid,
                 "title": "" if release is None else release.title,
                 "status": _status_of(release),
             },
@@ -1415,10 +1415,10 @@ def _resolve_release(  # noqa: PLR0913 - cohesive keyword-only run inputs
     tally: _Tally,
     *,
     scoped_ids: list[int],
-    release_id: str,
+    release_mbid: str,
     dry_run: bool,
 ) -> tuple[dict[str, object], list[dict[str, object]]]:
-    """Assign every file in scope to its track on *release_id*, then stage the whole stamp.
+    """Assign every file in scope to its track on *release_mbid*, then stage the whole stamp.
 
     All or nothing: one unassigned file stages nothing. Returns the release block and the
     unassigned rows. Raises :class:`ValueError` when MusicBrainz holds no such release or a
@@ -1426,9 +1426,9 @@ def _resolve_release(  # noqa: PLR0913 - cohesive keyword-only run inputs
     """
     # A stamp writes the release's track ids, which MusicBrainz replaces over time, so a real
     # run reads the current tracklist and a dry run keeps reading the cache.
-    release = lookups.release(release_id, fresh=not dry_run)
+    release = lookups.release(release_mbid, fresh=not dry_run)
     if release is None:
-        message = f"MusicBrainz holds no release {release_id}"
+        message = f"MusicBrainz holds no release {release_mbid}"
         raise ValueError(message)
     rows = _present_rows(conn, scoped_ids)
 
@@ -1574,7 +1574,7 @@ def _stamp(release: MBRelease, track: MBTrack, voter: _Voter) -> dict[str, list[
 def _release_block(release: MBRelease) -> dict[str, object]:
     """Return the release and its tracklist, for hand-staging an excluded file."""
     return {
-        "release_id": release.mbid,
+        "release_mbid": release.mbid,
         "title": release.title,
         "status": release.status,
         "country": release.country,

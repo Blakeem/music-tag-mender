@@ -578,7 +578,7 @@ class PathDomain:
                 from_path=from_path,
                 to_path=staged.to_path,
                 now=now,
-                reverted_from=staged.reverted_from,
+                reverted_to_version=staged.reverted_to_version,
                 note=staged.note,
             )
             store.delete_staged_path(conn, file_id)
@@ -1550,7 +1550,7 @@ def stage_paths_batch(
                     staged_at=now,
                     base_size_bytes=move.base_size_bytes,
                     base_mtime_ns=move.base_mtime_ns,
-                    reverted_from=None,
+                    reverted_to_version=None,
                 ),
             )
         sidecars = _plan_sidecars(
@@ -2172,7 +2172,7 @@ def _write_plan(
                 staged_at=now,
                 base_size_bytes=size,
                 base_mtime_ns=mtime_ns,
-                reverted_from=None,
+                reverted_to_version=None,
             ),
         )
 
@@ -2907,7 +2907,7 @@ def _stage_revert_row(  # noqa: PLR0913 - cohesive keyword-only revert-row paylo
             staged_at=now,
             base_size_bytes=size,
             base_mtime_ns=mtime_ns,
-            reverted_from=restores,
+            reverted_to_version=restores,
         ),
     )
 

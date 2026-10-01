@@ -1313,23 +1313,23 @@ def insert_path_revision(  # noqa: PLR0913 - cohesive append-only revision paylo
     from_path: str,
     to_path: str,
     now: str,
-    reverted_from: int | None = None,
+    reverted_to_version: int | None = None,
     note: str | None = None,
 ) -> None:
     """Append one ``path_revisions`` row. The append-only triggers refuse any rewrite."""
     conn.execute(
         """
         INSERT INTO path_revisions
-          (file_id, version, commit_id, created_at, origin, reverted_from, from_path, to_path,
+          (file_id, version, commit_id, created_at, origin, reverted_to_version, from_path, to_path,
            note)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (file_id, version, commit_id, now, origin, reverted_from, from_path, to_path, note),
+        (file_id, version, commit_id, now, origin, reverted_to_version, from_path, to_path, note),
     )
 
 
 _PATH_REVISION_COLUMNS = (
-    "file_id, version, commit_id, created_at, origin, reverted_from, from_path, to_path, note"
+    "file_id, version, commit_id, created_at, origin, reverted_to_version, from_path, to_path, note"
 )
 
 
@@ -1342,7 +1342,7 @@ class PathRevision:
     commit_id: int | None
     created_at: str
     origin: str
-    reverted_from: int | None
+    reverted_to_version: int | None
     from_path: str
     to_path: str
     note: str | None
@@ -1353,7 +1353,7 @@ class PathRevision:
             "version": self.version,
             "created_at": self.created_at,
             "origin": self.origin,
-            "reverted_from": self.reverted_from,
+            "reverted_to_version": self.reverted_to_version,
             "commit_id": self.commit_id,
             "from_path": self.from_path,
             "to_path": self.to_path,
@@ -1369,7 +1369,7 @@ def _row_to_path_revision(row: tuple[object, ...]) -> PathRevision:
         commit_id=None if row[2] is None else db.as_int(row[2]),
         created_at=str(row[3]),
         origin=str(row[4]),
-        reverted_from=None if row[5] is None else db.as_int(row[5]),
+        reverted_to_version=None if row[5] is None else db.as_int(row[5]),
         from_path=str(row[6]),
         to_path=str(row[7]),
         note=None if row[8] is None else str(row[8]),
@@ -1453,7 +1453,7 @@ _STAGED_PATH_FIELDS: Final = (
     "staged_at",
     "base_size_bytes",
     "base_mtime_ns",
-    "reverted_from",
+    "reverted_to_version",
 )
 _STAGED_PATH_COLUMNS: Final = ", ".join(_STAGED_PATH_FIELDS)
 
@@ -1474,7 +1474,7 @@ class StagedPath:
     staged_at: str
     base_size_bytes: int | None
     base_mtime_ns: int | None
-    reverted_from: int | None
+    reverted_to_version: int | None
 
 
 def _row_to_staged_path(row: tuple[object, ...]) -> StagedPath:
@@ -1488,7 +1488,7 @@ def _row_to_staged_path(row: tuple[object, ...]) -> StagedPath:
         staged_at=str(row[5]),
         base_size_bytes=None if row[6] is None else db.as_int(row[6]),
         base_mtime_ns=None if row[7] is None else db.as_int(row[7]),
-        reverted_from=None if row[8] is None else db.as_int(row[8]),
+        reverted_to_version=None if row[8] is None else db.as_int(row[8]),
     )
 
 
@@ -1507,7 +1507,7 @@ def upsert_staged_path(conn: sqlite3.Connection, staged: StagedPath) -> None:
           to_path = excluded.to_path, to_key = excluded.to_key, origin = excluded.origin,
           note = excluded.note, staged_at = excluded.staged_at,
           base_size_bytes = excluded.base_size_bytes, base_mtime_ns = excluded.base_mtime_ns,
-          reverted_from = excluded.reverted_from
+          reverted_to_version = excluded.reverted_to_version
         """,  # noqa: S608
         (
             staged.file_id,
@@ -1518,7 +1518,7 @@ def upsert_staged_path(conn: sqlite3.Connection, staged: StagedPath) -> None:
             staged.staged_at,
             staged.base_size_bytes,
             staged.base_mtime_ns,
-            staged.reverted_from,
+            staged.reverted_to_version,
         ),
     )
 

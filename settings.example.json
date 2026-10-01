@@ -1,5 +1,9 @@
 {
+  "acoustid_api_key": "",
+  "acoustid_rate_per_sec": "2.0",
+  "container_folders": "",
   "db_path": "",
+  "fpcalc_path": "",
   "genre_max_count": "4",
   "genre_min_weight": "2",
   "genre_stage_limit": "300",
@@ -9,5 +13,7 @@
   "music_path": "/path/to/your/music",
   "musicbrainz_contact": "https://github.com/Blakeem/music-tag-mender",
   "musicbrainz_rate_per_sec": "1.0",
+  "naming_pattern": "",
+  "song_stage_limit": "25",
   "year_stage_limit": "300"
 }

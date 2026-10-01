@@ -29,7 +29,7 @@ def test_apply_schema_stamps_current_version(db_conn: sqlite3.Connection) -> Non
     # db_conn already applied the schema; the stamp must match the constant the code ships.
     version = db_conn.execute("PRAGMA user_version").fetchone()[0]
     assert version == SCHEMA_VERSION
-    assert SCHEMA_VERSION == 26
+    assert SCHEMA_VERSION == 27
 
 
 def test_apply_schema_creates_genre_tables(db_conn: sqlite3.Connection) -> None:
@@ -1486,7 +1486,7 @@ def test_v24_migration_is_idempotent() -> None:
 
 # --- v25: the path staging columns ----------------------------------------------------
 
-_PATH_STAGING_COLUMNS = ("to_key", "base_size_bytes", "base_mtime_ns", "reverted_from")
+_PATH_STAGING_COLUMNS = ("to_key", "base_size_bytes", "base_mtime_ns", "reverted_to_version")
 
 
 def _path_staged_columns(conn: sqlite3.Connection) -> list[str]:
@@ -1537,7 +1537,7 @@ def test_v24_ledger_gains_the_path_staging_columns_in_place() -> None:
         assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
         assert _path_staged_columns(conn) == fresh_columns
         row = conn.execute(
-            "SELECT to_path, note, to_key, base_size_bytes, base_mtime_ns, reverted_from "
+            "SELECT to_path, note, to_key, base_size_bytes, base_mtime_ns, reverted_to_version "
             "FROM path_revisions_staged WHERE file_id = ?",
             (file_id,),
         ).fetchone()
@@ -1618,5 +1618,53 @@ def test_v25_ledger_gains_the_sidecar_tables_in_place() -> None:
         assert set(_SIDECAR_INDEXES) <= _schema_objects(conn, "index")
         assert set(_APPEND_ONLY_TRIGGERS) <= _schema_objects(conn, "trigger")
         assert conn.execute("SELECT id FROM files").fetchall() == [(file_id,)]
+    finally:
+        conn.close()
+
+
+# --- v27: the path tables' reverted_to_version ------------------------------------------
+
+_PATH_REVERT_TABLES = ("path_revisions", "path_revisions_staged")
+
+
+def test_v26_ledger_renames_the_path_revert_columns_in_place() -> None:
+    fresh = sqlite3.connect(":memory:")
+    try:
+        apply_schema(fresh)
+        fresh_columns = {table: _columns(fresh, table) for table in _PATH_REVERT_TABLES}
+    finally:
+        fresh.close()
+
+    conn = sqlite3.connect(":memory:")
+    try:
+        apply_schema(conn)
+        file_id = _insert_file(conn)
+        for table in _PATH_REVERT_TABLES:
+            conn.execute(f"ALTER TABLE {table} RENAME COLUMN reverted_to_version TO reverted_from")
+        conn.execute(
+            "INSERT INTO path_revisions (file_id, version, created_at, origin, reverted_from, "
+            "from_path, to_path) VALUES (?, 2, '2026-10-01T00:00:00+00:00', 'revert', 0, "
+            "'B/a.mp3', 'A/a.mp3')",
+            (file_id,),
+        )
+        conn.execute(
+            "INSERT INTO path_revisions_staged (file_id, to_path, origin, staged_at, "
+            "reverted_from) VALUES (?, 'A/a.mp3', 'revert', '2026-10-01T00:00:00+00:00', 1)",
+            (file_id,),
+        )
+        conn.execute("PRAGMA user_version = 26")
+        conn.commit()
+
+        apply_schema(conn)  # the in-place upgrade
+        conn.execute("PRAGMA user_version = 26")
+        apply_schema(conn)  # a second application must find both columns renamed
+
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        assert {table: _columns(conn, table) for table in _PATH_REVERT_TABLES} == fresh_columns
+        assert conn.execute("SELECT reverted_to_version FROM path_revisions").fetchall() == [(0,)]
+        staged = conn.execute("SELECT reverted_to_version FROM path_revisions_staged").fetchall()
+        assert staged == [(1,)]
+        with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+            conn.execute("UPDATE path_revisions SET reverted_to_version = 1")
     finally:
         conn.close()

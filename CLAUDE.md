@@ -24,7 +24,7 @@ genre counts).
 M4 phase 1 shipped too: `artists.py` (`resolve_artists` — cascade-stages the
 `artist.getCorrection` canonical name + MBID across `artist`/`albumartist`, with
 feat/sentinel/empty + per-file multi-value guards, dry-run, and the empty-staging
-precondition; results cache in the existing `lastfm_cache`). M4 phase 2 shipped the artist status tools:
+precondition. Its getCorrection results cache in `lastfm_correction_cache`). M4 phase 2 shipped the artist status tools:
 `set_artist_status`/`reset_artist_status` (scope by file or by a value matched across BOTH
 `artist` and `albumartist`), `list_files(artist_status=...)` and a `get_library_stats['artist']`
 block. The year axis (`years.py`) shipped next (MusicBrainz `originaldate` blank-fill,
@@ -43,7 +43,7 @@ by its AcoustID fingerprint. A folder whose files carry `musicbrainz_albumid` is
 those releases, a folder without ids converges on the one Official release most of its files share
 and fills only blank `title`/`tracknumber`/`discnumber` as `auto`, and a folder holding a pending
 file whose audio is not on its tagged release is reported in `rebind_folders`. A `done` or `manual`
-file off its release never holds its pending siblings on that route. `resolve_songs(release_id=...)` stamps a
+file off its release never holds its pending siblings on that route. `resolve_songs(release_mbid=...)` stamps a
 whole folder onto one chosen release as a single `manual` batch. The **mismatch-fix** surface
 records one path decision per file in `file_mismatch_status`. `legit_ignore` keeps the folder and
 renders the filename. `misfiled_deferred` lets the tags render every path level. No status keeps a
@@ -55,7 +55,7 @@ name. A changed tag, a committed move or a new uncovered flag re-surfaces the fi
 `set_mismatch_status` requires `covers`, takes one release-folder group per call, and refuses a
 keep that leaves a group member out. The report's `gate_open` holds when nothing is flagged and no
 exception is undecided. `mismatch.gate_state`, `check_files` and `planner_keep` are the gate the
-path domain will read. `list_files(mismatch_status=...)` and `get_library_stats['mismatch']` read the
+path domain reads. `list_files(mismatch_status=...)` and `get_library_stats['mismatch']` read the
 same classifier. `stage_tags_batch` stages several files atomically, always as
 `origin="manual"`. `reopen_axes(commit_id)` deletes the `done`/`no_match` rows of the files of a
 commit holding no `auto` revision, on all four tag axes, and keeps `manual`. The `detect_album_gaps` tool (`album_gaps.py` + the pure, standalone
@@ -81,8 +81,9 @@ whose album identity differs from their folder siblings'. A file's album identit
 `musicbrainz_albumid` when it carries one, and otherwise the display album artist, the album
 title and the year. The display album artist falls back `albumartist` → `Various
 Artists` when the `compilation` flag is set → `artist`. Comparison folds casing, typographic
-character choice and whitespace runs, and nothing else. It is deliberately NOT `mismatch.fold`,
-which strips every non-alphanumeric character and so erases the punctuation splits this
+character choice and whitespace runs, and nothing else. It is deliberately NOT
+`text_keys.alnum_ascii_key`, the mismatch detector's fold, which strips every non-alphanumeric
+character and so erases the punctuation splits this
 detector exists to find. Three tiers: `high` when the release ids differ or only some files
 carry one, `medium` for a name or year disagreement with no ids involved, `low` when one title
 carries a `(disc N: …)` suffix the others do not. Only the MINORITY is flagged, and every row
@@ -111,7 +112,7 @@ compares a file's year tags with the first-release year of its album's MusicBrai
 found by the album identity (album artist else artist, album). `high` means the `originaldate` year
 differs, `medium` means the `date` year is earlier than the first release. `release_limit` (default
 200) caps the uncached lookups one call makes, and cache writes are its only ledger writes.
-47 MCP tools total. Schema is **v26** (additive: v11 adds
+47 MCP tools total. Schema is **v27** (additive: v11 adds
 `musicbrainz_recording_cache`, v12 renames `file_album_status` → `file_year_status` in place —
 dispositions preserved; v13 adds `tag_revisions.managed_set`, stamping which managed-tag set
 governed each revision so a revert can restore emptiness on the widened fields; v14 adds
@@ -136,7 +137,9 @@ with a 7-day expiry on an empty answer). v23 adds `file_song_status` and
 which the stale-identity warning in `diff_tags` treats as confirmed. v24 rewrites each
 `file_mismatch_status` row as a JSON decision snapshot and drops `source_field`. v25 adds the
 path staging columns (`to_key`, the stage-time signature, `reverted_from`). v26 adds
-`sidecar_moves` and `sidecar_moves_staged`. A newer ledger is refused). The paths domain (`paths.py`) is the second `RevisionDomain`. `stage_paths_batch`,
+`sidecar_moves` and `sidecar_moves_staged`. v27 renames `reverted_from` to `reverted_to_version` on
+`path_revisions` and `path_revisions_staged`, so `history_paths` and `history_tags` name the restored
+version alike. A newer ledger is refused). The paths domain (`paths.py`) is the second `RevisionDomain`. `stage_paths_batch`,
 `unstage_paths`, `diff_paths`, `commit_paths`, `history_paths` and `revert_paths` move files with one
 `files.id` across every move, never overwrite a target, and prune emptied source folders. A move
 that landed before a crash is finished by the next `commit_paths`. The naming pattern
@@ -329,12 +332,15 @@ src/tagmend/
   log.py            shared logger (use everywhere)
   config.py         settings.json (platformdirs) + typed Settings
   cli.py            Typer CLI (thin)
+  configui.py       loopback config web UI that edits settings.json
   mcp_server.py     FastMCP server (thin) — 47 tools
   engine/
     db.py           SQLite connection (WAL)
-    schema.py       all DDL + PRAGMA user_version (v26)
+    schema.py       all DDL + PRAGMA user_version (v27)
     path_keys.py    path identity keys, subtree key ranges, the folder-argument normalizer
     text_keys.py    the shared text fold keys (alnum, display, artist name, loose, title)
+    clock.py        the engine's one source of the current time
+    validation.py   argument checks shared by the engine entry points
     scan.py         filesystem discovery + signatures
     health.py       check_health / readiness + interrupted-commit report
     store.py        pure data access: files/file_tags + tag_revisions[_staged] + tag-axis derived status + mismatch status
@@ -343,10 +349,11 @@ src/tagmend/
     versioning.py   tag-revision baseline/append + revert + history
     commits.py      domain-neutral commit core: commits table + RevisionDomain + run_commit
     staging.py      tags domain (TagDomain) + stage/diff/commit_tags orchestration
-    lastfm.py       Last.fm top-tags client: lastfm_cache + pacing (getCorrection → M4)
+    lastfm.py       Last.fm client: top-tags (`lastfm_cache`) and `artist.getCorrection` (`lastfm_correction_cache`), paced
     acoustid.py     fpcalc Fingerprinter + AcoustidClient (gzip POST lookup, paced) + their caches
     release_match.py  pure release-matching helpers (track text keys, positions, disc expectation)
     musicbrainz.py  MusicBrainz client: release-group year, recording lookup, artist-by-MBID name, release-by-MBID tracklist
+    lookup_clients.py  uses an injected lookup client or builds and owns a real one
     axis.py         the parameterized Axis: one outcome-row model for genre/artist/year/song, plus the mismatch axis entry
     axis_status.py  the one set_/reset_<axis>_status implementation, parameterized by Axis
     classify.py     genre vocab/overlay loader + fold-key index + classify.classify_genres (pure)
@@ -356,6 +363,7 @@ src/tagmend/
     years.py        resolve_years + set/reset_year_status: MusicBrainz originaldate blank-fill + file_year_status workflow
     mismatch.py     detect_mismatches + set/reset_mismatch_status + layout_of + the path gate: tags vs every path level, tiered
     path_text.py    clean_value and the part rules: what a tag value and a path part may hold
+    detector_core.py  the shared core of the detect_* family: tiers, folder buckets and positions
     track_conflicts.py  detect_track_conflicts: intra-folder (disc, track) slot collisions
     album_conflicts.py  detect_album_conflicts: intra-folder album-identity splits, tiered
     release_disagreements.py  detect_release_disagreements: tags vs the MusicBrainz release the file's album id names, tiered

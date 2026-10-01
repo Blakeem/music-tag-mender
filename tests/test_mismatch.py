@@ -2,7 +2,9 @@
 
 Pure tests run the ``_classify`` core over constructed inputs, one per path layout and
 comparison, flagged and clean. Integration tests scan generated audio, then detect, and cover
-the dispositions, the CLI and the MCP wiring.
+the path decisions (one test per cell of their state table), the status-tool guards, the gate
+API, the CLI and the MCP wiring. A committed path change is simulated by moving the file on
+disk, appending its ``path_revisions`` row and repointing its ``files`` row.
 """
 
 from __future__ import annotations
@@ -10,8 +12,9 @@ from __future__ import annotations
 import asyncio
 import functools
 import unicodedata
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import TYPE_CHECKING, Final
 
 import pytest
 from typer.testing import CliRunner
@@ -22,20 +25,32 @@ from tagmend.cli import app
 from tagmend.config import Settings
 from tagmend.engine import artists, axis, mismatch, path_keys, staging, store, versioning
 from tagmend.engine.db import connect
-from tagmend.engine.detector_core import parse_position
+from tagmend.engine.detector_core import Tier, parse_position
 from tagmend.engine.library import scan_library
 from tagmend.engine.mismatch import (
+    CHANGED_MOVED,
+    CHANGED_TAGS,
+    CHANGED_UNCOVERED,
+    CURATED,
     DISC_FOLDER_NUMBER,
     FILENAME_TITLE,
     FILENAME_TRACK,
+    LEGIT_IGNORE,
+    MISFILED_DEFERRED,
+    PENDING,
     RELEASE_FOLDER_ALBUM,
     RELEASE_FOLDER_YEAR,
     TOP_FOLDER_ARTIST,
     detect_mismatches,
 )
 from tagmend.engine.path_text import clean_value
+from tagmend.engine.schema import apply_schema
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 _MUSIC = Path("/library/music")
+_NOW = "2026-10-01T00:00:00+00:00"
 _SOUNDTRACKS = frozenset({"soundtracks"})
 runner = CliRunner()
 
@@ -619,10 +634,14 @@ def test_report_rows_and_header_shape() -> None:
         "exceptions_undecided",
         "disagreement_rate",
         "path_signal_unreliable",
+        "gate_open",
         "suppressed",
+        "stale",
         "container_suppressed",
         "summary",
     }
+    assert payload["gate_open"] is False
+    assert payload["stale"] == 0
     assert payload["flagged"] == 2
     assert payload["group_count"] == 2
     assert payload["by_comparison"] == {DISC_FOLDER_NUMBER: 1, FILENAME_TITLE: 1}
@@ -635,8 +654,17 @@ def test_report_rows_and_header_shape() -> None:
         "folder": str(_MUSIC / _ALBUM / "CD1"),
         "filename": "01 Song.mp3",
         "tier": "high",
-        "differences": [{"comparison": DISC_FOLDER_NUMBER, "tag_value": "2", "path_value": "CD1"}],
+        "differences": [
+            {
+                "comparison": DISC_FOLDER_NUMBER,
+                "tag_value": "2",
+                "path_value": "CD1",
+                "silenced": False,
+            },
+        ],
         "exception": None,
+        "was": None,
+        "changed": None,
     }
     exception_rows = payload["exception_rows"]
     assert isinstance(exception_rows, list)
@@ -722,12 +750,29 @@ def _disposition_library() -> list[mismatch._FileInput]:
     ]
 
 
-def _disp(status: str, field: str | None, value: str | None) -> store.MismatchStatusRow:
-    return store.MismatchStatusRow(status=status, source_field=field, source_value=value)
+def _decision(
+    status: str,
+    covers: list[str],
+    tags: dict[str, str | None],
+    *,
+    folder: str | None = None,
+    path_version: int = 0,
+) -> store.MismatchStatusRow:
+    """Build a stored decision, a keep bound to *folder* under the test music path."""
+    return store.MismatchStatusRow(
+        status=status,
+        covers=tuple(covers),
+        tags=tags,
+        path_version=path_version,
+        folder_key=None if folder is None else path_keys.path_key(_MUSIC / folder),
+    )
 
 
-def test_fresh_disposition_silences_its_file_and_reports_it() -> None:
-    dispositions = {100: _disp("legit_ignore", "albumartist", "Jem")}
+_JEM_TAGS: dict[str, str | None] = {"albumartist": "Jem", "artist": "Ozzy Osbourne"}
+
+
+def test_a_decision_silences_only_the_names_it_covers() -> None:
+    dispositions = {100: _decision(LEGIT_IGNORE, [TOP_FOLDER_ARTIST], _JEM_TAGS, folder=_OZZY)}
     files = [
         *_disposition_library(),
         _mk(102, _OZZY, "04 Iron Gland.mp3", albumartist="Ozzy Osbourne", title="Angry Chair"),
@@ -737,32 +782,86 @@ def test_fresh_disposition_silences_its_file_and_reports_it() -> None:
 
     assert _find(report, 100) is None
     assert report.flagged == 2
-    assert report.suppressed == {"legit_ignore": 1}
+    assert report.suppressed == {LEGIT_IGNORE: 1}
+    assert report.stale == 0
     ozzy = next(g for g in _view(report, group=True).groups if g.folder == str(_MUSIC / _OZZY))
-    assert ozzy.suppressed == {"legit_ignore": 1}
-    assert ozzy.unflagged_ids == [100, 101]
+    assert ozzy.suppressed == {LEGIT_IGNORE: 1}
+    # A file whose every flag is silenced is decided, so it is neither flagged nor unflagged.
+    assert (ozzy.file_ids, ozzy.unflagged_ids) == ([102], [101])
 
 
-def test_stale_disposition_resurfaces() -> None:
-    dispositions = {100: _disp("legit_ignore", "albumartist", "Old Name")}
+def test_a_decision_on_other_tags_resurfaces_with_was_and_changed() -> None:
+    dispositions = {
+        100: _decision(LEGIT_IGNORE, [TOP_FOLDER_ARTIST], {"albumartist": "Old"}, folder=_OZZY),
+    }
 
     report = mismatch._classify(_disposition_library(), _MUSIC, dispositions=dispositions)
 
-    assert _tier(report, 100) == "high"
+    row = _find(report, 100)
+    assert row is not None
+    assert (row.tier, row.was, row.changed) == ("high", LEGIT_IGNORE, CHANGED_TAGS)
     assert report.suppressed == {}
+    assert report.stale == 0  # the keep still binds its folder
+
+
+def test_a_decision_bound_to_another_location_is_stale() -> None:
+    dispositions = {
+        100: _decision(LEGIT_IGNORE, [TOP_FOLDER_ARTIST], _JEM_TAGS, folder="Elsewhere"),
+        101: _decision(MISFILED_DEFERRED, [], {}, path_version=0),
+    }
+
+    report = mismatch._classify(
+        _disposition_library(),
+        _MUSIC,
+        dispositions=dispositions,
+        path_versions={101: 1},
+    )
+
+    row = _find(report, 100)
+    assert row is not None
+    assert (row.was, row.changed) == (LEGIT_IGNORE, CHANGED_MOVED)
+    assert report.suppressed == {}
+    assert report.stale == 2
+    assert "2 decision(s) no longer in force" in report.summary
 
 
 def test_both_statuses_silence_flagged_and_exception_rows() -> None:
     dispositions = {
-        100: _disp("legit_ignore", "albumartist", "Jem"),
-        150: _disp("misfiled_deferred", "albumartist", "Future Islands"),
+        100: _decision(LEGIT_IGNORE, [TOP_FOLDER_ARTIST], _JEM_TAGS, folder=_OZZY),
+        150: _decision(
+            MISFILED_DEFERRED,
+            [TOP_FOLDER_ARTIST, CURATED],
+            {"albumartist": "Future Islands", "artist": None},
+        ),
     }
 
     report = mismatch._classify(_disposition_library(), _MUSIC, dispositions=dispositions)
 
     assert report.rows == []
     assert report.exception_rows == []
-    assert report.suppressed == {"legit_ignore": 1, "misfiled_deferred": 1}
+    assert report.suppressed == {LEGIT_IGNORE: 1, MISFILED_DEFERRED: 1}
+    assert report.gate_open is True
+
+
+def test_a_class_outside_covers_keeps_the_exception_open() -> None:
+    dispositions = {
+        150: _decision(
+            MISFILED_DEFERRED,
+            [TOP_FOLDER_ARTIST],
+            {"albumartist": "Future Islands", "artist": None},
+        ),
+    }
+
+    report = mismatch._classify(_disposition_library(), _MUSIC, dispositions=dispositions)
+
+    assert _find(report, 150) is None  # its top-folder difference is silenced
+    (exception,) = report.exception_rows
+    assert (exception.file_id, exception.was, exception.changed) == (
+        150,
+        MISFILED_DEFERRED,
+        CHANGED_UNCOVERED,
+    )
+    assert report.gate_open is False
 
 
 # --- layout_of -----------------------------------------------------------------------
@@ -884,7 +983,12 @@ def test_detect_integration_flags_high_and_is_read_only(
     assert row is not None
     assert row.tier == "high"
     assert [d.to_dict() for d in row.differences] == [
-        {"comparison": TOP_FOLDER_ARTIST, "tag_value": "Jem", "path_value": "Ozzy Osbourne"},
+        {
+            "comparison": TOP_FOLDER_ARTIST,
+            "tag_value": "Jem",
+            "path_value": "Ozzy Osbourne",
+            "silenced": False,
+        },
     ]
 
     # Read-only: nothing staged and the file's tags are untouched on disk/in the ledger.
@@ -1021,52 +1125,327 @@ def test_mcp_detect_tool_listed_and_callable(music_dir: Path) -> None:
 # --- disposition verbs + staleness (engine, real library) ---------------------------
 
 
+def _ozzy_ids(settings: Settings, ozzy: Path) -> tuple[int, int]:
+    """Return the ids of the mislabeled Jem file and its clean Dreamer sibling."""
+    return (
+        _file_id(settings, ozzy, "01 Gets Me Through.mp3"),
+        _file_id(settings, ozzy, "03 Dreamer.mp3"),
+    )
+
+
+def _stored(settings: Settings) -> dict[int, store.MismatchStatusRow]:
+    conn = connect(settings.db_path)
+    try:
+        apply_schema(conn)
+        return store.load_mismatch_statuses(conn)
+    finally:
+        conn.close()
+
+
 def test_set_and_reset_mismatch_status_via_detect(
     engine_settings: Settings,
     music_dir: Path,
 ) -> None:
     ozzy = _make_mislabeled_library(music_dir)
     scan_library(engine_settings)
-    jem_id = _file_id(engine_settings, ozzy, "01 Gets Me Through.mp3")
+    jem_id, dreamer_id = _ozzy_ids(engine_settings, ozzy)
+    group = detect_mismatches(engine_settings, group=True).groups[0]
+    assert (group.file_ids, group.unflagged_ids) == ([jem_id], [dreamer_id])
 
-    assert _find(detect_mismatches(engine_settings), jem_id) is not None  # baseline flagged
-
-    affected = mismatch.set_mismatch_status(
+    result = mismatch.set_mismatch_status(
         engine_settings,
-        file_ids=[jem_id],
-        status="legit_ignore",
+        status=LEGIT_IGNORE,
+        covers=[*group.comparisons],
+        file_ids=[*group.file_ids, *group.unflagged_ids],
     )
-    assert affected == 1
+
+    assert result.to_dict() == {
+        "status": LEGIT_IGNORE,
+        "affected": 2,
+        "skipped_unflagged": 0,
+        "covers": {TOP_FOLDER_ARTIST: 1},
+        "files": [
+            {"file_id": jem_id, "folder": "kept", "filename": "rendered"},
+            {"file_id": dreamer_id, "folder": "kept", "filename": "rendered"},
+        ],
+        "note": mismatch.FILENAME_NOTE,
+    }
     report = detect_mismatches(engine_settings)
-    assert _find(report, jem_id) is None  # silenced
-    assert report.suppressed == {"legit_ignore": 1}
+    assert _find(report, jem_id) is None
+    assert report.suppressed == {LEGIT_IGNORE: 2}
+    assert report.gate_open is True
 
     assert mismatch.reset_mismatch_status(engine_settings, file_ids=[jem_id]) == 1
-    assert _find(detect_mismatches(engine_settings), jem_id) is not None  # re-surfaced
+    assert _find(detect_mismatches(engine_settings), jem_id) is not None
 
 
-def test_set_mismatch_status_by_value_matches_both_fields(
+def test_a_kept_row_is_tiered_by_its_unsilenced_differences(
     engine_settings: Settings,
     music_dir: Path,
 ) -> None:
     ozzy = _make_mislabeled_library(music_dir)
     scan_library(engine_settings)
-    jem_id = _file_id(engine_settings, ozzy, "01 Gets Me Through.mp3")
+    jem_id, dreamer_id = _ozzy_ids(engine_settings, ozzy)
+    mismatch.set_mismatch_status(
+        engine_settings,
+        status=LEGIT_IGNORE,
+        covers=[TOP_FOLDER_ARTIST],
+        file_ids=[jem_id, dreamer_id],
+    )
+    staging.stage_tags(engine_settings, file_id=jem_id, tags={"title": ["Gets Me Thru"]})
+    staging.commit_tags(engine_settings)
 
-    # "Jem" is the albumartist of the flagged file -> value scope catches it.
-    affected = mismatch.set_mismatch_status(engine_settings, value="Jem", status="legit_ignore")
-    assert affected == 1
-    assert _find(detect_mismatches(engine_settings), jem_id) is None
+    report = detect_mismatches(engine_settings)
+
+    row = _find(report, jem_id)
+    assert row is not None
+    assert {d.comparison: d.silenced for d in row.differences} == {
+        TOP_FOLDER_ARTIST: True,
+        FILENAME_TITLE: False,
+    }
+    assert not row.carries(TOP_FOLDER_ARTIST)
+    assert row.tier == Tier.LOW.value
+    assert (report.high, report.medium, report.low) == (0, 0, 1)
+    assert report.by_comparison == {FILENAME_TITLE: 1}
+    assert _view(report, comparison=TOP_FOLDER_ARTIST).rows == []
+    assert [r.file_id for r in _view(report, comparison=FILENAME_TITLE).rows] == [jem_id]
 
 
-def test_set_mismatch_status_rejects_unknown_status(
+def test_set_writes_only_the_names_each_file_flags(
     engine_settings: Settings,
     music_dir: Path,
 ) -> None:
-    _make_mislabeled_library(music_dir)
+    ozzy = _make_mislabeled_library(music_dir)
     scan_library(engine_settings)
-    with pytest.raises(ValueError, match="unknown status"):
-        mismatch.set_mismatch_status(engine_settings, file_ids=[1], status="no_match")
+    jem_id, dreamer_id = _ozzy_ids(engine_settings, ozzy)
+
+    mismatch.set_mismatch_status(
+        engine_settings,
+        status=LEGIT_IGNORE,
+        covers=[TOP_FOLDER_ARTIST, FILENAME_TITLE, CURATED],
+        file_ids=[jem_id, dreamer_id],
+    )
+
+    folder_key = path_keys.path_key(ozzy)
+    assert _stored(engine_settings) == {
+        jem_id: store.MismatchStatusRow(
+            LEGIT_IGNORE, (TOP_FOLDER_ARTIST,), _JEM_TAGS, 0, folder_key
+        ),
+        dreamer_id: store.MismatchStatusRow(LEGIT_IGNORE, (), {}, 0, folder_key),
+    }
+
+
+def test_set_by_value_defers_only_the_carriers_that_flag(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    ozzy = _make_mislabeled_library(music_dir)
+    scan_library(engine_settings)
+    jem_id, _ = _ozzy_ids(engine_settings, ozzy)
+
+    # Both Ozzy files carry the value, and only the Jem file's top folder differs.
+    result = mismatch.set_mismatch_status(
+        engine_settings,
+        status=MISFILED_DEFERRED,
+        covers=[TOP_FOLDER_ARTIST],
+        value="Ozzy Osbourne",
+    )
+
+    assert (result.affected, result.skipped_unflagged) == (1, 1)
+    assert [decided.folder for decided in result.files] == ["rendered"]
+    assert set(_stored(engine_settings)) == {jem_id}
+
+
+def _guard_library(settings: Settings, music_dir: Path) -> dict[str, int]:
+    """The mislabeled Ozzy group plus a second flagged group. Return the ids by role."""
+    ozzy = _make_mislabeled_library(music_dir)
+    other = music_dir / "Other Artist" / "Album"
+    make_track(other / "01 Song.mp3", {"albumartist": ["Nobody"]})
+    scan_library(settings)
+    jem_id, dreamer_id = _ozzy_ids(settings, ozzy)
+    return {"jem": jem_id, "dreamer": dreamer_id, "other": _file_id(settings, other, "01 Song.mp3")}
+
+
+_REFUSALS = [
+    pytest.param(
+        {"status": MISFILED_DEFERRED, "covers": [], "file_ids": ["jem"]},
+        r"outside covers: \[\(\d+, 'top_folder_artist'\)\].*detect_mismatches\(folder=",
+        id="name-outside-covers",
+    ),
+    pytest.param(
+        {"status": MISFILED_DEFERRED, "covers": [TOP_FOLDER_ARTIST], "file_ids": ["jem", "other"]},
+        "these files span 2",
+        id="two-groups",
+    ),
+    pytest.param(
+        {"status": LEGIT_IGNORE, "covers": [TOP_FOLDER_ARTIST], "file_ids": ["jem"]},
+        r"member file_id\(s\) \[\d+\] would hold no keep.*unflagged_ids",
+        id="keep-splits-the-group",
+    ),
+    pytest.param(
+        {"status": MISFILED_DEFERRED, "covers": [], "file_ids": ["dreamer"]},
+        "Omit unflagged_ids",
+        id="defer-unflagged",
+    ),
+    pytest.param(
+        {"status": LEGIT_IGNORE, "covers": [TOP_FOLDER_ARTIST], "value": "Jem"},
+        "value scope takes only",
+        id="value-keep",
+    ),
+    pytest.param(
+        {"status": MISFILED_DEFERRED, "covers": [TOP_FOLDER_ARTIST, CURATED], "value": "Jem"},
+        "value scope takes only",
+        id="value-other-covers",
+    ),
+    pytest.param(
+        {"status": PENDING, "covers": [], "file_ids": ["jem"]},
+        "unknown status",
+        id="pending-is-not-a-set-status",
+    ),
+    pytest.param(
+        {"status": LEGIT_IGNORE, "covers": ["folder_artist"], "file_ids": ["jem"]},
+        "unknown covers name",
+        id="unknown-name",
+    ),
+    pytest.param(
+        {"status": LEGIT_IGNORE, "covers": [], "file_ids": [99999]},
+        "unknown file_id",
+        id="unknown-id",
+    ),
+]
+
+
+@pytest.mark.parametrize(("call", "match"), _REFUSALS)
+def test_set_refuses_the_entire_call(
+    engine_settings: Settings,
+    music_dir: Path,
+    call: dict[str, object],
+    match: str,
+) -> None:
+    ids = _guard_library(engine_settings, music_dir)
+    file_ids = call.get("file_ids")
+    kwargs = dict(call)
+    if isinstance(file_ids, list):
+        kwargs["file_ids"] = [ids.get(name, name) for name in file_ids]
+
+    with pytest.raises(ValueError, match=match):
+        mismatch.set_mismatch_status(engine_settings, **kwargs)  # type: ignore[arg-type]
+
+    assert _stored(engine_settings) == {}
+
+
+def _stage_path_row(settings: Settings, file_id: int) -> None:
+    conn = connect(settings.db_path)
+    try:
+        conn.execute(
+            "INSERT INTO path_revisions_staged (file_id, to_path, origin, staged_at) "
+            "VALUES (?, '/elsewhere/a.mp3', 'manual', ?)",
+            (file_id, _NOW),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_both_tools_refuse_a_file_with_a_staged_path_change(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    ids = _guard_library(engine_settings, music_dir)
+    _stage_path_row(engine_settings, ids["other"])
+
+    with pytest.raises(ValueError, match="unstage_paths"):
+        mismatch.set_mismatch_status(
+            engine_settings,
+            status=MISFILED_DEFERRED,
+            covers=[TOP_FOLDER_ARTIST],
+            file_ids=[ids["other"]],
+        )
+    with pytest.raises(ValueError, match="unstage_paths"):
+        mismatch.reset_mismatch_status(engine_settings, file_ids=[ids["other"]])
+    assert _stored(engine_settings) == {}
+
+
+def test_both_tools_refuse_a_missing_file(engine_settings: Settings, music_dir: Path) -> None:
+    ids = _guard_library(engine_settings, music_dir)
+    (music_dir / "Other Artist" / "Album" / "01 Song.mp3").unlink()
+    scan_library(engine_settings)
+
+    with pytest.raises(ValueError, match=rf"\[{ids['other']}\] are missing from disk"):
+        mismatch.set_mismatch_status(
+            engine_settings,
+            status=MISFILED_DEFERRED,
+            covers=[TOP_FOLDER_ARTIST],
+            file_ids=[ids["other"]],
+        )
+    with pytest.raises(ValueError, match="missing from disk"):
+        mismatch.reset_mismatch_status(engine_settings, file_ids=[ids["other"]])
+
+
+def test_a_keep_of_the_entire_group_reads_legit_ignore_on_every_member(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    ids = _guard_library(engine_settings, music_dir)
+    ozzy = next(
+        g for g in detect_mismatches(engine_settings, group=True).groups if ids["jem"] in g.file_ids
+    )
+
+    mismatch.set_mismatch_status(
+        engine_settings,
+        status=LEGIT_IGNORE,
+        covers=[*ozzy.comparisons],
+        file_ids=[*ozzy.file_ids, *ozzy.unflagged_ids],
+    )
+
+    conn = connect(engine_settings.db_path)
+    try:
+        states = mismatch.file_states(conn, engine_settings, [ids["jem"], ids["dreamer"]])
+        assert {fid: state.status for fid, state in states.items()} == {
+            ids["jem"]: LEGIT_IGNORE,
+            ids["dreamer"]: LEGIT_IGNORE,
+        }
+        assert mismatch.planner_keep(conn, ids["jem"]) is True
+        assert mismatch.planner_keep(conn, ids["other"]) is False
+    finally:
+        conn.close()
+
+
+def test_gate_state_and_check_files_follow_the_decisions(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    ozzy = _make_mislabeled_library(music_dir)
+    scan_library(engine_settings)
+    jem_id, dreamer_id = _ozzy_ids(engine_settings, ozzy)
+
+    def check() -> list[tuple[int, str]]:
+        conn = connect(engine_settings.db_path)
+        try:
+            return mismatch.check_files(conn, engine_settings, [jem_id, dreamer_id])
+        finally:
+            conn.close()
+
+    assert mismatch.gate_state(engine_settings) == mismatch.GateState(
+        open=False,
+        flagged=1,
+        exceptions_undecided=0,
+    )
+    assert check() == [(jem_id, TOP_FOLDER_ARTIST)]
+
+    mismatch.set_mismatch_status(
+        engine_settings,
+        status=MISFILED_DEFERRED,
+        covers=[TOP_FOLDER_ARTIST],
+        file_ids=[jem_id],
+    )
+
+    assert mismatch.gate_state(engine_settings).to_dict() == {
+        "open": True,
+        "flagged": 0,
+        "exceptions_undecided": 0,
+    }
+    assert check() == []
 
 
 def test_disposition_goes_stale_when_albumartist_edited(
@@ -1076,17 +1455,23 @@ def test_disposition_goes_stale_when_albumartist_edited(
     ozzy = _make_mislabeled_library(music_dir)
     scan_library(engine_settings)
     jem_file = ozzy / "01 Gets Me Through.mp3"
-    jem_id = _file_id(engine_settings, ozzy, "01 Gets Me Through.mp3")
+    jem_id, _ = _ozzy_ids(engine_settings, ozzy)
 
-    mismatch.set_mismatch_status(engine_settings, file_ids=[jem_id], status="legit_ignore")
-    assert _find(detect_mismatches(engine_settings), jem_id) is None  # silenced
+    mismatch.set_mismatch_status(
+        engine_settings,
+        status=MISFILED_DEFERRED,
+        covers=[TOP_FOLDER_ARTIST],
+        file_ids=[jem_id],
+    )
+    assert _find(detect_mismatches(engine_settings), jem_id) is None
 
-    # Edit the albumartist on disk (still disagreeing) + rescan -> snapshot changes -> stale.
+    # Edit the albumartist on disk (still disagreeing) + rescan -> the covered tag changed.
     make_track(jem_file, {"albumartist": ["Jem Griffiths"], "artist": ["Ozzy Osbourne"]})
     scan_library(engine_settings)
 
     resurfaced = _find(detect_mismatches(engine_settings), jem_id)
-    assert resurfaced is not None  # the stale disposition no longer silences it
+    assert resurfaced is not None
+    assert (resurfaced.was, resurfaced.changed) == (MISFILED_DEFERRED, CHANGED_TAGS)
 
 
 # --- end-to-end mismatch-fix flow ----------------------------------------------------
@@ -1154,10 +1539,14 @@ def test_mismatch_fix_flow_end_to_end(
     assert _find(report, jem1).tier == "high"  # type: ignore[union-attr]
     assert [r.file_id for r in report.exception_rows] == [fp_id]
 
-    # 2. silence the curated single -> suppressed + reported, not in rows.
-    assert (
-        mismatch.set_mismatch_status(engine_settings, file_ids=[fp_id], status="legit_ignore") == 1
+    # 2. keep the curated single's folder -> suppressed + reported, not in rows.
+    kept = mismatch.set_mismatch_status(
+        engine_settings,
+        status=LEGIT_IGNORE,
+        covers=[TOP_FOLDER_ARTIST, CURATED],
+        file_ids=[fp_id],
     )
+    assert kept.affected == 1
     silenced = detect_mismatches(engine_settings)
     assert _find(silenced, fp_id) is None
     assert silenced.exception_rows == []
@@ -1243,15 +1632,20 @@ def test_mcp_set_and_reset_mismatch_status_envelopes(music_dir: Path) -> None:
     ozzy = _make_mislabeled_library(music_dir)
     mcp_server.scan_library(path=str(music_dir))
     jem_id = _file_id(config.load_settings(), ozzy, "01 Gets Me Through.mp3")
+    dreamer_id = _file_id(config.load_settings(), ozzy, "03 Dreamer.mp3")
 
-    ok = mcp_server.set_mismatch_status("legit_ignore", file_ids=[jem_id])
-    assert ok == {"ok": True, "affected": 1}
+    split = mcp_server.set_mismatch_status("legit_ignore", ["top_folder_artist"], [jem_id])
+    assert split["ok"] is False
+    assert "unflagged_ids" in str(split["error"])
+
+    ok = mcp_server.set_mismatch_status(
+        "legit_ignore",
+        ["top_folder_artist"],
+        file_ids=[jem_id, dreamer_id],
+    )
+    assert (ok["ok"], ok["affected"], ok["note"]) == (True, 2, mismatch.FILENAME_NOTE)
     payload = mcp_server.detect_mismatches()
-    assert payload["suppressed"] == {"legit_ignore": 1}
-
-    bad = mcp_server.set_mismatch_status("no_match", file_ids=[jem_id])
-    assert bad["ok"] is False
-    assert "error" in bad
+    assert (payload["suppressed"], payload["gate_open"]) == ({"legit_ignore": 2}, True)
 
     assert mcp_server.reset_mismatch_status(file_ids=[jem_id]) == {"ok": True, "affected": 1}
 
@@ -1457,7 +1851,14 @@ def test_container_files_leave_the_reliability_sample() -> None:
 
 
 def test_container_and_disposition_suppression_are_distinct() -> None:
-    dispositions = {200: _disp("legit_ignore", "albumartist", "Wrong Artist")}
+    dispositions = {
+        200: _decision(
+            LEGIT_IGNORE,
+            [TOP_FOLDER_ARTIST],
+            {"albumartist": "Wrong Artist", "artist": None},
+            folder="The Luna Sequence/(2010) Album",
+        ),
+    }
 
     report = mismatch._classify(
         _container_library(),
@@ -1505,3 +1906,456 @@ def test_detect_container_suppression_integration(tmp_path: Path, music_dir: Pat
     assert report.container_suppressed == {"Soundtracks": 4}
     leaf = str(music_dir / "Soundtracks" / "Album A")
     assert detect_mismatches(listed, folder=leaf).rows == []
+
+
+# --- the decision lifecycle: one test per cell of the state table ---------------------
+#
+# T flags the top folder (albumartist "Other" under "Artist") and its filename title. Its
+# filename number 2 is its place in the folder's (disc, track) order while its sibling S sits
+# on disc 1, so a disc edit on S decides whether T's track comparison flags. S flags nothing.
+
+_T_FILE = "02 Song.mp3"
+_S_FILE = "01 Other Song.mp3"
+_T_NAMES = frozenset({TOP_FOLDER_ARTIST, FILENAME_TITLE})
+
+_NO_ROW = "no_row"
+_KEEP_IN_FORCE = "keep_in_force"
+_MISFILED_CURRENT = "misfiled_current"
+_KEEP_NOT_IN_FORCE = "keep_not_in_force"
+_MISFILED_STALE = "misfiled_stale"
+_STATES = (_NO_ROW, _KEEP_IN_FORCE, _MISFILED_CURRENT, _KEEP_NOT_IN_FORCE, _MISFILED_STALE)
+_MOVED_STATES = frozenset({_KEEP_NOT_IN_FORCE, _MISFILED_STALE})
+_KEEP_STATES = frozenset({_KEEP_IN_FORCE, _KEEP_NOT_IN_FORCE})
+
+
+@dataclass(frozen=True, slots=True)
+class _Lib:
+    settings: Settings
+    music: Path
+    t: int
+    s: int
+
+
+@dataclass(frozen=True, slots=True)
+class _Reading:
+    """T's status, unsilenced names, planner keep, stored row status and change reason."""
+
+    status: str
+    unsilenced: frozenset[str]
+    keep: bool
+    row: str | None
+    changed: str | None
+
+
+def _lifecycle_library(settings: Settings, music_dir: Path, *, sibling_disc: str = "1") -> _Lib:
+    album = music_dir / "Artist" / "Album"
+    common = {"album": ["Album"], "tracknumber": ["1"]}
+    make_track(
+        album / _T_FILE,
+        {
+            "albumartist": ["Other"],
+            "artist": ["Other"],
+            "title": ["Different Title"],
+            "discnumber": ["2"],
+            **common,
+        },
+    )
+    make_track(
+        album / _S_FILE,
+        {
+            "albumartist": ["Artist"],
+            "artist": ["Artist"],
+            "title": ["Other Song"],
+            "discnumber": [sibling_disc],
+            **common,
+        },
+    )
+    scan_library(settings)
+    return _Lib(
+        settings=settings,
+        music=music_dir,
+        t=_file_id(settings, album, _T_FILE),
+        s=_file_id(settings, album, _S_FILE),
+    )
+
+
+def _path_of(lib: _Lib, file_id: int) -> Path:
+    conn = connect(lib.settings.db_path)
+    try:
+        row = store.get_file_by_id(conn, file_id)
+        assert row is not None
+        return Path(row.folder) / row.filename
+    finally:
+        conn.close()
+
+
+def _commit_move(lib: _Lib, targets: dict[int, Path]) -> None:
+    """Move each file on disk, append its path revision and repoint its row, as C4 will."""
+    sources = {file_id: _path_of(lib, file_id) for file_id in targets}
+    conn = connect(lib.settings.db_path)
+    try:
+        versions = store.path_versions(conn)
+        for file_id, target in targets.items():
+            target.parent.mkdir(parents=True, exist_ok=True)
+            sources[file_id].rename(target)
+            store.insert_path_revision(
+                conn,
+                file_id=file_id,
+                version=versions.get(file_id, 0) + 1,
+                commit_id=None,
+                origin="manual",
+                from_path=str(sources[file_id]),
+                to_path=str(target),
+                now=_NOW,
+            )
+            store.relocate_file(
+                conn, file_id, folder=str(target.parent), filename=target.name, now=_NOW
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _move_group(lib: _Lib, folder: str) -> None:
+    target = lib.music / "Artist" / folder
+    _commit_move(lib, {fid: target / _path_of(lib, fid).name for fid in (lib.t, lib.s)})
+
+
+def _retag(lib: _Lib, file_id: int, **tags: str) -> None:
+    staging.stage_tags(lib.settings, file_id=file_id, tags={k: [v] for k, v in tags.items()})
+    staging.commit_tags(lib.settings)
+
+
+def _decide(lib: _Lib, status: str, covers: frozenset[str] = _T_NAMES) -> None:
+    file_ids = [lib.t, lib.s] if status == LEGIT_IGNORE else [lib.t]
+    mismatch.set_mismatch_status(
+        lib.settings,
+        status=status,
+        covers=sorted(covers),
+        file_ids=file_ids,
+    )
+
+
+def _enter(lib: _Lib, state: str, covers: frozenset[str] = _T_NAMES) -> None:
+    if state in _KEEP_STATES:
+        _decide(lib, LEGIT_IGNORE, covers)
+    elif state != _NO_ROW:
+        _decide(lib, MISFILED_DEFERRED, covers)
+    if state in _MOVED_STATES:
+        _move_group(lib, "Album Moved")
+
+
+def _reading(lib: _Lib) -> _Reading:
+    conn = connect(lib.settings.db_path)
+    try:
+        state = mismatch.file_states(conn, lib.settings, [lib.t])[lib.t]
+        row = store.get_mismatch_status(conn, lib.t)
+        keep = mismatch.planner_keep(conn, lib.t)
+    finally:
+        conn.close()
+    return _Reading(
+        status=state.status,
+        unsilenced=state.unsilenced,
+        keep=keep,
+        row=None if row is None else row.status,
+        changed=state.changed,
+    )
+
+
+def _human_sets(lib: _Lib, state: str) -> None:
+    _decide(lib, MISFILED_DEFERRED if state in _KEEP_STATES else LEGIT_IGNORE)
+
+
+def _covered_tag_changes(lib: _Lib, _state: str) -> None:
+    _retag(lib, lib.t, title="Another Title")
+
+
+def _covered_tags_return(lib: _Lib, _state: str) -> None:
+    _retag(lib, lib.t, title="Another Title")
+    _retag(lib, lib.t, title="Different Title")
+
+
+def _move_folder(lib: _Lib, _state: str) -> None:
+    _move_group(lib, "Album Elsewhere")
+
+
+def _move_filename(lib: _Lib, _state: str) -> None:
+    path = _path_of(lib, lib.t)
+    _commit_move(lib, {lib.t: path.with_name("02 Song (Live).mp3")})
+
+
+def _revert(lib: _Lib, state: str) -> None:
+    if state not in _MOVED_STATES:
+        _move_group(lib, "Album Moved")
+    _move_group(lib, "Album")
+
+
+def _human_resets(lib: _Lib, _state: str) -> None:
+    mismatch.reset_mismatch_status(lib.settings, file_ids=[lib.t])
+
+
+def _uncovered_name_flags(lib: _Lib, _state: str) -> None:
+    _retag(lib, lib.t, album="Elsewhere")
+
+
+def _sibling_flips(lib: _Lib, _state: str) -> None:
+    _retag(lib, lib.s, discnumber="2")
+
+
+_EVENTS: dict[str, Callable[[_Lib, str], None]] = {
+    "human_sets": _human_sets,
+    "covered_tag_changes": _covered_tag_changes,
+    "covered_tags_return": _covered_tags_return,
+    "committed_move_folder": _move_folder,
+    "committed_move_filename": _move_filename,
+    "revert_returns_old_path": _revert,
+    "human_resets": _human_resets,
+    "name_outside_covers_flags": _uncovered_name_flags,
+    "sibling_edit_flips_a_flag": _sibling_flips,
+}
+
+_TOP: Final = TOP_FOLDER_ARTIST
+_TITLE: Final = FILENAME_TITLE
+_BOTH = frozenset({_TOP, _TITLE})
+_NONE: frozenset[str] = frozenset()
+
+
+def _pending(*names: str, row: str | None = None, changed: str | None = None) -> _Reading:
+    """A reading of T that flags *names* and so reads pending, the planner keeping nothing."""
+    return _Reading(PENDING, frozenset(names), keep=False, row=row, changed=changed)
+
+
+_K, _M = LEGIT_IGNORE, MISFILED_DEFERRED
+_TABLE: dict[tuple[str, str], _Reading] = {
+    # no row: flags follow the tags and the path.
+    (_NO_ROW, "human_sets"): _Reading(_K, _NONE, keep=True, row=_K, changed=None),
+    (_NO_ROW, "covered_tag_changes"): _pending(_TOP, _TITLE),
+    (_NO_ROW, "covered_tags_return"): _pending(_TOP, _TITLE),
+    (_NO_ROW, "committed_move_folder"): _pending(_TOP, _TITLE),
+    (_NO_ROW, "committed_move_filename"): _pending(_TOP, _TITLE),
+    (_NO_ROW, "revert_returns_old_path"): _pending(_TOP, _TITLE),
+    (_NO_ROW, "human_resets"): _pending(_TOP, _TITLE),
+    (_NO_ROW, "name_outside_covers_flags"): _pending(_TOP, _TITLE, RELEASE_FOLDER_ALBUM),
+    (_NO_ROW, "sibling_edit_flips_a_flag"): _pending(_TOP, _TITLE, FILENAME_TRACK),
+    # keep in force: the folder stays kept while its key matches, whatever the tags do.
+    (_KEEP_IN_FORCE, "human_sets"): _Reading(_M, _NONE, keep=False, row=_M, changed=None),
+    (_KEEP_IN_FORCE, "covered_tag_changes"): _Reading(
+        PENDING, frozenset({_TITLE}), keep=True, row=_K, changed=CHANGED_TAGS
+    ),
+    (_KEEP_IN_FORCE, "covered_tags_return"): _Reading(_K, _NONE, keep=True, row=_K, changed=None),
+    (_KEEP_IN_FORCE, "committed_move_folder"): _pending(
+        _TOP, _TITLE, row=_K, changed=CHANGED_MOVED
+    ),
+    (_KEEP_IN_FORCE, "committed_move_filename"): _Reading(
+        PENDING, frozenset({_TITLE}), keep=True, row=_K, changed=CHANGED_MOVED
+    ),
+    (_KEEP_IN_FORCE, "revert_returns_old_path"): _Reading(
+        PENDING, frozenset({_TITLE}), keep=True, row=_K, changed=CHANGED_MOVED
+    ),
+    (_KEEP_IN_FORCE, "human_resets"): _pending(_TOP, _TITLE),
+    (_KEEP_IN_FORCE, "name_outside_covers_flags"): _Reading(
+        PENDING, frozenset({RELEASE_FOLDER_ALBUM}), keep=True, row=_K, changed=CHANGED_UNCOVERED
+    ),
+    (_KEEP_IN_FORCE, "sibling_edit_flips_a_flag"): _Reading(
+        PENDING, frozenset({FILENAME_TRACK}), keep=True, row=_K, changed=CHANGED_UNCOVERED
+    ),
+    # misfiled current: every name binds to the path version.
+    (_MISFILED_CURRENT, "human_sets"): _Reading(_K, _NONE, keep=True, row=_K, changed=None),
+    (_MISFILED_CURRENT, "covered_tag_changes"): _pending(_TITLE, row=_M, changed=CHANGED_TAGS),
+    (_MISFILED_CURRENT, "covered_tags_return"): _Reading(
+        _M, _NONE, keep=False, row=_M, changed=None
+    ),
+    (_MISFILED_CURRENT, "committed_move_folder"): _pending(
+        _TOP, _TITLE, row=_M, changed=CHANGED_MOVED
+    ),
+    (_MISFILED_CURRENT, "committed_move_filename"): _pending(
+        _TOP, _TITLE, row=_M, changed=CHANGED_MOVED
+    ),
+    (_MISFILED_CURRENT, "revert_returns_old_path"): _pending(
+        _TOP, _TITLE, row=_M, changed=CHANGED_MOVED
+    ),
+    (_MISFILED_CURRENT, "human_resets"): _pending(_TOP, _TITLE),
+    (_MISFILED_CURRENT, "name_outside_covers_flags"): _pending(
+        RELEASE_FOLDER_ALBUM, row=_M, changed=CHANGED_UNCOVERED
+    ),
+    (_MISFILED_CURRENT, "sibling_edit_flips_a_flag"): _pending(
+        FILENAME_TRACK, row=_M, changed=CHANGED_UNCOVERED
+    ),
+    # keep not in force: reads as no row until a revert returns the kept folder.
+    (_KEEP_NOT_IN_FORCE, "human_sets"): _Reading(_M, _NONE, keep=False, row=_M, changed=None),
+    (_KEEP_NOT_IN_FORCE, "covered_tag_changes"): _pending(
+        _TOP, _TITLE, row=_K, changed=CHANGED_MOVED
+    ),
+    (_KEEP_NOT_IN_FORCE, "covered_tags_return"): _pending(
+        _TOP, _TITLE, row=_K, changed=CHANGED_MOVED
+    ),
+    (_KEEP_NOT_IN_FORCE, "committed_move_folder"): _pending(
+        _TOP, _TITLE, row=_K, changed=CHANGED_MOVED
+    ),
+    (_KEEP_NOT_IN_FORCE, "committed_move_filename"): _pending(
+        _TOP, _TITLE, row=_K, changed=CHANGED_MOVED
+    ),
+    (_KEEP_NOT_IN_FORCE, "revert_returns_old_path"): _Reading(
+        PENDING, frozenset({_TITLE}), keep=True, row=_K, changed=CHANGED_MOVED
+    ),
+    (_KEEP_NOT_IN_FORCE, "human_resets"): _pending(_TOP, _TITLE),
+    (_KEEP_NOT_IN_FORCE, "name_outside_covers_flags"): _pending(
+        _TOP, _TITLE, RELEASE_FOLDER_ALBUM, row=_K, changed=CHANGED_UNCOVERED
+    ),
+    (_KEEP_NOT_IN_FORCE, "sibling_edit_flips_a_flag"): _pending(
+        _TOP, _TITLE, FILENAME_TRACK, row=_K, changed=CHANGED_UNCOVERED
+    ),
+    # misfiled stale: never re-arms, even when a revert returns the old path.
+    (_MISFILED_STALE, "human_sets"): _Reading(_K, _NONE, keep=True, row=_K, changed=None),
+    (_MISFILED_STALE, "covered_tag_changes"): _pending(_TOP, _TITLE, row=_M, changed=CHANGED_MOVED),
+    (_MISFILED_STALE, "covered_tags_return"): _pending(_TOP, _TITLE, row=_M, changed=CHANGED_MOVED),
+    (_MISFILED_STALE, "committed_move_folder"): _pending(
+        _TOP, _TITLE, row=_M, changed=CHANGED_MOVED
+    ),
+    (_MISFILED_STALE, "committed_move_filename"): _pending(
+        _TOP, _TITLE, row=_M, changed=CHANGED_MOVED
+    ),
+    (_MISFILED_STALE, "revert_returns_old_path"): _pending(
+        _TOP, _TITLE, row=_M, changed=CHANGED_MOVED
+    ),
+    (_MISFILED_STALE, "human_resets"): _pending(_TOP, _TITLE),
+    (_MISFILED_STALE, "name_outside_covers_flags"): _pending(
+        _TOP, _TITLE, RELEASE_FOLDER_ALBUM, row=_M, changed=CHANGED_UNCOVERED
+    ),
+    (_MISFILED_STALE, "sibling_edit_flips_a_flag"): _pending(
+        _TOP, _TITLE, FILENAME_TRACK, row=_M, changed=CHANGED_UNCOVERED
+    ),
+}
+
+
+def test_the_state_table_has_no_blank_cell() -> None:
+    assert set(_TABLE) == {(state, event) for state in _STATES for event in _EVENTS}
+
+
+@pytest.mark.parametrize(("state", "event"), list(_TABLE), ids=[f"{s}-{e}" for s, e in _TABLE])
+def test_decision_lifecycle_cell(
+    engine_settings: Settings,
+    music_dir: Path,
+    state: str,
+    event: str,
+) -> None:
+    lib = _lifecycle_library(engine_settings, music_dir)
+    _enter(lib, state)
+
+    _EVENTS[event](lib, state)
+
+    expected = _TABLE[(state, event)]
+    assert _reading(lib) == expected
+    # S never flags, so the gate is open exactly when T flags nothing unsilenced.
+    assert mismatch.gate_state(engine_settings).open is (not expected.unsilenced)
+
+
+_COVERED_SIBLING: dict[str, _Reading] = {
+    _NO_ROW: _pending(_TOP, _TITLE, FILENAME_TRACK),
+    _KEEP_IN_FORCE: _Reading(_K, _NONE, keep=True, row=_K, changed=None),
+    _MISFILED_CURRENT: _Reading(_M, _NONE, keep=False, row=_M, changed=None),
+    _KEEP_NOT_IN_FORCE: _pending(_TOP, _TITLE, FILENAME_TRACK, row=_K, changed=CHANGED_MOVED),
+    _MISFILED_STALE: _pending(_TOP, _TITLE, FILENAME_TRACK, row=_M, changed=CHANGED_MOVED),
+}
+
+
+@pytest.mark.parametrize("state", _STATES)
+def test_a_sibling_edit_that_flips_a_covered_flag_back_is_silenced(
+    engine_settings: Settings,
+    music_dir: Path,
+    state: str,
+) -> None:
+    # With S on T's disc, T's track flags at decision time, so the decision covers it.
+    lib = _lifecycle_library(engine_settings, music_dir, sibling_disc="2")
+    _enter(lib, state, _T_NAMES | {FILENAME_TRACK})
+
+    _retag(lib, lib.s, discnumber="1")  # T's track comparison clears
+    _retag(lib, lib.s, discnumber="2")  # and flags again
+
+    assert _reading(lib) == _COVERED_SIBLING[state]
+
+
+# --- v23 decisions after the v24 upgrade ------------------------------------------------
+
+
+def _legacy_ledger(settings: Settings, rows: list[tuple[int, str, str | None, str | None]]) -> None:
+    """Rebuild ``file_mismatch_status`` in its v23 shape holding *rows*, stamped v23."""
+    conn = connect(settings.db_path)
+    try:
+        conn.execute("DROP TABLE file_mismatch_status")
+        conn.execute(
+            "CREATE TABLE file_mismatch_status (file_id INTEGER PRIMARY KEY REFERENCES files(id) "
+            "ON DELETE CASCADE, status TEXT NOT NULL, source_field TEXT, source_value TEXT, "
+            "updated_at TEXT NOT NULL)",
+        )
+        conn.executemany(
+            "INSERT INTO file_mismatch_status VALUES (?, ?, ?, ?, ?)",
+            [(*row, _NOW) for row in rows],
+        )
+        conn.execute("PRAGMA user_version = 23")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_migrated_decisions_silence_only_the_top_folder_comparison(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    tracks = {
+        "keep": ("Artist/Album", {"albumartist": ["Jem"], "artist": ["Artist"]}),
+        "null_keep": ("Artist/Blank", {}),
+        "fix": ("Ozzy/Tour", {"artist": ["Ozzy Osbourne"], "title": ["Other"]}),
+        "album_keep": ("Artist/Record", {"albumartist": ["Someone"], "album": ["Different"]}),
+        "null_fix": ("Artist/Quiet", {}),
+        "defer": ("Ozzy/Record", {"artist": ["Jem"]}),
+    }
+    for folder, tags in tracks.values():
+        make_track(music_dir / folder / "01 Song.mp3", tags or None)
+    scan_library(engine_settings)
+    ids = {
+        name: _file_id(engine_settings, music_dir / folder, "01 Song.mp3")
+        for name, (folder, _) in tracks.items()
+    }
+    _legacy_ledger(
+        engine_settings,
+        [
+            (ids["keep"], LEGIT_IGNORE, "albumartist", "Jem"),
+            (ids["null_keep"], LEGIT_IGNORE, None, None),
+            (ids["fix"], MISFILED_DEFERRED, "artist", "Ozzy Osbourne"),
+            (ids["album_keep"], LEGIT_IGNORE, "albumartist", "Someone"),
+            (ids["null_fix"], MISFILED_DEFERRED, None, None),
+            (ids["defer"], MISFILED_DEFERRED, "artist", "Jem"),
+        ],
+    )
+
+    def readings() -> dict[str, tuple[str, frozenset[str], str | None]]:
+        conn = connect(engine_settings.db_path)
+        try:
+            apply_schema(conn)
+            states = mismatch.file_states(conn, engine_settings, list(ids.values()))
+        finally:
+            conn.close()
+        return {
+            name: (states[fid].status, states[fid].unsilenced, states[fid].changed)
+            for name, fid in ids.items()
+        }
+
+    assert readings() == {
+        "keep": (LEGIT_IGNORE, frozenset(), None),
+        "null_keep": (LEGIT_IGNORE, frozenset(), None),
+        "fix": (PENDING, frozenset({FILENAME_TITLE}), CHANGED_UNCOVERED),
+        "album_keep": (PENDING, frozenset({RELEASE_FOLDER_ALBUM}), CHANGED_UNCOVERED),
+        "null_fix": (MISFILED_DEFERRED, frozenset(), None),
+        "defer": (MISFILED_DEFERRED, frozenset(), None),
+    }
+
+    staging.stage_tags(engine_settings, file_id=ids["keep"], tags={"albumartist": ["Jem G"]})
+    staging.stage_tags(engine_settings, file_id=ids["null_keep"], tags={"artist": ["Nobody"]})
+    staging.stage_tags(engine_settings, file_id=ids["defer"], tags={"albumartist": ["Someone New"]})
+    staging.commit_tags(engine_settings)
+
+    changed = readings()
+    assert changed["keep"] == (PENDING, frozenset({TOP_FOLDER_ARTIST}), CHANGED_TAGS)
+    assert changed["null_keep"] == (PENDING, frozenset({TOP_FOLDER_ARTIST}), CHANGED_TAGS)
+    assert changed["defer"] == (PENDING, frozenset({TOP_FOLDER_ARTIST}), CHANGED_TAGS)

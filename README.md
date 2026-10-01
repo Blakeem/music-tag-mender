@@ -192,12 +192,12 @@ The MCP server exposes 38 tools. All tag edits are staged in memory and only wri
 
 ### Mismatch fixing
 
-Use `detect_mismatches` (above) to find files whose path disagrees with their own tags, then drive the fix through the staging engine (`stage_tags_batch` → `commit_tags` → `reopen_axes`) and disposition the false positives.
+Use `detect_mismatches` (above) to find files whose path disagrees with their own tags. Fix a wrong tag through the staging engine (`stage_tags_batch` → `commit_tags` → `reopen_axes`), or record a path decision for the group. `legit_ignore` keeps the folder. `misfiled_deferred` lets the tags render every level of the path. No decision keeps a filename, so write a wording you want to keep into the tag. A decision covers the names its group flags. The file flags again when a covered tag changes or a committed move changes its path. The report reads `gate_open: true` once every group is fixed or decided.
 
 | Tool | Description |
 |------|-------------|
-| `set_mismatch_status` | Silence a mismatch false positive (`legit_ignore`) or defer a misfiled file (`misfiled_deferred`), or clear with `pending` |
-| `reset_mismatch_status` | Clear any mismatch disposition for in-scope files, returning them to `pending` |
+| `set_mismatch_status` | Record a path decision for one group. `legit_ignore` keeps its folder, and `misfiled_deferred` renders every level from the tags |
+| `reset_mismatch_status` | Delete the path decision of in-scope files |
 | `reopen_axes` | After committing a manual identity fix, re-open the file's genre, artist, year and song outcomes. `manual` rows are kept |
 
 ## Development

@@ -688,6 +688,21 @@ def test_detect_mismatches_rejects_an_unknown_comparison(music_dir: Path) -> Non
     assert "unknown comparison" in str(payload["error"])
 
 
+def test_set_mismatch_status_requires_covers_and_offers_only_decisions() -> None:
+    tools = asyncio.run(mcp_server.mcp.list_tools())
+
+    tool = next(tool for tool in tools if tool.name == "set_mismatch_status")
+    schema = tool.inputSchema
+
+    assert set(schema["required"]) == {"status", "covers"}
+    assert set(_enum_values(schema["properties"]["status"])) == {
+        "legit_ignore",
+        "misfiled_deferred",
+    }
+    covers = json.dumps(schema["properties"]["covers"])
+    assert all(f'"{name}"' in covers for name in mismatch.NAMES)
+
+
 def test_tool_schemas_survive_the_envelope() -> None:
     tools = asyncio.run(mcp_server.mcp.list_tools())
 

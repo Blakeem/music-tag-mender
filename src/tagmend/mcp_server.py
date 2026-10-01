@@ -154,8 +154,9 @@ def get_library_stats() -> dict[str, object]:
       ``manual`` for ``resolve_years``. Drill with ``list_files(year_status=...)``.
     * ``song``: ``pending`` / ``staged`` / ``done`` / ``manual`` for ``resolve_songs``. Drill
       with ``list_files(song_status=...)``.
-    * ``mismatch``: ``pending`` / ``legit_ignore`` / ``misfiled_deferred`` for
-      ``detect_mismatches`` dispositions. Drill with ``list_files(mismatch_status=...)``.
+    * ``mismatch``: ``pending`` / ``legit_ignore`` / ``misfiled_deferred``, the path decision
+      each present file reads (see ``detect_mismatches``). The counts sum to ``present``. Drill
+      with ``list_files(mismatch_status=...)``.
     """
     return {"ok": True, **library.get_library_stats(load_settings())}
 
@@ -419,18 +420,18 @@ def list_files(  # noqa: PLR0913 - cohesive MCP discovery filters
             | ``staged`` | ``done``). Combined with the other filters, a file must match ALL.
             ``song_source_album_mbid`` / ``song_source_release_track_mbid`` carry the release
             ids a stored decision was taken against.
-        mismatch_status: Return only files with this mismatch disposition
-            (``pending`` | ``legit_ignore`` | ``misfiled_deferred``). Combined with the other
-            filters, a file must match ALL. ``mismatch_source_field`` / ``mismatch_source_value``
-            carry the disagreeing tag a stored disposition was recorded against.
+        mismatch_status: Return only present files reading this path decision
+            (``pending`` | ``legit_ignore`` | ``misfiled_deferred``). A decided file that flags
+            again reads ``pending``. Combined with the other filters, a file must match ALL.
+            ``mismatch_source_value`` carries the snapshot of the decision the file reads:
+            ``covers``, ``tags``, ``path_version`` and, on a keep, ``folder_key``.
 
     Returns:
         ``{"ok": True, "files": [{file_id, folder, filename, ext, is_missing,
         managed_tags, genre_status, genre_source_artist, genre_source_album,
         artist_status, artist_source_artist, artist_source_albumartist, year_status,
         year_source_artist, year_source_album, song_status, song_source_album_mbid,
-        song_source_release_track_mbid, mismatch_status, mismatch_source_field,
-        mismatch_source_value}, ...]}``,
+        song_source_release_track_mbid, mismatch_status, mismatch_source_value}, ...]}``,
         or ``{"ok": False, "error": ...}`` on a bad request.
     """
     views = library.list_files(
@@ -455,7 +456,7 @@ def get_file(file_id: int) -> dict[str, object]:
     managed_tags, genre_status, genre_source_artist, genre_source_album, artist_status,
     artist_source_artist, artist_source_albumartist, year_status, year_source_artist,
     year_source_album, song_status, song_source_album_mbid, song_source_release_track_mbid,
-    mismatch_status, mismatch_source_field, mismatch_source_value}}``,
+    mismatch_status, mismatch_source_value}}``,
     or ``{"ok": False, "error": ...}`` if the id is unknown.
     """
     view = library.get_file(load_settings(), file_id)
@@ -508,19 +509,32 @@ def detect_mismatches(
     ``exceptions_undecided``, outside ``flagged``. A curated file skips the album and year
     comparisons. An exception file that also differs is in ``rows`` as well.
 
-    Recommended workflow: start with ``group=true`` for one line per release folder, then expand
-    one with ``folder="<group folder>"``. Fix a wrong tag with ``stage_tags_batch`` ->
-    ``diff_tags`` -> ``commit_tags(path=<folder>)`` -> ``reopen_axes``. Silence a correct path
-    or defer a misfiled file with ``set_mismatch_status``. A silenced file leaves the rows and is
-    counted under ``suppressed``. The disposition goes stale, and the file re-surfaces, when its
-    ``albumartist`` (or ``artist``) changes.
+    The path decisions (``set_mismatch_status``) gate the path tools. ``gate_open`` is true when
+    ``flagged`` and ``exceptions_undecided`` are both 0. Workflow:
+
+    1. Finish the tag phases first, ``resolve_songs`` included, so the filename comparisons
+       judge verified titles and track numbers.
+    2. Set ``container_folders`` for a top folder that holds several artists
+       (``Soundtracks``).
+    3. Call ``detect_mismatches(group=true)``. For each group, either fix the tags
+       (``stage_tags_batch`` -> ``commit_tags`` -> ``reopen_axes``) and re-read the group, or
+       call ``set_mismatch_status(file_ids=<file_ids>, status="misfiled_deferred",
+       covers=<comparisons + exception>)``, or call ``set_mismatch_status(file_ids=<file_ids +
+       unflagged_ids>, status="legit_ignore", covers=<same>)``.
+    4. Stop when the header reads ``gate_open: true``.
+
+    A decision silences the names it covers while it binds the file. A covered tag edit, a
+    committed move and a name outside its covers each make the file flag again. Its row then
+    carries ``was`` (the decision) and ``changed`` (``uncovered``, ``moved`` or ``tags``).
+    ``suppressed`` counts the files per decision in force, and ``stale`` the decisions no longer
+    in force.
 
     Tiers: a ``top_folder_artist`` difference is ``high`` in a group with mixed albumartists,
     ``medium`` in a uniform group, and ``low`` in a one-file or curated group, for the
     ``artist`` fallback, or while ``path_signal_unreliable`` is true (more than 30 percent of
     files differ from their top folder). A number difference is ``high``. A name difference is
     ``low`` for a near spelling, ``high`` when no word is shared, else ``medium``. A file's tier
-    is its most severe difference.
+    is its most severe unsilenced difference.
 
     Args:
         tier: Return only files of this tier. Exception rows are dropped. In the grouped view,
@@ -531,20 +545,23 @@ def detect_mismatches(
             ``file_count``, ``flagged``, ``tier``, ``comparisons`` (``{name: {files, tag,
             path}}``, one example pair each), ``mb_stamped`` (every flagged file carries
             ``musicbrainz_albumid``), ``exception``, ``suppressed``, ``file_ids`` (flagged and
-            exception files) and ``unflagged_ids`` (every other present file).
+            exception files) and ``unflagged_ids`` (the present files that flag nothing). A
+            file whose every flag a decision silences is in neither. ``comparisons`` counts
+            silenced names too, since a new decision's ``covers`` must name every flag.
         folder: Return the flat rows of the group this folder keys, or of this folder. Takes
             precedence over ``group``. Compared as a path: case and ``/`` versus backslash do
             not matter on Windows, and a relative folder resolves under ``music_path``.
-        comparison: Return only files carrying this difference. Each row still lists every
-            difference of its file. Exception rows are dropped.
+        comparison: Return only files carrying this difference unsilenced. Each row still lists
+            every difference of its file, silenced ones included. Exception rows are dropped.
 
     Returns:
         ``{"ok": True, rows, exception_rows, groups, total_files, flagged, group_count,
         by_comparison, high, medium, low, exceptions_undecided, disagreement_rate,
-        path_signal_unreliable, suppressed, container_suppressed, summary}``. Each row is
-        ``{file_id, folder, filename, tier, differences: [{comparison, tag_value, path_value}],
-        exception}``. The counts describe the whole library. Or ``{"ok": False, "error": ...}``
-        (no music path configured, an unknown tier or comparison).
+        path_signal_unreliable, gate_open, suppressed, stale, container_suppressed, summary}``.
+        Each row is ``{file_id, folder, filename, tier, differences: [{comparison, tag_value,
+        path_value, silenced}], exception, was, changed}``. The counts describe the entire
+        library. Or ``{"ok": False, "error": ...}`` (no music path configured, an unknown tier
+        or comparison).
     """
     report = mismatch.detect_mismatches(
         load_settings(),
@@ -1409,39 +1426,72 @@ def reset_artist_status(
 @mcp.tool()
 @_error_envelope
 def set_mismatch_status(
-    status: Literal["legit_ignore", "misfiled_deferred", "pending"],
+    status: Literal["legit_ignore", "misfiled_deferred"],
+    covers: list[
+        Literal[
+            "top_folder_artist",
+            "release_folder_album",
+            "release_folder_year",
+            "disc_folder_number",
+            "filename_track",
+            "filename_title",
+            "curated",
+            "nested",
+        ]
+    ],
     file_ids: list[int] | None = None,
     value: str | None = None,
 ) -> dict[str, object]:
-    """Silence a mismatch false positive or defer a misfiled file (or clear with ``pending``).
+    """Record a path decision for one ``detect_mismatches`` group, so the path tools may proceed.
 
-    For files ``detect_mismatches`` flags, record a sticky disposition so the detector stops
-    surfacing them: ``legit_ignore`` for a false positive (a legit remix/guest/alias), or
-    ``misfiled_deferred`` for a genuinely misfiled file you want to handle later. Both snapshot
-    the file's current disagreeing tag, so the disposition goes stale — and the file
-    re-surfaces — if that tag later changes. ``pending`` removes any disposition (re-queue). An
-    accepted fix needs NO disposition: once you correct the tag so it agrees with the path, the
-    detector stops flagging it on its own.
+    * ``legit_ignore``: the file's current folder stays. The path tools keep the folder and
+      render only the filename from the tags. It may also be set on a file that flags nothing,
+      a durable keep of its folder.
+    * ``misfiled_deferred``: the tags are right. The path tools render every level of the path
+      from the tags.
 
-    Scope is ``file_ids`` when given, else every file carrying ``value`` as its ``artist`` OR
-    ``albumartist`` tag (so silencing ``"Jem"`` catches it on either field).
+    No status keeps a filename. Covering a filename difference means the tag is right and the
+    filename will follow it. To keep a filename's wording, write it into the tag.
+
+    Finish the tag phases (``resolve_songs`` included) and set ``container_folders`` first.
+    Then read ``detect_mismatches(group=true)``. Per group, fix the tags, or call
+    ``set_mismatch_status(file_ids=<file_ids>, status="misfiled_deferred", covers=<comparisons +
+    exception>)``, or ``set_mismatch_status(file_ids=<file_ids + unflagged_ids>,
+    status="legit_ignore", covers=<same>)``. Stop when ``detect_mismatches`` reads
+    ``gate_open: true``.
+
+    The entire call is refused, nothing written, when a scoped file flags a name outside
+    ``covers`` (the error lists each ``(file_id, name)``), when the scope spans more than one
+    release-folder group, when a keep would leave a present group member without a keep, when
+    ``misfiled_deferred`` names a file that flags nothing, when a file holds a staged path
+    change (run ``unstage_paths``), and for an unknown or missing id.
+
+    Each row covers the names its file flags now and snapshots their tags, the file's path
+    version and, on a keep, its folder. The file flags again when a covered tag changes, when a
+    committed move changes its path, or when it flags a name outside its covers.
 
     Args:
-        status: ``legit_ignore`` | ``misfiled_deferred`` to disposition, ``pending`` to clear.
-        file_ids: Limit to these file ids.
-        value: Limit to files carrying this value as ``artist`` or ``albumartist`` (used when
-            ``file_ids`` is omitted).
+        status: ``legit_ignore`` (keep the folder) or ``misfiled_deferred`` (render every level).
+        covers: The comparisons and class decided: the group's ``comparisons`` keys plus its
+            ``exception``. Pass ``[]`` to keep the folder of files that flag nothing.
+        file_ids: The files decided, from one group.
+        value: Instead of ``file_ids``, every present file carrying this ``artist`` or
+            ``albumartist`` whose top folder differs. Takes only
+            ``status="misfiled_deferred"`` with ``covers=["top_folder_artist"]``.
 
     Returns:
-        ``{"ok": True, "affected": <count>}``, or ``{"ok": False, "error": ...}``.
+        ``{"ok": True, status, affected, skipped_unflagged, covers: {name: files}, files:
+        [{file_id, folder: "kept" | "rendered", filename: "rendered"}], note}``, or
+        ``{"ok": False, "error": ...}``.
     """
-    affected = mismatch.set_mismatch_status(
+    result = mismatch.set_mismatch_status(
         load_settings(),
+        status=status,
+        covers=covers,
         file_ids=file_ids,
         value=value,
-        status=status,
     )
-    return {"ok": True, "affected": affected}
+    return {"ok": True, **result.to_dict()}
 
 
 @mcp.tool()
@@ -1450,10 +1500,10 @@ def reset_mismatch_status(
     file_ids: list[int] | None = None,
     value: str | None = None,
 ) -> dict[str, object]:
-    """Clear any mismatch disposition for in-scope files, returning them to ``pending``.
+    """Delete the path decision of in-scope files, so ``detect_mismatches`` reads them afresh.
 
-    Removes the ``legit_ignore``/``misfiled_deferred`` disposition so ``detect_mismatches`` will
-    surface the files again.
+    A delete authorises nothing, so no covers or group rule applies. Refused for an unknown or
+    missing id and for a file holding a staged path change (run ``unstage_paths``).
 
     Args:
         file_ids: Limit to these file ids.
@@ -1461,8 +1511,7 @@ def reset_mismatch_status(
             ``file_ids`` is omitted).
 
     Returns:
-        ``{"ok": True, "affected": <count>}``, or ``{"ok": False, "error": ...}`` if a file id
-        is unknown.
+        ``{"ok": True, "affected": <count>}``, or ``{"ok": False, "error": ...}``.
     """
     affected = mismatch.reset_mismatch_status(
         load_settings(),

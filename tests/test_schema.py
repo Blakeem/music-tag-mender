@@ -27,7 +27,7 @@ def test_apply_schema_stamps_current_version(db_conn: sqlite3.Connection) -> Non
     # db_conn already applied the schema; the stamp must match the constant the code ships.
     version = db_conn.execute("PRAGMA user_version").fetchone()[0]
     assert version == SCHEMA_VERSION
-    assert SCHEMA_VERSION == 23
+    assert SCHEMA_VERSION == 24
 
 
 def test_apply_schema_creates_genre_tables(db_conn: sqlite3.Connection) -> None:
@@ -75,11 +75,12 @@ def test_file_mismatch_status_columns(db_conn: sqlite3.Connection) -> None:
     cursor = db_conn.execute("PRAGMA table_info(file_mismatch_status)")
     columns = {str(row[1]): (str(row[2]), bool(row[3]), bool(row[5])) for row in cursor.fetchall()}
     # name -> (declared type, NOT NULL, is-primary-key)
-    assert columns["file_id"] == ("INTEGER", False, True)
-    assert columns["status"] == ("TEXT", True, False)
-    assert columns["source_field"] == ("TEXT", False, False)
-    assert columns["source_value"] == ("TEXT", False, False)
-    assert columns["updated_at"] == ("TEXT", True, False)
+    assert columns == {
+        "file_id": ("INTEGER", False, True),
+        "status": ("TEXT", True, False),
+        "source_value": ("TEXT", False, False),
+        "updated_at": ("TEXT", True, False),
+    }
 
 
 def test_apply_schema_is_idempotent() -> None:
@@ -895,9 +896,8 @@ def test_file_mismatch_status_cascades_on_file_delete(db_conn: sqlite3.Connectio
     file_id = _insert_file(db_conn)
     db_conn.execute(
         """
-        INSERT INTO file_mismatch_status
-          (file_id, status, source_field, source_value, updated_at)
-        VALUES (?, 'legit_ignore', 'albumartist', 'Jem', '2026-07-04T00:00:00+00:00')
+        INSERT INTO file_mismatch_status (file_id, status, source_value, updated_at)
+        VALUES (?, 'legit_ignore', '{"covers":[]}', '2026-07-04T00:00:00+00:00')
         """,
         (file_id,),
     )
@@ -1323,5 +1323,119 @@ def test_v20_upgrade_replays_manual_revisions_without_the_song_table() -> None:
 
         assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
         assert conn.execute("SELECT COUNT(*) FROM file_song_status").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+# --- v24: mismatch rows as covers snapshots -----------------------------------------
+
+_V23_MISMATCH_DDL = """
+CREATE TABLE file_mismatch_status (
+  file_id       INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
+  status        TEXT NOT NULL,
+  source_field  TEXT,
+  source_value  TEXT,
+  updated_at    TEXT NOT NULL
+)
+"""
+
+
+def _build_v23_mismatch_ledger(conn: sqlite3.Connection) -> dict[str, int]:
+    """Build a v23 ledger holding the four legacy row shapes. Returns their file ids."""
+    apply_schema(conn)
+    conn.execute("DROP TABLE file_mismatch_status")
+    conn.execute(_V23_MISMATCH_DDL)
+    ids = {
+        name: _insert_file_at(conn, f"/lib/{name}", "a.mp3")
+        for name in ("keep", "fix", "null_keep", "null_fix")
+    }
+    rows = [
+        (ids["keep"], "legit_ignore", "albumartist", "Jem"),
+        (ids["fix"], "misfiled_deferred", "artist", "Ozzy"),
+        (ids["null_keep"], "legit_ignore", None, None),
+        (ids["null_fix"], "misfiled_deferred", None, None),
+    ]
+    conn.executemany(
+        """
+        INSERT INTO file_mismatch_status
+          (file_id, status, source_field, source_value, updated_at)
+        VALUES (?, ?, ?, ?, '2026-07-04T00:00:00+00:00')
+        """,
+        rows,
+    )
+    conn.execute("PRAGMA user_version = 23")
+    conn.commit()
+    return ids
+
+
+def _mismatch_snapshots(conn: sqlite3.Connection) -> dict[int, tuple[str, object]]:
+    cursor = conn.execute("SELECT file_id, status, source_value FROM file_mismatch_status")
+    return {int(row[0]): (str(row[1]), json.loads(str(row[2]))) for row in cursor.fetchall()}
+
+
+def test_v23_mismatch_rows_become_covers_snapshots_in_place() -> None:
+    conn = sqlite3.connect(":memory:")
+    try:
+        ids = _build_v23_mismatch_ledger(conn)
+
+        apply_schema(conn)  # the in-place upgrade
+
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        assert _columns(conn, "file_mismatch_status") == [
+            "file_id",
+            "status",
+            "source_value",
+            "updated_at",
+        ]
+        covers = ["top_folder_artist"]
+        blank = {"albumartist": None, "artist": None}
+        assert _mismatch_snapshots(conn) == {
+            ids["keep"]: (
+                "legit_ignore",
+                {
+                    "covers": covers,
+                    "tags": {"albumartist": "Jem"},
+                    "path_version": 0,
+                    "folder_key": path_keys.path_key("/lib/keep"),
+                },
+            ),
+            ids["fix"]: (
+                "misfiled_deferred",
+                {
+                    "covers": covers,
+                    "tags": {"albumartist": None, "artist": "Ozzy"},
+                    "path_version": 0,
+                },
+            ),
+            ids["null_keep"]: (
+                "legit_ignore",
+                {
+                    "covers": covers,
+                    "tags": blank,
+                    "path_version": 0,
+                    "folder_key": path_keys.path_key("/lib/null_keep"),
+                },
+            ),
+            ids["null_fix"]: (
+                "misfiled_deferred",
+                {"covers": covers, "tags": blank, "path_version": 0},
+            ),
+        }
+    finally:
+        conn.close()
+
+
+def test_v24_migration_is_idempotent() -> None:
+    conn = sqlite3.connect(":memory:")
+    try:
+        _build_v23_mismatch_ledger(conn)
+        apply_schema(conn)
+        migrated = _mismatch_snapshots(conn)
+        conn.execute("PRAGMA user_version = 23")
+        conn.commit()
+
+        apply_schema(conn)  # source_field is gone, so the rewrite does not run again
+
+        assert _mismatch_snapshots(conn) == migrated
     finally:
         conn.close()

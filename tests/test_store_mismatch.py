@@ -1,19 +1,34 @@
-"""Unit tests for the mismatch-axis data-access layer in :mod:`tagmend.engine.store`.
+"""Unit tests for the mismatch-axis data access in :mod:`tagmend.engine.store`.
 
-Covers the ``file_mismatch_status`` CRUD wrappers, the bulk ``load_mismatch_statuses``
-reader, the stored-or-pending ``derived_mismatch_status`` (which must NOT route through the
-field-aware ``derived_status`` used by the other axes), and the SQL-aggregate
-``mismatch_status_counts`` + its ``compute_stats`` block.
+Covers the ``file_mismatch_status`` row and its JSON snapshot, the bulk
+``load_mismatch_statuses`` reader, and the ``path_revisions`` helpers the mismatch reading and
+the path tools share. The reading itself (:func:`tagmend.engine.mismatch.file_states`) is
+covered in ``test_mismatch.py``.
 """
 
 from __future__ import annotations
 
 import sqlite3
 
-from tagmend.engine import axis, store
+from tagmend.engine import path_keys, store
 
 _NOW = "2026-07-04T00:00:00+00:00"
 _LATER = "2026-07-04T01:00:00+00:00"
+
+_KEEP = store.MismatchStatusRow(
+    status="legit_ignore",
+    covers=("top_folder_artist",),
+    tags={"albumartist": "Jem", "artist": None},
+    path_version=0,
+    folder_key="/lib",
+)
+_DEFER = store.MismatchStatusRow(
+    status="misfiled_deferred",
+    covers=("filename_title", "curated"),
+    tags={"title": "Song"},
+    path_version=2,
+    folder_key=None,
+)
 
 
 def _insert(
@@ -33,7 +48,7 @@ def _insert(
     )
 
 
-# --- CRUD ----------------------------------------------------------------------------
+# --- the decision row ----------------------------------------------------------------
 
 
 def test_mismatch_status_absent_returns_none(db_conn: sqlite3.Connection) -> None:
@@ -43,53 +58,58 @@ def test_mismatch_status_absent_returns_none(db_conn: sqlite3.Connection) -> Non
 
 def test_mismatch_status_set_get_delete_round_trip(db_conn: sqlite3.Connection) -> None:
     file_id = _insert(db_conn)
-    store.set_mismatch_status(
-        db_conn,
-        file_id=file_id,
-        status="legit_ignore",
-        source_field="albumartist",
-        source_value="Jem",
-        now=_NOW,
-    )
-    row = store.get_mismatch_status(db_conn, file_id)
-    assert row is not None
-    assert row.status == "legit_ignore"
-    assert row.source_field == "albumartist"
-    assert row.source_value == "Jem"
 
+    store.set_mismatch_status(db_conn, file_id=file_id, row=_KEEP, now=_NOW)
+
+    assert store.get_mismatch_status(db_conn, file_id) == _KEEP
     store.delete_mismatch_status(db_conn, file_id)
     assert store.get_mismatch_status(db_conn, file_id) is None
     store.delete_mismatch_status(db_conn, file_id)  # idempotent no-op
 
 
-def test_mismatch_status_set_replaces_and_allows_null_sources(
+def test_mismatch_status_snapshot_omits_folder_key_on_a_deferral(
     db_conn: sqlite3.Connection,
 ) -> None:
     file_id = _insert(db_conn)
-    store.set_mismatch_status(
-        db_conn,
-        file_id=file_id,
-        status="legit_ignore",
-        source_field="artist",
-        source_value="X",
-        now=_NOW,
+
+    store.set_mismatch_status(db_conn, file_id=file_id, row=_DEFER, now=_NOW)
+
+    raw = db_conn.execute(
+        "SELECT source_value FROM file_mismatch_status WHERE file_id = ?",
+        (file_id,),
+    ).fetchone()[0]
+    assert raw == (
+        '{"covers":["filename_title","curated"],"path_version":2,"tags":{"title":"Song"}}'
     )
-    store.set_mismatch_status(
-        db_conn,
-        file_id=file_id,
-        status="misfiled_deferred",
-        source_field=None,
-        source_value=None,
-        now=_LATER,
+
+
+def test_mismatch_status_set_replaces(db_conn: sqlite3.Connection) -> None:
+    file_id = _insert(db_conn)
+    store.set_mismatch_status(db_conn, file_id=file_id, row=_KEEP, now=_NOW)
+
+    store.set_mismatch_status(db_conn, file_id=file_id, row=_DEFER, now=_LATER)
+
+    assert store.get_mismatch_status(db_conn, file_id) == _DEFER
+
+
+def test_a_row_with_no_snapshot_binds_nothing(db_conn: sqlite3.Connection) -> None:
+    # The column stays nullable after the v24 upgrade, so a hand-written row may hold NULL.
+    file_id = _insert(db_conn)
+    db_conn.execute(
+        "INSERT INTO file_mismatch_status (file_id, status, source_value, updated_at) "
+        "VALUES (?, 'misfiled_deferred', NULL, ?)",
+        (file_id, _NOW),
     )
+
     row = store.get_mismatch_status(db_conn, file_id)
-    assert row is not None
-    assert row.status == "misfiled_deferred"
-    assert row.source_field is None
-    assert row.source_value is None
 
-
-# --- load_mismatch_statuses (bulk read for the skip-filter) --------------------------
+    assert row == store.MismatchStatusRow(
+        status="misfiled_deferred",
+        covers=(),
+        tags={},
+        path_version=None,
+        folder_key=None,
+    )
 
 
 def test_load_mismatch_statuses_empty(db_conn: sqlite3.Connection) -> None:
@@ -99,146 +119,64 @@ def test_load_mismatch_statuses_empty(db_conn: sqlite3.Connection) -> None:
 def test_load_mismatch_statuses_returns_all_rows(db_conn: sqlite3.Connection) -> None:
     one = _insert(db_conn, filename="one.mp3")
     two = _insert(db_conn, filename="two.mp3")
-    _insert(db_conn, filename="none.mp3")  # no disposition -> absent from the map
-    store.set_mismatch_status(
-        db_conn,
-        file_id=one,
-        status="legit_ignore",
-        source_field="albumartist",
-        source_value="Jem",
-        now=_NOW,
-    )
-    store.set_mismatch_status(
-        db_conn,
-        file_id=two,
-        status="misfiled_deferred",
-        source_field="artist",
-        source_value="Q",
-        now=_NOW,
-    )
+    _insert(db_conn, filename="none.mp3")  # no decision -> absent from the map
+    store.set_mismatch_status(db_conn, file_id=one, row=_KEEP, now=_NOW)
+    store.set_mismatch_status(db_conn, file_id=two, row=_DEFER, now=_NOW)
 
-    loaded = store.load_mismatch_statuses(db_conn)
-    assert set(loaded) == {one, two}
-    assert loaded[one].status == "legit_ignore"
-    assert loaded[one].source_field == "albumartist"
-    assert loaded[two].source_value == "Q"
+    assert store.load_mismatch_statuses(db_conn) == {one: _KEEP, two: _DEFER}
 
 
-# --- derived_mismatch_status (stored-or-pending, never staged/done) ------------------
-
-
-def test_derived_mismatch_status_pending_when_no_row(db_conn: sqlite3.Connection) -> None:
-    file_id = _insert(db_conn)
-    assert store.derived_mismatch_status(db_conn, file_id) == "pending"
-
-
-def test_derived_mismatch_status_returns_stored(db_conn: sqlite3.Connection) -> None:
-    file_id = _insert(db_conn)
-    store.set_mismatch_status(
-        db_conn,
-        file_id=file_id,
-        status="legit_ignore",
-        source_field="albumartist",
-        source_value="Jem",
-        now=_NOW,
-    )
-    assert store.derived_mismatch_status(db_conn, file_id) == "legit_ignore"
-
-
-def test_derived_mismatch_status_ignores_staged_and_auto_changes(
+def test_compute_stats_leaves_the_mismatch_block_to_the_library(
     db_conn: sqlite3.Connection,
 ) -> None:
-    # A staged/committed artist change must NOT read as a mismatch state: the mismatch axis
-    # is stored-or-pending, so a file with only an artist auto revision stays 'pending'.
-    file_id = _insert(db_conn)
-    store.insert_revision(
-        db_conn,
-        file_id=file_id,
-        version=0,
-        origin="auto",
-        managed_tags={"artist": ["X"]},
-        diff={"artist": {"from": [], "to": ["X"]}},
-        now=_NOW,
-    )
-    store.upsert_staged_tag(
-        db_conn,
-        file_id=file_id,
-        managed_tags={"albumartist": ["Y"]},
-        origin="manual",
-        now=_NOW,
-    )
-    # Artist axis sees staged/done; mismatch axis stays pending (no disposition row).
-    assert store.derived_status(db_conn, axis.ARTIST_AXIS, file_id) == "staged"
-    assert store.derived_mismatch_status(db_conn, file_id) == "pending"
+    # The mismatch reading needs the comparator and the settings, which store has neither of.
+    _insert(db_conn)
+    assert "mismatch" not in store.compute_stats(db_conn)
 
 
-# --- mismatch_status_counts (SQL aggregate; pending = files - rows) ------------------
+# --- path_revisions helpers ------------------------------------------------------------
 
 
-def test_mismatch_status_counts_all_keys_present_when_empty(
-    db_conn: sqlite3.Connection,
-) -> None:
-    counts = store.mismatch_status_counts(db_conn)
-    assert set(counts) == store.MISMATCH_WORKFLOW_STATUSES
-    assert all(value == 0 for value in counts.values())
+def test_path_versions_hold_each_file_s_highest_version(db_conn: sqlite3.Connection) -> None:
+    moved = _insert(db_conn, filename="moved.mp3")
+    _insert(db_conn, filename="still.mp3")
+    for version in (1, 2):
+        store.insert_path_revision(
+            db_conn,
+            file_id=moved,
+            version=version,
+            commit_id=None,
+            origin="manual",
+            from_path="/lib/a.mp3",
+            to_path="/lib/b.mp3",
+            now=_NOW,
+        )
+
+    assert store.path_versions(db_conn) == {moved: 2}
 
 
-def test_mismatch_status_counts_matrix(db_conn: sqlite3.Connection) -> None:
-    pending = _insert(db_conn, filename="p.mp3")  # no row
-    ignore = _insert(db_conn, filename="i.mp3")
-    deferred = _insert(db_conn, filename="d.mp3")
-    assert pending  # bound for clarity
-    store.set_mismatch_status(
-        db_conn,
-        file_id=ignore,
-        status="legit_ignore",
-        source_field="albumartist",
-        source_value="Jem",
-        now=_NOW,
-    )
-    store.set_mismatch_status(
-        db_conn,
-        file_id=deferred,
-        status="misfiled_deferred",
-        source_field="artist",
-        source_value="Q",
-        now=_NOW,
+def test_relocate_file_moves_the_row_and_its_path_key(db_conn: sqlite3.Connection) -> None:
+    file_id = _insert(db_conn, folder="/lib/Old", filename="a.mp3")
+
+    store.relocate_file(db_conn, file_id, folder="/lib/New", filename="b.mp3", now=_LATER)
+
+    row = store.get_file_by_id(db_conn, file_id)
+    assert row is not None
+    assert (row.folder, row.filename) == ("/lib/New", "b.mp3")
+    assert store.get_file(db_conn, "/lib/New", "b.mp3") == row
+    assert store.get_file(db_conn, "/lib/Old", "a.mp3") is None
+    key = db_conn.execute("SELECT path_key FROM files WHERE id = ?", (file_id,)).fetchone()[0]
+    assert key == path_keys.file_path_key("/lib/New", "b.mp3")
+
+
+def test_staged_path_file_ids_names_only_staged_files(db_conn: sqlite3.Connection) -> None:
+    staged = _insert(db_conn, filename="staged.mp3")
+    clean = _insert(db_conn, filename="clean.mp3")
+    db_conn.execute(
+        "INSERT INTO path_revisions_staged (file_id, to_path, origin, staged_at) "
+        "VALUES (?, '/lib/x.mp3', 'manual', ?)",
+        (staged, _NOW),
     )
 
-    counts = store.mismatch_status_counts(db_conn)
-    assert counts == {"pending": 1, "legit_ignore": 1, "misfiled_deferred": 1}
-
-
-def test_mismatch_status_counts_pending_is_files_minus_rows(
-    db_conn: sqlite3.Connection,
-) -> None:
-    for index in range(5):
-        _insert(db_conn, filename=f"f{index}.mp3")
-    ignore = _insert(db_conn, filename="i.mp3")
-    store.set_mismatch_status(
-        db_conn,
-        file_id=ignore,
-        status="legit_ignore",
-        source_field="albumartist",
-        source_value="Jem",
-        now=_NOW,
-    )
-    counts = store.mismatch_status_counts(db_conn)
-    assert counts["legit_ignore"] == 1
-    assert counts["misfiled_deferred"] == 0
-    assert counts["pending"] == 5  # 6 files - 1 disposition row
-
-
-def test_compute_stats_includes_mismatch_block(db_conn: sqlite3.Connection) -> None:
-    file_id = _insert(db_conn)
-    store.set_mismatch_status(
-        db_conn,
-        file_id=file_id,
-        status="legit_ignore",
-        source_field="albumartist",
-        source_value="Jem",
-        now=_NOW,
-    )
-    stats = store.compute_stats(db_conn)
-    assert "mismatch" in stats
-    assert stats["mismatch"] == store.mismatch_status_counts(db_conn)
+    assert store.staged_path_file_ids(db_conn, [clean, staged]) == [staged]
+    assert store.staged_path_file_ids(db_conn, []) == []

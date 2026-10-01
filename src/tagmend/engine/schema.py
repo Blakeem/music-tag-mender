@@ -60,14 +60,8 @@ ledger upgrades in place with no data loss):
 The mismatch-fix review surface adds one more side table (schema v10, purely additive — a v9
 ledger upgrades in place with no data loss):
 
-* ``file_mismatch_status`` — the 4th per-file status table (the mismatch-axis twin of the
-  three shipped status tables). Stores ONLY the sticky per-file dispositions
-  (``'legit_ignore'`` — a false positive to silence; ``'misfiled_deferred'`` — a misfiled
-  file deferred for later). An accepted fix needs NO row: once the tag agrees with the path,
-  the detector stops flagging it. ``source_field``/``source_value`` snapshot the disagreeing
-  tag (which of ``albumartist``/``artist`` + its value at decision time) so a later tag change
-  makes the disposition stale and the file re-surfaces. Unlike the other three axes this one
-  has NO ``staged``/``done`` derivation, so it never routes through ``derived_status``.
+* ``file_mismatch_status``: one path decision per file (``legit_ignore`` or
+  ``misfiled_deferred``). An accepted fix needs no row. v24 below gives its shape.
 
 The album-gaps MusicBrainz recording-search tier adds one more side table (schema v11, purely
 additive — a v10 ledger upgrades in place with no data loss):
@@ -193,6 +187,15 @@ The song axis adds one table and one column (schema v23. A v22 ledger upgrades i
   the release and release-track ids, so an identity fix that rebinds a file re-opens it.
 * ``tag_revisions_staged.supplied_keys``: the JSON list of the keys the caller supplied for a
   staged file. :func:`_migrate_staged_supplied_keys` adds it as NULL.
+
+The path-decision pass reshapes one table (schema v24. A v23 ledger upgrades in place with every
+row preserved):
+
+* ``file_mismatch_status.source_value`` holds one JSON snapshot per decision. It records the
+  names the decision covers, the values of their tags, the file's path version and, on a
+  ``legit_ignore`` row, the key of the folder it keeps. ``source_field`` is dropped.
+  :func:`_migrate_mismatch_covers` rewrites each earlier row as a decision on the top-folder
+  comparison alone.
 """
 
 from __future__ import annotations
@@ -210,7 +213,7 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
-SCHEMA_VERSION: Final = 23
+SCHEMA_VERSION: Final = 24
 
 _FILES_DDL: Final = """
 CREATE TABLE IF NOT EXISTS files (
@@ -519,18 +522,15 @@ CREATE TABLE IF NOT EXISTS acoustid_cache (
 )
 """
 
-# Per-file mismatch disposition (the 4th per-file status table; the mismatch-axis twin of
-# ``file_genre_status``). Stores ONLY the sticky dispositions the detector honours:
-# ``'legit_ignore'`` (a false positive to silence) and ``'misfiled_deferred'`` (a misfiled
-# file deferred for later). An accepted fix needs NO row — once the tag agrees with the path
-# the detector stops flagging it. ``source_field`` (``'albumartist'``/``'artist'``) +
-# ``source_value`` snapshot the disagreeing tag at decision time, so a later tag change makes
-# the disposition stale and the file re-surfaces. See PLAN — mismatch-fix (review surface).
+# One path decision per file. ``legit_ignore`` keeps the file's folder, and
+# ``misfiled_deferred`` lets the tags render the entire path. ``source_value`` is the JSON
+# snapshot that binds the decision to its tags and location
+# (:class:`tagmend.engine.store.MismatchStatusRow`). It stays nullable because the v24 upgrade
+# drops a column in place and cannot add NOT NULL.
 _FILE_MISMATCH_STATUS_DDL: Final = """
 CREATE TABLE IF NOT EXISTS file_mismatch_status (
   file_id       INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
   status        TEXT NOT NULL,
-  source_field  TEXT,
   source_value  TEXT,
   updated_at    TEXT NOT NULL
 )
@@ -707,6 +707,84 @@ def _migrate_staged_supplied_keys(connection: sqlite3.Connection) -> None:
         return
     connection.execute("ALTER TABLE tag_revisions_staged ADD COLUMN supplied_keys TEXT")
     logger.info("schema v23: added tag_revisions_staged.supplied_keys")
+
+
+# Frozen history like :data:`_MANAGED_SET_WIDENING_DATE`: every pre-v24 row was set on the
+# top-folder comparison, whatever that comparison is later named.
+_LEGACY_MISMATCH_COVERS: Final = ("top_folder_artist",)
+
+
+def _legacy_mismatch_snapshot(
+    status: str,
+    source_field: str | None,
+    source_value: str | None,
+    folder: str | None,
+) -> str:
+    """Return the v24 JSON snapshot of one pre-v24 ``file_mismatch_status`` row.
+
+    A row with no source field was set on a file with neither artist tag, so it records both as
+    blank and silences nothing until a tag appears. An ``artist`` row records ``albumartist`` as
+    blank, since v23 read ``artist`` only while ``albumartist`` was blank. A keep binds to the
+    folder the ledger holds now, which is the folder it was set on, since nothing moved files
+    before v24.
+    """
+    tags: dict[str, str | None] = (
+        {"albumartist": source_value}
+        if source_field == "albumartist"
+        else {"albumartist": None, "artist": source_value if source_field == "artist" else None}
+    )
+    snapshot: dict[str, object] = {
+        "covers": list(_LEGACY_MISMATCH_COVERS),
+        "tags": tags,
+        "path_version": 0,
+    }
+    if status == "legit_ignore" and folder is not None:
+        snapshot["folder_key"] = path_keys.path_key(folder)
+    return json.dumps(snapshot, sort_keys=True, separators=(",", ":"))
+
+
+def _migrate_mismatch_covers(connection: sqlite3.Connection) -> None:
+    """v24: rewrite each mismatch row as a JSON snapshot and drop ``source_field``.
+
+    Runs BEFORE the DDL, so a fresh ledger takes the v24 shape from
+    :data:`_FILE_MISMATCH_STATUS_DDL`. Idempotent: it fires only while ``source_field`` exists.
+    The rewrite and the drop land in one transaction.
+    """
+    if not _table_exists(connection, "file_mismatch_status"):
+        return
+    if not _column_exists(connection, "file_mismatch_status", "source_field"):
+        return
+
+    connection.execute("BEGIN")
+    try:
+        cursor = connection.execute(
+            """
+            SELECT m.file_id, m.status, m.source_field, m.source_value, f.folder
+            FROM file_mismatch_status AS m LEFT JOIN files AS f ON f.id = m.file_id
+            """,
+        )
+        rows = cursor.fetchall()
+        connection.executemany(
+            "UPDATE file_mismatch_status SET source_value = ? WHERE file_id = ?",
+            [
+                (
+                    _legacy_mismatch_snapshot(
+                        str(row[1]),
+                        None if row[2] is None else str(row[2]),
+                        None if row[3] is None else str(row[3]),
+                        None if row[4] is None else str(row[4]),
+                    ),
+                    int(row[0]),
+                )
+                for row in rows
+            ],
+        )
+        connection.execute("ALTER TABLE file_mismatch_status DROP COLUMN source_field")
+    except BaseException:
+        connection.rollback()
+        raise
+    connection.commit()
+    logger.info("schema v24: rewrote %d mismatch row(s) as covers snapshots", len(rows))
 
 
 def _keyed_file_rows(connection: sqlite3.Connection) -> list[tuple[int, str, str, str]]:
@@ -1094,8 +1172,9 @@ def apply_schema(connection: sqlite3.Connection) -> None:
     :func:`_migrate_release_group_cache_name`, :func:`_migrate_mbid_columns`,
     :func:`_migrate_drop_files_status`, :func:`_migrate_lastfm_correction_cache`) and v21
     snapshots the tag-axis status rows (:func:`_migrate_axis_outcomes`) and adds the staged
-    changed fields (:func:`_migrate_staged_changed_fields`), and v23 adds the staged supplied
-    keys (:func:`_migrate_staged_supplied_keys`). v15, v16 and v22 add cache tables only, and
+    changed fields (:func:`_migrate_staged_changed_fields`), v23 adds the staged supplied
+    keys (:func:`_migrate_staged_supplied_keys`) and v24 rewrites the mismatch rows as covers
+    snapshots (:func:`_migrate_mismatch_covers`). v15, v16 and v22 add cache tables only, and
     v23 adds ``file_song_status``, which the DDL creates, so they need no migration step. The
     triggers come after every migration, so a migration that updates a log runs before they
     exist.
@@ -1128,6 +1207,7 @@ def apply_schema(connection: sqlite3.Connection) -> None:
     _migrate_axis_outcomes(connection)
     _migrate_staged_changed_fields(connection)
     _migrate_staged_supplied_keys(connection)
+    _migrate_mismatch_covers(connection)
     connection.execute(_FILES_DDL)
     connection.execute(_FILES_PATH_KEY_INDEX_DDL)
     connection.execute(_FILE_TAGS_DDL)

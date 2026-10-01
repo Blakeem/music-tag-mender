@@ -43,14 +43,21 @@ by its AcoustID fingerprint. A folder whose files carry `musicbrainz_albumid` is
 those releases, a folder without ids converges on the one Official release most of its files share
 and fills only blank `title`/`tracknumber`/`discnumber` as `auto`, and a folder whose audio is not
 on its tagged release is reported in `rebind_folders`. `resolve_songs(release_id=...)` stamps a
-whole folder onto one chosen release as a single `manual` batch. The **mismatch-fix** surface shipped last (decide run `fix-mismatches`, Run 2):
-`detect_mismatches` gained sticky per-file dispositions (`file_mismatch_status` —
-`legit_ignore`/`misfiled_deferred`, snapshot-and-go-stale), grouped output (`group=True`) +
-exact-folder expansion + a staleness-aware skip-filter; `set_mismatch_status`/
-`reset_mismatch_status`; `stage_tags_batch` (one atomic multi-file stage, always
-`origin="manual"`); and `reopen_axes(commit_id)`, which deletes the `done`/`no_match` rows of
-the files of a commit holding no `auto` revision, on all four tag axes, and keeps `manual`. `list_files(mismatch_status=...)` + a `get_library_stats['mismatch']` block
-round it out. The `detect_album_gaps` tool (`album_gaps.py` + the pure, standalone
+whole folder onto one chosen release as a single `manual` batch. The **mismatch-fix** surface
+records one path decision per file in `file_mismatch_status`. `legit_ignore` keeps the folder and
+renders the filename. `misfiled_deferred` lets the tags render every path level. No status keeps a
+filename. The decision's JSON snapshot holds the names it `covers`, their tag inputs, the file's
+path version and, on a keep, its folder key. A covered name stays silenced while its tags hold and
+its binding holds: the folder key for a keep's folder-level name, the path version for every other
+name. A changed tag, a committed move or a new uncovered flag re-surfaces the file with
+`was`/`changed`.
+`set_mismatch_status` requires `covers`, takes one release-folder group per call, and refuses a
+keep that leaves a group member out. The report's `gate_open` holds when nothing is flagged and no
+exception is undecided. `mismatch.gate_state`, `check_files` and `planner_keep` are the gate the
+path domain will read. `list_files(mismatch_status=...)` and `get_library_stats['mismatch']` read the
+same classifier. `stage_tags_batch` stages several files atomically, always as
+`origin="manual"`. `reopen_axes(commit_id)` deletes the `done`/`no_match` rows of the files of a
+commit holding no `auto` revision, on all four tag axes, and keeps `manual`. The `detect_album_gaps` tool (`album_gaps.py` + the pure, standalone
 `parsing.py`) groups blank-`album` files by folder and proposes sibling / folder-parse fills
 plus a review-only MusicBrainz `(artist, title)` recording tier (`mb_recording`, opt-out via
 `use_musicbrainz=False`, cached in `musicbrainz_recording_cache`) for the `stage_tags_batch →
@@ -101,7 +108,7 @@ compares a file's year tags with the first-release year of its album's MusicBrai
 found by the album identity (album artist else artist, album). `high` means the `originaldate` year
 differs, `medium` means the `date` year is earlier than the first release. `release_limit` (default
 200) caps the uncached lookups one call makes, and cache writes are its only ledger writes.
-38 MCP tools total. Schema is **v23** (additive: v11 adds
+38 MCP tools total. Schema is **v24** (additive: v11 adds
 `musicbrainz_recording_cache`, v12 renames `file_album_status` → `file_year_status` in place —
 dispositions preserved; v13 adds `tag_revisions.managed_set`, stamping which managed-tag set
 governed each revision so a revert can restore emptiness on the widened fields; v14 adds
@@ -123,7 +130,8 @@ columns, drops the unused `files.status`, and makes `tag_revisions.managed_set` 
 keyed to its size and mtime) and `acoustid_cache` (AcoustID lookups keyed by a fingerprint hash,
 with a 7-day expiry on an empty answer). v23 adds `file_song_status` and
 `tag_revisions_staged.supplied_keys`, the keys the caller passed that survive a `fill_only` drop,
-which the stale-identity warning in `diff_tags` treats as confirmed. A newer
+which the stale-identity warning in `diff_tags` treats as confirmed. v24 rewrites each
+`file_mismatch_status` row as a JSON decision snapshot and drops `source_field`. A newer
 ledger is refused). M6 organize/paths (`paths.py`)
 is a paper sketch (its DDL ships in v6; logic deferred).
 
@@ -307,7 +315,7 @@ src/tagmend/
   mcp_server.py     FastMCP server (thin) — 38 tools
   engine/
     db.py           SQLite connection (WAL)
-    schema.py       all DDL + PRAGMA user_version (v23)
+    schema.py       all DDL + PRAGMA user_version (v24)
     path_keys.py    path identity keys, subtree key ranges, the folder-argument normalizer
     text_keys.py    the shared text fold keys (alnum, display, artist name, loose, title)
     scan.py         filesystem discovery + signatures
@@ -322,14 +330,14 @@ src/tagmend/
     acoustid.py     fpcalc Fingerprinter + AcoustidClient (gzip POST lookup, paced) + their caches
     release_match.py  pure release-matching helpers (track text keys, positions, disc expectation)
     musicbrainz.py  MusicBrainz client: release-group year, recording lookup, artist-by-MBID name, release-by-MBID tracklist
-    axis.py         the parameterized Axis: one outcome-row model for genre/artist/year, plus the mismatch disposition model
+    axis.py         the parameterized Axis: one outcome-row model for genre/artist/year/song, plus the mismatch axis entry
     axis_status.py  the one set_/reset_<axis>_status implementation, parameterized by Axis
     classify.py     genre vocab/overlay loader + fold-key index + classify.classify_genres (pure)
     genres.py       resolve_genres + set/reset_genre_status
     artists.py      resolve_artists + set/reset_artist_status: MusicBrainz-by-MBID then getCorrection cascade-stage + file_artist_status workflow
     songs.py        resolve_songs + set/reset_song_status: AcoustID folder consensus, anchored check, rebind report, manual release path
     years.py        resolve_years + set/reset_year_status: MusicBrainz originaldate blank-fill + file_year_status workflow
-    mismatch.py     detect_mismatches + set/reset_mismatch_status + layout_of: tags vs every path level, tiered
+    mismatch.py     detect_mismatches + set/reset_mismatch_status + layout_of + the path gate: tags vs every path level, tiered
     path_text.py    clean_value: the value rule a tag obeys inside one path part
     track_conflicts.py  detect_track_conflicts: intra-folder (disc, track) slot collisions
     album_conflicts.py  detect_album_conflicts: intra-folder album-identity splits, tiered

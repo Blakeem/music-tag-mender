@@ -24,13 +24,14 @@ from typing import TYPE_CHECKING, Final
 
 import mutagen
 
-from tagmend.engine import axis, clock, db, path_keys, scan, schema, store, versioning
+from tagmend.engine import axis, clock, db, mismatch, path_keys, scan, schema, store, versioning
 from tagmend.engine.tags import TAG_READER_VERSION, read_tags
 from tagmend.engine.validation import check_limit, require_choice
 from tagmend.log import get_logger
 
 if TYPE_CHECKING:
     import sqlite3
+    from collections.abc import Mapping
 
     from tagmend.config import Settings
 
@@ -63,8 +64,7 @@ class FileView:
     song_source_album_mbid: str | None = None  # release ids a done/manual was recorded against
     song_source_release_track_mbid: str | None = None
     mismatch_status: str = "pending"
-    mismatch_source_field: str | None = None  # which tag a disposition was recorded against
-    mismatch_source_value: str | None = None  # that tag's value at decision time
+    mismatch_source_value: dict[str, object] | None = None  # the decision's snapshot
 
     def to_dict(self) -> dict[str, object]:
         """JSON-serializable form for the MCP tool."""
@@ -88,7 +88,6 @@ class FileView:
             "song_source_album_mbid": self.song_source_album_mbid,
             "song_source_release_track_mbid": self.song_source_release_track_mbid,
             "mismatch_status": self.mismatch_status,
-            "mismatch_source_field": self.mismatch_source_field,
             "mismatch_source_value": self.mismatch_source_value,
         }
 
@@ -110,23 +109,38 @@ def _axis_view(
     return status, row.identity.primary, row.identity.secondary
 
 
-def _to_view(conn: sqlite3.Connection, row: store.FileRow) -> FileView:
+def _mismatch_view(
+    state: mismatch.MismatchState | None,
+) -> tuple[str, dict[str, object] | None]:
+    """Return a file's mismatch status plus the snapshot of the decision that sets it.
+
+    A missing file has no reading (``None``) and shows ``pending``. The snapshot rides along
+    only while the decision is the status the file reads.
+    """
+    if state is None:
+        return "pending", None
+    row = state.row
+    if row is None or row.status != state.status:
+        return state.status, None
+    return state.status, row.snapshot()
+
+
+def _to_view(
+    conn: sqlite3.Connection,
+    row: store.FileRow,
+    mismatch_state: mismatch.MismatchState | None,
+) -> FileView:
     """Build a :class:`FileView` from a file row, reading its managed-tag subset.
 
-    Also resolves the file's genre, artist, year, song and mismatch statuses. For a stored decision
-    the source values it was recorded against ride along so a reviewer can compare them with
-    the current ``managed_tags``.
+    Also resolves the file's genre, artist, year and song statuses, and takes its mismatch
+    reading from *mismatch_state*. For a stored decision the source values it was recorded
+    against ride along so a reviewer can compare them with the current ``managed_tags``.
     """
     genre_status, genre_artist, genre_album = _axis_view(conn, axis.GENRE_AXIS, row.id)
     artist_status, artist_artist, artist_albumartist = _axis_view(conn, axis.ARTIST_AXIS, row.id)
     year_status, year_artist, year_album = _axis_view(conn, axis.YEAR_AXIS, row.id)
     song_status, song_album_mbid, song_release_track_mbid = _axis_view(conn, axis.SONG_AXIS, row.id)
-
-    mismatch_status = store.derived_mismatch_status(conn, row.id)
-    mismatch_decision = store.get_mismatch_status(conn, row.id)
-    has_stored_mismatch = (
-        mismatch_decision is not None and mismatch_status == mismatch_decision.status
-    )
+    mismatch_status, mismatch_source = _mismatch_view(mismatch_state)
     return FileView(
         file_id=row.id,
         folder=row.folder,
@@ -147,13 +161,23 @@ def _to_view(conn: sqlite3.Connection, row: store.FileRow) -> FileView:
         song_source_album_mbid=song_album_mbid,
         song_source_release_track_mbid=song_release_track_mbid,
         mismatch_status=mismatch_status,
-        mismatch_source_field=mismatch_decision.source_field
-        if has_stored_mismatch and mismatch_decision
-        else None,
-        mismatch_source_value=mismatch_decision.source_value
-        if has_stored_mismatch and mismatch_decision
-        else None,
+        mismatch_source_value=mismatch_source,
     )
+
+
+def _views(
+    conn: sqlite3.Connection,
+    settings: Settings,
+    rows: list[store.FileRow],
+    mismatch_states: Mapping[int, mismatch.MismatchState] | None = None,
+) -> list[FileView]:
+    """Build the views of *rows*, reading their mismatch states unless given them."""
+    states = (
+        mismatch.file_states(conn, settings, [row.id for row in rows])
+        if mismatch_states is None
+        else mismatch_states
+    )
+    return [_to_view(conn, row, states.get(row.id)) for row in rows]
 
 
 def _row_matches_status(  # noqa: PLR0913 - cohesive keyword-only status filters
@@ -165,12 +189,14 @@ def _row_matches_status(  # noqa: PLR0913 - cohesive keyword-only status filters
     year_status: str | None,
     song_status: str | None,
     mismatch_status: str | None,
+    mismatch_states: Mapping[int, mismatch.MismatchState],
 ) -> bool:
     """Return whether *row* satisfies every requested workflow-status filter.
 
     Each non-``None`` filter must match the file's derived status on that axis (the axes are
     independent and field-aware), and a ``None`` filter is ignored. A missing file has no
-    status on the genre, artist, year or song axis, so any of those filters excludes it.
+    status on any axis, so any filter excludes it. *mismatch_states* holds the present files'
+    mismatch readings.
     """
     tag_filters = (
         (axis.GENRE_AXIS, genre_status),
@@ -183,10 +209,10 @@ def _row_matches_status(  # noqa: PLR0913 - cohesive keyword-only status filters
             continue
         if row.is_missing or store.derived_status(conn, tag_axis, row.id) != wanted:
             return False
-    return not (
-        mismatch_status is not None
-        and store.derived_mismatch_status(conn, row.id) != mismatch_status
-    )
+    if mismatch_status is None:
+        return True
+    state = mismatch_states.get(row.id)
+    return state is not None and state.status == mismatch_status
 
 
 def list_files(  # noqa: PLR0913 - cohesive keyword-only discovery filters
@@ -207,14 +233,14 @@ def list_files(  # noqa: PLR0913 - cohesive keyword-only discovery filters
     Windows and a relative *path* resolves under ``music_path``), filtered to one genre, artist
     and/or year workflow status (``pending`` | ``no_identity`` | ``no_match`` | ``manual`` |
     ``staged`` | ``done``), one song workflow status (``pending`` | ``manual`` | ``staged`` |
-    ``done``), one mismatch disposition (``pending`` | ``legit_ignore`` |
-    ``misfiled_deferred``), and/or capped at *limit* rows. ``genre_status="no_match"`` is the
-    "fix by hand" worklist. ``no_identity`` lists the files the axis has no identity for, which
-    no resolver selects. A genre, artist, year or song filter never returns a missing file. With NO
-    status filter the cap is applied before reading tags, so a large library stays cheap to
-    browse. With any filter, all candidate rows are examined, ALL filters are applied, and the
-    cap counts the *matching* files. Raises :class:`ValueError` for an unknown status, a
-    negative *limit* or a *path* outside ``music_path``. Read-only.
+    ``done``), one mismatch status (``pending`` | ``legit_ignore`` | ``misfiled_deferred``,
+    read by :func:`tagmend.engine.mismatch.file_states`), and/or capped at *limit* rows.
+    ``genre_status="no_match"`` is the "fix by hand" worklist. ``no_identity`` lists the files
+    the axis has no identity for, which no resolver selects. No status filter returns a missing
+    file. With NO status filter the cap is applied before reading tags, so a large library
+    stays cheap to browse. With any filter, all candidate rows are examined, ALL filters are
+    applied, and the cap counts the *matching* files. Raises :class:`ValueError` for an unknown
+    status, a negative *limit* or a *path* outside ``music_path``. Read-only.
     """
     check_limit(limit)
     require_choice("genre_status", genre_status, store.GENRE_WORKFLOW_STATUSES)
@@ -244,11 +270,18 @@ def list_files(  # noqa: PLR0913 - cohesive keyword-only discovery filters
         if not filtered:
             if root_key is not None and limit is not None:
                 rows = rows[:limit]
-            return [_to_view(connection, row) for row in rows]
+            return _views(connection, settings, rows)
 
+        # The mismatch filter reads every candidate in one comparator pass. Without it, only
+        # the matched rows are read, below.
+        states = (
+            {}
+            if mismatch_status is None
+            else mismatch.file_states(connection, settings, [row.id for row in rows])
+        )
         # Status filter(s): the cap counts MATCHING files, so examine rows until it fills.
         # When several are set, a file must satisfy ALL to match.
-        views: list[FileView] = []
+        matched: list[store.FileRow] = []
         for row in rows:
             if not _row_matches_status(
                 connection,
@@ -258,12 +291,18 @@ def list_files(  # noqa: PLR0913 - cohesive keyword-only discovery filters
                 year_status=year_status,
                 song_status=song_status,
                 mismatch_status=mismatch_status,
+                mismatch_states=states,
             ):
                 continue
-            views.append(_to_view(connection, row))
-            if limit is not None and len(views) >= limit:
+            matched.append(row)
+            if limit is not None and len(matched) >= limit:
                 break
-        return views
+        return _views(
+            connection,
+            settings,
+            matched,
+            None if mismatch_status is None else states,
+        )
     finally:
         connection.close()
 
@@ -274,7 +313,7 @@ def get_file(settings: Settings, file_id: int) -> FileView | None:
     try:
         schema.apply_schema(connection)
         row = store.get_file_by_id(connection, file_id)
-        return None if row is None else _to_view(connection, row)
+        return None if row is None else _views(connection, settings, [row])[0]
     finally:
         connection.close()
 
@@ -715,10 +754,12 @@ def _reconcile_missing(conn: sqlite3.Connection, root: Path, counters: _Counters
 
 
 def get_library_stats(settings: Settings) -> dict[str, object]:
-    """Return library-wide counts from the snapshot."""
+    """Return library-wide counts from the snapshot, the mismatch block read by the comparator."""
     connection = db.connect(settings.db_path)
     try:
         schema.apply_schema(connection)
-        return store.compute_stats(connection)
+        stats = store.compute_stats(connection)
+        stats["mismatch"] = mismatch.status_counts(connection, settings)
+        return stats
     finally:
         connection.close()

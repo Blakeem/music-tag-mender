@@ -9,9 +9,8 @@ staging area and the current tags. A ``done`` or ``no_match`` row counts only wh
 still match the file, so a revert, a rescan after an external edit or an identity fix re-opens the
 file with no writer. A ``manual`` row is sticky until ``reset_<axis>_status`` deletes it.
 
-The mismatch axis keeps its disposition model. A ``legit_ignore`` or ``misfiled_deferred`` row
-blocks while its snapshotted tag value is unchanged (:func:`mismatch_decision_blocks`), and the
-file is ``pending`` otherwise (:func:`tagmend.engine.store.derived_mismatch_status`).
+The mismatch axis keeps path decisions instead of outcomes. Its one ``source_value`` JSON holds
+the snapshot, and :mod:`tagmend.engine.mismatch` classifies it against the comparator.
 
 Like the rest of :mod:`tagmend.engine.store`, the helpers here never commit. The conn-owning
 layer owns the transaction.
@@ -33,21 +32,8 @@ logger = get_logger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
-class StatusRow:
-    """One row from a ``file_<axis>_status`` table, with its two source-identity values.
-
-    ``source_primary`` / ``source_secondary`` are positional: each axis maps them to its own
-    column names via :attr:`Axis.source_columns`.
-    """
-
-    status: str
-    source_primary: str | None
-    source_secondary: str | None
-
-
-@dataclass(frozen=True, slots=True)
 class Identity:
-    """The two identity values an outcome is decided against, in :class:`StatusRow` order."""
+    """The two identity values an outcome is decided against, in source-column order."""
 
     primary: str | None
     secondary: str | None
@@ -70,8 +56,9 @@ class Axis:
     status_table: str
     """The ``file_<name>_status`` table name."""
 
-    source_columns: tuple[str, str]
-    """The table's two identity column names, in :class:`StatusRow` order."""
+    source_columns: tuple[str, str] | None
+    """The table's two identity column names, in :class:`Identity` order. ``None`` on the
+    mismatch axis, which keeps no outcome rows."""
 
     workflow_statuses: frozenset[str]
     """The valid derived-status set."""
@@ -220,14 +207,12 @@ SONG_AXIS: Final = Axis(
     identity=_song_identity,
 )
 
+# A path decision settles no tag, so the axis decides no field and has no staged state.
 MISMATCH_AXIS: Final = Axis(
     name="mismatch",
-    # The two identity fields the detector reads. This axis has no staged/done derivation,
-    # and these fields collide with the artist axis's, so they never feed derived_status.
-    fields=("albumartist", "artist"),
+    fields=(),
     status_table="file_mismatch_status",
-    # Positional: source_primary = the disagreeing FIELD NAME, source_secondary = its VALUE.
-    source_columns=("source_field", "source_value"),
+    source_columns=None,
     workflow_statuses=frozenset({"pending", "legit_ignore", "misfiled_deferred"}),
     scope_fields=("artist", "albumartist"),
     identity=None,
@@ -248,29 +233,17 @@ def identity_of(axis: Axis, tags: Mapping[str, list[str]]) -> Identity | None:
     return axis.identity(tags)
 
 
+def _outcome_columns(axis: Axis) -> tuple[str, str]:
+    """Return *axis*'s two identity columns. Raises :class:`ValueError` for the mismatch axis."""
+    if axis.source_columns is None:
+        message = f"the {axis.name} axis keeps no outcome rows"
+        raise ValueError(message)
+    return axis.source_columns
+
+
 def field_values(axis: Axis, tags: Mapping[str, list[str]]) -> dict[str, list[str]]:
     """Return the values of every :attr:`Axis.fields` tag, an absent tag as ``[]``."""
     return {name: list(tags.get(name, [])) for name in axis.fields}
-
-
-def mismatch_decision_blocks(decision: StatusRow, identity: Identity) -> bool:
-    """Whether a mismatch disposition still silences its file.
-
-    ``source_primary`` is the FIELD NAME the disagreement was recorded on
-    (``'albumartist'``/``'artist'``) and ``source_secondary`` is that field's VALUE at decision
-    time. *identity* carries the file's CURRENT first ``albumartist`` (``primary``) and
-    ``artist`` (``secondary``). A disposition blocks only while the snapshotted value equals
-    the current value of its own source field, so any change to that field, its removal
-    included, makes the disposition stale and the file re-surfaces. A ``None`` source field
-    compares its snapshot against ``None``.
-    """
-    if decision.source_primary == "albumartist":
-        current = identity.primary
-    elif decision.source_primary == "artist":
-        current = identity.secondary
-    else:
-        current = None
-    return decision.source_secondary == current
 
 
 # --- outcome rows (the three tag axes) -----------------------------------------------
@@ -291,7 +264,7 @@ class OutcomeRow:
 
 def get_outcome(conn: sqlite3.Connection, axis: Axis, file_id: int) -> OutcomeRow | None:
     """Return *file_id*'s outcome row on the tag *axis*, or ``None`` if it has none."""
-    primary_col, secondary_col = axis.source_columns
+    primary_col, secondary_col = _outcome_columns(axis)
     row = conn.execute(
         f"SELECT status, {primary_col}, {secondary_col}, source_value "  # noqa: S608 - trusted Axis
         f"FROM {axis.status_table} WHERE file_id = ?",
@@ -326,7 +299,7 @@ def put_outcome(  # noqa: PLR0913 - cohesive keyword-only outcome payload
     """
     identity = identity_of(axis, tags) or Identity(primary=None, secondary=None)
     source_value = json.dumps(field_values(axis, tags), sort_keys=True, separators=(",", ":"))
-    primary_col, secondary_col = axis.source_columns
+    primary_col, secondary_col = _outcome_columns(axis)
     conn.execute(
         f"INSERT OR REPLACE INTO {axis.status_table} ("  # noqa: S608 - identifiers from trusted Axis
         f"  file_id, status, {primary_col}, {secondary_col}, source_value, updated_at"
@@ -335,45 +308,7 @@ def put_outcome(  # noqa: PLR0913 - cohesive keyword-only outcome payload
     )
 
 
-# --- generic status row access (parameterized by Axis) -------------------------------
-
-
-def get_status(conn: sqlite3.Connection, axis: Axis, file_id: int) -> StatusRow | None:
-    """Return *file_id*'s stored decision on *axis*, or ``None`` if it has none."""
-    primary_col, secondary_col = axis.source_columns
-    cursor = conn.execute(
-        f"SELECT status, {primary_col}, {secondary_col} "  # noqa: S608 - column names from trusted Axis
-        f"FROM {axis.status_table} WHERE file_id = ?",
-        (file_id,),
-    )
-    row = cursor.fetchone()
-    if row is None:
-        return None
-    return StatusRow(
-        status=str(row[0]),
-        source_primary=None if row[1] is None else str(row[1]),
-        source_secondary=None if row[2] is None else str(row[2]),
-    )
-
-
-def set_status(  # noqa: PLR0913 - cohesive keyword-only status payload
-    conn: sqlite3.Connection,
-    axis: Axis,
-    *,
-    file_id: int,
-    status: str,
-    source_primary: str | None,
-    source_secondary: str | None,
-    now: str,
-) -> None:
-    """Insert or replace *file_id*'s stored decision on *axis* with its two source values."""
-    primary_col, secondary_col = axis.source_columns
-    conn.execute(
-        f"INSERT OR REPLACE INTO {axis.status_table} ("  # noqa: S608 - identifiers from trusted Axis
-        f"  file_id, status, {primary_col}, {secondary_col}, updated_at"
-        f") VALUES (?, ?, ?, ?, ?)",
-        (file_id, status, source_primary, source_secondary, now),
-    )
+# --- status row removal (parameterized by Axis) --------------------------------------
 
 
 def delete_status(conn: sqlite3.Connection, axis: Axis, file_id: int) -> None:

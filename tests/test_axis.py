@@ -1,15 +1,17 @@
 """Unit tests for :mod:`tagmend.engine.axis` — the parameterised status abstraction.
 
-These tests pin each axis's descriptor (fields, identity, scope fields, statuses) and the
-mismatch disposition rule directly, so a refactor cannot silently change semantics. The
-classifier that reads the outcome rows is covered in ``test_store_genre.py`` and
-``test_axis_status.py``.
+These tests pin each axis's descriptor (fields, identity, scope fields, statuses) directly, so a
+refactor cannot silently change semantics. The classifier that reads the outcome rows is covered
+in ``test_store_genre.py`` and ``test_axis_status.py``, and the mismatch reading in
+``test_mismatch.py``.
 
 These are pure-unit tests on frozen dataclasses and module-level constants: no DB,
 no temp library, no audio files.
 """
 
 from __future__ import annotations
+
+from typing import TYPE_CHECKING, cast
 
 import pytest
 
@@ -23,12 +25,14 @@ from tagmend.engine.axis import (
     YEAR_AXIS,
     Identity,
     LookupIdentity,
-    StatusRow,
     field_values,
+    get_outcome,
     identity_of,
     lookup_identity,
-    mismatch_decision_blocks,
 )
+
+if TYPE_CHECKING:
+    import sqlite3
 
 # ---------------------------------------------------------------------------
 # Genre axis: config invariants
@@ -228,7 +232,7 @@ def test_no_match_in_year_workflow_statuses() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Mismatch axis: config invariants (positional source: field name + value)
+# Mismatch axis: config invariants (one JSON snapshot, no outcome columns)
 # ---------------------------------------------------------------------------
 
 
@@ -236,17 +240,19 @@ def test_mismatch_axis_name() -> None:
     assert MISMATCH_AXIS.name == "mismatch"
 
 
-def test_mismatch_axis_fields() -> None:
-    # The detect fields — recorded but NEVER used for staged/done derivation on this axis.
-    assert MISMATCH_AXIS.fields == ("albumartist", "artist")
+def test_mismatch_axis_decides_no_field() -> None:
+    # A path decision settles no tag, so no staged tag change reads as a mismatch state.
+    assert MISMATCH_AXIS.fields == ()
 
 
 def test_mismatch_axis_status_table() -> None:
     assert MISMATCH_AXIS.status_table == "file_mismatch_status"
 
 
-def test_mismatch_axis_source_columns() -> None:
-    assert MISMATCH_AXIS.source_columns == ("source_field", "source_value")
+def test_mismatch_axis_has_no_outcome_columns() -> None:
+    assert MISMATCH_AXIS.source_columns is None
+    with pytest.raises(ValueError, match="mismatch axis keeps no outcome rows"):
+        get_outcome(cast("sqlite3.Connection", None), MISMATCH_AXIS, 1)
 
 
 def test_mismatch_axis_workflow_statuses_exact_set() -> None:
@@ -263,67 +269,6 @@ def test_mismatch_has_no_no_match_or_staged_done_states() -> None:
     assert "no_match" not in MISMATCH_AXIS.workflow_statuses
     assert "staged" not in MISMATCH_AXIS.workflow_statuses
     assert "done" not in MISMATCH_AXIS.workflow_statuses
-
-
-# ---------------------------------------------------------------------------
-# mismatch_decision_blocks: blocks iff the snapshotted value still matches its field
-# ---------------------------------------------------------------------------
-# source_primary = the FIELD NAME ('albumartist'|'artist'); source_secondary = its snapshot.
-# identity.primary = current first albumartist; identity.secondary = current first artist.
-
-
-def test_mismatch_albumartist_blocks_when_value_unchanged() -> None:
-    decision = StatusRow(
-        status="legit_ignore", source_primary="albumartist", source_secondary="Jem"
-    )
-    identity = Identity(primary="Jem", secondary="Ozzy Osbourne")
-    assert mismatch_decision_blocks(decision, identity) is True
-
-
-def test_mismatch_albumartist_stale_when_value_changed() -> None:
-    decision = StatusRow(
-        status="legit_ignore", source_primary="albumartist", source_secondary="Jem"
-    )
-    identity = Identity(primary="Ozzy Osbourne", secondary="Ozzy Osbourne")
-    assert mismatch_decision_blocks(decision, identity) is False
-
-
-def test_mismatch_albumartist_stale_when_tag_removed() -> None:
-    # The albumartist tag was cleared (current is None) -> the snapshot no longer matches.
-    decision = StatusRow(
-        status="misfiled_deferred", source_primary="albumartist", source_secondary="Jem"
-    )
-    identity = Identity(primary=None, secondary="Ozzy Osbourne")
-    assert mismatch_decision_blocks(decision, identity) is False
-
-
-def test_mismatch_artist_field_compares_against_secondary() -> None:
-    decision = StatusRow(status="misfiled_deferred", source_primary="artist", source_secondary="X")
-    # Its own field (artist) is compared against identity.secondary, not primary.
-    assert mismatch_decision_blocks(decision, Identity(primary="Y", secondary="X")) is True
-    assert mismatch_decision_blocks(decision, Identity(primary="X", secondary="Z")) is False
-
-
-def test_mismatch_misfiled_deferred_follows_the_same_rule() -> None:
-    fresh = StatusRow(
-        status="misfiled_deferred", source_primary="albumartist", source_secondary="Q"
-    )
-    assert mismatch_decision_blocks(fresh, Identity(primary="Q", secondary=None)) is True
-    assert mismatch_decision_blocks(fresh, Identity(primary="R", secondary=None)) is False
-
-
-def test_mismatch_null_source_field_blocks_only_when_snapshot_none() -> None:
-    # A file that had neither tag: field None, value None -> compares None == None -> blocks.
-    both_none = StatusRow(status="legit_ignore", source_primary=None, source_secondary=None)
-    assert mismatch_decision_blocks(both_none, Identity(primary=None, secondary=None)) is True
-    assert mismatch_decision_blocks(both_none, Identity(primary="A", secondary="B")) is True
-
-
-def test_mismatch_none_value_on_albumartist_field() -> None:
-    # source_field set but snapshot None: blocks only while current is also None.
-    decision = StatusRow(status="legit_ignore", source_primary="albumartist", source_secondary=None)
-    assert mismatch_decision_blocks(decision, Identity(primary=None, secondary="X")) is True
-    assert mismatch_decision_blocks(decision, Identity(primary="V", secondary="X")) is False
 
 
 # ---------------------------------------------------------------------------

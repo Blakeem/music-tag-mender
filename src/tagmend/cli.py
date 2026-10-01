@@ -166,7 +166,8 @@ def detect_mismatches(
         )
     for row in report.rows:
         differences = "  ".join(
-            f"{d.comparison}: {d.tag_value!r} vs {d.path_value!r}" for d in row.differences
+            f"{d.comparison}: {d.tag_value!r} vs {d.path_value!r}{' (silenced)' * d.silenced}"
+            for d in row.differences
         )
         typer.echo(
             f"  [{(row.tier or '').upper():6}] {differences}  {row.folder}\\{row.filename}",

@@ -106,14 +106,13 @@ def _record(
 
 def _legacy_row(conn: sqlite3.Connection, file_id: int, status: str, artist: str | None) -> None:
     """Write a pre-v21 genre row: an identity snapshot and a NULL value snapshot."""
-    axis.set_status(
-        conn,
-        axis.GENRE_AXIS,
-        file_id=file_id,
-        status=status,
-        source_primary=artist,
-        source_secondary=None,
-        now=_NOW,
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO file_genre_status
+          (file_id, status, source_artist, source_album, source_value, updated_at)
+        VALUES (?, ?, ?, NULL, NULL, ?)
+        """,
+        (file_id, status, artist, _NOW),
     )
 
 

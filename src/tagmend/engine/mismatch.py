@@ -4,8 +4,13 @@ The comparator reads the ``files``/``file_tags`` snapshot, writes nothing, stage
 never reaches the network. It names the levels of each present file's path (:class:`Layout`),
 then runs six comparisons over them through one tolerance ladder, so a difference in formatting
 alone never flags. Curated and nested folders are exceptions: listed for a decision and never
-counted as flags. :func:`set_mismatch_status` and :func:`reset_mismatch_status` are the module's
-only writers, and they write only ``file_mismatch_status`` rows. A fresh row silences its file.
+counted as flags.
+
+A path decision (``file_mismatch_status``) records what the path planner may do with a file.
+``legit_ignore`` keeps its folder, and ``misfiled_deferred`` renders every level from the tags.
+No decision keeps a filename. :func:`set_mismatch_status` and :func:`reset_mismatch_status` are the
+only writers of those rows. :func:`file_states` reads each file against its row, and
+:func:`gate_state`, :func:`check_files` and :func:`planner_keep` are what the path tools call.
 """
 
 from __future__ import annotations
@@ -14,12 +19,13 @@ import functools
 import itertools
 import re
 import unicodedata
+from collections import Counter
 from dataclasses import dataclass, field, replace
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
-from tagmend.engine import axis, axis_status, db, path_keys, schema, store
+from tagmend.engine import axis, axis_status, clock, db, path_keys, schema, store
 from tagmend.engine.detector_core import (
     NON_ALBUM_FOLDERS,
     TIER_RANK,
@@ -36,7 +42,7 @@ from tagmend.log import get_logger
 
 if TYPE_CHECKING:
     import sqlite3
-    from collections.abc import Iterable, Mapping
+    from collections.abc import Collection, Iterable, Mapping
 
     from tagmend.config import Settings
 
@@ -59,6 +65,42 @@ COMPARISONS: Final = (
 
 CURATED: Final = "curated"
 NESTED: Final = "nested"
+CLASSES: Final = frozenset({CURATED, NESTED})
+
+# Every name a decision covers, in report order. A keep binds its folder-level names to the
+# folder, and every other name binds to the file's path version.
+NAMES: Final = (*COMPARISONS, CURATED, NESTED)
+FOLDER_NAMES: Final = frozenset(
+    {TOP_FOLDER_ARTIST, RELEASE_FOLDER_ALBUM, RELEASE_FOLDER_YEAR, DISC_FOLDER_NUMBER, *CLASSES},
+)
+
+# The tags each comparison holds against the path text. A class compares no tag.
+_TAG_INPUTS: Final[dict[str, tuple[str, ...]]] = {
+    TOP_FOLDER_ARTIST: ("albumartist", "artist"),
+    RELEASE_FOLDER_ALBUM: ("album",),
+    RELEASE_FOLDER_YEAR: ("date", "originaldate"),
+    DISC_FOLDER_NUMBER: ("discnumber",),
+    FILENAME_TRACK: ("tracknumber", "discnumber"),
+    FILENAME_TITLE: ("title",),
+    CURATED: (),
+    NESTED: (),
+}
+
+PENDING: Final = "pending"
+LEGIT_IGNORE: Final = "legit_ignore"
+MISFILED_DEFERRED: Final = "misfiled_deferred"
+_SET_STATUSES: Final = frozenset({LEGIT_IGNORE, MISFILED_DEFERRED})
+
+# Why a decided file flags again, the most specific reason first.
+CHANGED_UNCOVERED: Final = "uncovered"
+CHANGED_MOVED: Final = "moved"
+CHANGED_TAGS: Final = "tags"
+_CHANGE_ORDER: Final = (CHANGED_UNCOVERED, CHANGED_MOVED, CHANGED_TAGS)
+
+FILENAME_NOTE: Final = (
+    "No status keeps a filename. The path planner renders every filename from the tags, so "
+    "write a wording you want to keep into the tag."
+)
 
 # Above this library-wide rate of top-folder differences the top folder likely does not name the
 # album artist, so those differences are tiered low. A path-encoding library measures about 1.4%.
@@ -78,10 +120,6 @@ _DETECT_FIELDS: Final = (
     "title",
     "musicbrainz_albumid",
 )
-
-# The dispositions :func:`set_mismatch_status` may write. ``pending`` deletes the row
-# (re-queue). This axis has no ``staged`` or ``done``, since an accepted fix needs no row.
-_USER_MISMATCH_STATUSES: Final = frozenset({"legit_ignore", "misfiled_deferred", "pending"})
 
 # Folders that collect releases rather than hold one, matched punctuation-insensitively like the
 # shared non-album names. The three additions were measured on the live library.
@@ -337,8 +375,10 @@ def _container_keys(settings: Settings) -> frozenset[str]:
     return frozenset(alnum_ascii_key(name) for name in settings.container_folders)
 
 
-def _path_parts(folder: str, music_path: Path) -> tuple[str, ...]:
-    """Return *folder*'s parts under *music_path*, empty at the root or outside it."""
+def _path_parts(folder: str, music_path: Path | None) -> tuple[str, ...]:
+    """Return *folder*'s parts under *music_path*, empty at the root, outside it or without it."""
+    if music_path is None:
+        return ()
     try:
         return Path(folder).relative_to(music_path).parts
     except ValueError:
@@ -477,12 +517,17 @@ class _ParsedName:
 
 @dataclass(frozen=True, slots=True)
 class Difference:
-    """One comparison that disagrees: the tag's value and the path text it was compared with."""
+    """One comparison that disagrees: the tag's value and the path text it was compared with.
+
+    ``silenced`` marks a difference a decision in force silences. The report row sets it, since
+    judging a file precedes reading its decision.
+    """
 
     comparison: str
     tag_value: str
     path_value: str
     tier: str
+    silenced: bool = False
 
     def to_dict(self) -> dict[str, object]:
         """JSON-serializable form for the MCP tool."""
@@ -490,6 +535,7 @@ class Difference:
             "comparison": self.comparison,
             "tag_value": self.tag_value,
             "path_value": self.path_value,
+            "silenced": self.silenced,
         }
 
 
@@ -497,8 +543,11 @@ class Difference:
 class MismatchRow:
     """One file: every difference it carries, its tier, and its exception class.
 
-    ``tier`` is ``None`` only on an exception row with no difference. ``group_folder`` is the
-    release folder for a file under a disc subfolder, else the file's folder.
+    ``differences`` lists silenced differences too, so a group names every flag a new decision
+    must cover. ``tier`` and :meth:`carries` read only the unsilenced ones, and ``tier`` is
+    ``None`` on an exception row with none. ``group_folder`` is the release folder for a file
+    under a disc subfolder, else the file's folder. ``was`` and ``changed`` are set on a file
+    whose decision no longer silences it (:class:`MismatchState`).
     """
 
     file_id: int
@@ -508,10 +557,12 @@ class MismatchRow:
     differences: tuple[Difference, ...]
     exception: str | None
     group_folder: str
+    was: str | None = None
+    changed: str | None = None
 
     def carries(self, comparison: str) -> bool:
-        """Whether one of this file's differences is *comparison*."""
-        return any(d.comparison == comparison for d in self.differences)
+        """Whether *comparison* is one of this file's differences no decision silences."""
+        return any(d.comparison == comparison and not d.silenced for d in self.differences)
 
     def to_dict(self) -> dict[str, object]:
         """JSON-serializable form for the MCP tool."""
@@ -522,6 +573,8 @@ class MismatchRow:
             "tier": self.tier,
             "differences": [d.to_dict() for d in self.differences],
             "exception": self.exception,
+            "was": self.was,
+            "changed": self.changed,
         }
 
 
@@ -543,7 +596,9 @@ class MismatchGroup:
     """One release folder's flagged and exception files (the ``group=True`` view).
 
     The keys of ``comparisons`` plus ``exception`` are the names a decision covers. ``file_ids``
-    holds the flagged and exception files, ``unflagged_ids`` every other present file.
+    holds the flagged and exception files, ``unflagged_ids`` the present files that flag no
+    name. A file whose every flag a decision silences is in neither, and ``suppressed`` counts
+    the files per decision in force.
     """
 
     folder: str
@@ -585,14 +640,15 @@ class _GroupMembers:
 class MismatchesReport:
     """Immutable summary of one :func:`detect_mismatches` run, JSON-ready for the MCP tool.
 
-    The counts describe the whole library minus files a fresh disposition silenced, whatever
-    the view. ``flagged`` counts files with a difference, and the tier counts sum to it.
-    ``exception_rows`` lists every undecided curated or nested file, outside ``flagged``.
-    ``group_count`` counts the groups holding a flagged or exception file. ``suppressed`` maps a
-    disposition status to the files it silenced. ``container_suppressed`` maps a container top
-    folder to the files whose top-folder comparison it skipped. ``groups`` is filled only in the
-    grouped view. ``members``, ``mb_stamped_ids`` and ``suppressed_by_group`` build that view and
-    are not serialized.
+    The counts describe the entire library, whatever the view. ``flagged`` counts files with a
+    difference no decision silences, and the tier counts sum to it. ``exception_rows`` lists
+    every curated or nested file whose class no decision silences, outside ``flagged``.
+    ``gate_open`` holds when both are zero. ``group_count`` counts the groups holding a flagged
+    or exception file. ``suppressed`` maps a status to the files whose decision is in force, and
+    ``stale`` counts the decisions no longer in force. ``container_suppressed`` maps a container
+    top folder to the files whose top-folder comparison it skipped. ``groups`` is filled only in
+    the grouped view. ``members``, ``mb_stamped_ids``, ``suppressed_by_group`` and
+    ``flagging_ids`` build that view and are not serialized.
     """
 
     rows: list[MismatchRow]
@@ -608,12 +664,15 @@ class MismatchesReport:
     disagreement_rate: float
     path_signal_unreliable: bool
     summary: str
+    gate_open: bool
     suppressed: dict[str, int] = field(default_factory=dict)
+    stale: int = 0
     container_suppressed: dict[str, int] = field(default_factory=dict)
     groups: list[MismatchGroup] = field(default_factory=list)
     members: dict[str, _GroupMembers] = field(default_factory=dict)
     mb_stamped_ids: frozenset[int] = frozenset()
     suppressed_by_group: dict[str, dict[str, int]] = field(default_factory=dict)
+    flagging_ids: frozenset[int] = frozenset()
 
     def to_dict(self) -> dict[str, object]:
         """JSON-serializable form for the MCP tool."""
@@ -633,7 +692,9 @@ class MismatchesReport:
             # the RELIABILITY_FLOOR comparison.
             "disagreement_rate": round(self.disagreement_rate, 4),
             "path_signal_unreliable": self.path_signal_unreliable,
+            "gate_open": self.gate_open,
             "suppressed": self.suppressed,
+            "stale": self.stale,
             "container_suppressed": self.container_suppressed,
             "summary": self.summary,
         }
@@ -996,52 +1057,149 @@ def _differences(
     return (first, *item.others)
 
 
-def _row(item: _Judged, differences: tuple[Difference, ...]) -> MismatchRow:
-    """Build the report row of *item*, its tier the most severe of its differences."""
-    tier = min((Tier(d.tier) for d in differences), key=TIER_RANK.__getitem__, default=None)
+def _row(item: _Judged, differences: tuple[Difference, ...], state: MismatchState) -> MismatchRow:
+    """Build the report row of *item*, its tier the most severe of its unsilenced differences."""
+    marked = tuple(replace(d, silenced=d.comparison not in state.unsilenced) for d in differences)
+    open_tiers = (Tier(d.tier) for d in marked if not d.silenced)
+    tier = min(open_tiers, key=TIER_RANK.__getitem__, default=None)
     return MismatchRow(
         file_id=item.file.file_id,
         folder=item.file.folder,
         filename=item.file.filename,
         tier=None if tier is None else tier.value,
-        differences=differences,
+        differences=marked,
         exception=item.layout.exception,
         group_folder=item.group_folder,
+        was=state.was,
+        changed=state.changed,
     )
 
 
-def _disposition_blocks(disposition: store.MismatchStatusRow, f: _FileInput) -> bool:
-    """Whether *f*'s stored disposition is still fresh (its snapshotted tag is unchanged).
+# --- path decisions: silencing, keep in force and the status reading -----------------
 
-    Delegates to :func:`tagmend.engine.axis.mismatch_decision_blocks`, so this skip path and
-    the user-facing :func:`tagmend.engine.store.derived_mismatch_status` share one rule.
+
+@dataclass(frozen=True, slots=True)
+class MismatchState:
+    """One present file's reading on the mismatch axis.
+
+    ``names`` holds the comparisons and the class the file flags, and ``unsilenced`` those its
+    decision does not silence. ``status`` is ``pending`` while ``unsilenced`` holds a name, else
+    the status of a decision in force, else ``pending``. On a decided file that flags again,
+    ``was`` is the decision and ``changed`` the first reason of :data:`_CHANGE_ORDER` that
+    applies. ``in_force`` says whether ``row`` still binds the file's location.
     """
-    return axis.mismatch_decision_blocks(
-        axis.StatusRow(
-            status=disposition.status,
-            source_primary=disposition.source_field,
-            source_secondary=disposition.source_value,
-        ),
-        axis.Identity(
-            primary=_clean(f.tags.get("albumartist")), secondary=_clean(f.tags.get("artist"))
-        ),
+
+    status: str
+    names: frozenset[str]
+    unsilenced: frozenset[str]
+    was: str | None
+    changed: str | None
+    row: store.MismatchStatusRow | None
+    in_force: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _Location:
+    """Where a file sits now, as the key of its folder and its highest path version."""
+
+    folder_key: str
+    path_version: int
+
+
+def _location(file: _FileInput, versions: Mapping[int, int]) -> _Location:
+    """Return *file*'s :class:`_Location`, version 0 for a file that never moved."""
+    return _Location(
+        folder_key=path_keys.path_key(file.folder),
+        path_version=versions.get(file.file_id, 0),
     )
 
 
-def _classify(
+def _keeps_folder(row: store.MismatchStatusRow | None, folder_key: str) -> bool:
+    """Whether *row* is a keep bound to the folder keyed *folder_key*."""
+    return row is not None and row.status == LEGIT_IGNORE and row.folder_key == folder_key
+
+
+def _in_force(row: store.MismatchStatusRow, location: _Location) -> bool:
+    """Whether *row* still binds, a keep to its folder or a deferral to its path version."""
+    if row.status == LEGIT_IGNORE:
+        return row.folder_key == location.folder_key
+    return row.path_version == location.path_version
+
+
+def _bound(row: store.MismatchStatusRow, name: str, location: _Location) -> bool:
+    """Whether *row* still binds *name*.
+
+    A keep binds a folder-level name to the folder, so a revert to that folder silences it
+    again. Every other name binds to the path version, which any committed move advances.
+    """
+    if row.status == LEGIT_IGNORE and name in FOLDER_NAMES:
+        return row.folder_key == location.folder_key
+    return row.path_version == location.path_version
+
+
+def _tags_hold(row: store.MismatchStatusRow, file: _FileInput, name: str) -> bool:
+    """Whether each tag of *name* that *row* snapshotted still holds the snapshotted value."""
+    # A v23 row set on albumartist never snapshotted artist, which its comparison did not read.
+    return all(
+        row.tags[tag] == _clean(file.tags.get(tag)) for tag in _TAG_INPUTS[name] if tag in row.tags
+    )
+
+
+def _change(
+    row: store.MismatchStatusRow | None,
+    file: _FileInput,
+    name: str,
+    location: _Location,
+) -> str | None:
+    """Return why *row* does not silence the flagged *name*, or ``None`` when it does."""
+    if row is None or name not in row.covers:
+        return CHANGED_UNCOVERED
+    if not _bound(row, name, location):
+        return CHANGED_MOVED
+    if not _tags_hold(row, file, name):
+        return CHANGED_TAGS
+    return None
+
+
+def _state(
+    file: _FileInput,
+    names: frozenset[str],
+    row: store.MismatchStatusRow | None,
+    location: _Location,
+) -> MismatchState:
+    """Read *file*, which flags *names*, against its stored decision *row*."""
+    changes = {
+        name: change for name in names if (change := _change(row, file, name, location)) is not None
+    }
+    unsilenced = frozenset(changes)
+    if row is None:
+        return MismatchState(PENDING, names, unsilenced, None, None, row, in_force=False)
+    in_force = _in_force(row, location)
+    if changes:
+        reason = next(change for change in _CHANGE_ORDER if change in changes.values())
+        return MismatchState(PENDING, names, unsilenced, row.status, reason, row, in_force)
+    status = row.status if in_force else PENDING
+    return MismatchState(status, names, unsilenced, None, None, row, in_force)
+
+
+def _names_of(item: _Judged) -> frozenset[str]:
+    """Return the comparisons *item* differs on, plus its exception class."""
+    names = {difference.comparison for difference in item.others}
+    if item.top is not None and item.top.differs:
+        names.add(TOP_FOLDER_ARTIST)
+    if item.layout.exception is not None:
+        names.add(item.layout.exception)
+    return frozenset(names)
+
+
+def _judge_all(
     files: list[_FileInput],
-    music_path: Path,
-    *,
-    dispositions: dict[int, store.MismatchStatusRow] | None = None,
-    container_keys: frozenset[str] = frozenset(),
-) -> MismatchesReport:
-    """Classify every present file into a full :class:`MismatchesReport` (pure core).
-
-    The reliability guard and the group tiers see every file. A fresh disposition then
-    silences its file's row and exception row, and is counted in ``suppressed``.
-    """
+    music_path: Path | None,
+    container_keys: frozenset[str],
+) -> list[_Judged]:
+    """Lay out and judge every file in *files*, each beside its folder siblings."""
     numbering = _numbering(files)
-    judged = [
+    return [
         _judge(
             f,
             _layout(_path_parts(f.folder, music_path), f.filename, container_keys),
@@ -1049,41 +1207,82 @@ def _classify(
         )
         for f in files
     ]
+
+
+@dataclass(slots=True)
+class _Tally:
+    """The per-file counts :func:`_classify` gathers beside the rows."""
+
+    suppressed: dict[str, int] = field(default_factory=dict)
+    suppressed_by_group: dict[str, dict[str, int]] = field(default_factory=dict)
+    container_suppressed: dict[str, int] = field(default_factory=dict)
+    flagging_ids: set[int] = field(default_factory=set)
+    stale: int = 0
+
+    def add(self, item: _Judged, state: MismatchState) -> None:
+        """Count *item*'s container skip, its decision in force or stale, and its flags."""
+        if item.layout.container:
+            name = item.layout.top_folder or Path(item.file.folder).name
+            self.container_suppressed[name] = self.container_suppressed.get(name, 0) + 1
+        if state.row is not None and not state.in_force:
+            self.stale += 1
+        if state.status != PENDING:
+            self.suppressed[state.status] = self.suppressed.get(state.status, 0) + 1
+            by_status = self.suppressed_by_group.setdefault(item.group_key, {})
+            by_status[state.status] = by_status.get(state.status, 0) + 1
+        if state.names:
+            self.flagging_ids.add(item.file.file_id)
+
+
+def _classify(
+    files: list[_FileInput],
+    music_path: Path,
+    *,
+    dispositions: Mapping[int, store.MismatchStatusRow] | None = None,
+    path_versions: Mapping[int, int] | None = None,
+    container_keys: frozenset[str] = frozenset(),
+) -> MismatchesReport:
+    """Classify every present file into a full :class:`MismatchesReport` (pure core).
+
+    The reliability guard and the group tiers see every file. Each file is then read against its
+    stored decision (:func:`_state`). It joins ``rows`` while a comparison is unsilenced and
+    ``exception_rows`` while its class is.
+    """
+    judged = _judge_all(files, music_path, container_keys)
     rate, unreliable = _reliability(judged)
     members = _group_members(judged)
     albumartists = _albumartists_by_group(judged)
     stored = dispositions or {}
+    versions = path_versions or {}
 
     rows: list[MismatchRow] = []
     exception_rows: list[MismatchRow] = []
-    suppressed: dict[str, int] = {}
-    suppressed_by_group: dict[str, dict[str, int]] = {}
-    container_suppressed: dict[str, int] = {}
+    tally = _Tally()
     for item in judged:
-        if item.layout.container:
-            name = item.layout.top_folder or Path(item.file.folder).name
-            container_suppressed[name] = container_suppressed.get(name, 0) + 1
+        state = _state(
+            item.file,
+            _names_of(item),
+            stored.get(item.file.file_id),
+            _location(item.file, versions),
+        )
+        tally.add(item, state)
+        if not state.unsilenced:
+            continue
         differences = _differences(
             item,
             group_size=len(members[item.group_key].file_ids),
             albumartists=len(albumartists.get(item.group_key, set())),
             unreliable=unreliable,
         )
-        if not differences and item.layout.exception is None:
-            continue
-        disposition = stored.get(item.file.file_id)
-        if disposition is not None and _disposition_blocks(disposition, item.file):
-            suppressed[disposition.status] = suppressed.get(disposition.status, 0) + 1
-            by_status = suppressed_by_group.setdefault(item.group_key, {})
-            by_status[disposition.status] = by_status.get(disposition.status, 0) + 1
-            continue
-        row = _row(item, differences)
-        if differences:
+        row = _row(item, differences, state)
+        if state.unsilenced - CLASSES:
             rows.append(row)
-        if item.layout.exception is not None:
+        if state.unsilenced & CLASSES:
             exception_rows.append(row)
 
-    rows.sort(key=lambda r: (min(TIER_RANK[Tier(d.tier)] for d in r.differences), r.file_id))
+    rows.sort(
+        key=lambda r: (TIER_RANK[Tier(r.tier)] if r.tier is not None else len(TIER_RANK), r.file_id)
+    )
     exception_rows.sort(key=lambda r: r.file_id)
     mb_stamped_ids = frozenset(f.file_id for f in files if f.value("musicbrainz_albumid"))
     return _assemble_report(
@@ -1092,9 +1291,7 @@ def _classify(
         total_files=len(files),
         rate=rate,
         unreliable=unreliable,
-        suppressed=suppressed,
-        suppressed_by_group=suppressed_by_group,
-        container_suppressed=container_suppressed,
+        tally=tally,
         members=members,
         mb_stamped_ids=mb_stamped_ids,
     )
@@ -1107,9 +1304,7 @@ def _assemble_report(  # noqa: PLR0913 - cohesive keyword-only report payload
     total_files: int,
     rate: float,
     unreliable: bool,
-    suppressed: dict[str, int],
-    suppressed_by_group: dict[str, dict[str, int]],
-    container_suppressed: dict[str, int],
+    tally: _Tally,
     members: dict[str, _GroupMembers],
     mb_stamped_ids: frozenset[int],
 ) -> MismatchesReport:
@@ -1126,8 +1321,9 @@ def _assemble_report(  # noqa: PLR0913 - cohesive keyword-only report payload
         group_count=group_count,
         total_files=total_files,
         unreliable=unreliable,
-        silenced=sum(suppressed.values()),
-        container_files=sum(container_suppressed.values()),
+        decided=sum(tally.suppressed.values()),
+        stale=tally.stale,
+        container_files=sum(tally.container_suppressed.values()),
     )
     return MismatchesReport(
         rows=rows,
@@ -1143,11 +1339,14 @@ def _assemble_report(  # noqa: PLR0913 - cohesive keyword-only report payload
         disagreement_rate=rate,
         path_signal_unreliable=unreliable,
         summary=summary,
-        suppressed=suppressed,
-        container_suppressed=container_suppressed,
+        gate_open=not rows and not exception_rows,
+        suppressed=tally.suppressed,
+        stale=tally.stale,
+        container_suppressed=tally.container_suppressed,
         members=members,
         mb_stamped_ids=mb_stamped_ids,
-        suppressed_by_group=suppressed_by_group,
+        suppressed_by_group=tally.suppressed_by_group,
+        flagging_ids=frozenset(tally.flagging_ids),
     )
 
 
@@ -1159,12 +1358,14 @@ def _summarize(  # noqa: PLR0913 - cohesive keyword-only summary inputs
     group_count: int,
     total_files: int,
     unreliable: bool,
-    silenced: int,
+    decided: int,
+    stale: int,
     container_files: int,
 ) -> str:
     """Build a short, plain human summary of the run."""
     note = " (path signal unreliable: top-folder differences tiered low)" if unreliable else ""
-    silenced_note = f" {silenced} file(s) silenced by a disposition." if silenced else ""
+    decided_note = f" {decided} file(s) hold a decision in force." if decided else ""
+    stale_note = f" {stale} decision(s) no longer in force." if stale else ""
     container_note = (
         f" {container_files} file(s) under a container folder skip the top-folder comparison."
         if container_files
@@ -1174,7 +1375,7 @@ def _summarize(  # noqa: PLR0913 - cohesive keyword-only summary inputs
         f"Flagged {flagged} of {total_files} file(s): {tiers[Tier.HIGH]} high, "
         f"{tiers[Tier.MEDIUM]} medium, {tiers[Tier.LOW]} low{note}. "
         f"{exceptions} exception file(s) undecided. {group_count} group(s) to review."
-        f"{silenced_note}{container_note}"
+        f"{decided_note}{stale_note}{container_note}"
     )
 
 
@@ -1206,7 +1407,6 @@ def _build_groups(
     report: MismatchesReport,
 ) -> list[MismatchGroup]:
     """Fold *rows* and *exception_rows* into one group per release folder, folder-sorted."""
-    listed = {r.file_id for r in report.rows} | {r.file_id for r in report.exception_rows}
     flagged_by_key: dict[str, list[MismatchRow]] = {}
     for row in rows:
         flagged_by_key.setdefault(path_keys.path_key(row.group_folder), []).append(row)
@@ -1233,7 +1433,7 @@ def _build_groups(
                 exception=next((r.exception for r in (*excepted, *flagged) if r.exception), None),
                 suppressed=dict(report.suppressed_by_group.get(key, {})),
                 file_ids=sorted({r.file_id for r in (*flagged, *excepted)}),
-                unflagged_ids=sorted(set(members.file_ids) - listed),
+                unflagged_ids=sorted(set(members.file_ids) - report.flagging_ids),
             ),
         )
     groups.sort(key=lambda g: g.folder)
@@ -1285,8 +1485,21 @@ def _clean(value: str | None) -> str | None:
     return stripped or None
 
 
-def _load_inputs(connection: sqlite3.Connection) -> list[_FileInput]:
-    """Read every present file and the tags the comparator reads, in two queries."""
+def _load_inputs(
+    connection: sqlite3.Connection,
+    *,
+    near: Collection[int] | None = None,
+) -> list[_FileInput]:
+    """Read every present file and the tags the comparator reads, in two queries.
+
+    With *near*, keep only the files sharing a folder with one of those ids, since the track
+    comparison numbers a file among its folder siblings.
+    """
+    rows = [row for row in store.list_files(connection) if not row.is_missing]
+    if near is not None:
+        wanted = set(near)
+        folders = {path_keys.path_key(row.folder) for row in rows if row.id in wanted}
+        rows = [row for row in rows if path_keys.path_key(row.folder) in folders]
     tag_values = store.load_tag_values(connection, _DETECT_FIELDS)
     return [
         _FileInput(
@@ -1295,8 +1508,7 @@ def _load_inputs(connection: sqlite3.Connection) -> list[_FileInput]:
             filename=row.filename,
             tags=tag_values.get(row.id, {}),
         )
-        for row in store.list_files(connection)
-        if not row.is_missing
+        for row in rows
     ]
 
 
@@ -1314,8 +1526,10 @@ def detect_mismatches(  # noqa: PLR0913 - cohesive keyword-only view parameters
     A read-only pass over the snapshot: no tag writes, nothing staged, no network. Each present
     file's path is split into its top folder, release folder, disc subfolder and filename, and
     six comparisons run over them (:data:`COMPARISONS`). A blank tag never flags. Curated and
-    nested files are listed in ``exception_rows``, outside ``flagged``. A file with a fresh
-    disposition (see :func:`set_mismatch_status`) is silenced and counted in ``suppressed``.
+    nested files are listed in ``exception_rows``, outside ``flagged``. A path decision
+    (:func:`set_mismatch_status`) silences the names it covers while it binds the file
+    (:class:`MismatchState`). A file it no longer silences carries ``was`` and ``changed``.
+    ``gate_open`` holds when no flagged file and no undecided exception remains.
 
     *tier* and *comparison* keep only the rows of that tier, or carrying that comparison. Each
     row still lists every difference of its file. *group* returns one group per release folder,
@@ -1337,6 +1551,7 @@ def detect_mismatches(  # noqa: PLR0913 - cohesive keyword-only view parameters
         schema.apply_schema(connection)
         files = _load_inputs(connection)
         dispositions = store.load_mismatch_statuses(connection)
+        versions = store.path_versions(connection)
     finally:
         connection.close()
 
@@ -1344,11 +1559,12 @@ def detect_mismatches(  # noqa: PLR0913 - cohesive keyword-only view parameters
         files,
         music_path,
         dispositions=dispositions,
+        path_versions=versions,
         container_keys=_container_keys(settings),
     )
     logger.info(
         "detect complete: total=%d flagged=%d groups=%d exceptions=%d rate=%.3f "
-        "unreliable=%s silenced=%d",
+        "unreliable=%s decided=%d stale=%d gate_open=%s",
         report.total_files,
         report.flagged,
         report.group_count,
@@ -1356,6 +1572,8 @@ def detect_mismatches(  # noqa: PLR0913 - cohesive keyword-only view parameters
         report.disagreement_rate,
         report.path_signal_unreliable,
         sum(report.suppressed.values()),
+        report.stale,
+        report.gate_open,
     )
     return _narrow(
         report,
@@ -1367,74 +1585,392 @@ def detect_mismatches(  # noqa: PLR0913 - cohesive keyword-only view parameters
     )
 
 
-# --- disposition verbs: the module's only writers, of status rows and never tags ------
+def file_states(
+    conn: sqlite3.Connection,
+    settings: Settings,
+    file_ids: Collection[int] | None = None,
+) -> dict[int, MismatchState]:
+    """Return the reading of every present file, or of the present files among *file_ids*.
 
-
-def _snapshot_source(tags: dict[str, list[str]]) -> tuple[str | None, str | None]:
-    """Snapshot the disagreeing tag by detect priority: albumartist-if-present, else artist.
-
-    Returns ``(source_field, source_value)`` using the SAME cleaning the detector applies, so
-    the freshness re-check compares like with like. Both ``None`` when the file has neither a
-    non-blank ``albumartist`` nor ``artist``.
+    The one status reading behind :func:`detect_mismatches`, ``list_files``, ``get_file`` and the
+    library stats. Without ``music_path`` no folder level can be named, so only the filename
+    comparisons run. Reads only, on the caller's connection.
     """
-    albumartist = _first_clean(tags, "albumartist")
-    if albumartist is not None:
-        return "albumartist", albumartist
-    artist = _first_clean(tags, "artist")
-    if artist is not None:
-        return "artist", artist
-    return None, None
+    wanted = None if file_ids is None else set(file_ids)
+    judged = _judge_all(
+        _load_inputs(conn, near=wanted),
+        settings.music_path,
+        _container_keys(settings),
+    )
+    stored = store.load_mismatch_statuses(conn)
+    versions = store.path_versions(conn)
+    return {
+        item.file.file_id: _state(
+            item.file,
+            _names_of(item),
+            stored.get(item.file.file_id),
+            _location(item.file, versions),
+        )
+        for item in judged
+        if wanted is None or item.file.file_id in wanted
+    }
 
 
-def _first_clean(tags: dict[str, list[str]], name: str) -> str | None:
-    """Return the cleaned ordinal-0 value of *name*, or ``None`` when absent/blank."""
-    values = tags.get(name, [])
-    return _clean(values[0]) if values else None
+def status_counts(conn: sqlite3.Connection, settings: Settings) -> dict[str, int]:
+    """Count the present files per mismatch status. Every status is a key, summing to present."""
+    counts = dict.fromkeys(sorted(axis.MISMATCH_AXIS.workflow_statuses), 0)
+    for state in file_states(conn, settings).values():
+        counts[state.status] += 1
+    return counts
+
+
+# --- the contract with the path tools ------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class GateState:
+    """The library-wide stage gate, open when no file flags and no exception is undecided."""
+
+    open: bool
+    flagged: int
+    exceptions_undecided: int
+
+    def to_dict(self) -> dict[str, object]:
+        """JSON-serializable form for a tool envelope."""
+        return {
+            "open": self.open,
+            "flagged": self.flagged,
+            "exceptions_undecided": self.exceptions_undecided,
+        }
+
+
+def gate_state(settings: Settings) -> GateState:
+    """Return the gate ``stage_paths`` and ``stage_paths_batch`` read before staging.
+
+    Raises :class:`ValueError` when no music path is configured.
+    """
+    report = detect_mismatches(settings)
+    return GateState(
+        open=report.gate_open,
+        flagged=report.flagged,
+        exceptions_undecided=report.exceptions_undecided,
+    )
+
+
+def check_files(
+    conn: sqlite3.Connection,
+    settings: Settings,
+    file_ids: Collection[int],
+) -> list[tuple[int, str]]:
+    """Return each ``(file_id, name)`` the given files flag that no decision silences.
+
+    The commit check ``commit_paths`` runs on its forward rows, at the location the ledger
+    records. A missing file is not judged. Raises :class:`ValueError` when no music path is
+    configured.
+    """
+    _require_music_path(settings)
+    states = file_states(conn, settings, file_ids)
+    return [
+        (file_id, name)
+        for file_id in sorted(states)
+        for name in NAMES
+        if name in states[file_id].unsilenced
+    ]
+
+
+def planner_keep(conn: sqlite3.Connection, file_id: int) -> bool:
+    """Whether *file_id*'s folder stays, since it holds a keep bound to its current folder.
+
+    Tags play no part, so a later tag edit never releases a kept folder. A name that flags
+    again closes the gate instead.
+    """
+    row = store.get_file_by_id(conn, file_id)
+    if row is None:
+        return False
+    return _keeps_folder(store.get_mismatch_status(conn, file_id), path_keys.path_key(row.folder))
+
+
+# --- the status tools: the only writers of file_mismatch_status ----------------------
+
+
+@dataclass(frozen=True, slots=True)
+class DecidedFile:
+    """What the path planner does with one decided file's folder and filename."""
+
+    file_id: int
+    folder: str
+    filename: str
+
+    def to_dict(self) -> dict[str, object]:
+        """JSON-serializable form for the MCP tool."""
+        return {"file_id": self.file_id, "folder": self.folder, "filename": self.filename}
+
+
+@dataclass(frozen=True, slots=True)
+class MismatchStatusResult:
+    """One :func:`set_mismatch_status` call: the rows it wrote and what the planner will do.
+
+    ``covers`` counts the written files per covered name. ``skipped_unflagged`` counts the
+    carriers of a *value* scope whose top folder agrees with their tags.
+    """
+
+    status: str
+    affected: int
+    skipped_unflagged: int
+    covers: dict[str, int]
+    files: list[DecidedFile]
+
+    def to_dict(self) -> dict[str, object]:
+        """JSON-serializable form for the MCP tool."""
+        return {
+            "status": self.status,
+            "affected": self.affected,
+            "skipped_unflagged": self.skipped_unflagged,
+            "covers": self.covers,
+            "files": [decided.to_dict() for decided in self.files],
+            "note": FILENAME_NOTE,
+        }
+
+
+def _require_covers(covers: Collection[str]) -> frozenset[str]:
+    """Return *covers* as a set, or raise :class:`ValueError` naming each unknown name."""
+    unknown = sorted(set(covers) - set(NAMES))
+    if unknown:
+        message = f"unknown covers name(s): {unknown} (expected some of {', '.join(NAMES)})"
+        raise ValueError(message)
+    return frozenset(covers)
+
+
+def _require_value_decision(status: str, covered: frozenset[str]) -> None:
+    """Refuse a *value* scope for anything but a top-folder deferral."""
+    if status == MISFILED_DEFERRED and covered == {TOP_FOLDER_ARTIST}:
+        return
+    message = (
+        'a value scope takes only status="misfiled_deferred" with '
+        'covers=["top_folder_artist"]. Pass file_ids for any other decision'
+    )
+    raise ValueError(message)
+
+
+def _refuse_missing(conn: sqlite3.Connection, file_ids: list[int]) -> None:
+    """Raise :class:`ValueError` naming each id of *file_ids* the last scan found missing."""
+    missing = store.missing_file_ids(conn)
+    absent = [file_id for file_id in file_ids if file_id in missing]
+    if absent:
+        message = f"file_id(s) {absent} are missing from disk. Rescan, or leave them out"
+        raise ValueError(message)
+
+
+def _refuse_staged_paths(conn: sqlite3.Connection, file_ids: list[int]) -> None:
+    """Raise :class:`ValueError` naming each id of *file_ids* with a staged path change."""
+    staged = store.staged_path_file_ids(conn, file_ids)
+    if staged:
+        message = f"file_id(s) {staged} hold a staged path change. Run unstage_paths on them first"
+        raise ValueError(message)
+
+
+def _refuse_spanning_groups(targets: list[_Judged]) -> None:
+    """Refuse a scope spanning more than one release-folder group, naming the groups."""
+    folders = {item.group_key: item.group_folder for item in targets}
+    if len(folders) > 1:
+        message = (
+            f"one call decides one release-folder group, and these files span "
+            f"{len(folders)}: {sorted(folders.values())}. Call once per group"
+        )
+        raise ValueError(message)
+
+
+def _refuse_uncovered(
+    targets: list[_Judged],
+    covered: frozenset[str],
+    names: Mapping[int, frozenset[str]],
+) -> None:
+    """Refuse a file flagging a name outside *covered*, naming each ``(file_id, name)``."""
+    pairs = [
+        (item.file.file_id, name)
+        for item in targets
+        for name in NAMES
+        if name in names[item.file.file_id] - covered
+    ]
+    if pairs:
+        message = (
+            f"file(s) flag names outside covers: {pairs}. Read "
+            f"detect_mismatches(folder={targets[0].group_folder!r}) and pass every name it "
+            f"lists, or fix the tags first"
+        )
+        raise ValueError(message)
+
+
+def _refuse_unflagged_deferral(
+    targets: list[_Judged],
+    names: Mapping[int, frozenset[str]],
+) -> None:
+    """Refuse ``misfiled_deferred`` on a file that flags no comparison and holds no class."""
+    unflagged = [item.file.file_id for item in targets if not names[item.file.file_id]]
+    if unflagged:
+        message = (
+            f"misfiled_deferred needs a flag or a class, and file_id(s) {unflagged} have "
+            f"neither. Omit unflagged_ids from a misfiled_deferred call"
+        )
+        raise ValueError(message)
+
+
+def _refuse_split_keep(
+    targets: list[_Judged],
+    judged: list[_Judged],
+    stored: Mapping[int, store.MismatchStatusRow],
+) -> None:
+    """Refuse a keep that would leave a present member of its group without a keep in force."""
+    group_key = targets[0].group_key
+    target_ids = {item.file.file_id for item in targets}
+    left = [
+        item.file.file_id
+        for item in judged
+        if item.group_key == group_key
+        and item.file.file_id not in target_ids
+        and not _keeps_folder(stored.get(item.file.file_id), path_keys.path_key(item.file.folder))
+    ]
+    if left:
+        message = (
+            f"legit_ignore keeps an entire group, and member file_id(s) {left} would hold no "
+            f"keep. Pass the group's file_ids and unflagged_ids together"
+        )
+        raise ValueError(message)
+
+
+def _refuse_unsafe(  # noqa: PLR0913 - one guard pass over the call's entire context
+    status: str,
+    covered: frozenset[str],
+    targets: list[_Judged],
+    judged: list[_Judged],
+    names: Mapping[int, frozenset[str]],
+    stored: Mapping[int, store.MismatchStatusRow],
+) -> None:
+    """Run every guard that refuses the entire call before anything is written."""
+    if not targets:
+        return
+    _refuse_spanning_groups(targets)
+    _refuse_uncovered(targets, covered, names)
+    if status == MISFILED_DEFERRED:
+        _refuse_unflagged_deferral(targets, names)
+    else:
+        _refuse_split_keep(targets, judged, stored)
+
+
+def _decision_row(
+    status: str,
+    item: _Judged,
+    names: frozenset[str],
+    versions: Mapping[int, int],
+) -> store.MismatchStatusRow:
+    """Snapshot *item*'s flagged *names*, their tags, its path version and a keep's folder."""
+    covers = tuple(name for name in NAMES if name in names)
+    location = _location(item.file, versions)
+    return store.MismatchStatusRow(
+        status=status,
+        covers=covers,
+        tags={tag: _clean(item.file.tags.get(tag)) for name in covers for tag in _TAG_INPUTS[name]},
+        path_version=location.path_version,
+        folder_key=location.folder_key if status == LEGIT_IGNORE else None,
+    )
 
 
 def set_mismatch_status(
     settings: Settings,
     *,
+    status: str,
+    covers: Collection[str],
     file_ids: list[int] | None = None,
     value: str | None = None,
-    status: str,
-) -> int:
-    """Set a sticky mismatch disposition (or clear it with ``pending``) for every file in scope.
+) -> MismatchStatusResult:
+    """Record one path decision for every file in scope, or refuse the entire call.
 
-    ``legit_ignore`` silences a false positive. ``misfiled_deferred`` defers a genuinely
-    misfiled file. Both snapshot the file's current disagreeing tag (``source_field`` /
-    ``source_value``) so a later tag change makes the disposition stale and the file
-    re-surfaces on the next detect. ``pending`` deletes any row (re-queue). Scope follows
-    :func:`tagmend.engine.axis_status.status_scope`: *file_ids* when given, else every file
-    carrying *value* as ``artist`` OR ``albumartist``. Returns the number of files affected.
-    Raises :class:`ValueError` for an unknown *status*. Owns its transaction and writes only
-    ``file_mismatch_status`` rows.
+    ``legit_ignore`` keeps each file's folder, so the path planner renders only its filename.
+    ``misfiled_deferred`` says the tags are right, so the planner renders every level. No status
+    keeps a filename. Covering a filename difference means the tag is right and the filename
+    will follow it. To keep a filename's wording, write it into the tag.
+
+    *covers* names the comparisons and classes decided, read from the group row. Each written
+    row covers the names its file flags now, and snapshots their tags, the file's path version
+    and, on a keep, its folder key (:class:`tagmend.engine.store.MismatchStatusRow`). A keep may
+    cover nothing, a durable keep of an unflagged file's folder.
+
+    Scope is *file_ids* when given, else the present files carrying *value* as ``artist`` or
+    ``albumartist`` whose top folder differs (other carriers count as ``skipped_unflagged``). A
+    *value* scope takes only ``misfiled_deferred`` with ``covers=["top_folder_artist"]``.
+
+    Raises :class:`ValueError`, writing nothing, for an unknown *status* or name, a missing music
+    path, an unknown or missing id, a file with a staged path change, a scope spanning two
+    release-folder groups, a file flagging a name outside *covers*, a deferral of a file that
+    flags nothing, and a keep that would leave a present group member without a keep in force.
+    Owns its transaction.
     """
-    require_choice("status", status, _USER_MISMATCH_STATUSES)
+    require_choice("status", status, _SET_STATUSES)
+    covered = _require_covers(covers)
+    by_value = file_ids is None and value is not None
+    if by_value:
+        _require_value_decision(status, covered)
+    music_path = _require_music_path(settings)
+    rows: dict[int, store.MismatchStatusRow] = {}
+    candidates: list[_Judged] = []
 
-    def write(conn: sqlite3.Connection, file_id: int, now: str) -> None:
-        if status == "pending":
-            store.delete_mismatch_status(conn, file_id)
-            return
-        source_field, source_value = _snapshot_source(store.get_tags(conn, file_id))
-        store.set_mismatch_status(
-            conn,
-            file_id=file_id,
-            status=status,
-            source_field=source_field,
-            source_value=source_value,
-            now=now,
+    connection = db.connect(settings.db_path)
+    try:
+        schema.apply_schema(connection)
+        scoped = axis_status.status_scope(
+            connection,
+            axis.MISMATCH_AXIS,
+            file_ids=file_ids,
+            value=value,
         )
+        if not by_value:
+            _refuse_missing(connection, scoped)
+        judged = _judge_all(_load_inputs(connection), music_path, _container_keys(settings))
+        names = {item.file.file_id: _names_of(item) for item in judged}
+        by_id = {item.file.file_id: item for item in judged}
+        candidates = [by_id[file_id] for file_id in scoped if file_id in by_id]
+        targets = [
+            item
+            for item in candidates
+            if not by_value or TOP_FOLDER_ARTIST in names[item.file.file_id]
+        ]
+        _refuse_staged_paths(connection, [item.file.file_id for item in targets])
+        versions = store.path_versions(connection)
+        _refuse_unsafe(
+            status,
+            covered,
+            targets,
+            judged,
+            names,
+            store.load_mismatch_statuses(connection),
+        )
+        rows = {
+            item.file.file_id: _decision_row(status, item, names[item.file.file_id], versions)
+            for item in targets
+        }
+        now = clock.utc_now()
+        for file_id, row in rows.items():
+            store.set_mismatch_status(connection, file_id=file_id, row=row, now=now)
+        connection.commit()
+    finally:
+        connection.close()
 
-    affected = axis_status.apply_status(
-        settings,
-        axis.MISMATCH_AXIS,
-        file_ids=file_ids,
-        value=value,
-        write=write,
+    result = MismatchStatusResult(
+        status=status,
+        affected=len(rows),
+        skipped_unflagged=len(candidates) - len(rows),
+        covers=dict(Counter(name for row in rows.values() for name in row.covers)),
+        files=[
+            DecidedFile(
+                file_id=file_id,
+                folder="kept" if status == LEGIT_IGNORE else "rendered",
+                filename="rendered",
+            )
+            for file_id in rows
+        ],
     )
-    logger.info("set mismatch status=%s for %d file(s)", status, affected)
-    return affected
+    logger.info("set mismatch status=%s for %d file(s)", status, result.affected)
+    return result
 
 
 def reset_mismatch_status(
@@ -1443,14 +1979,30 @@ def reset_mismatch_status(
     file_ids: list[int] | None = None,
     value: str | None = None,
 ) -> int:
-    """Delete the mismatch disposition for every file in scope (back to ``pending``).
+    """Delete the path decision of every file in scope, so each reads its flags again.
 
-    Same scoping as :func:`set_mismatch_status`. Returns the number of files affected. Owns
-    its transaction.
+    Scope is *file_ids* when given, else every file carrying *value* as ``artist`` or
+    ``albumartist``. A delete authorises nothing, so no covers or group rule applies. Raises
+    :class:`ValueError`, deleting nothing, for an unknown or missing id and for a file with a
+    staged path change. Returns the number of files in scope. Owns its transaction.
     """
-    return axis_status.reset_status(
-        settings,
-        axis.MISMATCH_AXIS,
-        file_ids=file_ids,
-        value=value,
-    )
+    scoped: list[int] = []
+    connection = db.connect(settings.db_path)
+    try:
+        schema.apply_schema(connection)
+        scoped = axis_status.status_scope(
+            connection,
+            axis.MISMATCH_AXIS,
+            file_ids=file_ids,
+            value=value,
+        )
+        if file_ids is not None:
+            _refuse_missing(connection, scoped)
+        _refuse_staged_paths(connection, scoped)
+        for file_id in scoped:
+            store.delete_mismatch_status(connection, file_id)
+        connection.commit()
+    finally:
+        connection.close()
+    logger.info("reset mismatch status for %d file(s)", len(scoped))
+    return len(scoped)

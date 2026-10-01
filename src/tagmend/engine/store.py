@@ -272,7 +272,11 @@ def list_files(conn: sqlite3.Connection, *, limit: int | None = None) -> list[Fi
 
 
 def compute_stats(conn: sqlite3.Connection) -> dict[str, object]:
-    """Return library-wide counts for the ``stats`` command / MCP tool."""
+    """Return library-wide counts for the ``stats`` command / MCP tool.
+
+    The mismatch block needs the path comparator and the settings, so
+    :func:`tagmend.engine.library.get_library_stats` adds it.
+    """
     total_files = _scalar_int(conn, "SELECT COUNT(*) FROM files")
     missing = _scalar_int(conn, "SELECT COUNT(*) FROM files WHERE is_missing = 1")
     present = total_files - missing
@@ -297,7 +301,6 @@ def compute_stats(conn: sqlite3.Connection) -> dict[str, object]:
         "artist": status_counts(conn, axis.ARTIST_AXIS),
         "year": status_counts(conn, axis.YEAR_AXIS),
         "song": status_counts(conn, axis.SONG_AXIS),
-        "mismatch": mismatch_status_counts(conn),
     }
 
 
@@ -1186,121 +1189,153 @@ def record_outcome(
     axis.put_outcome(conn, axis_, file_id=file_id, status=status, tags=tags, now=now)
 
 
-# --- file_mismatch_status (per-file mismatch dispositions; mismatch-axis twin) --------
+# --- file_mismatch_status (one path decision per file) -------------------------------
 
-# The three mismatch workflow states (re-exported from the mismatch axis). Two are stored
-# (``legit_ignore``/``misfiled_deferred`` — rows in ``file_mismatch_status``), and
-# ``pending`` = no row. There are NO ``staged``/``done`` states on this axis: an accepted fix
-# needs no row (the tag simply agrees with the path). Single source of truth for the
-# ``list_files(mismatch_status=...)`` filter and the stats counts.
+# The mismatch axis's statuses. The two decisions are stored rows, and ``pending`` means no
+# decision in force. :mod:`tagmend.engine.mismatch` derives which one a file reads.
 MISMATCH_WORKFLOW_STATUSES: Final = axis.MISMATCH_AXIS.workflow_statuses
 
 
 @dataclass(frozen=True, slots=True)
 class MismatchStatusRow:
-    """One row from ``file_mismatch_status`` (a sticky per-file disposition).
+    """One ``file_mismatch_status`` row, holding a decision and the snapshot that binds it.
 
-    ``source_field`` is which identity tag disagreed (``'albumartist'``/``'artist'``) and
-    ``source_value`` is that tag's value at decision time — the staleness snapshot.
+    ``covers`` names the comparisons and classes the file flagged when the decision was set.
+    ``tags`` holds their tag values then, a blank tag as ``None``. ``path_version`` is the
+    file's highest ``path_revisions`` version then, and ``folder_key`` the key of the folder a
+    ``legit_ignore`` row keeps. Both are ``None`` on a row with no snapshot, which binds nothing.
     """
 
     status: str
-    source_field: str | None
-    source_value: str | None
+    covers: tuple[str, ...]
+    tags: dict[str, str | None]
+    path_version: int | None
+    folder_key: str | None
+
+    def snapshot(self) -> dict[str, object]:
+        """Return the JSON snapshot ``source_value`` holds, ``folder_key`` only when set."""
+        snapshot: dict[str, object] = {
+            "covers": list(self.covers),
+            "tags": self.tags,
+            "path_version": self.path_version,
+        }
+        if self.folder_key is not None:
+            snapshot["folder_key"] = self.folder_key
+        return snapshot
 
 
-def _mismatch_row(decision: axis.StatusRow) -> MismatchStatusRow:
-    """Adapt a generic axis :class:`~tagmend.engine.axis.StatusRow` to the mismatch-named row."""
+def _mismatch_row(status: object, raw_snapshot: object) -> MismatchStatusRow:
+    """Build a :class:`MismatchStatusRow` from a raw status and ``source_value``."""
+    snapshot = (
+        {} if raw_snapshot is None else cast("dict[str, object]", json.loads(str(raw_snapshot)))
+    )
+    covers = cast("list[str]", snapshot.get("covers", []))
+    tags = cast("dict[str, str | None]", snapshot.get("tags", {}))
+    path_version = snapshot.get("path_version")
+    folder_key = snapshot.get("folder_key")
     return MismatchStatusRow(
-        status=decision.status,
-        source_field=decision.source_primary,
-        source_value=decision.source_secondary,
+        status=str(status),
+        covers=tuple(covers),
+        tags=dict(tags),
+        path_version=None if path_version is None else db.as_int(path_version),
+        folder_key=None if folder_key is None else str(folder_key),
     )
 
 
 def get_mismatch_status(conn: sqlite3.Connection, file_id: int) -> MismatchStatusRow | None:
-    """Return *file_id*'s stored mismatch disposition, or ``None`` if it has none."""
-    decision = axis.get_status(conn, axis.MISMATCH_AXIS, file_id)
-    return None if decision is None else _mismatch_row(decision)
+    """Return *file_id*'s stored path decision, or ``None`` if it has none."""
+    row = conn.execute(
+        "SELECT status, source_value FROM file_mismatch_status WHERE file_id = ?",
+        (file_id,),
+    ).fetchone()
+    return None if row is None else _mismatch_row(row[0], row[1])
 
 
-def set_mismatch_status(  # noqa: PLR0913 - cohesive keyword-only status payload
+def set_mismatch_status(
     conn: sqlite3.Connection,
     *,
     file_id: int,
-    status: str,
-    source_field: str | None,
-    source_value: str | None,
+    row: MismatchStatusRow,
     now: str,
 ) -> None:
-    """Insert or replace *file_id*'s stored mismatch disposition.
-
-    ``source_field``/``source_value`` record the disagreeing tag (which field + its value the
-    disposition was taken against), so a later tag change marks it stale and re-processable.
-    """
-    axis.set_status(
-        conn,
-        axis.MISMATCH_AXIS,
-        file_id=file_id,
-        status=status,
-        source_primary=source_field,
-        source_secondary=source_value,
-        now=now,
+    """Insert or replace *file_id*'s stored path decision with *row*."""
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO file_mismatch_status (file_id, status, source_value, updated_at)
+        VALUES (?, ?, ?, ?)
+        """,
+        (file_id, row.status, _dump_json(row.snapshot()), now),
     )
 
 
 def delete_mismatch_status(conn: sqlite3.Connection, file_id: int) -> None:
-    """Remove *file_id*'s stored mismatch disposition (no-op if none)."""
+    """Remove *file_id*'s stored path decision (no-op if none)."""
     axis.delete_status(conn, axis.MISMATCH_AXIS, file_id)
 
 
 def load_mismatch_statuses(conn: sqlite3.Connection) -> dict[int, MismatchStatusRow]:
-    """Return every stored mismatch disposition keyed by ``file_id`` in ONE SELECT.
+    """Return every stored path decision keyed by ``file_id``, in one ``SELECT``."""
+    cursor = conn.execute("SELECT file_id, status, source_value FROM file_mismatch_status")
+    return {db.as_int(row[0]): _mismatch_row(row[1], row[2]) for row in cursor.fetchall()}
 
-    The bulk read the detector's skip-filter uses so it needs no per-file query.
-    """
-    cursor = conn.execute(
-        "SELECT file_id, status, source_field, source_value FROM file_mismatch_status",
+
+# --- path_revisions (append-only location history) ---------------------------------
+
+
+def insert_path_revision(  # noqa: PLR0913 - cohesive append-only revision payload
+    conn: sqlite3.Connection,
+    *,
+    file_id: int,
+    version: int,
+    commit_id: int | None,
+    origin: str,
+    from_path: str,
+    to_path: str,
+    now: str,
+) -> None:
+    """Append one ``path_revisions`` row. The append-only triggers refuse any rewrite."""
+    conn.execute(
+        """
+        INSERT INTO path_revisions
+          (file_id, version, commit_id, created_at, origin, from_path, to_path)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (file_id, version, commit_id, now, origin, from_path, to_path),
     )
-    result: dict[int, MismatchStatusRow] = {}
-    for row in cursor.fetchall():
-        result[db.as_int(row[0])] = MismatchStatusRow(
-            status=str(row[1]),
-            source_field=None if row[2] is None else str(row[2]),
-            source_value=None if row[3] is None else str(row[3]),
-        )
-    return result
 
 
-def derived_mismatch_status(conn: sqlite3.Connection, file_id: int) -> str:
-    """Return *file_id*'s mismatch status: the stored disposition, else ``pending``.
-
-    Deliberately NOT routed through :func:`derived_status`: the mismatch axis has no
-    ``staged``/``done`` derivation, and its ``fields`` collide with the artist axis's, so a
-    staged artist change must never read as a mismatch state. Stored-or-pending, full stop.
-    """
-    decision = axis.get_status(conn, axis.MISMATCH_AXIS, file_id)
-    return "pending" if decision is None else decision.status
+def path_versions(conn: sqlite3.Connection) -> dict[int, int]:
+    """Return each file's highest ``path_revisions`` version. A file with none is absent."""
+    cursor = conn.execute("SELECT file_id, MAX(version) FROM path_revisions GROUP BY file_id")
+    return {db.as_int(row[0]): db.as_int(row[1]) for row in cursor.fetchall()}
 
 
-def mismatch_status_counts(conn: sqlite3.Connection) -> dict[str, int]:
-    """Return file counts per mismatch workflow status, all three keys always present.
+def relocate_file(
+    conn: sqlite3.Connection,
+    file_id: int,
+    *,
+    folder: str,
+    filename: str,
+    now: str,
+) -> None:
+    """Point *file_id*'s row at a new path, its path key included, and bump ``updated_at``."""
+    conn.execute(
+        "UPDATE files SET folder = ?, filename = ?, path_key = ?, updated_at = ? WHERE id = ?",
+        (folder, filename, path_keys.file_path_key(folder, filename), now, file_id),
+    )
 
-    A SQL aggregate over ``file_mismatch_status`` (NOT the per-file ``derived_status`` loop
-    the other axes use — this axis has no staged/done derivation): stored statuses come from a
-    ``GROUP BY``, and ``pending`` = total files - rows.
-    """
-    counts = dict.fromkeys(sorted(axis.MISMATCH_AXIS.workflow_statuses), 0)
-    total_files = _scalar_int(conn, "SELECT COUNT(*) FROM files")
-    rows = 0
-    for row in conn.execute("SELECT status, COUNT(*) FROM file_mismatch_status GROUP BY status"):
-        status = str(row[0])
-        count = db.as_int(row[1])
-        rows += count
-        if status in counts:
-            counts[status] = count
-    counts["pending"] = total_files - rows
-    return counts
+
+def staged_path_file_ids(conn: sqlite3.Connection, file_ids: list[int]) -> list[int]:
+    """Return the ids of *file_ids* that hold a ``path_revisions_staged`` row, in id order."""
+    if not file_ids:
+        return []
+    placeholders = ",".join("?" for _ in file_ids)
+    cursor = conn.execute(
+        f"SELECT file_id FROM path_revisions_staged WHERE file_id IN ({placeholders}) "  # noqa: S608
+        "ORDER BY file_id",
+        tuple(file_ids),
+    )
+    return [db.as_int(row[0]) for row in cursor.fetchall()]
 
 
 def distinct_artists(conn: sqlite3.Connection) -> list[tuple[str, int]]:

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import httpx
 import mutagen
 import pytest
 
@@ -24,7 +25,7 @@ from tagmend.engine import axis, staging, store, versioning, years
 from tagmend.engine.db import connect
 from tagmend.engine.library import list_files as library_list
 from tagmend.engine.library import scan_library
-from tagmend.engine.musicbrainz import MBReleaseGroup, MusicBrainzError
+from tagmend.engine.musicbrainz import MBReleaseGroup, MusicBrainzClient, MusicBrainzError
 from tagmend.engine.schema import apply_schema
 
 # Import tags so its module-load RegisterFreeformKey runs before make_track writes an
@@ -119,6 +120,34 @@ def test_commit_then_read_fills_originaldate_and_keeps_date(
     on_disk = read_tags(track).tags
     assert on_disk["originaldate"] == ["1970"]
     assert on_disk["date"] == ["2015"]  # reissue year preserved on disk
+
+
+def test_blank_fill_stages_the_full_first_release_date_from_a_search_answer(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    make_track(music_dir / "a.mp3", {"artist": ["Black Sabbath"], "album": ["Paranoid"]})
+    scan_library(engine_settings)
+    group = {
+        "id": "rg-1",
+        "title": "Paranoid",
+        "primary-type": "Album",
+        "first-release-date": "1970-09-18",
+        "score": 100,
+    }
+    transport = httpx.MockTransport(
+        lambda _request: httpx.Response(200, json={"release-groups": [group]}),
+    )
+    conn = connect(engine_settings.db_path)
+    try:
+        apply_schema(conn)
+        with MusicBrainzClient("TagMend/test", conn, rate_per_sec=0.0, transport=transport) as mb:
+            years.resolve_years(engine_settings, client=mb)
+    finally:
+        conn.close()
+
+    [view] = staging.diff_tags(engine_settings)
+    assert view.diff["originaldate"] == {"from": [], "to": ["1970-09-18"]}
 
 
 # --- (b) present value: already-tagged file is settled, never overwritten ----------

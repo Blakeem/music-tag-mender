@@ -138,7 +138,7 @@ def test_returns_album_original_year(db_conn: sqlite3.Connection) -> None:
         album = client.album_first_release("Black Sabbath", "Paranoid")
 
     assert album is not None
-    assert album.original_date == "1970"  # normalized to the four-digit year
+    assert album.original_date == "1970-09-18"  # the full date, as MusicBrainz gives it
     assert album.album_title == "Paranoid"
     assert album.release_group_mbid == "rg-1"
     assert album.release_mbid == "rel-1"
@@ -228,7 +228,7 @@ def test_edition_suffix_in_request_still_matches_plain_release_group(
     with client:
         album = client.album_first_release("Dark Tranquillity", "Fiction (Deluxe Edition)")
     assert album is not None
-    assert album.original_date == "2007"
+    assert album.original_date == "2007-04-20"
     assert album.release_group_mbid == "rg-fiction"
 
 
@@ -305,7 +305,7 @@ def test_found_result_is_positive_cached(db_conn: sqlite3.Connection) -> None:
         # Second call is served from cache — no second network request.
         again = client.album_first_release("Black Sabbath", "Paranoid")
     assert again is not None
-    assert again.original_date == "1970"
+    assert again.original_date == "1970-09-18"
     assert len(calls) == 1
 
     cached = get_cached_mb_release_group(db_conn, _request_key("Black Sabbath", "Paranoid"))
@@ -822,7 +822,7 @@ def test_release_by_mbid_queries_the_release_endpoint_with_recordings(
 
     url = seen[0].url
     assert url.path.endswith("/ws/2/release/rel-1")
-    assert url.params["inc"] == "recordings+artist-credits"
+    assert url.params["inc"] == "recordings+artist-credits+release-groups+labels+isrcs"
     assert url.params["fmt"] == "json"
 
 
@@ -992,9 +992,10 @@ def test_bumping_the_release_version_changes_the_request_key(
     assert _release_request_key("abc") != before
 
 
-def test_the_release_version_is_three() -> None:
-    # Version 3 added the pregap and data tracks, so every release cached earlier re-fetches.
-    assert musicbrainz._RELEASE_VERSION == "3"
+def test_the_release_version_is_four() -> None:
+    # Version 4 added the release group, labels, ASIN, ISRCs and credited names, so every
+    # release cached earlier re-fetches.
+    assert musicbrainz._RELEASE_VERSION == "4"
 
 
 def test_release_by_mbid_keeps_the_pregap_and_data_tracks_in_disc_order(
@@ -1075,12 +1076,14 @@ def test_the_sort_credit_round_trips_through_the_cache(db_conn: sqlite3.Connecti
     assert cached.artist_sort == "36 Crazyfists"
 
 
-def test_a_version_one_release_row_is_a_miss(
+@pytest.mark.parametrize("old_version", ["1", "3"])
+def test_an_older_release_row_is_a_miss(
     db_conn: sqlite3.Connection,
     monkeypatch: pytest.MonkeyPatch,
+    old_version: str,
 ) -> None:
     with monkeypatch.context() as patch:
-        patch.setattr(musicbrainz, "_RELEASE_VERSION", "1")
+        patch.setattr(musicbrainz, "_RELEASE_VERSION", old_version)
         old_client, _ = _client(db_conn, [_json_response(_release_body())])
         with old_client:
             old_client.release_by_mbid("rel-1")
@@ -1090,7 +1093,76 @@ def test_a_version_one_release_row_is_a_miss(
         release = client.release_by_mbid("rel-1")
 
     assert release is not None
-    assert len(calls) == 1  # the version-1 row did not answer, so the release re-fetched
+    assert len(calls) == 1  # the older row did not answer, so the release re-fetched
+
+
+def _stamp_body() -> dict[str, object]:
+    """Return a release body carrying the release group, labels, ASIN and ISRCs."""
+    body = _release_body(
+        **{
+            "asin": "B00001",
+            "release-group": {
+                "id": "rg-1",
+                "primary-type": "Album",
+                "secondary-types": ["Compilation"],
+                "first-release-date": "2003-11-07",
+            },
+            "label-info": [
+                {"catalog-number": "CAT-1", "label": {"name": "One"}},
+                {"catalog-number": "CAT-2", "label": {"name": "Two"}},
+                {"catalog-number": "CAT-1", "label": {"name": "One again"}},
+                {"catalog-number": None, "label": {"name": "None"}},
+            ],
+        },
+    )
+    media = body["media"]
+    assert isinstance(media, list)
+    media[0]["tracks"][0]["recording"]["isrcs"] = ["USAAA0300001", "USAAA0300002"]
+    media[0]["tracks"][1]["artist-credit"] = [
+        {"name": "A", "joinphrase": " vs. ", "artist": {"id": "a-1"}},
+        {"name": "Unlinked", "joinphrase": " & "},
+        {"name": "B", "joinphrase": "", "artist": {"id": "a-2"}},
+    ]
+    return body
+
+
+def test_release_by_mbid_parses_the_release_group_labels_asin_and_isrcs(
+    db_conn: sqlite3.Connection,
+) -> None:
+    client, _ = _client(db_conn, [_json_response(_stamp_body())])
+    with client:
+        release = client.release_by_mbid("rel-1")
+
+    assert release is not None
+    assert release.release_group_mbid == "rg-1"
+    assert release.release_types == ("album", "compilation")
+    assert release.first_release_date == "2003-11-07"
+    assert release.catalog_numbers == ("CAT-1", "CAT-2")
+    assert release.asin == "B00001"
+    first, second = release.media[0].tracks
+    assert first.isrcs == ("USAAA0300001", "USAAA0300002")
+    assert first.artist_names == ("36 Crazyfists",)
+    assert second.isrcs == ()
+    # A credited name with no artist id is left out, so the names stay aligned with the ids.
+    assert second.artist_names == ("A", "B")
+    assert second.artist_mbids == ("a-1", "a-2")
+    assert _release_from_json("rel-1", _release_to_json(release)) == release
+
+
+def test_a_release_with_no_group_labels_or_isrcs_parses_them_empty(
+    db_conn: sqlite3.Connection,
+) -> None:
+    client, _ = _client(db_conn, [_json_response(_release_body())])
+    with client:
+        release = client.release_by_mbid("rel-1")
+
+    assert release is not None
+    assert release.release_group_mbid == ""
+    assert release.release_types == ()
+    assert release.first_release_date == ""
+    assert release.catalog_numbers == ()
+    assert release.asin == ""
+    assert release.media[0].tracks[0].isrcs == ()
 
 
 # --- 503 backoff: MusicBrainz's own rate-limit signal ---------------------------------

@@ -108,6 +108,18 @@ def test_an_originaldate_in_another_year_is_high() -> None:
     assert row.tier == Tier.HIGH.value
 
 
+def test_a_full_first_release_date_compares_by_its_year() -> None:
+    # resolve_years writes the release group's full date, so the lookup carries one too.
+    table = {_SABBATH: _rg("1970-09-18")}
+
+    agreeing = _run([_f(originaldate="1970", date="1970-09-18")], table)
+    differing = _run([_f(originaldate="1999-01-01")], table)
+
+    assert agreeing.flagged == 0
+    [row] = differing.rows
+    assert row.first_release_year == "1970"
+
+
 def test_an_originaldate_carrying_no_year_is_high() -> None:
     report = _run([_f(originaldate="unknown")])
 

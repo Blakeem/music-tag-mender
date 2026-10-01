@@ -673,6 +673,161 @@ def test_manual_release_path_keeps_a_date_only_on_the_files_own_dateless_release
     assert _diffs(engine_settings)[_NAMES[1]].target.get("date", []) == date
 
 
+_GROUP_FIELDS = (
+    "musicbrainz_releasegroupid",
+    "musicbrainz_albumtype",
+    "catalognumber",
+    "asin",
+    "isrc",
+    "originaldate",
+)
+
+
+def _group_release() -> MBRelease:
+    """Return the LP with its release group, two catalog numbers, an ASIN and ISRCs."""
+    release = _release(_LP)
+    medium = release.media[0]
+    tracks = tuple(
+        replace(track, isrcs=(f"USAAA03000{track.position}",)) for track in medium.tracks
+    )
+    return replace(
+        release,
+        media=(replace(medium, tracks=tracks),),
+        release_group_mbid="rg-lp",
+        release_types=("album", "compilation"),
+        first_release_date="2003-11-07",
+        catalog_numbers=("CAT-1", "CAT-2"),
+        asin="B00001",
+    )
+
+
+@pytest.mark.parametrize(
+    ("release", "expected"),
+    [
+        pytest.param(
+            _group_release(),
+            {
+                "musicbrainz_releasegroupid": ["rg-lp"],
+                "musicbrainz_albumtype": ["album", "compilation"],
+                "catalognumber": ["CAT-1", "CAT-2"],
+                "asin": ["B00001"],
+                "isrc": ["USAAA030002"],
+                "originaldate": ["2003-11-07"],
+            },
+            id="writes-the-group-block",
+        ),
+        pytest.param(_release(_LP), {name: [] for name in _GROUP_FIELDS}, id="clears-each-field"),
+    ],
+)
+def test_a_rebind_stamp_writes_or_clears_the_release_group_label_and_isrc_fields(
+    engine_settings: Settings,
+    music_dir: Path,
+    release: MBRelease,
+    expected: dict[str, list[str]],
+) -> None:
+    folder = music_dir / "Greatest Hits"
+    held = {
+        "musicbrainz_albumtype": ["single"],
+        "catalognumber": ["OLD-1"],
+        "asin": ["B0OLD"],
+        "isrc": ["GBOLD0000001"],
+    }
+    _make_folder(
+        folder,
+        [
+            {"title": [title], "tracknumber": [f"{n}/16"], **_WRONG_STAMP, **held}
+            for n, title in enumerate(_TITLES, 1)
+        ],
+    )
+    library.scan_library(engine_settings)
+    kit = _wrong_stamp_kit()
+    kit.releases = FakeReleases(release)
+
+    result = _resolve(engine_settings, kit, folder=str(folder), release_mbid=_LP)
+
+    assert result.staged_files == 4
+    target = _diffs(engine_settings)[_NAMES[1]].target
+    assert {name: target.get(name, []) for name in _GROUP_FIELDS} == expected
+
+
+@pytest.mark.parametrize(
+    ("held_date", "group_date", "originaldate"),
+    [
+        pytest.param("1997-10", "1998-01-01", ["1997-10"], id="keeps-a-different-date"),
+        pytest.param("2003", "2003-11-07", ["2003-11-07"], id="refines-a-bare-year"),
+        pytest.param("2003-11-07", "2003", ["2003-11-07"], id="never-loses-precision"),
+    ],
+)
+def test_a_same_release_stamp_keeps_the_files_own_fields_and_only_refines_its_date(
+    engine_settings: Settings,
+    music_dir: Path,
+    held_date: str,
+    group_date: str,
+    originaldate: list[str],
+) -> None:
+    folder = music_dir / "LP"
+    held = {
+        "musicbrainz_albumid": [_LP],
+        "asin": ["B0OWN"],
+        "catalognumber": ["OWN-1"],
+        "isrc": ["GBOWN0000001"],
+        "originaldate": [held_date],
+    }
+    _make_folder(
+        folder,
+        [
+            {"title": [title], "tracknumber": [str(n)], "musicbrainz_trackid": [f"rec-{n}"], **held}
+            for n, title in enumerate(_TITLES, 1)
+        ],
+    )
+    library.scan_library(engine_settings)
+    release = replace(_release(_LP), first_release_date=group_date)
+    kit = Kit(acoustid=FakeAcoustid(_lp_bodies(_NAMES)), releases=FakeReleases(release))
+
+    result = _resolve(engine_settings, kit, folder=str(folder), release_mbid=_LP)
+
+    assert result.staged_files == 4
+    target = _diffs(engine_settings)[_NAMES[1]].target
+    assert target["asin"] == ["B0OWN"]
+    assert target["catalognumber"] == ["OWN-1"]
+    # The file already names this recording, which the release lists no ISRC for.
+    assert target["isrc"] == ["GBOWN0000001"]
+    assert target["originaldate"] == originaldate
+
+
+@pytest.mark.parametrize(
+    ("credit", "mbids", "names"),
+    [
+        pytest.param("A vs. B", ("a-1", "a-2"), ("A", "B"), id="two-artists"),
+        pytest.param("A", ("a-1",), ("A",), id="one-artist"),
+    ],
+)
+def test_a_stamp_writes_artists_aligned_with_the_artist_ids(
+    engine_settings: Settings,
+    music_dir: Path,
+    credit: str,
+    mbids: tuple[str, ...],
+    names: tuple[str, ...],
+) -> None:
+    folder = _wrong_stamp_folder(music_dir)
+    library.scan_library(engine_settings)
+    kit = _wrong_stamp_kit()
+    release = _release(_LP)
+    medium = release.media[0]
+    tracks = tuple(
+        replace(track, artist_credit=credit, artist_mbids=mbids, artist_names=names)
+        for track in medium.tracks
+    )
+    kit.releases = FakeReleases(replace(release, media=(replace(medium, tracks=tracks),)))
+
+    result = _resolve(engine_settings, kit, folder=str(folder), release_mbid=_LP)
+
+    assert result.staged_files == 4
+    target = _diffs(engine_settings)[_NAMES[1]].target
+    assert target["artists"] == list(names)
+    assert target["musicbrainz_artistid"] == list(mbids)
+
+
 def test_manual_release_path_stamps_the_track_ids_musicbrainz_lists_now(
     engine_settings: Settings,
     music_dir: Path,

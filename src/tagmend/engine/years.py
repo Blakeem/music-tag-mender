@@ -3,7 +3,7 @@
 The year-axis orchestrator, a near-clone of :mod:`tagmend.engine.genres`. It selects the
 in-scope files that derive ``pending`` on :data:`tagmend.engine.axis.YEAR_AXIS`, groups the
 blank ones by ``(albumartist-else-artist, album)`` (the SAME identity genre uses), looks up each
-group's original first-release year via MusicBrainz, and **blank-fills** ``originaldate``.
+group's first-release date via MusicBrainz, and **blank-fills** ``originaldate``.
 
 Design notes (the spec):
 
@@ -108,7 +108,7 @@ def resolve_years(  # noqa: PLR0913 - cohesive keyword-only scope + injection pa
     files in scope that derive ``pending``. A selected file that already carries
     ``originaldate`` records ``done`` with no lookup. The blank ones are grouped by
     ``(albumartist-else-artist, album)``, and per group MusicBrainz is asked for the original
-    first-release year. A hit stages ``originaldate`` (``origin='auto'``, only that field) and
+    first-release date. A hit stages ``originaldate`` (``origin='auto'``, only that field) and
     records ``done``. A miss records ``no_match`` against the resolved identity. ``date`` is
     never written. A transient MusicBrainz error leaves the group ``pending`` without aborting
     the call.

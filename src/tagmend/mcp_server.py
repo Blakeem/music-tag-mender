@@ -766,7 +766,7 @@ def detect_year_disagreements(
     lookup ``resolve_years`` makes, sharing its cache, so an album ``resolve_years`` already
     looked up costs no request.
 
-    Tiers, on the year alone, because the cached lookup keeps only the first-release year:
+    Tiers, on the year alone:
 
     * ``high``: the file's ``originaldate`` year differs from the first-release year.
     * ``medium``: the file's ``date`` year is EARLIER than the first-release year. A later
@@ -1895,11 +1895,11 @@ def resolve_years(
     limit: int | None = None,
     dry_run: bool = False,  # noqa: FBT001, FBT002 - MCP tool surface, not a Python API
 ) -> dict[str, object]:
-    """Blank-fill the original release year (``originaldate``) from MusicBrainz (writes no disk).
+    """Blank-fill the original release date (``originaldate``) from MusicBrainz (writes no disk).
 
     For each selected file with a blank ``originaldate`` this looks up its album group
     ``(albumartist-else-artist, album)`` on MusicBrainz (a release group's
-    ``first-release-date``, e.g. *Paranoid* = 1970, distinct from the reissue ``date``) and
+    ``first-release-date``, e.g. *Paranoid* = 1970-09-18, distinct from the reissue ``date``) and
     stages it into ``originaldate`` as an ``auto`` change replacing ONLY that field (every other
     managed tag preserved), recording ``done``. A group MusicBrainz has no usable Album release
     group for records ``no_match``. A selected file that already carries ``originaldate``
@@ -1923,7 +1923,7 @@ def resolve_years(
             refused.
         limit: Max files to settle this call (default ``year_stage_limit``). Call again while
             ``more`` is true.
-        dry_run: Preview the album → original-year mappings and the would-settle and
+        dry_run: Preview the album → original-date mappings and the would-settle and
             would-stage counts without writing anything. Lookups still run. A cached answer
             costs nothing and a cache miss makes a live request. A dry run skips the
             empty-staging precondition.
@@ -2084,17 +2084,18 @@ def resolve_songs(
     true, then ``limit=0`` for the free whole-library tally. Review it, then make the real
     calls and apply each with ``diff_tags`` and ``commit_tags``. For each ``rebind_folders``
     entry call ``resolve_songs(folder=F, release_mbid=R, dry_run=True)`` per candidate R, then
-    the real call, ``diff_tags``, ``commit_tags(path=F)``, ``reopen_axes(commit_id)``,
-    ``reset_year_status(file_ids=<the rebound files>)`` (the manual commit recorded year
-    ``manual`` when it cleared ``originaldate``), then ``resolve_years``.
+    the real call, ``diff_tags``, ``commit_tags(path=F)`` and ``reopen_axes(commit_id)``.
 
     With ``release_mbid`` the call takes the manual release path. Every file in scope must sit
     on exactly one track of that release, or nothing is staged and the files come back in
-    ``unassigned`` with a reason. Otherwise the whole release stamp (names, sort names, ids,
-    date, numbers, release fields, ``artists`` cleared) is staged as one ``manual`` batch.
-    A release field the release leaves blank keeps the file's value when the file already
-    names that release. A real run fetches the release fresh, so the stamp carries the track
-    ids MusicBrainz lists now. A dry run reads the cache.
+    ``unassigned`` with a reason. Otherwise the whole release stamp (names, sort names,
+    ``artists``, ids, dates, numbers, release, release-group, label and ``isrc`` fields) is
+    staged as one ``manual`` batch. A field MusicBrainz leaves blank keeps the file's value
+    when the file already names that release (for ``isrc``, that recording), and a rebind
+    clears it. ``originaldate`` takes the release group's first-release date, but on the
+    file's own release only to fill a blank value or refine a bare year or year-month of it.
+    A real run fetches the release fresh, so the stamp carries the track ids MusicBrainz lists
+    now. A dry run reads the cache.
 
     Args:
         folder: Limit to the files directly in this folder. Compared as a path, and a

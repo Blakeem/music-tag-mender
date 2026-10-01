@@ -1,23 +1,25 @@
-"""MusicBrainz client: an album's original (first) release year, cached and paced.
+"""MusicBrainz client: release groups, recordings, artists and releases, cached and paced.
 
-The year-axis authority (mirrors :mod:`tagmend.engine.lastfm`'s shape). Last.fm cannot
-supply an album's year and has no album correction; MusicBrainz can — a *release-group*'s
-``first-release-date`` is the original year (e.g. *Paranoid* = 1970), distinct from a
-reissue *release* ``date`` (the edition year). Four endpoints are used:
+The year axis takes an album's original release date from this module. Last.fm supplies no
+album year. A *release-group*'s ``first-release-date`` is the original release date (*Paranoid*
+is 1970-09-18), distinct from a reissue *release* ``date`` (the edition date). Four endpoints
+are used:
 
-* ``/ws/2/release-group/`` (Lucene query ``artist:"…" AND releasegroup:"…"``) — ranked
-  candidate release groups; we keep only ``primary-type == "Album"`` groups that carry no
-  non-studio secondary type and whose title matches the album asked for, then pick the
-  highest-scoring one.
-* ``/ws/2/recording/`` (Lucene query ``artist:"…" AND recording:"…"``) — a review-only
-  ``(artist, title)`` → album lookup feeding ``detect_album_gaps``' recording tier. Ranked
-  candidate recordings; we keep only the highest-scoring recording that has a release whose
-  release group is a usable Album (same ``primary-type``/secondary-type gate) and return that
-  release group's title (+ recording MBID + release-group MBID).
+* ``/ws/2/release-group/`` (Lucene query ``artist:"…" AND releasegroup:"…"``): ranked
+  candidate release groups, feeding ``resolve_years`` and ``detect_year_disagreements``. A
+  candidate is kept only when it has ``primary-type == "Album"``, no non-studio secondary type,
+  a title matching the album asked for and a non-empty ``first-release-date``. The
+  highest-scoring one is picked.
+* ``/ws/2/recording/`` (Lucene query ``artist:"…" AND recording:"…"``): a review-only
+  ``(artist, title)`` → album lookup feeding ``detect_album_gaps``' recording tier. Only a
+  recording with a release whose release group is a usable Album (same ``primary-type`` and
+  secondary-type gate) is kept. The highest-scoring one is picked. The lookup returns its
+  release group's title, its recording MBID and its release-group MBID.
 * ``/ws/2/artist/<mbid>?inc=aliases``: a direct lookup by the MBID a file carries, feeding
   ``resolve_artists``' MusicBrainz tier.
-* ``/ws/2/release/<mbid>?inc=recordings+artist-credits``: a direct release and tracklist
-  lookup, feeding ``detect_release_disagreements``.
+* ``/ws/2/release/<mbid>?inc=recordings+artist-credits+release-groups+labels+isrcs``: a
+  direct release and tracklist lookup, feeding ``detect_release_disagreements`` and the
+  ``resolve_songs`` release stamp.
 
 Each lookup's parsed result is cached persistently, so every unique entity is queried at most
 once. Release groups live in ``musicbrainz_release_group_cache``, recordings in
@@ -95,10 +97,10 @@ _EXCLUDED_SECONDARY_TYPES: Final = frozenset(
     }
 )
 
-# Folded into both cache keys so tightening the selection rules re-fetches every lookup that
-# was resolved under the old ones, instead of replaying its stale cached pick forever. The album
+# Folded into both cache keys so changing the selection or parse rules re-fetches every lookup
+# resolved under the old ones, instead of replaying its stale cached pick forever. The album
 # and recording paths share the excluded-secondary-type set, so one bump must invalidate both.
-_SELECTION_VERSION: Final = "2"
+_SELECTION_VERSION: Final = "3"
 
 # The artist lookup runs its own version token: it has no selection rules to tighten, so a
 # release-group rule change must not re-fetch every artist. Bump only when the fields
@@ -106,14 +108,11 @@ _SELECTION_VERSION: Final = "2"
 _ARTIST_VERSION: Final = "1"
 
 # The release lookup's own version token, for the same reason the artist lookup has one.
-_RELEASE_VERSION: Final = "3"
+_RELEASE_VERSION: Final = "4"
 
-# One trailing parenthetical/bracketed segment — the edition suffix a tag carries and a release
+# One trailing parenthetical or bracketed segment: the edition suffix a tag carries and a release
 # group does not (``Fiction (Deluxe Edition)``, ``The Red Album [Deluxe Edition]``).
 _EDITION_SUFFIX: Final = re.compile(r"\s*[(\[][^()\[\]]*[)\]]\s*$")
-
-# A bare four-digit year prefix length (MusicBrainz dates are ``YYYY`` / ``YYYY-MM`` / full).
-_YEAR_PREFIX_LEN: Final = 4
 
 # A 404 from the artist endpoint is a real answer (no such artist), not a transient failure.
 _HTTP_NOT_FOUND: Final = 404
@@ -128,7 +127,7 @@ _THROTTLE_BACKOFF_SECONDS: Final = 1.0
 
 @dataclass(frozen=True, slots=True)
 class MBReleaseGroup:
-    """A MusicBrainz release group's original-year resolution for the year axis."""
+    """A MusicBrainz release group's original-date resolution for the year axis."""
 
     album_title: str
     original_date: str
@@ -140,8 +139,8 @@ class MBReleaseGroup:
 class MBRecording:
     """A MusicBrainz recording's resolved album for the review-only album-gaps tier.
 
-    ``album_title`` is the release group's title (the proposed ``album`` fill);
-    ``release_group_mbid`` and ``recording_mbid`` are carried for provenance/audit.
+    ``album_title`` is the release group's title (the proposed ``album`` fill).
+    ``release_group_mbid`` and ``recording_mbid`` are carried for provenance and audit.
     """
 
     album_title: str
@@ -173,6 +172,7 @@ class MBTrack:
     track ON THIS RELEASE. ``recording_mbid`` is Picard's ``musicbrainz_trackid`` and
     identifies the recording, which can appear on many releases. A tagged file carries both,
     so either one finds its track here without matching on title or position.
+    ``artist_names`` holds each credited name beside its id in ``artist_mbids``, one to one.
     """
 
     position: int
@@ -183,6 +183,8 @@ class MBTrack:
     artist_credit: str
     artist_sort: str
     artist_mbids: tuple[str, ...]
+    isrcs: tuple[str, ...] = ()
+    artist_names: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -203,6 +205,7 @@ class MBRelease:
     The authority for what a folder's tags SHOULD say: the album title, the album artist
     credit, the per-track titles and numbers, and how many tracks each disc holds.
     ``artist_sort`` is the credit in Picard's sort form, as :class:`MBTrack` carries its own.
+    ``release_types`` is the release group's primary type then its secondary types, lowercased.
     """
 
     mbid: str
@@ -215,6 +218,11 @@ class MBRelease:
     status: str
     barcode: str
     media: tuple[MBMedium, ...]
+    release_group_mbid: str = ""
+    release_types: tuple[str, ...] = ()
+    first_release_date: str = ""
+    catalog_numbers: tuple[str, ...] = ()
+    asin: str = ""
 
     def track_by_release_track_mbid(self, mbid: str) -> MBTrack | None:
         """Return the track carrying *mbid* as its release-track id, or ``None``."""
@@ -242,7 +250,7 @@ class MBReleaseGroupSource(Protocol):
     """The release-group lookup the orchestrator depends on (so it can use a fake in tests).
 
     Returns an :class:`MBReleaseGroup` when a usable Album release group is found, or ``None`` when
-    nothing usable exists (genuinely no first-release year for the year axis to fill).
+    nothing usable exists (genuinely no first-release date for the year axis to fill).
     """
 
     def album_first_release(self, artist: str, album: str) -> MBReleaseGroup | None:
@@ -299,7 +307,7 @@ class MusicBrainzClient:
     Implements :class:`MBReleaseGroupCacheSource`, :class:`MBRecordingSource`,
     :class:`MBArtistSource` and :class:`MBReleaseSource`.
 
-    Owns one :class:`httpx.Client` for its lifetime via the context-manager protocol; use it
+    Owns one :class:`httpx.Client` for its lifetime via the context-manager protocol. Use it
     as ``with MusicBrainzClient(...) as client:``. The cache connection is supplied by the
     caller (the orchestrator owns it) and committed eagerly after each network fetch so an
     error later in a batch never loses prior cache work.
@@ -416,7 +424,7 @@ class MusicBrainzClient:
         A direct lookup by id, never a search: the file already supplies the identity, so
         there is no candidate ranking and no ambiguity. Cache first (positive or negative),
         else one paced network query. A ``404`` is a real answer (no such artist) and is
-        negative-cached; any other non-2xx raises :class:`MusicBrainzError` and caches nothing.
+        negative-cached. Any other non-2xx raises :class:`MusicBrainzError` and caches nothing.
         """
         request_key = _artist_request_key(mbid)
 
@@ -441,7 +449,7 @@ class MusicBrainzClient:
         A direct lookup by id, like :meth:`artist_by_mbid`: the file supplies the identity.
         Cache first (positive or negative), else one paced network query. *fresh* skips the
         cache read, so the fetched answer replaces the cached one. A ``404`` is a real answer
-        and is negative-cached; any other non-2xx raises :class:`MusicBrainzError`.
+        and is negative-cached. Any other non-2xx raises :class:`MusicBrainzError`.
         """
         request_key = _release_request_key(mbid)
 
@@ -639,7 +647,7 @@ class MusicBrainzClient:
         logger.debug("musicbrainz release request mbid=%r", mbid)
         return self._get_json(
             f"{_RELEASE_API_URL}{mbid}",
-            {"inc": "recordings+artist-credits", "fmt": "json"},
+            {"inc": "recordings+artist-credits+release-groups+labels+isrcs", "fmt": "json"},
             not_found_ok=True,
             what="release lookup",
         )
@@ -820,11 +828,12 @@ def _release_request_key(mbid: str) -> str:
 
 @dataclass(frozen=True, slots=True)
 class _Credit:
-    """One artist credit: its display string, its sort string and its artist MBIDs."""
+    """One artist credit: its display and sort strings, its artist MBIDs and their names."""
 
     display: str
     sort: str
     mbids: tuple[str, ...]
+    names: tuple[str, ...]
 
 
 def _credit(entries: object) -> _Credit:
@@ -834,13 +843,15 @@ def _credit(entries: object) -> _Credit:
     the next (``Kruder`` + ``" & "`` then ``Dorfmeister``), which is how the display string
     keeps the collaboration visible while the ids stay separable. The sort string joins each
     part's artist sort name the same way, which is Picard's ``artistsort`` form
-    (``Perry, Linda feat. Slick, Grace``).
+    (``Perry, Linda feat. Slick, Grace``). A credited name is kept only beside an id, so
+    ``names`` and ``mbids`` stay aligned one to one.
     """
     if not isinstance(entries, list):
-        return _Credit(display="", sort="", mbids=())
+        return _Credit(display="", sort="", mbids=(), names=())
     display: list[str] = []
     sort: list[str] = []
     mbids: list[str] = []
+    names: list[str] = []
     for entry in entries:
         if not isinstance(entry, dict):
             continue
@@ -854,7 +865,13 @@ def _credit(entries: object) -> _Credit:
         sort.extend((sort_name, join))
         if isinstance(artist_id, str):
             mbids.append(artist_id)
-    return _Credit(display="".join(display), sort="".join(sort), mbids=tuple(mbids))
+            names.append(name)
+    return _Credit(
+        display="".join(display),
+        sort="".join(sort),
+        mbids=tuple(mbids),
+        names=tuple(names),
+    )
 
 
 def _parse_track(entry: object, medium_credit: _Credit) -> MBTrack | None:
@@ -866,10 +883,8 @@ def _parse_track(entry: object, medium_credit: _Credit) -> MBTrack | None:
         return None
 
     recording = entry.get("recording")
-    recording_mbid = ""
-    if isinstance(recording, dict):
-        found = recording.get("id")
-        recording_mbid = found if isinstance(found, str) else ""
+    recording_fields = recording if isinstance(recording, dict) else {}
+    recording_mbid = _as_str(recording_fields.get("id"))
 
     credit = _credit(entry.get("artist-credit"))
     if not credit.display:
@@ -887,6 +902,8 @@ def _parse_track(entry: object, medium_credit: _Credit) -> MBTrack | None:
         artist_credit=credit.display,
         artist_sort=credit.sort,
         artist_mbids=credit.mbids,
+        isrcs=_distinct(_as_list(recording_fields.get("isrcs"))),
+        artist_names=credit.names,
     )
 
 
@@ -900,6 +917,14 @@ def _parse_release(mbid: str, body: dict[str, object]) -> MBRelease | None:
         return None
 
     release_credit = _credit(body.get("artist-credit"))
+    raw_group = body.get("release-group")
+    group = raw_group if isinstance(raw_group, dict) else {}
+    release_types = [group.get("primary-type"), *_as_list(group.get("secondary-types"))]
+    catalog_numbers = [
+        entry.get("catalog-number")
+        for entry in _as_list(body.get("label-info"))
+        if isinstance(entry, dict)
+    ]
     media: list[MBMedium] = []
     raw_media = body.get("media")
     if isinstance(raw_media, list):
@@ -934,6 +959,11 @@ def _parse_release(mbid: str, body: dict[str, object]) -> MBRelease | None:
         status=_as_str(body.get("status")),
         barcode=_as_str(body.get("barcode")),
         media=tuple(media),
+        release_group_mbid=_as_str(group.get("id")),
+        release_types=tuple(t.lower() for t in _distinct(release_types)),
+        first_release_date=_as_str(group.get("first-release-date")),
+        catalog_numbers=_distinct(catalog_numbers),
+        asin=_as_str(body.get("asin")),
     )
 
 
@@ -961,6 +991,16 @@ def _int_or_zero(value: object) -> int:
     return value if isinstance(value, int) else 0
 
 
+def _as_list(value: object) -> list[object]:
+    """Return *value* as a list, or empty when it is absent or not a list."""
+    return cast("list[object]", value) if isinstance(value, list) else []
+
+
+def _distinct(values: list[object]) -> tuple[str, ...]:
+    """Return the distinct non-blank strings of *values*, in their first order."""
+    return tuple(dict.fromkeys(v for v in values if isinstance(v, str) and v.strip()))
+
+
 def _release_to_json(release: MBRelease) -> str:
     """Serialize a parsed release for the cache column."""
     return json.dumps(
@@ -973,6 +1013,11 @@ def _release_to_json(release: MBRelease) -> str:
             "country": release.country,
             "status": release.status,
             "barcode": release.barcode,
+            "release_group_mbid": release.release_group_mbid,
+            "release_types": list(release.release_types),
+            "first_release_date": release.first_release_date,
+            "catalog_numbers": list(release.catalog_numbers),
+            "asin": release.asin,
             "media": [
                 {
                     "position": m.position,
@@ -989,6 +1034,8 @@ def _release_to_json(release: MBRelease) -> str:
                             "artist_credit": t.artist_credit,
                             "artist_sort": t.artist_sort,
                             "artist_mbids": list(t.artist_mbids),
+                            "isrcs": list(t.isrcs),
+                            "artist_names": list(t.artist_names),
                         }
                         for t in m.tracks
                     ],
@@ -1017,6 +1064,11 @@ def _release_from_json(mbid: str, payload: str) -> MBRelease | None:
         country=str(data.get("country", "")),
         status=str(data.get("status", "")),
         barcode=str(data.get("barcode", "")),
+        release_group_mbid=str(data.get("release_group_mbid", "")),
+        release_types=tuple(data.get("release_types") or ()),
+        first_release_date=str(data.get("first_release_date", "")),
+        catalog_numbers=tuple(data.get("catalog_numbers") or ()),
+        asin=str(data.get("asin", "")),
         media=tuple(
             MBMedium(
                 position=int(m.get("position", 0)),
@@ -1033,6 +1085,8 @@ def _release_from_json(mbid: str, payload: str) -> MBRelease | None:
                         artist_credit=str(t.get("artist_credit", "")),
                         artist_sort=str(t.get("artist_sort", "")),
                         artist_mbids=tuple(t.get("artist_mbids") or ()),
+                        isrcs=tuple(t.get("isrcs") or ()),
+                        artist_names=tuple(t.get("artist_names") or ()),
                     )
                     for t in (m.get("tracks") or [])
                 ),
@@ -1052,8 +1106,8 @@ def _select_album(body: dict[str, object], requested_album: str) -> MBReleaseGro
 
     Keeps only ``primary-type == "Album"`` groups with no excluded secondary type, a title
     matching *requested_album* (see :func:`_title_matches`) and a non-empty
-    ``first-release-date``; returns the highest-scoring one (``None`` when nothing usable).
-    The year is normalized to the four-digit prefix.
+    ``first-release-date``. Returns the highest-scoring one (``None`` when nothing usable).
+    The date is kept exactly as MusicBrainz gives it, which is Picard's ``originaldate`` form.
     """
     raw_groups = body.get("release-groups")
     if not isinstance(raw_groups, list):
@@ -1104,11 +1158,9 @@ def _candidate(entry: object, requested_album: str) -> tuple[int, MBReleaseGroup
     if isinstance(secondary, list) and any(s in _EXCLUDED_SECONDARY_TYPES for s in secondary):
         return None
 
-    raw_date = entry.get("first-release-date")
-    if not isinstance(raw_date, str) or not raw_date:
+    original_date = entry.get("first-release-date")
+    if not isinstance(original_date, str) or not original_date:
         return None
-    prefix = raw_date[:_YEAR_PREFIX_LEN]
-    original_date = prefix if len(raw_date) >= _YEAR_PREFIX_LEN and prefix.isdigit() else raw_date
 
     raw_score = entry.get("score")
     score = raw_score if isinstance(raw_score, int) else 0
@@ -1143,7 +1195,7 @@ def _select_recording(body: dict[str, object]) -> MBRecording | None:
     """Pick the best recording whose release group is a usable Album from a search response.
 
     Keeps only recordings that have a release whose release group is ``primary-type ==
-    "Album"`` with no excluded secondary type; returns the highest-scoring one's
+    "Album"`` with no excluded secondary type. Returns the highest-scoring one's
     release-group title (+ ids), or ``None`` when nothing usable exists.
     """
     raw_recordings = body.get("recordings")
@@ -1191,9 +1243,9 @@ def _recording_candidate(entry: object) -> tuple[int, MBRecording] | None:
 def _usable_release_group(entry: dict[str, object]) -> tuple[str, str] | None:
     """Return ``(title, release_group_mbid)`` for the first usable Album release, or ``None``.
 
-    Scans the recording's ``releases``; a release's ``release-group`` qualifies when its
+    Scans the recording's ``releases``. A release's ``release-group`` qualifies when its
     ``primary-type == "Album"``, it carries no excluded secondary type, and it has a non-empty
-    title (sharing :func:`_candidate`'s Album gate; there is no requested title to match here).
+    title. This is :func:`_candidate`'s Album gate with no requested title to match.
     """
     releases = entry.get("releases")
     if not isinstance(releases, list):

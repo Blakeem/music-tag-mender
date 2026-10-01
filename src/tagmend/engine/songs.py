@@ -93,6 +93,7 @@ _RECORDING_ID: Final = "musicbrainz_trackid"
 _ARTIST: Final = "artist"
 _ALBUM_ARTIST: Final = "albumartist"
 _ARTIST_ID: Final = "musicbrainz_artistid"
+_ORIGINAL_DATE: Final = "originaldate"
 
 # Recording gate thresholds, as the song-axis decision run measured them.
 _SCORE_FLOOR: Final = 0.9
@@ -118,25 +119,23 @@ _QUALIFIER: Final = re.compile(
 )
 _PLACEHOLDER_TITLE: Final = re.compile(r"^track\s*\d+$", re.IGNORECASE)
 
-# Fields only the old release describes. A rebind clears them because a release lookup cannot
-# supply them, and a library server keeps showing a stale one.
-_RELEASE_ONLY_TAGS: Final = (
-    "musicbrainz_releasegroupid",
-    "musicbrainz_albumtype",
-    "catalognumber",
-    "asin",
-    "originaldate",
-)
-_RECORDING_ONLY_TAGS: Final = ("isrc",)
 # A release that holds no value for one of these says nothing against the file's own value, so
-# a stamp onto the release the file already names keeps it. A rebind still clears it.
+# a stamp onto the release the file already names keeps it. A rebind still clears it, because a
+# library server keeps showing a stale one.
 _KEPT_ON_OWN_RELEASE: Final = (
     "date",
     "releasecountry",
     "musicbrainz_albumstatus",
     "barcode",
     "media",
+    "musicbrainz_releasegroupid",
+    "musicbrainz_albumtype",
+    "catalognumber",
+    "asin",
+    "artists",
 )
+# The same rule keyed on the recording, because an ISRC names the recording on every release.
+_KEPT_ON_OWN_RECORDING: Final = ("isrc",)
 
 _HELD_KINDS: Final = (
     "disagreement",
@@ -1533,12 +1532,18 @@ def _stamp(release: MBRelease, track: MBTrack, voter: _Voter) -> dict[str, list[
     """Return the whole release stamp for one file: every value written, every stale one cleared.
 
     Sort names are replaced from the credits, never cleared, because a library server keeps a
-    stored sort name after the tag goes empty. ``artists`` is cleared because the credit
-    carries no per-artist names to align with the ids written. On the file's own release a
-    field of :data:`_KEPT_ON_OWN_RELEASE` the release leaves blank is left out, so it is kept.
+    stored sort name after the tag goes empty. On the file's own release a field of
+    :data:`_KEPT_ON_OWN_RELEASE` the release leaves blank is left out, so it is kept, as is a
+    field of :data:`_KEPT_ON_OWN_RECORDING` on the file's own recording. ``originaldate`` on
+    the file's own release is written only when it refines the file's value (:func:`_refines`).
     """
     medium = _medium(release, track)
     track_count = _track_count(medium)
+    own_release = voter.value(_ALBUM_ID) == release.mbid
+    own_recording = voter.value(_RECORDING_ID) == track.recording_mbid
+    kept = (_KEPT_ON_OWN_RELEASE if own_release else ()) + (
+        _KEPT_ON_OWN_RECORDING if own_recording else ()
+    )
     stamp: dict[str, list[str]] = {
         _TITLE: [track.title],
         _TRACK: [f"{track.position}/{track_count}"],
@@ -1546,29 +1551,42 @@ def _stamp(release: MBRelease, track: MBTrack, voter: _Voter) -> dict[str, list[
         _ARTIST: _one(track.artist_credit),
         "artistsort": _one(track.artist_sort),
         _ARTIST_ID: list(track.artist_mbids),
-        "artists": [],
+        "artists": list(track.artist_names),
         _ALBUM_ARTIST: _one(release.artist_credit),
         "albumartistsort": _one(release.artist_sort),
         "musicbrainz_albumartistid": list(release.artist_mbids),
         "album": [release.title],
         "date": _one(release.date),
+        _ORIGINAL_DATE: _one(release.first_release_date),
         "releasecountry": _one(release.country),
         "musicbrainz_albumstatus": _one(release_match.album_status(release)),
+        "musicbrainz_albumtype": list(release.release_types),
+        "catalognumber": list(release.catalog_numbers),
         "barcode": _one(release.barcode),
+        "asin": _one(release.asin),
         "media": _one("" if medium is None else medium.format),
         _ALBUM_ID: [release.mbid],
+        "musicbrainz_releasegroupid": _one(release.release_group_mbid),
         "musicbrainz_releasetrackid": _one(track.release_track_mbid),
         _RECORDING_ID: _one(track.recording_mbid),
+        "isrc": list(track.isrcs),
     }
-    if voter.value(_ALBUM_ID) != release.mbid:
-        stamp.update({name: [] for name in _RELEASE_ONLY_TAGS})
-    else:
-        for name in _KEPT_ON_OWN_RELEASE:
-            if not stamp[name]:
-                del stamp[name]
-    if voter.value(_RECORDING_ID) != track.recording_mbid:
-        stamp.update({name: [] for name in _RECORDING_ONLY_TAGS})
+
+    for name in kept:
+        if not stamp[name]:
+            del stamp[name]
+    if own_release and not _refines(voter.value(_ORIGINAL_DATE), release.first_release_date):
+        del stamp[_ORIGINAL_DATE]
     return stamp
+
+
+def _refines(held: str, date: str) -> bool:
+    """Return whether *date* adds precision to *held*: *held* is blank, or its year or year-month.
+
+    A different or equally precise value is the owner's, so the stamp never writes over it.
+    """
+    held_date = held.strip()
+    return not held_date or date.startswith(f"{held_date}-")
 
 
 def _release_block(release: MBRelease) -> dict[str, object]:

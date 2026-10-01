@@ -308,8 +308,9 @@ def _scalar_int(conn: sqlite3.Connection, sql: str) -> int:
 
 # --- tag_revisions (append-only history; PLAN.md §7) -------------------------------
 
-# Valid ``origin`` values. ``scan`` = the version-0 baseline, ``auto``/``manual`` =
-# normal writes, ``revert`` = a revert (which is itself an appended revision).
+# Valid ``origin`` values. ``scan`` = an observation of the file on disk (the version-0
+# baseline, or a re-baseline under a newer managed set), ``auto``/``manual`` = normal writes,
+# ``revert`` = a revert (which is itself an appended revision).
 _REVISION_ORIGINS: Final = frozenset({"scan", "auto", "manual", "revert"})
 
 _REVISION_COLUMNS = (
@@ -344,6 +345,7 @@ class Revision:
             "managed_tags": self.managed_tags,
             "diff": self.diff,
             "note": self.note,
+            "managed_set": self.managed_set,
         }
 
 
@@ -382,10 +384,10 @@ def insert_revision(  # noqa: PLR0913 - cohesive append-only revision payload
     :data:`~tagmend.engine.tags.MANAGED_SET_VERSION`, which is what lets revert read a tag
     omitted from the snapshot as "empty then" rather than "not tracked then".
 
-    *commit_id* groups this change with the other files in the same commit; it is
-    ``None`` for the version-0 baseline, which precedes any commit. Raises
-    :class:`ValueError` for an unknown *origin*. The ``(file_id, version)`` PK rejects a
-    duplicate version with :class:`sqlite3.IntegrityError`.
+    *commit_id* groups this change with the other files in the same commit. It is ``None``
+    for a ``scan`` observation (the version-0 baseline or a re-baseline), which no commit
+    makes. Raises :class:`ValueError` for an unknown *origin*. The ``(file_id, version)`` PK
+    rejects a duplicate version with :class:`sqlite3.IntegrityError`.
     """
     if origin not in _REVISION_ORIGINS:
         message = f"unknown revision origin: {origin!r}"
@@ -441,6 +443,27 @@ def revisions_for_commit(conn: sqlite3.Connection, commit_id: int) -> list[Revis
     cursor = conn.execute(
         f"SELECT {_REVISION_COLUMNS} FROM tag_revisions WHERE commit_id = ? ORDER BY file_id",  # noqa: S608
         (commit_id,),
+    )
+    return [_row_to_revision(tuple(row)) for row in cursor.fetchall()]
+
+
+def latest_revision(conn: sqlite3.Connection, file_id: int) -> Revision | None:
+    """Return *file_id*'s highest-version revision, or ``None`` if it has none yet."""
+    cursor = conn.execute(
+        f"SELECT {_REVISION_COLUMNS} FROM tag_revisions WHERE file_id = ? "  # noqa: S608
+        "ORDER BY version DESC LIMIT 1",
+        (file_id,),
+    )
+    row = cursor.fetchone()
+    return None if row is None else _row_to_revision(tuple(row))
+
+
+def revisions_after(conn: sqlite3.Connection, file_id: int, version: int) -> list[Revision]:
+    """Return every revision of *file_id* newer than *version*, oldest first."""
+    cursor = conn.execute(
+        f"SELECT {_REVISION_COLUMNS} FROM tag_revisions "  # noqa: S608
+        "WHERE file_id = ? AND version > ? ORDER BY version",
+        (file_id, version),
     )
     return [_row_to_revision(tuple(row)) for row in cursor.fetchall()]
 

@@ -964,6 +964,7 @@ def _insert_history(  # noqa: PLR0913 - one revision row, every column spelled o
     origin: str,
     managed_tags: dict[str, list[str]],
     diff: dict[str, dict[str, list[str]]],
+    managed_set: int = MANAGED_SET_VERSION,
 ) -> None:
     conn.execute(
         """
@@ -979,7 +980,7 @@ def _insert_history(  # noqa: PLR0913 - one revision row, every column spelled o
             origin,
             json.dumps(managed_tags),
             json.dumps(diff),
-            MANAGED_SET_VERSION,
+            managed_set,
         ),
     )
 
@@ -998,8 +999,8 @@ def _status_rows(conn: sqlite3.Connection) -> dict[str, list[tuple[object, ...]]
     return rows
 
 
-def _build_previous_axis_ledger(conn: sqlite3.Connection) -> dict[str, int]:
-    """A previous-version ledger: manual, auto and baseline revisions, old rows, watermarks."""
+def _previous_axis_schema(conn: sqlite3.Connection) -> None:
+    """Turn a fresh ledger into the previous version's tables: no v21 columns, ``voided_auto``."""
     apply_schema(conn)
     for table in _AXIS_TABLES:
         conn.execute(f"ALTER TABLE {table} DROP COLUMN source_value")
@@ -1015,6 +1016,11 @@ def _build_previous_axis_ledger(conn: sqlite3.Connection) -> dict[str, int]:
         )
         """,
     )
+
+
+def _build_previous_axis_ledger(conn: sqlite3.Connection) -> dict[str, int]:
+    """A previous-version ledger: manual, auto and baseline revisions, old rows, watermarks."""
+    _previous_axis_schema(conn)
     fixed = _insert_tagged_file(conn, "fixed.mp3")
     resolved = _insert_tagged_file(conn, "resolved.mp3")
     excluded = _insert_tagged_file(conn, "excluded.mp3")
@@ -1119,6 +1125,47 @@ def test_previous_ledger_gains_axis_outcomes_in_place() -> None:
             "SELECT file_id, managed_tags, changed_fields FROM tag_revisions_staged",
         ).fetchall()
         assert staged == [(ids["excluded"], '{"genre":["pop"]}', None)]
+    finally:
+        conn.close()
+
+
+def test_axis_outcome_replay_ignores_widening_noise() -> None:
+    # Both manual revisions carry an artistsort key. Only the one whose previous revision's
+    # managed set governed artistsort is a human change. The other is widening noise.
+    conn = sqlite3.connect(":memory:")
+    try:
+        _previous_axis_schema(conn)
+        widened = _insert_tagged_file(conn, "widened.mp3")
+        governed = _insert_tagged_file(conn, "governed.mp3")
+        sort_added = {"artistsort": {"from": [], "to": ["Band, The"]}}
+        _insert_history(conn, widened, 0, "scan", {"genre": ["rock"]}, {}, managed_set=1)
+        _insert_history(
+            conn,
+            widened,
+            1,
+            "manual",
+            {"genre": ["jazz"], "artistsort": ["Band, The"]},
+            {"genre": {"from": ["rock"], "to": ["jazz"]}, **sort_added},
+            managed_set=2,
+        )
+        _insert_history(conn, governed, 0, "scan", {"genre": ["rock"]}, {}, managed_set=2)
+        _insert_history(
+            conn,
+            governed,
+            1,
+            "manual",
+            {"genre": ["rock"], "artistsort": ["Band, The"]},
+            sort_added,
+            managed_set=2,
+        )
+        conn.execute(f"PRAGMA user_version = {_PREVIOUS_VERSION}")
+        conn.commit()
+
+        apply_schema(conn)
+
+        rows = _status_rows(conn)
+        assert [row[:2] for row in rows["file_genre_status"]] == [(widened, "manual")]
+        assert [row[:2] for row in rows["file_artist_status"]] == [(governed, "manual")]
     finally:
         conn.close()
 

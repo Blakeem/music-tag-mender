@@ -208,10 +208,9 @@ MANAGED_TAGS: Final[frozenset[str]] = (
 # Which managed set governed a given revision, so revert can tell "this tag was empty then"
 # from "this tag was not tracked then". Version 1 is the pre-widening five-tag set, version 2
 # adds the thirteen identity fields, version 3 the seven release-stamp fields, version 4 the
-# ``artists`` list. Every new revision is stamped with :data:`MANAGED_SET_VERSION`;
-# :func:`tagmend.engine.versioning._revert_target_tags` looks the stamp up here. Widening the
-# set again means a new entry and a bump, never editing an existing entry, since stored
-# revisions point at it.
+# ``artists`` list. Every new revision is stamped with :data:`MANAGED_SET_VERSION`, and
+# :func:`governed_tags` looks a stamp up here. Widening the set again means a new entry and a
+# bump, never editing an existing entry, since stored revisions point at it.
 MANAGED_SET_VERSION: Final = 4
 
 MANAGED_SETS: Final[Mapping[int, frozenset[str]]] = {
@@ -220,6 +219,16 @@ MANAGED_SETS: Final[Mapping[int, frozenset[str]]] = {
     3: ORIGINAL_MANAGED_TAGS | _WIDENED_MANAGED_TAGS | RELEASE_STAMP_TAGS,
     4: MANAGED_TAGS,
 }
+
+
+def governed_tags(managed_set: int) -> frozenset[str]:
+    """Return the tags a revision stamped *managed_set* governed.
+
+    An unknown stamp falls back to the pre-widening set: preserve rather than delete, since
+    deleting is the unrecoverable direction.
+    """
+    return MANAGED_SETS.get(managed_set, ORIGINAL_MANAGED_TAGS)
+
 
 # Which reader produced a snapshot row, so an incremental scan can spot rows left behind by
 # an older one and re-read them exactly once. BUMP THIS IN THE SAME COMMIT as any change to

@@ -25,7 +25,7 @@ from tagmend.engine import axis, commits, genres, health, library, staging, stor
 from tagmend.engine.db import connect
 from tagmend.engine.lastfm import LastfmError
 from tagmend.engine.musicbrainz import MusicBrainzError
-from tagmend.engine.tags import read_tags
+from tagmend.engine.tags import MANAGED_SET_VERSION, read_tags
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -459,6 +459,17 @@ def test_history_names_the_version_a_revert_restored(music_dir: Path) -> None:
     assert latest["origin"] == "revert"
     assert latest["reverted_to_version"] == 0
     assert "reverted_from" not in latest
+
+
+def test_history_rows_carry_their_managed_set(music_dir: Path) -> None:
+    file_id = _scanned_track_id(music_dir)
+    mcp_server.stage_tags(file_id, {"genre": ["Synthwave"]})
+    mcp_server.commit_tags()
+
+    history = mcp_server.history_tags(file_id)["history"]
+
+    assert isinstance(history, list)
+    assert [row["managed_set"] for row in history] == [MANAGED_SET_VERSION, MANAGED_SET_VERSION]
 
 
 def test_list_commits_and_get_commit(music_dir: Path) -> None:

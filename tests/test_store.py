@@ -340,6 +340,7 @@ def test_revision_to_dict_keys(db_conn: sqlite3.Connection) -> None:
         "managed_tags",
         "diff",
         "note",
+        "managed_set",
     }
 
 

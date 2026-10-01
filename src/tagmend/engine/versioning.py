@@ -1,8 +1,8 @@
 """Append-only tag-revision history + revert (M3).
 
 The heart of TagMend's safety story. Every managed-tag change to a file appends a new
-row to ``tag_revisions`` keyed ``(file_id, version)`` — version 0 is the original
-as-found baseline, +1 per change — storing a FULL snapshot of the managed tags plus a
+row to ``tag_revisions`` keyed ``(file_id, version)``. Version 0 is the original as-found
+baseline and each later row is +1. A row stores a FULL snapshot of the managed tags plus a
 human-readable diff. History is never mutated or deleted.
 
 **Revert is itself an append, not a pointer move.** ``revert_tags(file, target)`` reads the
@@ -15,12 +15,14 @@ current state is always ``MAX(version)`` and is already materialized in the live
 
 Why version 0 is captured lazily (:func:`ensure_baseline` on first write, not at scan):
 files that are never edited get no revision rows, so the log stays proportional to
-*changes*, not to library size.
+*changes*, not to library size. A snapshot covers only the fields its own managed set
+governed, so before a write to a file whose latest revision predates the current set,
+:func:`observe_widened_fields` appends a ``scan`` re-baseline that records the newer fields.
 
-Transaction ownership mirrors the rest of the engine: :func:`ensure_baseline` and
-:func:`append_revision` take an open connection and never commit
-(building blocks a future cascade can batch inside one transaction). :func:`revert_tags`
-owns its own connection/commit — like :func:`tagmend.engine.library.scan_library` —
+Transaction ownership mirrors the rest of the engine: :func:`ensure_baseline`,
+:func:`observe_widened_fields` and :func:`append_revision` take an open connection and never
+commit (building blocks a future cascade can batch inside one transaction). :func:`revert_tags`
+owns its own connection and commit, like :func:`tagmend.engine.library.scan_library`,
 because it pairs a disk write with DB writes as one atomic user-facing action.
 
 See PLAN.md §7 (versioning/undo semantics) and §11 (safety model).
@@ -36,9 +38,9 @@ import mutagen
 
 from tagmend.engine import clock, commits, db, schema, store
 from tagmend.engine.tags import (
-    MANAGED_SETS,
+    MANAGED_SET_VERSION,
     MANAGED_TAGS,
-    ORIGINAL_MANAGED_TAGS,
+    governed_tags,
     read_tags,
     write_managed_tags,
 )
@@ -106,6 +108,51 @@ def ensure_baseline(
     return True
 
 
+def predates_managed_set(revision: Revision) -> bool:
+    """Whether *revision* was stamped under an older managed set than the current one."""
+    return revision.managed_set < MANAGED_SET_VERSION
+
+
+def observe_widened_fields(
+    conn: sqlite3.Connection,
+    file_id: int,
+    *,
+    managed_tags: dict[str, list[str]],
+    now: str,
+) -> bool:
+    """Re-baseline *file_id* under the current managed set when its latest revision predates it.
+
+    Without this, a change to a newer field has no record of the field's previous value, so its
+    commit diff reads ``from: []`` and a revert cannot restore it. The appended ``scan`` revision
+    snapshots *managed_tags* (read from disk) under the current set. Its diff covers only the
+    fields the older set governed, so it holds external drift and is ``{}`` when there is none.
+    Returns whether a row was written. Does not commit.
+    """
+    latest = store.latest_revision(conn, file_id)
+    if latest is None or not predates_managed_set(latest):
+        return False
+
+    governed = governed_tags(latest.managed_set)
+    snapshot = managed_subset(managed_tags)
+    drift = compute_diff(_restrict(latest.managed_tags, governed), _restrict(snapshot, governed))
+    store.insert_revision(
+        conn,
+        file_id=file_id,
+        version=latest.version + 1,
+        origin="scan",
+        managed_tags=snapshot,
+        diff=drift,
+        now=now,
+        note=f"re-baseline: managed set {latest.managed_set} -> {MANAGED_SET_VERSION}",
+    )
+    return True
+
+
+def _restrict(tags: dict[str, list[str]], fields: frozenset[str]) -> dict[str, list[str]]:
+    """Return the entries of *tags* whose key is in *fields*."""
+    return {key: values for key, values in tags.items() if key in fields}
+
+
 def append_revision(  # noqa: PLR0913 - cohesive revision-append inputs
     conn: sqlite3.Connection,
     file_id: int,
@@ -125,21 +172,17 @@ def append_revision(  # noqa: PLR0913 - cohesive revision-append inputs
     :class:`ValueError` if no baseline exists yet (call :func:`ensure_baseline` first).
     Does not commit.
     """
-    previous = store.max_version(conn, file_id)
-    if previous is None:
-        message = f"no baseline revision for file_id={file_id}; call ensure_baseline first"
+    previous_revision = store.latest_revision(conn, file_id)
+    if previous_revision is None:
+        message = f"no baseline revision for file_id={file_id}, call ensure_baseline first"
         raise ValueError(message)
-    previous_revision = store.get_revision(conn, file_id, previous)
-    if previous_revision is None:  # pragma: no cover - defensive; previous came from MAX()
-        message = f"revision {previous} vanished for file_id={file_id}"
-        raise RuntimeError(message)
 
     new_snapshot = managed_subset(managed_tags)
     diff = compute_diff(previous_revision.managed_tags, new_snapshot)
     if not diff:
         return None
 
-    version = previous + 1
+    version = previous_revision.version + 1
     store.insert_revision(
         conn,
         file_id=file_id,
@@ -155,35 +198,33 @@ def append_revision(  # noqa: PLR0913 - cohesive revision-append inputs
 
 
 def _revert_target_tags(
-    path: Path,
-    snapshot: dict[str, list[str]],
-    managed_set: int,
+    target: Revision,
+    later: list[Revision],
+    current: dict[str, list[str]],
 ) -> dict[str, list[str]]:
-    """Return the managed-tag dict to write when reverting *path* to *snapshot*.
+    """Return the managed-tag dict to write when reverting to *target*.
 
-    Guards the widened-:data:`~tagmend.engine.tags.MANAGED_TAGS` migration hazard, per
-    revision rather than globally. :func:`~tagmend.engine.tags.write_managed_tags` deletes
-    every managed key ABSENT from the dict it is given, so writing a historical snapshot
-    verbatim is only safe for the keys that snapshot actually governed. *managed_set* is the
-    revision's own stamp (a key of :data:`~tagmend.engine.tags.MANAGED_SETS`), so absence is
-    read correctly in both directions: a field the set governed was genuinely empty at
-    capture and must be deleted to restore that emptiness, while a field outside it was
-    simply not tracked and is taken from the file's CURRENT on-disk value.
-
-    Stamping is what makes this exact. Before it, every snapshot was treated as
-    pre-widening, so the 13 widened fields could never be emptied by a revert and the revert
-    reported success while changing nothing. An unknown stamp falls back to the pre-widening
-    set: preserve rather than delete, since deleting is the unrecoverable direction. This
-    mirrors the merge-onto-current guard the staging path already applies in
-    :func:`tagmend.engine.staging.stage_tags`.
+    :func:`~tagmend.engine.tags.write_managed_tags` deletes every managed key ABSENT from the
+    dict it is given, so a snapshot is exact only for the fields its own managed set governed.
+    A governed field absent from it was empty at capture and is deleted. A field outside that
+    set is read from the first revision in *later* (the revisions after *target*) whose set
+    governs it, absence included, when that revision is a ``scan`` observation. Otherwise the
+    file's *current* value is kept: a commit or revert snapshot holds that change's own output,
+    and an observation after it would only see that output.
     """
-    governed = MANAGED_SETS.get(managed_set, ORIGINAL_MANAGED_TAGS)
-    target = managed_subset(read_tags(path).tags)
-    target.update(snapshot)
-    for field in governed:
-        if field not in snapshot:
-            target.pop(field, None)
-    return target
+    governed = governed_tags(target.managed_set)
+
+    planned: dict[str, list[str]] = {}
+    for field in MANAGED_TAGS - governed:
+        first = next(
+            (revision for revision in later if field in governed_tags(revision.managed_set)),
+            None,
+        )
+        source = first.managed_tags if first is not None and first.origin == "scan" else current
+        if field in source:
+            planned[field] = source[field]
+    planned.update(target.managed_tags)
+    return planned
 
 
 def _revert_plan(
@@ -210,6 +251,16 @@ def _revert_plan(
     return target, Path(file_row.folder) / file_row.filename
 
 
+def _observe_durably(conn: sqlite3.Connection, file_id: int, path: Path) -> None:
+    """Re-baseline a stale-set file from disk and commit it before any revert write.
+
+    A crash after the revert's disk write then rolls back only the revert row, so the rerun
+    diffs against the pre-write observation instead of recording the revert as drift.
+    """
+    observe_widened_fields(conn, file_id, managed_tags=read_tags(path).tags, now=clock.utc_now())
+    conn.commit()
+
+
 def _revert_file(
     conn: sqlite3.Connection,
     file_id: int,
@@ -220,32 +271,36 @@ def _revert_file(
 ) -> tuple[int, bool]:
     """Restore one file to *target_version* and append the revert revision. No commit.
 
-    The shared per-file revert core (single-file revert = a group revert of one).
-    Validates, writes the target snapshot to disk FIRST, refreshes the live
-    ``file_tags`` snapshot from the re-read file, then appends a new
-    ``origin='revert'`` revision (``reverted_to_version=target_version``) under *commit_id*.
-    Unlike :func:`append_revision`, a revert is **always** recorded even when the
-    managed tags did not change — it is an explicit, audited action and is what makes
-    "revert a revert" work. Returns ``(new version, changed)``, where *changed* is
-    ``False`` for a revert that moved nothing on disk (an empty diff); callers report that
-    as ``noop`` rather than as a successful revert.
+    The shared per-file revert core (single-file revert = a group revert of one). The caller
+    has already re-baselined a stale-set file (:func:`_observe_durably`). It validates, writes
+    the target snapshot to disk FIRST, refreshes the live ``file_tags`` snapshot from the
+    re-read file, then appends a new ``origin='revert'`` revision
+    (``reverted_to_version=target_version``) under *commit_id*. Unlike
+    :func:`append_revision`, a revert is **always** recorded even when the managed tags did
+    not change. It is an explicit, audited action and is what makes "revert a revert" work.
+    Returns ``(new version, changed)``, where *changed* is ``False`` for a revert that moved
+    nothing on disk (an empty diff). Callers report that as ``noop`` rather than as a
+    successful revert.
 
     Raises :class:`ValueError` if the file is unknown, the file is flagged missing, or the
     target revision is unknown (:func:`_revert_plan`). Leaves all DB writes in the open
     transaction. The caller owns the ``conn.commit()``.
     """
     target, path = _revert_plan(conn, file_id, target_version)
+    now = clock.utc_now()
+    current = managed_subset(read_tags(path).tags)
 
-    # Disk write first, before any DB append: a write failure aborts with no row. The
-    # snapshot is merged onto the file's current values for every field OUTSIDE the target
-    # revision's own managed set, which it never governed (see _revert_target_tags). A revert
+    # Disk write first, before the revert row: a write failure aborts with no row. A revert
     # that moves nothing skips the write, so it never rewrites the file.
-    planned = _revert_target_tags(path, target.managed_tags, target.managed_set)
-    if compute_diff(managed_subset(read_tags(path).tags), planned):
+    planned = _revert_target_tags(
+        target,
+        store.revisions_after(conn, file_id, target_version),
+        current,
+    )
+    if compute_diff(current, planned):
         write_managed_tags(path, planned)
 
     # Refresh the live snapshot so file_tags reflects the actual on-disk state.
-    now = clock.utc_now()
     reverted_tags = read_tags(path).tags
     store.replace_tags(conn, file_id, reverted_tags, now)
     # Re-sync the files-row signature to the just-written bytes (same fields the scanner
@@ -260,18 +315,14 @@ def _revert_file(
     )
 
     # Append the revert (always, even on an empty diff).
-    previous = store.max_version(conn, file_id)
-    if previous is None:  # pragma: no cover - defensive; target existed
+    previous_revision = store.latest_revision(conn, file_id)
+    if previous_revision is None:  # pragma: no cover - defensive, the target existed
         message = f"no baseline for file_id={file_id}"
-        raise RuntimeError(message)
-    previous_revision = store.get_revision(conn, file_id, previous)
-    if previous_revision is None:  # pragma: no cover - defensive
-        message = f"revision {previous} vanished for file_id={file_id}"
         raise RuntimeError(message)
 
     reverted_snapshot = managed_subset(reverted_tags)
     diff = compute_diff(previous_revision.managed_tags, reverted_snapshot)
-    version = previous + 1
+    version = previous_revision.version + 1
     store.insert_revision(
         conn,
         file_id=file_id,
@@ -355,10 +406,11 @@ def revert_tags(
             )
             raise ValueError(message)
 
+        _, path = _revert_plan(connection, file_id, version)
         if dry_run:
-            _, path = _revert_plan(connection, file_id, version)
             changed = _would_change(connection, file_id, version, path)
         else:
+            _observe_durably(connection, file_id, path)
             commit_id = commits.create_commit(
                 connection,
                 origin="revert",
@@ -462,34 +514,54 @@ def _would_change(
 ) -> bool:
     """Whether reverting *file_id* to *target_version* would move any managed tag on disk.
 
-    Compares the file's latest revision with the tags the revert would write, which is the
+    Compares the file's latest revision (or, when that predates the current managed set, the
+    disk the real run would observe first) with the tags the revert would write, which is the
     comparison :func:`_revert_file` makes after its write, so a dry run cannot promise a revert
     that delivers nothing. Costs one mutagen read per planned file, accepted deliberately: an
     honest preview is the point. An unreadable file is reported as changing, leaving the real
     run's error handling to deal with it.
     """
     target = store.get_revision(conn, file_id, target_version)
-    latest_version = store.max_version(conn, file_id)
-    latest = None if latest_version is None else store.get_revision(conn, file_id, latest_version)
+    latest = store.latest_revision(conn, file_id)
     if target is None or latest is None:  # pragma: no cover - defensive, the caller checked both
         return True
     try:
-        planned = _revert_target_tags(path, target.managed_tags, target.managed_set)
+        current = managed_subset(read_tags(path).tags)
     except (OSError, mutagen.MutagenError) as exc:  # type: ignore[attr-defined]
         logger.warning("revert preview: file_id=%d unreadable: %s", file_id, exc)
         return True
-    return bool(compute_diff(latest.managed_tags, planned))
+
+    # The real run re-baselines a stale-set file first, so its revert diffs against this disk.
+    basis = current if predates_managed_set(latest) else latest.managed_tags
+    planned = _revert_target_tags(
+        target,
+        store.revisions_after(conn, file_id, target_version),
+        current,
+    )
+    return bool(compute_diff(basis, planned))
+
+
+def _no_later_changes(conn: sqlite3.Connection, file_id: int, version: int) -> bool:
+    """Whether every revision of *file_id* after *version* is a drift-free ``scan`` observation.
+
+    A re-baseline with an empty diff records no change, so it never blocks undoing the commit
+    before it. A noop revert is an audited action, so it still counts as a later change.
+    """
+    return all(
+        revision.origin == "scan" and not revision.diff
+        for revision in store.revisions_after(conn, file_id, version)
+    )
 
 
 def _classify_for_revert(conn: sqlite3.Connection, revision: Revision) -> str:
     """Classify one commit revision: 'revertable' | 'noop' | 'skipped_later_changes' | 'missing'.
 
-    Read-only (shared by the dry run and the plan pass of a real run). A file is
-    revertable iff it still exists on disk and the commit's revision is its LATEST —
-    skip+report semantics: later changes are never silently destroyed; revert those
-    files per-file, deliberately, if that is really wanted. 'noop' is a revertable file
-    whose revert would move nothing (see :func:`_would_change`); it is still processed,
-    just reported honestly.
+    Read-only (shared by the dry run and the plan pass of a real run). A file is revertable
+    iff it still exists on disk and nothing changed it after the commit's revision
+    (:func:`_no_later_changes`). Skip+report semantics: later changes are never silently
+    destroyed. Revert those files per-file, deliberately, if that is really wanted. 'noop' is
+    a revertable file whose revert would move nothing (see :func:`_would_change`). It is still
+    processed, just reported honestly.
     """
     file_row = store.get_file_by_id(conn, revision.file_id)
     if file_row is None or file_row.is_missing:
@@ -497,8 +569,7 @@ def _classify_for_revert(conn: sqlite3.Connection, revision: Revision) -> str:
     path = Path(file_row.folder) / file_row.filename
     if not path.exists():
         return "missing"
-    latest = store.max_version(conn, revision.file_id)
-    if latest != revision.version:
+    if not _no_later_changes(conn, revision.file_id, revision.version):
         return "skipped_later_changes"
     if not _would_change(conn, revision.file_id, revision.version - 1, path):
         return "noop"
@@ -537,20 +608,21 @@ def revert_commit(
 
     The group counterpart of :func:`revert_tags` (PLAN.md §7: "reverting a whole
     ``commit_id`` undoes an entire run"). For each revision the target commit created,
-    the file is restored to the snapshot just before it (``version - 1`` — the
+    the file is restored to the snapshot just before it (``version - 1``, the
     baseline when the commit created version 1), appended as a new revision under ONE
     fresh ``origin='revert'`` commit whose ``reverted_from`` records the undone
     commit. History stays append-only: nothing is destroyed, and the revert commit can
     itself be reverted.
 
-    Skip + report: a file changed again by a LATER commit is skipped (status
-    ``skipped_later_changes``), never silently rolled past — revert it per-file if
-    that is really wanted. Missing files are reported, a per-file disk failure is
-    recorded as ``error`` and the rest of the group still completes.
+    Skip + report: a file changed again by a LATER commit or revert is skipped (status
+    ``skipped_later_changes``), never silently rolled past. Revert it per-file if that is
+    really wanted. A drift-free ``scan`` re-baseline is not a change. Missing files are
+    reported, a per-file disk failure is recorded as ``error`` and the rest of the group
+    still completes.
 
     Guards: the target must exist and not be ``status='applying'`` (run ``commit_tags``
-    to recover an interrupted run first); ``interrupted`` targets are allowed (reverts
-    whatever they durably committed). The staging area must be EMPTY — commit or
+    to recover an interrupted run first). ``interrupted`` targets are allowed (reverts
+    whatever they durably committed). The staging area must be EMPTY: commit or
     unstage pending work before rolling back (git's "commit or stash first").
 
     A file already holding its pre-commit state is reported ``noop``: the revert revision
@@ -558,11 +630,11 @@ def revert_commit(
     so the summary never claims a change that did not happen.
 
     *dry_run* returns the full per-file classification without touching anything
-    (``commit_id`` is ``None``; ``status='reverted'`` means "would be reverted",
+    (``commit_id`` is ``None``, ``status='reverted'`` means "would be reverted",
     ``noop`` means "would change nothing"). The preview reads each planned file from disk
     to tell those two apart.
 
-    Crash recovery is resume-free, like ``commit_tags``: just run it again — files
+    Crash recovery is resume-free, like ``commit_tags``: just run it again. Files
     already reverted by the crashed run now have a later revision and report as
     ``skipped_later_changes``, so nothing is double-reverted. Owns its transactions
     (per-file durability, mirroring the commit loop).
@@ -634,6 +706,8 @@ def revert_commit(
                 )
                 continue
             try:
+                _, path = _revert_plan(connection, revision.file_id, revision.version - 1)
+                _observe_durably(connection, revision.file_id, path)
                 new_version, changed = _revert_file(
                     connection,
                     revision.file_id,

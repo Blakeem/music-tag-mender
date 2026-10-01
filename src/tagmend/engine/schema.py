@@ -187,6 +187,7 @@ import json
 from typing import TYPE_CHECKING, Final, cast
 
 from tagmend.engine import axis, path_keys
+from tagmend.engine.tags import governed_tags
 from tagmend.log import get_logger
 
 if TYPE_CHECKING:
@@ -931,20 +932,26 @@ def _replay_manual_revisions(connection: sqlite3.Connection) -> int:
 
     The commit writer's manual rule applied to history, in ``(file_id, version)`` order so the
     latest manual revision wins. Snapshots come from the revision's own ``managed_tags`` and
-    the row is stamped with the revision's time, so a second run writes the same rows.
+    the row is stamped with the revision's time, so a second run writes the same rows. A diff
+    key the previous revision's managed set did not govern is widening noise, not a human
+    change: the diff reads ``from: []`` there whether or not the field held a value.
     """
     cursor = connection.execute(
         """
-        SELECT file_id, created_at, managed_tags, diff FROM tag_revisions
-        WHERE origin = 'manual' ORDER BY file_id, version
+        SELECT r.file_id, r.created_at, r.managed_tags, r.diff,
+               COALESCE(p.managed_set, r.managed_set)
+        FROM tag_revisions AS r
+        LEFT JOIN tag_revisions AS p ON p.file_id = r.file_id AND p.version = r.version - 1
+        WHERE r.origin = 'manual' ORDER BY r.file_id, r.version
         """,
     )
     written = 0
     for row in cursor.fetchall():
         managed_tags = cast("dict[str, list[str]]", json.loads(str(row[2])))
         diff = cast("dict[str, object]", json.loads(str(row[3])))
+        previously_governed = governed_tags(int(row[4]))
         for tag_axis in axis.TAG_AXES:
-            if not any(name in diff for name in tag_axis.fields):
+            if not any(name in diff and name in previously_governed for name in tag_axis.fields):
                 continue
             axis.put_outcome(
                 connection,

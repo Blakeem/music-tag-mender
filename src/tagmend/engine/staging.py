@@ -38,9 +38,11 @@ import mutagen
 
 from tagmend.engine import axis, clock, commits, db, path_keys, schema, store, versioning
 from tagmend.engine.tags import (
+    MANAGED_SET_VERSION,
     MANAGED_TAGS,
     RELEASE_STAMP_TAGS,
     ensure_writable,
+    governed_tags,
     read_tags,
     write_managed_tags,
 )
@@ -205,7 +207,7 @@ class TagDomain:
         if (stat_result.st_size, stat_result.st_mtime_ns) == base:
             return False
         current = versioning.managed_subset(read_tags(path).tags)
-        return bool(versioning.compute_diff(current, staged.managed_tags))
+        return not _holds_target(current, staged.managed_tags, store.latest_revision(conn, file_id))
 
     def apply_to_disk(
         self,
@@ -223,18 +225,38 @@ class TagDomain:
         append, the axis status rows (:func:`_record_axis_outcomes`) and the staged-row delete
         are left in the open transaction (``run_commit`` commits them together), the invariant
         that prevents double-applying. A target the file already holds is not written, so a
-        no-op commit never rewrites the file.
+        no-op commit never rewrites the file. A file whose latest revision predates the current
+        managed set was staged by an older build. It commits only as the re-apply of that
+        build's interrupted write, and otherwise raises :class:`ValueError`.
         """
         staged = _require_staged(conn, file_id)
+        current = read_tags(path).tags
+        latest = store.latest_revision(conn, file_id)
+        stale = latest is not None and versioning.predates_managed_set(latest)
+
+        # Never re-baseline here: a re-applied crash would observe the post-write disk. The
+        # re-apply is recorded against the stale snapshot instead, so its change stays here.
+        if stale and not _holds_target(
+            versioning.managed_subset(current), staged.managed_tags, latest
+        ):
+            message = (
+                f"file_id={file_id} was staged before managed set {MANAGED_SET_VERSION}, "
+                "unstage and stage it again"
+            )
+            raise ValueError(message)
 
         # Baseline (version 0) is captured at stage time, so this is a defensive no-op. It reads
         # disk for the same reason stage time does: a baseline is what a revert restores, so
         # it can never come from the snapshot mirror, which may lag the file.
-        current = read_tags(path).tags
         versioning.ensure_baseline(conn, file_id, managed_tags=current, now=now)
 
-        # Disk first, before any DB append.
-        disk_diff = versioning.compute_diff(versioning.managed_subset(current), staged.managed_tags)
+        # Disk first, before any DB append. A stale re-apply is never written, since its target
+        # lacks every newer field and the write would delete them.
+        disk_diff: dict[str, dict[str, list[str]]] = (
+            {}
+            if stale
+            else versioning.compute_diff(versioning.managed_subset(current), staged.managed_tags)
+        )
         if disk_diff:
             write_managed_tags(path, staged.managed_tags)
 
@@ -274,6 +296,23 @@ class TagDomain:
 
     def post_commit_file(self, conn: sqlite3.Connection, file_id: int) -> None:
         """Tags have no per-file filesystem follow-up."""
+
+
+def _holds_target(
+    disk: dict[str, list[str]],
+    target: dict[str, list[str]],
+    latest: store.Revision | None,
+) -> bool:
+    """Whether the managed tags on *disk* already equal the staged *target*.
+
+    When *latest* predates the current managed set, an older build staged the target and never
+    wrote a field newer than its set, so only the target's fields and the fields *latest*'s set
+    governed are compared.
+    """
+    if latest is None or not versioning.predates_managed_set(latest):
+        return not versioning.compute_diff(disk, target)
+    compared = set(target) | governed_tags(latest.managed_set)
+    return all(disk.get(key, []) == target.get(key, []) for key in compared)
 
 
 def _require_staged(conn: sqlite3.Connection, file_id: int) -> store.StagedTag:
@@ -353,7 +392,8 @@ def _stage_one(  # noqa: PLR0913 - cohesive keyword-only per-file staging payloa
 
     The shared per-file core of :func:`stage_tags` and :func:`stage_tags_batch`: rejects
     unmanaged keys, cleans every caller-supplied value (:func:`_clean_values`), rejects an
-    unknown or missing *file_id*, lazily captures the version-0 baseline, merges
+    unknown or missing *file_id*, lazily captures the version-0 baseline (or the re-baseline
+    :func:`tagmend.engine.versioning.observe_widened_fields` writes), merges
     *tags* onto the file's current managed subset (P0: omitted keys are preserved),
     and upserts the staged row with the file's signature as its base, so the commit can refuse
     a file edited since. A *fill_only* key is dropped when the file on disk already holds a
@@ -406,9 +446,10 @@ def _stage_one(  # noqa: PLR0913 - cohesive keyword-only per-file staging payloa
         message = f"cannot stage file_id={file_id}: {exc}"
         raise ValueError(message) from exc
 
-    # Capture v0 now (resume-free model): freeze the true original before any commit.
-    if store.max_version(conn, file_id) is None:
-        versioning.ensure_baseline(conn, file_id, managed_tags=current, now=now)
+    # Capture v0 now (resume-free model): freeze the true original before any commit. A file
+    # whose latest revision predates the current managed set is re-baselined for the same reason.
+    versioning.ensure_baseline(conn, file_id, managed_tags=current, now=now)
+    versioning.observe_widened_fields(conn, file_id, managed_tags=current, now=now)
 
     # No accidental deletion (P0): merge onto the current managed subset so omitted managed
     # keys are preserved through the commit's delete-on-absent write. The caller's values
@@ -590,9 +631,9 @@ def unstage_tags(settings: Settings, *, file_id: int) -> bool:
     """Drop the pending change for *file_id*. Returns ``True`` if a row was removed.
 
     A known file with nothing staged returns ``False``, and an unknown *file_id* raises
-    :class:`ValueError`, so a typo is never read as "nothing staged". A baseline captured at
-    stage time stays (history is proportional to staged intent). It is harmless and never
-    re-applied.
+    :class:`ValueError`, so a typo is never read as "nothing staged". A baseline or re-baseline
+    captured at stage time stays (history is proportional to staged intent). It is harmless and
+    never re-applied.
     """
     connection = db.connect(settings.db_path)
     try:

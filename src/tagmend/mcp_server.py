@@ -880,12 +880,14 @@ def history_tags(file_id: int) -> dict[str, object]:
     """Show the append-only tag-revision log for one file, oldest (version 0) first.
 
     Each revision carries its ``version``, ``origin`` (scan|auto|manual|revert), the
-    ``commit_id`` that grouped it, the full ``managed_tags`` snapshot at that version, and
-    the ``diff`` from the prior version. Use a ``version`` here with ``revert_tags``.
+    ``commit_id`` that grouped it, the full ``managed_tags`` snapshot at that version, the
+    ``diff`` from the prior version, and the ``managed_set`` that governed the snapshot. A
+    ``scan`` row is version 0 or a re-baseline that observed fields a newer managed set added.
+    Use a ``version`` here with ``revert_tags``.
 
     Returns ``{"ok": True, "history": [{version, created_at, origin, reverted_to_version,
-    commit_id, managed_tags, diff, note}, ...]}`` (empty if the file has no history), or
-    ``{"ok": False, "error": ...}`` if the file id is unknown.
+    commit_id, managed_tags, diff, note, managed_set}, ...]}`` (empty if the file has no
+    history), or ``{"ok": False, "error": ...}`` if the file id is unknown.
     """
     revisions = versioning.history_tags(load_settings(), file_id)
     return {"ok": True, "history": [r.to_dict() for r in revisions]}

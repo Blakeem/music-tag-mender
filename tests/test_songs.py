@@ -573,6 +573,139 @@ def test_a_rebind_folder_reports_an_ungated_targets_fpcalc_error(
     assert result.held_values == []
 
 
+class PartlyFailingReleases(FakeReleases):
+    """A release source whose lookups of the ``failing`` ids fail transiently."""
+
+    def __init__(self, *releases: MBRelease, failing: frozenset[str]) -> None:
+        super().__init__(*releases)
+        self._failing = failing
+
+    def release_by_mbid(self, mbid: str, *, fresh: bool = False) -> MBRelease | None:
+        if mbid in self._failing:
+            self.lookups.append(mbid)
+            message = f"MusicBrainz answered HTTP 503 for {mbid}"
+            raise MusicBrainzError(message)
+        return super().release_by_mbid(mbid, fresh=fresh)
+
+
+def _wrong_release() -> MBRelease:
+    """Return the release the wrong-stamp folder carries, which holds none of its recordings."""
+    return _release("rel-wrong", ["Numb", "Crawling", "Faint", "Papercut"], recordings=["x"] * 4)
+
+
+def _candidates_kit(count: int, failing: frozenset[str] = frozenset()) -> Kit:
+    """Return a kit whose every recording sits on *count* Official releases holding all four.
+
+    A lookup of a release in *failing* raises :class:`MusicBrainzError`.
+    """
+    candidates = [f"rel-c{n}" for n in range(count)]
+    bodies = {
+        f"fp-{name}": _body(
+            _recording(f"rec-{n}", _TITLES[n - 1], *(Slot(rid, n) for rid in candidates)),
+        )
+        for n, name in enumerate(_NAMES, 1)
+    }
+    releases = PartlyFailingReleases(
+        _wrong_release(),
+        *(_release(rid) for rid in candidates),
+        failing=failing,
+    )
+    return Kit(acoustid=FakeAcoustid(bodies), releases=releases)
+
+
+def _placements(rebind: Mapping[str, object]) -> list[tuple[object, ...]]:
+    """Return each candidate's id, status and the placement keys it carries, in report order."""
+    candidates = rebind["candidates"]
+    assert isinstance(candidates, list)
+    return [
+        (row["release_mbid"], row["status"], row.get("placed"), row.get("unassigned"))
+        for row in candidates
+    ]
+
+
+def test_rebind_candidates_report_placements_with_the_full_release_first_in_its_tier(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    _wrong_stamp_folder(music_dir)
+    library.scan_library(engine_settings)
+    halves = ("rel-official-half", "rel-boot-half")
+    bodies = {
+        f"fp-{name}": _body(
+            _recording(
+                f"rec-{n}",
+                _TITLES[n - 1],
+                Slot(halves[0], n, date=2001),
+                Slot(halves[1], n, date=1998),
+                Slot("rel-boot-full", n, date=1999),
+            ),
+        )
+        for n, name in enumerate(_NAMES, 1)
+    }
+    half = ["rec-1", "rec-2", "x3", "x4"]
+    kit = Kit(
+        acoustid=FakeAcoustid(bodies),
+        releases=FakeReleases(
+            _wrong_release(),
+            _release(halves[0], recordings=half),
+            _release(halves[1], status="Bootleg", recordings=half),
+            _release("rel-boot-full", status="Bootleg"),
+        ),
+    )
+
+    result = _resolve(engine_settings, kit)
+
+    [rebind] = result.rebind_folders
+    # The Official half release keeps its tier. The full bootleg passes the earlier half one.
+    assert _placements(rebind) == [
+        (halves[0], "official", 2, {"not_on_release": 2}),
+        ("rel-boot-full", "bootleg", 4, {}),
+        (halves[1], "bootleg", 2, {"not_on_release": 2}),
+    ]
+    assert staging.diff_tags(engine_settings) == []
+
+
+def test_rebind_placement_fetches_only_the_leading_candidates(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    _wrong_stamp_folder(music_dir)
+    library.scan_library(engine_settings)
+    kit = _candidates_kit(7)
+
+    result = _resolve(engine_settings, kit)
+
+    [rebind] = result.rebind_folders
+    # The confirm walk stops at the first Official candidate, so the rest stay unfetched there.
+    assert _placements(rebind) == [
+        ("rel-c0", "official", 4, {}),
+        *[(f"rel-c{n}", "unknown", 4, {}) for n in range(1, 5)],
+        *[(f"rel-c{n}", "unknown", None, None) for n in range(5, 7)],
+    ]
+    assert kit.releases.lookups == ["rel-wrong", *[f"rel-c{n}" for n in range(5)]]
+
+
+def test_a_musicbrainz_error_placing_a_candidate_keeps_the_rebind_report(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    _wrong_stamp_folder(music_dir)
+    library.scan_library(engine_settings)
+    kit = _candidates_kit(4, failing=frozenset({"rel-c2"}))
+
+    result = _resolve(engine_settings, kit)
+
+    [rebind] = result.rebind_folders
+    assert _placements(rebind) == [
+        ("rel-c0", "official", 4, {}),
+        ("rel-c1", "unknown", 4, {}),
+        ("rel-c2", "unknown", None, None),
+        ("rel-c3", "unknown", None, None),
+    ]
+    assert kit.releases.lookups == ["rel-wrong", "rel-c0", "rel-c1", "rel-c2"]
+    assert result.error_items == []
+
+
 def test_a_gate_failure_is_held_as_no_contribution_with_its_reason(
     engine_settings: Settings,
     music_dir: Path,

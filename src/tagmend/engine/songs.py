@@ -12,9 +12,10 @@ its tags. One :func:`resolve_songs` call runs these stages, top to bottom:
 4. Recording gate stage. Per voter, the dominant recordings its audio names, or no contribution.
 5. Stamp check stage. A gated pending voter whose tagged release its audio is absent from sends
    the folder to the rebind route.
-6. Route selector. The rebind route reports ranked candidate releases and stages nothing. The
-   anchored route checks each voter against the release it already names. The convergence route
-   settles the folder on one release its voters share.
+6. Route selector. The rebind route reports ranked candidate releases, places the folder's files
+   on the leading ones as the manual release path would, and stages nothing. The anchored route
+   checks each voter against the release it already names. The convergence route settles the
+   folder on one release its voters share.
 7. Outcome router. A fill stages the blank song fields (``origin='auto'``) and records ``done``.
    A verified file records ``done``. Held, review, ``lookup_empty`` and error outcomes are
    reported and store nothing. A gated target with no ``artist`` and no ``albumartist`` whose
@@ -107,6 +108,8 @@ _FLOOR_VOTERS: Final = 3
 
 # The confirm fetch stage stops after this many release lookups per folder.
 _CONFIRM_FETCHES: Final = 3
+# A rebind report places the folder's files on this many leading candidates, each one a lookup.
+_REBIND_PLACEMENT_FETCHES: Final = 5
 _OFFICIAL: Final = "official"
 _UNFETCHED: Final = "unknown"
 _NOT_FOUND: Final = "missing"
@@ -368,6 +371,29 @@ class _Ranking:
 
     representative: MBRelease | None
     rows: list[dict[str, object]]
+
+
+@dataclass(frozen=True, slots=True)
+class _Placement:
+    """How a folder's files place on one release.
+
+    ``slots`` holds each file's tracks there. ``reasons`` holds why each file is unassigned,
+    ``None`` for a file that lands on exactly one track.
+    """
+
+    slots: dict[int, list[_Slot]]
+    reasons: dict[int, str | None]
+
+    @property
+    def placed(self) -> int:
+        """How many files land on exactly one track."""
+        return sum(1 for reason in self.reasons.values() if reason is None)
+
+    @property
+    def unassigned(self) -> dict[str, int]:
+        """How many files each reason leaves unassigned, keyed by reason in name order."""
+        counts = Counter(reason for reason in self.reasons.values() if reason is not None)
+        return dict(sorted(counts.items()))
 
 
 @dataclass(frozen=True, slots=True)
@@ -805,6 +831,38 @@ def _claims(placements: dict[int, list[_Slot]]) -> dict[tuple[str, int, int], se
     return claims
 
 
+def _place(
+    release: MBRelease,
+    ballots: list[_Ballot],
+    operator_slots: dict[int, _Slot],
+) -> _Placement:
+    """Place each ballot's file on *release* and decide why each file left over is unassigned.
+
+    A file in *operator_slots* sits on the track the operator named instead of its audio's
+    tracks. Raises :class:`ValueError` when :func:`_check_operator_slots` refuses one.
+    """
+    placements: dict[int, list[_Slot]] = {}
+    reasons: dict[int, str | None] = {}
+
+    for ballot in ballots:
+        operator_slot = operator_slots.get(ballot.voter.file_id)
+        placements[ballot.voter.file_id] = (
+            _slots_on(release, ballot.gate.titled) if operator_slot is None else [operator_slot]
+        )
+    # Claims are built after the operator's slots replace the audio's, so an assigned track
+    # still collides with a sibling whose audio sits on it.
+    claims = _claims(placements)
+    _check_operator_slots(ballots, operator_slots, claims)
+    for ballot in ballots:
+        file_id = ballot.voter.file_id
+        reasons[file_id] = (
+            None
+            if file_id in operator_slots
+            else _evidence_reason(ballot) or _slot_reason(ballot, placements[file_id], claims)
+        )
+    return _Placement(slots=placements, reasons=reasons)
+
+
 # --- outcome rows --------------------------------------------------------------------
 
 
@@ -1099,9 +1157,7 @@ def _confirm(
             break
 
     def rank(rid: str) -> tuple[int, int]:
-        status = statuses.get(rid, _UNFETCHED)
-        tier = 0 if status == _OFFICIAL else 1 if status == _UNFETCHED else 2
-        return tier, order.index(rid)
+        return _status_tier(statuses.get(rid, _UNFETCHED)), order.index(rid)
 
     rows: list[dict[str, object]] = []
     for rid in sorted(order, key=rank):
@@ -1119,6 +1175,11 @@ def _confirm(
             },
         )
     return _Ranking(representative=representative, rows=rows)
+
+
+def _status_tier(status: str) -> int:
+    """Return a candidate row's report tier: Official, then unfetched, then any other status."""
+    return 0 if status == _OFFICIAL else 1 if status == _UNFETCHED else 2
 
 
 def _carried(ballots: list[_Ballot]) -> frozenset[str]:
@@ -1234,7 +1295,7 @@ def _rebind_report(ballots: list[_Ballot], lookups: _Lookups) -> dict[str, objec
             },
         )
     convergence = _converge(ballots)
-    candidates = (
+    ranked = (
         []
         if convergence is None
         else _confirm(convergence.narrowed, convergence.refs, carried, lookups).rows
@@ -1245,8 +1306,50 @@ def _rebind_report(ballots: list[_Ballot], lookups: _Lookups) -> dict[str, objec
         "flagged_file_ids": [
             b.voter.file_id for b in ballots if b.voter.unsettled and _stamp_fails(b)
         ],
-        "candidates": candidates,
+        "candidates": _placed_candidates(ranked, ballots, lookups),
     }
+
+
+def _placed_candidates(
+    rows: list[dict[str, object]],
+    ballots: list[_Ballot],
+    lookups: _Lookups,
+) -> list[dict[str, object]]:
+    """Add ``placed`` and ``unassigned`` to the leading candidate rows, then reorder each tier.
+
+    The first :data:`_REBIND_PLACEMENT_FETCHES` rows are fetched and placed as the manual
+    release path would place the folder. Within a status tier the placed rows come first,
+    fewest unassigned first. A row past the cap, one MusicBrainz does not hold, and every row
+    from a MusicBrainz error on carry neither key.
+    """
+    placements: dict[str, _Placement] = {}
+    placed_rows: list[dict[str, object]] = []
+
+    for row in rows[:_REBIND_PLACEMENT_FETCHES]:
+        release_mbid = str(row["release_mbid"])
+        try:
+            release = lookups.release(release_mbid)
+        except MusicBrainzError as exc:
+            # The ranked candidates stand without placements, so an error drops only the counts.
+            folder = ballots[0].voter.row.folder
+            logger.warning("musicbrainz error placing %s on %s: %s", folder, release_mbid, exc)
+            break
+        if release is not None:
+            placements[release_mbid] = _place(release, ballots, {})
+
+    def rank(row: dict[str, object]) -> tuple[int, bool, int]:
+        placement = placements.get(str(row["release_mbid"]))
+        unplaced = 0 if placement is None else sum(placement.unassigned.values())
+        return _status_tier(str(row["status"])), placement is None, unplaced
+
+    for row in sorted(rows, key=rank):
+        placement = placements.get(str(row["release_mbid"]))
+        placed_rows.append(
+            row
+            if placement is None
+            else row | {"placed": placement.placed, "unassigned": placement.unassigned},
+        )
+    return placed_rows
 
 
 # --- auto path -----------------------------------------------------------------------
@@ -1462,32 +1565,18 @@ def _resolve_release(  # noqa: PLR0913 - cohesive keyword-only run inputs
 
     now = datetime.now(UTC)
     ballots: list[_Ballot] = []
-    placements: dict[int, list[_Slot]] = {}
     for row in rows:
         evidence = _fresh_evidence(conn, row, lookups, now)
         voter = _Voter(row=row, tags=store.get_tags(conn, row.id), target=True, unsettled=True)
-        ballot = _Ballot(voter=voter, evidence=evidence, gate=_gate(evidence, voter.stem))
-        operator_slot = operator_slots.get(row.id)
-        ballots.append(ballot)
-        placements[row.id] = (
-            _slots_on(release, ballot.gate.titled) if operator_slot is None else [operator_slot]
-        )
-    # Claims are built after the operator's slots replace the audio's, so an assigned track
-    # still collides with a sibling whose audio sits on it.
-    claims = _claims(placements)
-    _check_operator_slots(ballots, operator_slots, claims)
+        ballots.append(_Ballot(voter=voter, evidence=evidence, gate=_gate(evidence, voter.stem)))
+    placement = _place(release, ballots, operator_slots)
 
     unassigned: list[dict[str, object]] = []
     stamps: list[tuple[_Voter, dict[str, list[str]], str]] = []
     for ballot in ballots:
         file_id = ballot.voter.file_id
-        slots = placements[file_id]
         placed_by = "operator" if file_id in operator_slots else "audio"
-        reason = (
-            None
-            if placed_by == "operator"
-            else _evidence_reason(ballot) or _slot_reason(ballot, slots, claims)
-        )
+        reason = placement.reasons[file_id]
         if reason == "error":
             tally.add_error(ballot.voter.file_id, ballot.evidence.error or "")
         if reason is not None:
@@ -1499,7 +1588,7 @@ def _resolve_release(  # noqa: PLR0913 - cohesive keyword-only run inputs
                 },
             )
         else:
-            stamp = _stamp(release, slots[0].track, ballot.voter)
+            stamp = _stamp(release, placement.slots[file_id][0].track, ballot.voter)
             stamps.append((ballot.voter, stamp, placed_by))
 
     block = _release_block(release)

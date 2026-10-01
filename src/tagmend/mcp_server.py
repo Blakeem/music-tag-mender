@@ -2065,6 +2065,14 @@ def resolve_songs(  # noqa: PLR0913 - cohesive scope, release path and run knobs
     value is never rewritten. A folder whose audio is not on the release it is tagged with
     stages nothing and comes back in ``rebind_folders`` with ranked candidate releases.
 
+    The first five candidates of a ``rebind_folders`` entry are placed as the manual release
+    path would place the folder. Each carries ``placed``, the count of the folder's files that
+    land on exactly one of its tracks, and ``unassigned``, a count per ``unassigned`` reason.
+    Within each status tier those candidates come first, fewest unassigned first. A candidate
+    with ``unassigned`` empty is one ``resolve_songs(folder=F, release_mbid=R)`` call away from
+    a stamp. A candidate carries neither key when it sits past the first five, MusicBrainz does
+    not hold it, or a MusicBrainz error stopped the fetches at it or before it.
+
     A file that agrees with its release records ``done``. A fill records ``done`` once staged.
     A disagreement, a slot two files claim, a file its release does not hold and a folder that
     does not converge are held (``held_values``, with ``have``/``want`` on a disagreement) and
@@ -2084,8 +2092,9 @@ def resolve_songs(  # noqa: PLR0913 - cohesive scope, release path and run knobs
     Workflow: run ``dry_run=True`` over the whole library first, repeating while ``more`` is
     true, then ``limit=0`` for the free whole-library tally. Review it, then make the real
     calls and apply each with ``diff_tags`` and ``commit_tags``. For each ``rebind_folders``
-    entry call ``resolve_songs(folder=F, release_mbid=R, dry_run=True)`` per candidate R, then
-    the real call, ``diff_tags``, ``commit_tags(path=F)`` and ``reopen_axes(commit_id)``.
+    entry pick a candidate R, preferring one with ``unassigned`` empty, and call
+    ``resolve_songs(folder=F, release_mbid=R, dry_run=True)``, then the real call,
+    ``diff_tags``, ``commit_tags(path=F)`` and ``reopen_axes(commit_id)``.
 
     With ``release_mbid`` the call takes the manual release path. Every file in scope must sit
     on exactly one track of that release, or nothing is staged and the files come back in

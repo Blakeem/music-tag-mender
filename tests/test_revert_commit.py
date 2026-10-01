@@ -23,7 +23,7 @@ from tagmend.engine import commits, staging, store, versioning
 from tagmend.engine.db import connect
 from tagmend.engine.library import scan_library
 from tagmend.engine.schema import apply_append_only_triggers, apply_schema
-from tagmend.engine.tags import read_tags, write_managed_tags
+from tagmend.engine.tags import TagWriteResult, read_tags, write_managed_tags
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -578,12 +578,12 @@ def test_revert_commit_per_file_failure_then_rerun(
         {a_id: {"genre": ["Synthwave"]}, b_id: {"genre": ["Metal"]}},
     )
 
-    def flaky_write(path: Path, managed_tags: dict[str, list[str]]) -> None:
-        # Fail the write for the SECOND file (B) only; A reverts durably.
+    def flaky_write(path: Path, managed_tags: dict[str, list[str]]) -> TagWriteResult:
+        # Fail the write for the SECOND file (B) only. A reverts durably.
         if path.name == b.name:
             message = "simulated disk failure"
             raise OSError(message)
-        write_managed_tags(path, managed_tags)
+        return write_managed_tags(path, managed_tags)
 
     monkeypatch.setattr(versioning, "write_managed_tags", flaky_write)
     result = versioning.revert_commit(engine_settings, target)

@@ -7,7 +7,8 @@ recordings carry that fingerprint, and two cache helper pairs keep both answers 
 * ``fingerprint_cache`` (:func:`get_fingerprint` / :func:`put_fingerprint`) holds one fpcalc
   outcome per file, reused while the files-row signature is unchanged. A failure is stored
   too, so an undecodable file does not re-run on every call. A timeout is never stored,
-  because the next run may succeed.
+  because the next run may succeed. :func:`rekey_fingerprint` carries a row across a tag write
+  that proved the decoded audio unchanged.
 * ``acoustid_cache`` (:func:`get_lookup` / :func:`put_lookup`) holds one lookup per request
   hash. An empty result is served for 7 days only, because AcoustID keeps learning new
   fingerprints. An error is never stored.
@@ -732,6 +733,27 @@ def put_fingerprint(  # noqa: PLR0913 - one keyword per stored column, cohesive 
             None if fingerprint is None else fingerprint.duration,
             now.isoformat(),
         ),
+    )
+
+
+def rekey_fingerprint(
+    conn: sqlite3.Connection,
+    file_id: int,
+    *,
+    before: tuple[int, int],
+    after: tuple[int, int],
+) -> None:
+    """Move *file_id*'s stored outcome from the *before* to the *after* ``(size, mtime_ns)``.
+
+    Called after a tag write that proved the decoded audio unchanged. A row at any other
+    signature was staled by an edit no scan has seen, so it stays stale.
+    """
+    conn.execute(
+        """
+        UPDATE fingerprint_cache SET size_bytes = ?, mtime_ns = ?
+        WHERE file_id = ? AND size_bytes = ? AND mtime_ns = ?
+        """,
+        (*after, file_id, *before),
     )
 
 

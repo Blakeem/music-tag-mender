@@ -22,11 +22,11 @@ An edit made outside TagMend reaches no revision on its own, so staging and reve
 it as a ``scan`` revision (:func:`observe_drift`) before writing over it.
 
 Transaction ownership mirrors the rest of the engine: :func:`ensure_baseline`,
-:func:`observe_widened_fields`, :func:`observe_drift` and :func:`append_revision` take an open
-connection and never commit (building blocks a future cascade can batch inside one
-transaction). :func:`revert_tags` owns its own connection and commit, like
-:func:`tagmend.engine.library.scan_library`, because it pairs a disk write with DB writes as
-one atomic user-facing action.
+:func:`observe_widened_fields`, :func:`observe_drift`, :func:`append_revision` and
+:func:`resync_signature` take an open connection and never commit (building blocks a future
+cascade can batch inside one transaction). :func:`revert_tags` owns its own connection and
+commit, like :func:`tagmend.engine.library.scan_library`, because it pairs a disk write with
+DB writes as one atomic user-facing action.
 
 See PLAN.md §7 (versioning/undo semantics) and §11 (safety model).
 """
@@ -39,7 +39,7 @@ from typing import TYPE_CHECKING, Final
 
 import mutagen
 
-from tagmend.engine import clock, commits, db, paths, schema, store
+from tagmend.engine import acoustid, clock, commits, db, paths, schema, store
 from tagmend.engine.tags import (
     MANAGED_SET_VERSION,
     MANAGED_TAGS,
@@ -236,6 +236,37 @@ def append_revision(  # noqa: PLR0913 - cohesive revision-append inputs
     return version
 
 
+def resync_signature(  # noqa: PLR0913 - cohesive keyword-only resync inputs
+    conn: sqlite3.Connection,
+    file_id: int,
+    path: Path,
+    *,
+    before_write: os.stat_result,
+    audio_proven: bool,
+    now: str,
+) -> None:
+    """Re-sync the files-row signature to *path*'s bytes after a tag write. Does not commit.
+
+    The next incremental scan then sees the file as unchanged. A write that proved the decoded
+    audio unchanged also carries the fingerprint row to the new signature.
+    """
+    stat_result = path.stat()
+    store.update_signature(
+        conn,
+        file_id,
+        size_bytes=stat_result.st_size,
+        mtime_ns=stat_result.st_mtime_ns,
+        now=now,
+    )
+    if audio_proven:
+        acoustid.rekey_fingerprint(
+            conn,
+            file_id,
+            before=(before_write.st_size, before_write.st_mtime_ns),
+            after=(stat_result.st_size, stat_result.st_mtime_ns),
+        )
+
+
 def _revert_target_tags(
     target: Revision,
     later: list[Revision],
@@ -378,21 +409,16 @@ def _revert_file(
     # Disk write first, before the revert row: a write failure aborts with no row. A revert
     # that moves nothing skips the write, so it never rewrites the file.
     planned = _planned_revert(conn, target, current)
+    before_write = path.stat()
+    audio_proven = False
     if compute_diff(current, planned):
-        write_managed_tags(path, planned)
+        audio_proven = write_managed_tags(path, planned).audio_proven
 
     # Refresh the live snapshot so file_tags reflects the actual on-disk state.
     reverted_tags = read_tags(path).tags
     store.replace_tags(conn, file_id, reverted_tags, now)
-    # Re-sync the files-row signature to the just-written bytes (same fields the scanner
-    # stats), so the next incremental scan sees the reverted file as unchanged.
-    stat_result = path.stat()
-    store.update_signature(
-        conn,
-        file_id,
-        size_bytes=stat_result.st_size,
-        mtime_ns=stat_result.st_mtime_ns,
-        now=now,
+    resync_signature(
+        conn, file_id, path, before_write=before_write, audio_proven=audio_proven, now=now
     )
 
     # Append the revert (always, even on an empty diff).

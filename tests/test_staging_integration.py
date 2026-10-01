@@ -26,7 +26,7 @@ from tagmend.engine import axis, commits, staging, store, tags, versioning
 from tagmend.engine.db import connect
 from tagmend.engine.library import ScanMode, scan_library
 from tagmend.engine.schema import apply_schema
-from tagmend.engine.tags import read_tags, write_managed_tags
+from tagmend.engine.tags import TagWriteResult, read_tags, write_managed_tags
 
 if TYPE_CHECKING:
     from tagmend.config import Settings
@@ -304,7 +304,7 @@ def test_commit_continues_past_an_unwritable_file(
     locked = tracks[1]
     real_write = write_managed_tags
 
-    def write_unless_locked(path: Path, managed: dict[str, list[str]]) -> bool:
+    def write_unless_locked(path: Path, managed: dict[str, list[str]]) -> TagWriteResult:
         if path.name == locked.name:
             message = f"file in use by another process: {path}"
             raise OSError(message)
@@ -342,7 +342,7 @@ def test_commit_error_envelope_via_mcp(music_dir: Path, monkeypatch: pytest.Monk
     file_id = _file_id(load_settings(), music_dir, track.name)
     assert mcp_server.stage_tags(file_id, {"genre": ["Jazz"]}) == {"ok": True}
 
-    def always_locked(path: Path, managed: dict[str, list[str]]) -> bool:
+    def always_locked(path: Path, managed: dict[str, list[str]]) -> TagWriteResult:
         message = f"file in use by another process: {path} ({len(managed)} tags)"
         raise OSError(message)
 

@@ -389,6 +389,23 @@ class _Container(StrEnum):
 VERIFIABLE_SUFFIXES: Final[frozenset[str]] = frozenset({".mp3", ".flac", ".m4a", ".ogg", ".opus"})
 
 
+# The containers whose hashed payload holds every byte the decoder reads. MP4 decoding also reads
+# the moov chunk offsets a save rewrites, and Ogg hashes no payload.
+_PAYLOAD_DECIDES_AUDIO: Final = frozenset({_Container.ID3, _Container.FLAC})
+
+
+@dataclass(frozen=True, slots=True)
+class TagWriteResult:
+    """What :func:`write_managed_tags` did to the file.
+
+    ``audio_proven`` holds after a write whose verified payload hash decides the decoded audio,
+    so a fingerprint taken before the write still describes the file.
+    """
+
+    written: bool
+    audio_proven: bool
+
+
 def _container_of(audio: FileType) -> _Container:
     """Return the container family of an opened *audio* file."""
     if isinstance(audio, ID3FileType):
@@ -892,7 +909,7 @@ def ensure_writable(path: Path) -> None:
         _require_lossless_id3_save(path)
 
 
-def write_managed_tags(path: Path, managed: dict[str, list[str]]) -> bool:
+def write_managed_tags(path: Path, managed: dict[str, list[str]]) -> TagWriteResult:
     """Surgically write the managed-tag set on *path*, leaving all other tags intact.
 
     For each key in :data:`MANAGED_TAGS`: a non-empty value list in *managed* is written
@@ -903,10 +920,11 @@ def write_managed_tags(path: Path, managed: dict[str, list[str]]) -> bool:
     values differ are touched, so an unchanged frame keeps its encoding. On an MP3, a value
     held only in ID3v1 stays there unless the target changes it.
 
-    Returns ``False`` without touching the file when nothing differs, and ``True`` after a
-    write. The write is atomic: tags are applied to a sibling temp copy which then atomically
-    replaces the original via :meth:`Path.replace`, so an interrupted write leaves the
-    original file untouched (PLAN.md §11). Lets :class:`mutagen.MutagenError` / ``OSError``
+    Returns ``written=False`` without touching the file when nothing differs. After a write it
+    returns ``written=True``, and ``audio_proven`` for an ID3 or FLAC file. The write is
+    atomic: tags are applied to a sibling temp copy which then atomically replaces the
+    original via :meth:`Path.replace`, so an interrupted write leaves the original file
+    untouched (PLAN.md §11). Lets :class:`mutagen.MutagenError` / ``OSError``
     propagate, mirroring :func:`read_tags`.
 
     The temp copy is verified before the swap: the audio payload hash (not for Ogg, whose
@@ -931,7 +949,7 @@ def write_managed_tags(path: Path, managed: dict[str, list[str]]) -> bool:
     # copies or rewrites the file.
     changes = _plan_changes(path, original, managed)
     if not changes:
-        return False
+        return TagWriteResult(written=False, audio_proven=False)
     container = _require_verifiable(path, original)
     kind = type(original)
     before = _snapshot(path, container, kind)
@@ -951,4 +969,4 @@ def write_managed_tags(path: Path, managed: dict[str, list[str]]) -> bool:
     finally:
         if not replaced:
             tmp.unlink(missing_ok=True)
-    return True
+    return TagWriteResult(written=True, audio_proven=container in _PAYLOAD_DECIDES_AUDIO)

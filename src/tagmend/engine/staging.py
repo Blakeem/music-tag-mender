@@ -259,8 +259,10 @@ class TagDomain:
             if stale
             else versioning.compute_diff(versioning.managed_subset(current), staged.managed_tags)
         )
+        before_write = path.stat()
+        audio_proven = False
         if disk_diff:
-            write_managed_tags(path, staged.managed_tags)
+            audio_proven = write_managed_tags(path, staged.managed_tags).audio_proven
 
         # Refresh the live snapshot, append the revision, delete the staged row.
         fresh = read_tags(path).tags
@@ -268,16 +270,8 @@ class TagDomain:
         _record_axis_outcomes(
             conn, file_id, staged=staged, disk_diff=disk_diff, fresh=fresh, now=now
         )
-        # Re-sync the files-row signature to the just-written bytes (same fields the
-        # scanner stats), so the next incremental scan sees this file as unchanged
-        # rather than spuriously re-flagging every committed file as updated.
-        stat_result = path.stat()
-        store.update_signature(
-            conn,
-            file_id,
-            size_bytes=stat_result.st_size,
-            mtime_ns=stat_result.st_mtime_ns,
-            now=now,
+        versioning.resync_signature(
+            conn, file_id, path, before_write=before_write, audio_proven=audio_proven, now=now
         )
         version = versioning.append_revision(
             conn,

@@ -44,6 +44,7 @@ from tagmend.engine.tags import (
     ORIGINAL_MANAGED_TAGS,
     TAG_READER_VERSION,
     TagWriteError,
+    TagWriteResult,
     read_tags,
     write_managed_tags,
 )
@@ -616,7 +617,7 @@ def test_write_leaves_unchanged_frames_untouched(tmp_path: Path) -> None:
     written = write_managed_tags(track, {**managed, "genre": ["Jazz"]})
 
     after = ID3(track)  # type: ignore[no-untyped-call]
-    assert written is True
+    assert written.written is True
     assert after["TRCK"].encoding == 0
     assert after["TRCK"].text == ["3/10"]
     assert read_tags(track).tags["genre"] == ["Jazz"]
@@ -631,10 +632,24 @@ def test_write_with_no_change_does_not_touch_the_file(tmp_path: Path, suffix: st
 
     written = write_managed_tags(track, managed)
 
-    assert written is False
+    assert written == TagWriteResult(written=False, audio_proven=False)
     assert track.read_bytes() == before_bytes
     assert track.stat().st_mtime_ns == before_mtime
     assert not list(tmp_path.glob("*.tagmend.tmp"))
+
+
+@pytest.mark.parametrize(
+    ("suffix", "audio_proven"),
+    [(".mp3", True), (".flac", True), (".m4a", False), (".ogg", False)],
+)
+def test_write_reports_whether_the_payload_hash_proves_the_audio(
+    tmp_path: Path, suffix: str, *, audio_proven: bool
+) -> None:
+    track = make_track(tmp_path / f"proof{suffix}", {"genre": ["Rock"]})
+
+    result = write_managed_tags(track, {"genre": ["Jazz"]})
+
+    assert result == TagWriteResult(written=True, audio_proven=audio_proven)
 
 
 def _managed(track: Path) -> dict[str, list[str]]:
@@ -746,7 +761,7 @@ def test_write_opens_the_temp_copy_as_the_original_class(tmp_path: Path) -> None
     frames.save(prefix)
     track.write_bytes(prefix.getvalue() + track.read_bytes())
 
-    assert write_managed_tags(track, {**_managed(track), "genre": ["Jazz"]}) is True
+    assert write_managed_tags(track, {**_managed(track), "genre": ["Jazz"]}).written is True
 
     assert read_tags(track).tags["genre"] == ["Jazz"]
     assert track.read_bytes().startswith(b"ID3")
@@ -838,7 +853,7 @@ def test_write_carries_v23_frames_the_upgrade_folds(tmp_path: Path) -> None:
         ],
     )
 
-    assert write_managed_tags(track, {**_managed(track), "genre": ["Jazz"]}) is True
+    assert write_managed_tags(track, {**_managed(track), "genre": ["Jazz"]}).written is True
 
     after = read_tags(track).tags
     assert after["date"] == ["2013-10-04 07:30:00"]
@@ -859,7 +874,7 @@ def test_write_deletes_a_v23_iso_tyer_date(tmp_path: Path, *, with_id3v1: bool) 
     target = _managed(track)
     assert target.pop("date") == ["2013-10-04"]
 
-    assert write_managed_tags(track, target) is True
+    assert write_managed_tags(track, target).written is True
 
     assert "date" not in read_tags(track).tags
     assert (track.read_bytes()[-128:-125] == b"TAG") is with_id3v1

@@ -8,7 +8,7 @@ the file exists — there are no tables yet. Each feature milestone adds its own
 from __future__ import annotations
 
 import sqlite3
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, SupportsInt, cast
 
 from tagmend.log import get_logger
 
@@ -29,6 +29,11 @@ def connect(db_path: Path) -> sqlite3.Connection:
     connection.execute("PRAGMA foreign_keys=ON")
     logger.debug("opened ledger at %s", db_path)
     return connection
+
+
+def as_int(value: object) -> int:
+    """Coerce a SQLite scalar to ``int`` for strict typing. ``None`` raises :class:`TypeError`."""
+    return int(cast("SupportsInt", value))
 
 
 def check_connection(db_path: Path) -> None:

@@ -18,11 +18,11 @@ agrees on:
   marker outranks the track artist, which is what keeps a various-artists release with no
   album artist from scattering across every track's artist.
 
-Titles and names are compared under :func:`_group_key`, which folds casing, typographic
-character choice and whitespace runs and nothing else. Punctuation is deliberately
-significant: ``The Crow: City of Angels`` and ``The Crow- City Of Angels`` are two albums
-downstream. A date is compared verbatim, because ``2005`` and ``2005-06-01`` are two grouping
-keys as well.
+Titles and names are compared under :func:`tagmend.engine.text_keys.display_key`, which folds
+casing, typographic character choice and whitespace runs and nothing else. Punctuation is
+deliberately significant: ``The Crow: City of Angels`` and ``The Crow- City Of Angels`` are
+two albums downstream. A date is compared verbatim, because ``2005`` and ``2005-06-01`` are
+two grouping keys as well.
 
 The report names the **minority**: the files whose identity differs from the one most of the
 folder shares, and every row carries that majority identity so a reviewer can see what the
@@ -43,7 +43,6 @@ it here would double-report it and let a blank identity win the majority vote.
 from __future__ import annotations
 
 import re
-import unicodedata
 from collections import Counter
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Final
@@ -58,12 +57,12 @@ from tagmend.engine.detector_core import (
     rows_in_tier,
     validate_tier,
 )
+from tagmend.engine.text_keys import display_key
 from tagmend.engine.validation import check_limit
 from tagmend.log import get_logger
 
 if TYPE_CHECKING:
     import sqlite3
-    from collections.abc import Mapping
 
     from tagmend.config import Settings
 
@@ -90,22 +89,6 @@ _COMPILATION_TRUE: Final = frozenset({"1", "t", "T", "true", "TRUE", "True"})
 # folder is reported at the low tier rather than as an error. It is only ever consulted
 # once the two base titles already match, so a real title carrying the word cannot trip it.
 _DISC_SUFFIX: Final = re.compile(r"\s*[(\[][^()\[\]]*\bdisc\b[^()\[\]]*[)\]]\s*$", re.IGNORECASE)
-
-# Typographic characters a server folds to ASCII before grouping. Deliberately NOT
-# :func:`tagmend.engine.detector_core.fold`, which strips every non-alphanumeric character: that
-# would erase ``The Crow: City of Angels`` against ``The Crow- City Of Angels``, which really
-# are two albums downstream and are exactly what this detector exists to find. Case and
-# surrounding or repeated whitespace are cosmetic. Punctuation is not.
-TYPOGRAPHIC: Final[Mapping[str, str]] = {
-    chr(codepoint): plain
-    for codepoints, plain in (
-        ((0x2010, 0x2011, 0x2012, 0x2013, 0x2014, 0x2212), "-"),
-        ((0x2018, 0x2019), "'"),
-        ((0x201C, 0x201D), '"'),
-        ((0x00A0, 0x2009, 0x202F), " "),
-    )
-    for codepoint in codepoints
-}
 
 _UNKNOWN_ARTIST: Final = "[Unknown Artist]"
 _VARIOUS_ARTISTS: Final = "Various Artists"
@@ -140,7 +123,7 @@ class _FileInput:
     album: str | None = None
     albumartist: str | None = None
     artist: str | None = None
-    release_id: str | None = None
+    release_mbid: str | None = None
     date: str | None = None
     compilation: str | None = None
 
@@ -165,22 +148,22 @@ class _FileInput:
     @property
     def identity(self) -> tuple[str, ...]:
         """Return the tuple that decides which album this file belongs to."""
-        release_id = (self.release_id or "").strip()
-        if release_id:
-            return ("release", release_id)
+        release_mbid = (self.release_mbid or "").strip()
+        if release_mbid:
+            return ("release", release_mbid)
         return (
             "name",
-            group_key(self.display_album_artist),
-            group_key(self.album or ""),
+            display_key(self.display_album_artist),
+            display_key(self.album or ""),
             (self.date or "").strip(),
         )
 
     @property
     def identity_label(self) -> str:
         """Return a short human label for this file's identity, for the grouped view."""
-        release_id = (self.release_id or "").strip()
-        if release_id:
-            return f"release:{release_id}"
+        release_mbid = (self.release_mbid or "").strip()
+        if release_mbid:
+            return f"release:{release_mbid}"
         date = (self.date or "").strip()
         suffix = f" [{date}]" if date else ""
         return f"{self.display_album_artist} - {self.album or ''}{suffix}"
@@ -198,7 +181,7 @@ class AlbumConflictRow:
     filename: str
     album: str | None
     albumartist: str | None
-    release_id: str | None
+    release_mbid: str | None
     date: str | None
     identity: str
     majority_identity: str
@@ -213,7 +196,7 @@ class AlbumConflictRow:
             "filename": self.filename,
             "album": self.album,
             "albumartist": self.albumartist,
-            "release_id": self.release_id,
+            "release_mbid": self.release_mbid,
             "date": self.date,
             "identity": self.identity,
             "majority_identity": self.majority_identity,
@@ -295,24 +278,9 @@ class AlbumConflictsReport:
 # --- pure classifier -----------------------------------------------------------------
 
 
-def group_key(value: str) -> str:
-    """Return the comparison key for an album or artist string.
-
-    Casing, typographic character choice and whitespace runs are cosmetic. Every other
-    difference separates two albums for anything reading these tags. Shared with
-    :mod:`tagmend.engine.disagreements`, which needs the same judgement about what is
-    cosmetic when it compares the same fields against MusicBrainz.
-    """
-    # NFC first, so the two byte-forms of one accented string compare equal. Deliberately not
-    # NFKD-with-marks-stripped like :func:`tagmend.engine.detector_core.fold`: that folds an accent
-    # away, and an accent really does separate two albums for anything reading these tags.
-    folded = "".join(TYPOGRAPHIC.get(ch, ch) for ch in unicodedata.normalize("NFC", value))
-    return " ".join(folded.casefold().split())
-
-
 def _base_title(album: str | None) -> str:
     """Return *album* with a trailing ``(disc N …)`` segment removed, folded."""
-    return group_key(_DISC_SUFFIX.sub("", album or ""))
+    return display_key(_DISC_SUFFIX.sub("", album or ""))
 
 
 def _is_compilation_missing_its_album_artist(files: list[_FileInput]) -> bool:
@@ -332,14 +300,14 @@ def _is_compilation_missing_its_album_artist(files: list[_FileInput]) -> bool:
         return False
     if any((f.compilation or "").strip() in _COMPILATION_TRUE for f in files):
         return False
-    if len({group_key(f.album or "") for f in files}) != 1:
+    if len({display_key(f.album or "") for f in files}) != 1:
         return False
 
     # A dominant track artist means this is that artist's album with a guest or two, and the
     # album artist to fill in is theirs. Only when no artist holds half the folder is it a
     # compilation, where the album artist is a various-artists marker instead. Without this,
     # a normal album carrying one guest track would be read as a compilation.
-    artists = Counter(group_key(f.artist or "") for f in files)
+    artists = Counter(display_key(f.artist or "") for f in files)
     if not artists:
         return False
     top = artists.most_common(1)[0][1]
@@ -362,15 +330,15 @@ def _is_context_folder(files: list[_FileInput]) -> str | None:
 
 def _tier_for(minority: _FileInput, majority: _FileInput) -> tuple[Tier, str]:
     """Return the tier and reason for *minority* against its folder's *majority* file."""
-    minority_id = (minority.release_id or "").strip()
-    majority_id = (majority.release_id or "").strip()
+    minority_id = (minority.release_mbid or "").strip()
+    majority_id = (majority.release_mbid or "").strip()
     if minority_id or majority_id:
         return (Tier.HIGH, _REASON_HIGH)
     # Both tests run at fold level. Comparing the raw strings for inequality made a folder
     # split by album artist or release date, whose album strings differ only cosmetically,
     # report a disc suffix that is not there.
-    minority_album = group_key(minority.album or "")
-    majority_album = group_key(majority.album or "")
+    minority_album = display_key(minority.album or "")
+    majority_album = display_key(majority.album or "")
     if (
         _base_title(minority.album) == _base_title(majority.album)
         and minority_album != majority_album
@@ -398,7 +366,7 @@ def _rows_for_folder(files: list[_FileInput]) -> tuple[list[AlbumConflictRow], _
                 filename=f.filename,
                 album=f.album,
                 albumartist=f.albumartist,
-                release_id=f.release_id,
+                release_mbid=f.release_mbid,
                 date=f.date,
                 identity=f.identity_label,
                 majority_identity=majority.identity_label,
@@ -423,7 +391,7 @@ def _compilation_rows(files: list[_FileInput]) -> list[AlbumConflictRow]:
             filename=f.filename,
             album=f.album,
             albumartist=f.albumartist,
-            release_id=f.release_id,
+            release_mbid=f.release_mbid,
             date=f.date,
             identity=f.identity_label,
             majority_identity=shared,
@@ -604,7 +572,7 @@ def _load_inputs(connection: sqlite3.Connection) -> list[_FileInput]:
                 album=values.get("album"),
                 albumartist=values.get("albumartist"),
                 artist=values.get("artist"),
-                release_id=values.get("musicbrainz_albumid"),
+                release_mbid=values.get("musicbrainz_albumid"),
                 # A raw Vorbis YEAR is the only release-date spelling no alias maps to ``date``.
                 date=(values.get("date") or "").strip() or values.get("year"),
                 compilation=values.get("compilation"),

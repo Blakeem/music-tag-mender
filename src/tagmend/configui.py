@@ -55,7 +55,7 @@ _CSRF_PLACEHOLDER: Final = "__CSRF_TOKEN__"
 
 # Numeric field families (light save-time validation only; ``load_settings`` still coerces).
 _INT_KEYS: Final[frozenset[str]] = frozenset(
-    {"genre_min_weight", "genre_stage_limit", "album_stage_limit"},
+    {"genre_min_weight", "genre_stage_limit", "year_stage_limit"},
 )
 _FLOAT_KEYS: Final[frozenset[str]] = frozenset(
     {"lastfm_rate_per_sec", "musicbrainz_rate_per_sec"},
@@ -114,7 +114,7 @@ def build_seed(settings: Settings) -> dict[str, object]:
         "genre_stage_limit": str(settings.genre_stage_limit),
         "musicbrainz_rate_per_sec": str(settings.musicbrainz_rate_per_sec),
         "musicbrainz_contact": settings.musicbrainz_contact,
-        "album_stage_limit": str(settings.album_stage_limit),
+        "year_stage_limit": str(settings.year_stage_limit),
     }
     has_key = settings.lastfm_api_key is not None
     values["lastfm_api_key"] = MASK_PLACEHOLDER if has_key else ""

@@ -77,7 +77,7 @@ def _commit_status(settings: Settings, commit_id: int) -> str | None:
     conn = connect(settings.db_path)
     try:
         apply_schema(conn)
-        commit = commits.get_commit(conn, commit_id)
+        commit = commits.get_commit_in(conn, commit_id)
         return None if commit is None else commit.status
     finally:
         conn.close()
@@ -247,7 +247,7 @@ def test_revert_refreshes_signature_so_next_scan_is_unchanged(
 
     staging.stage_tags(engine_settings, file_id=file_id, tags={"genre": ["Synthwave"]})
     staging.commit_tags(engine_settings)
-    versioning.revert(engine_settings, file_id, 0)
+    versioning.revert_tags(engine_settings, file_id, 0)
 
     result = scan_library(engine_settings)
 
@@ -737,7 +737,7 @@ def test_widened_fields_ride_through_commit_and_revert(
     assert committed.diff == {"genre": {"from": ["Rock"], "to": ["Synthwave"]}}
 
     # Revert to the v0 baseline restores genre; the widened fields (in the baseline) survive.
-    versioning.revert(engine_settings, file_id, 0)
+    versioning.revert_tags(engine_settings, file_id, 0)
     reverted = read_tags(track).tags
     for field, value in _RICH_STAMP.items():
         assert reverted.get(field) == value, field
@@ -1021,7 +1021,7 @@ def _stage_mixed_sweep(engine_settings: Settings, music_dir: Path) -> None:
 def _commit_origin(engine_settings: Settings, commit_id: int) -> str:
     conn = connect(engine_settings.db_path)
     try:
-        commit = commits.get_commit(conn, commit_id)
+        commit = commits.get_commit_in(conn, commit_id)
         assert commit is not None
         return commit.origin
     finally:
@@ -1349,7 +1349,7 @@ def test_albumartist_lookalike_survives_commit_and_revert(
     assert committed["ALBUMARTIST"] == ["Smashing Pumpkins"]
     assert committed[lookalike] == [""]
 
-    versioning.revert(engine_settings, file_id, 0)
+    versioning.revert_tags(engine_settings, file_id, 0)
     reverted = FLAC(track)
     assert reverted["ALBUMARTIST"] == ["Smashing Pumpkins"]
     assert reverted["ARTIST"] == ["Smashing Pumpkins"]

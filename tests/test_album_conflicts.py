@@ -30,7 +30,7 @@ def _f(  # noqa: PLR0913 - one keyword per detected field, cohesive by design
     album: str | None = "Album",
     albumartist: str | None = "Band",
     artist: str | None = "Band",
-    release_id: str | None = None,
+    release_mbid: str | None = None,
     date: str | None = None,
     compilation: str | None = None,
 ) -> _FileInput:
@@ -42,7 +42,7 @@ def _f(  # noqa: PLR0913 - one keyword per detected field, cohesive by design
         album=album,
         albumartist=albumartist,
         artist=artist,
-        release_id=release_id,
+        release_mbid=release_mbid,
         date=date,
         compilation=compilation,
     )
@@ -59,13 +59,13 @@ def test_a_folder_whose_files_agree_flags_nothing() -> None:
     assert report.total_files == 3
 
 
-def test_a_folder_agreeing_only_on_the_release_id_flags_nothing() -> None:
+def test_a_folder_agreeing_only_on_the_release_mbid_flags_nothing() -> None:
     # The release id is the strongest claim, so it settles the folder on its own even when
     # the album strings differ in spacing or case.
     report = _classify(
         [
-            _f(1, release_id="rel-1", album="The Album"),
-            _f(2, filename="b.mp3", release_id="rel-1", album="the  album"),
+            _f(1, release_mbid="rel-1", album="The Album"),
+            _f(2, filename="b.mp3", release_mbid="rel-1", album="the  album"),
         ],
     )
 
@@ -79,14 +79,14 @@ def test_a_single_file_folder_is_never_a_conflict() -> None:
 # --- high: the files claim different releases ----------------------------------------
 
 
-def test_partial_release_id_coverage_is_high() -> None:
+def test_partial_release_mbid_coverage_is_high() -> None:
     # 21 real folders look like this. A server keyed on the id puts the tagged files in one
     # album and the untagged ones in another, however identical their album strings are.
     report = _classify(
         [
-            _f(1, release_id="rel-1"),
-            _f(2, filename="b.mp3", release_id="rel-1"),
-            _f(3, filename="c.mp3", release_id=None),
+            _f(1, release_mbid="rel-1"),
+            _f(2, filename="b.mp3", release_mbid="rel-1"),
+            _f(3, filename="c.mp3", release_mbid=None),
         ],
     )
 
@@ -96,12 +96,12 @@ def test_partial_release_id_coverage_is_high() -> None:
     assert "release id" in report.rows[0].reason
 
 
-def test_two_different_release_ids_is_high() -> None:
+def test_two_different_release_mbids_is_high() -> None:
     report = _classify(
         [
-            _f(1, release_id="rel-1"),
-            _f(2, filename="b.mp3", release_id="rel-1"),
-            _f(3, filename="c.mp3", release_id="rel-2"),
+            _f(1, release_mbid="rel-1"),
+            _f(2, filename="b.mp3", release_mbid="rel-1"),
+            _f(3, filename="c.mp3", release_mbid="rel-2"),
         ],
     )
 
@@ -113,8 +113,8 @@ def test_the_minority_is_flagged_not_the_majority() -> None:
     # The fix direction is always "join the majority", so only the files that have to change
     # are rows. A caller can hand exactly those ids to stage_tags_batch.
     report = _classify(
-        [_f(i, filename=f"{i}.mp3", release_id="rel-1") for i in range(1, 9)]
-        + [_f(9, filename="9.mp3", release_id="rel-2")],
+        [_f(i, filename=f"{i}.mp3", release_mbid="rel-1") for i in range(1, 9)]
+        + [_f(9, filename="9.mp3", release_mbid="rel-2")],
     )
 
     assert report.flagged == 1
@@ -139,7 +139,7 @@ def test_a_folder_with_no_majority_flags_all_but_one() -> None:
 # --- medium: the names disagree ------------------------------------------------------
 
 
-def test_album_name_disagreement_without_release_ids_is_medium() -> None:
+def test_album_name_disagreement_without_release_mbids_is_medium() -> None:
     report = _classify(
         [
             _f(1, album="The Crow: City of Angels"),
@@ -153,7 +153,7 @@ def test_album_name_disagreement_without_release_ids_is_medium() -> None:
     assert "album" in report.rows[0].reason
 
 
-def test_albumartist_disagreement_without_release_ids_is_medium() -> None:
+def test_albumartist_disagreement_without_release_mbids_is_medium() -> None:
     report = _classify(
         [
             _f(1, albumartist="Band"),
@@ -202,7 +202,7 @@ def test_a_compilation_flag_stands_in_for_a_missing_album_artist() -> None:
     assert report.flagged == 0
 
 
-def test_date_disagreement_without_release_ids_is_medium() -> None:
+def test_date_disagreement_without_release_mbids_is_medium() -> None:
     report = _classify(
         [
             _f(1, date="2005"),
@@ -287,8 +287,8 @@ def test_a_context_folder_group_names_no_file_ids() -> None:
 def test_tier_counts_always_sum_to_flagged() -> None:
     report = _classify(
         [
-            _f(1, release_id="rel-1"),
-            _f(2, filename="b.mp3", release_id=None),
+            _f(1, release_mbid="rel-1"),
+            _f(2, filename="b.mp3", release_mbid=None),
             _f(3, folder=r"C:\m\B\Two", album="A"),
             _f(4, folder=r"C:\m\B\Two", filename="b.mp3", album="B"),
             _f(5, folder=r"C:\m\B\Singles", album="X"),
@@ -306,9 +306,9 @@ def test_tier_counts_always_sum_to_flagged() -> None:
 def test_groups_report_the_identity_breakdown_per_folder() -> None:
     report = _classify(
         [
-            _f(1, release_id="rel-1"),
-            _f(2, filename="b.mp3", release_id="rel-1"),
-            _f(3, filename="c.mp3", release_id="rel-2"),
+            _f(1, release_mbid="rel-1"),
+            _f(2, filename="b.mp3", release_mbid="rel-1"),
+            _f(3, filename="c.mp3", release_mbid="rel-2"),
         ],
     )
 
@@ -323,9 +323,9 @@ def test_groups_report_the_identity_breakdown_per_folder() -> None:
 def test_group_file_ids_name_only_the_flagged_minority() -> None:
     report = _classify(
         [
-            _f(1, release_id="rel-1"),
-            _f(2, filename="b.mp3", release_id="rel-1"),
-            _f(3, filename="c.mp3", release_id="rel-2"),
+            _f(1, release_mbid="rel-1"),
+            _f(2, filename="b.mp3", release_mbid="rel-1"),
+            _f(3, filename="c.mp3", release_mbid="rel-2"),
         ],
     )
 
@@ -335,9 +335,9 @@ def test_group_file_ids_name_only_the_flagged_minority() -> None:
 def test_group_file_count_counts_every_present_file_in_the_folder() -> None:
     report = _classify(
         [
-            _f(1, release_id="rel-1"),
-            _f(2, filename="b.mp3", release_id="rel-1"),
-            _f(3, filename="c.mp3", release_id="rel-2"),
+            _f(1, release_mbid="rel-1"),
+            _f(2, filename="b.mp3", release_mbid="rel-1"),
+            _f(3, filename="c.mp3", release_mbid="rel-2"),
             _f(4, filename="d.mp3", album=None),
         ],
     )
@@ -663,9 +663,9 @@ def test_folder_wins_over_group() -> None:
 def test_grouped_view_respects_tier() -> None:
     report = _classify(
         [
-            _f(1, folder=r"C:\m\A\Album", release_id="r1"),
-            _f(2, folder=r"C:\m\A\Album", filename="b.mp3", release_id="r1"),
-            _f(3, folder=r"C:\m\A\Album", filename="c.mp3", release_id="r2"),
+            _f(1, folder=r"C:\m\A\Album", release_mbid="r1"),
+            _f(2, folder=r"C:\m\A\Album", filename="b.mp3", release_mbid="r1"),
+            _f(3, folder=r"C:\m\A\Album", filename="c.mp3", release_mbid="r2"),
             _f(11, folder=r"C:\m\B\Album"),
             _f(12, folder=r"C:\m\B\Album", filename="b.mp3"),
             _f(13, folder=r"C:\m\B\Album", filename="c.mp3", album="Album (disc 2: Extra)"),

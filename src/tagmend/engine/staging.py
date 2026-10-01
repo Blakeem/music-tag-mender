@@ -22,7 +22,7 @@ transaction — the revision is appended *and* the staged row deleted, so a revi
 exists without its staged row already gone. Anything still staged was not durably
 committed; the next commit re-applies it idempotently.
 
-Like :func:`tagmend.engine.versioning.revert` and
+Like :func:`tagmend.engine.versioning.revert_tags` and
 :func:`tagmend.engine.library.scan_library`, every public function here owns its own
 connection and commit; the building blocks in :mod:`tagmend.engine.store` never commit.
 """
@@ -770,7 +770,7 @@ def reopen_axes(settings: Settings, *, commit_id: int) -> ReopenResult:
     try:
         schema.apply_schema(connection)
 
-        if commits.get_commit(connection, commit_id) is None:
+        if commits.get_commit_in(connection, commit_id) is None:
             message = f"unknown commit_id={commit_id}"
             raise ValueError(message)
         revisions = store.revisions_for_commit(connection, commit_id)

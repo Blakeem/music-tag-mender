@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -54,11 +55,43 @@ def test_negative_stage_limit_falls_back_to_default() -> None:
     # A stage limit caps a Python slice, where -1 would mean "all but the last one".
     defaults = config.load_settings()
     config.set_setting("genre_stage_limit", "-1")
-    config.set_setting("album_stage_limit", "-5")
+    config.set_setting("year_stage_limit", "-5")
 
     settings = config.load_settings()
     assert settings.genre_stage_limit == defaults.genre_stage_limit
-    assert settings.album_stage_limit == defaults.album_stage_limit
+    assert settings.year_stage_limit == defaults.year_stage_limit
+
+
+def test_year_stage_limit_defaults_to_300() -> None:
+    assert config.load_settings().year_stage_limit == 300
+
+
+def _write_raw_settings(raw: dict[str, str]) -> None:
+    path = config.settings_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(raw), encoding="utf-8")
+
+
+def test_legacy_album_stage_limit_is_read_as_year_stage_limit() -> None:
+    _write_raw_settings({"album_stage_limit": "40"})
+
+    assert config.load_settings().year_stage_limit == 40
+
+
+def test_save_rewrites_legacy_album_stage_limit() -> None:
+    _write_raw_settings({"album_stage_limit": "40"})
+
+    config.set_setting("genre_stage_limit", "5")
+
+    saved = json.loads(config.settings_path().read_text(encoding="utf-8"))
+    assert saved["year_stage_limit"] == "40"
+    assert "album_stage_limit" not in saved
+
+
+def test_new_key_wins_over_legacy_key() -> None:
+    _write_raw_settings({"album_stage_limit": "40", "year_stage_limit": "70"})
+
+    assert config.load_settings().year_stage_limit == 70
 
 
 @pytest.mark.parametrize("token", ["", "0", "none", "NULL", "None"])

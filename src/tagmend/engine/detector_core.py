@@ -1,13 +1,12 @@
-"""The shared core of the ``detect_*`` family: tiers, folder buckets, fold keys and positions."""
+"""The shared core of the ``detect_*`` family: tiers, folder buckets and positions."""
 
 from __future__ import annotations
 
-import re
-import unicodedata
 from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, Protocol
 
+from tagmend.engine.text_keys import alnum_ascii_key
 from tagmend.engine.validation import require_choice
 
 if TYPE_CHECKING:
@@ -30,20 +29,6 @@ TIERS: Final = frozenset(t.value for t in Tier)
 NON_ALBUM_FOLDERS: Final = frozenset(
     {"singles", "featured", "remixes", "bonus", "live", "ep"},
 )
-
-# Ligature/eszett map applied after casefold (which already folds ``ß`` → ``ss`` and
-# ``Æ`` → ``æ`` etc.), covering the compatibility cases NFKD does not decompose.
-_LIGATURES: Final = {
-    "æ": "ae",
-    "ø": "o",
-    "œ": "oe",
-    "ł": "l",
-    "þ": "th",
-    "ð": "d",
-}
-_LIGATURE_TABLE: Final = str.maketrans(_LIGATURES)
-
-_NON_ALNUM: Final = re.compile(r"[^a-z0-9]+")
 
 # A tracknumber/discnumber may be stored as "7" or as the "7/12" slash form. Only the part
 # before the slash is the position.
@@ -69,29 +54,13 @@ def validate_tier(tier: str | None) -> None:
     require_choice("tier", tier, TIERS)
 
 
-def fold(s: str) -> str:
-    """Return the detector's fold-key for *s*: casefold + Unicode/ligature fold + strip.
-
-    Casefold, translate the residual ligatures NFKD leaves intact (``æ`` → ``ae`` …),
-    NFKD-decompose and drop combining marks (diacritics), then strip everything outside
-    ``[a-z0-9]``. Deliberately a **superset** of :func:`tagmend.engine.classify.fold` (the
-    genre fold-key, which is casefold + strip only): the detector additionally needs the
-    Unicode/ligature folding so ``Leæther Strip`` == ``Leaether Strip`` and ``Dååth`` ==
-    ``Daath``. A match and compare key only, never written to disk.
-    """
-    translated = s.casefold().translate(_LIGATURE_TABLE)
-    decomposed = unicodedata.normalize("NFKD", translated)
-    without_marks = "".join(ch for ch in decomposed if not unicodedata.combining(ch))
-    return _NON_ALNUM.sub("", without_marks)
-
-
 # Punctuation-insensitive, because a folder named ``E.P.`` or ``Live!`` holds an EP or a live set.
-_NON_ALBUM_KEYS: Final = frozenset(fold(name) for name in NON_ALBUM_FOLDERS)
+_NON_ALBUM_KEYS: Final = frozenset(alnum_ascii_key(name) for name in NON_ALBUM_FOLDERS)
 
 
 def is_non_album_folder(folder: str) -> bool:
     """Return whether *folder*'s leaf name marks a collection rather than one album."""
-    return fold(Path(folder).name) in _NON_ALBUM_KEYS
+    return alnum_ascii_key(Path(folder).name) in _NON_ALBUM_KEYS
 
 
 def group_by_folder[T: _HasFolder](items: Iterable[T]) -> dict[str, list[T]]:

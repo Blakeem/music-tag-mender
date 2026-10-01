@@ -41,12 +41,12 @@ from tagmend.engine import db, path_keys, schema, store
 from tagmend.engine.detector_core import (
     TIER_RANK,
     Tier,
-    fold,
     group_by_folder,
     is_non_album_folder,
     parse_position,
     validate_tier,
 )
+from tagmend.engine.text_keys import alnum_ascii_key
 from tagmend.engine.validation import check_limit
 from tagmend.log import get_logger
 
@@ -222,7 +222,7 @@ def _is_context_folder(files: list[_FileInput]) -> str | None:
 
 def _tier_for(peers: list[_FileInput]) -> tuple[Tier, str]:
     """Classify one slot's colliding files by how their titles and containers compare."""
-    titles = {fold(f.title) for f in peers if f.title}
+    titles = {alnum_ascii_key(f.title) for f in peers if f.title}
     if len(titles) > 1:
         return Tier.HIGH, _REASON_HIGH
     if len({f.ext.lower() for f in peers}) > 1:

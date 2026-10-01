@@ -94,9 +94,9 @@ def _f(file_id: int = 1, **overrides: object) -> _FileInput:
         "file_id": file_id,
         "folder": r"C:\m\Band\Album",
         "filename": f"{file_id}.mp3",
-        "release_id": _RELEASE_ID,
-        "release_track_id": "rt-1",
-        "recording_id": "rec-1",
+        "release_mbid": _RELEASE_ID,
+        "release_track_mbid": "rt-1",
+        "recording_mbid": "rec-1",
         "album": "Real Album",
         "albumartist": "Band",
         "artist": "Band",
@@ -130,12 +130,12 @@ def test_a_file_matching_its_release_flags_nothing() -> None:
     assert report.releases_checked == 1
 
 
-def test_a_file_with_no_release_id_is_never_looked_up() -> None:
+def test_a_file_with_no_release_mbid_is_never_looked_up() -> None:
     source = FakeReleaseSource({})
-    report = _classify([_f(release_id=None)], source, release_limit=None)
+    report = _classify([_f(release_mbid=None)], source, release_limit=None)
 
     assert report.flagged == 0
-    assert report.skipped_no_release_id == 1
+    assert report.skipped_no_release_mbid == 1
     assert source.lookups == []
 
 
@@ -145,7 +145,7 @@ def test_each_release_is_fetched_once_for_all_its_files() -> None:
     )
     files = [
         _f(1),
-        _f(2, release_track_id="rt-2", recording_id="rec-2", title="Song Two", tracknumber="2"),
+        _f(2, release_track_mbid="rt-2", recording_mbid="rec-2", title="Song Two", tracknumber="2"),
     ]
     report = _classify(files, source, release_limit=None)
 
@@ -157,7 +157,7 @@ def test_each_release_is_fetched_once_for_all_its_files() -> None:
 
 
 def test_a_file_whose_track_id_is_not_on_the_release_is_high() -> None:
-    report = _run([_f(release_track_id="rt-99", recording_id="rec-99")])
+    report = _run([_f(release_track_mbid="rt-99", recording_mbid="rec-99")])
 
     assert report.high == 1
     assert report.rows[0].field == "musicbrainz_releasetrackid"
@@ -281,7 +281,7 @@ def test_a_date_agreeing_on_the_year_alone_is_not_a_disagreement() -> None:
 
 
 def test_release_level_fields_are_checked_even_with_no_track_ids() -> None:
-    report = _run([_f(release_track_id=None, recording_id=None, album="Wrong Album")])
+    report = _run([_f(release_track_mbid=None, recording_mbid=None, album="Wrong Album")])
 
     fields = {r.field for r in report.rows}
     assert "album" in fields
@@ -291,13 +291,13 @@ def test_release_level_fields_are_checked_even_with_no_track_ids() -> None:
 
 
 def test_track_level_fields_are_skipped_with_no_track_ids() -> None:
-    report = _run([_f(release_track_id=None, recording_id=None, title="Anything At All")])
+    report = _run([_f(release_track_mbid=None, recording_mbid=None, title="Anything At All")])
 
     assert {r.field for r in report.rows} == set()
 
 
-def test_the_recording_id_matches_when_the_release_track_id_is_missing() -> None:
-    report = _run([_f(release_track_id=None, title="Wrong Title")])
+def test_the_recording_mbid_matches_when_the_release_track_mbid_is_missing() -> None:
+    report = _run([_f(release_track_mbid=None, title="Wrong Title")])
 
     assert report.medium == 1
     assert report.rows[0].field == "title"
@@ -307,7 +307,7 @@ def test_the_recording_id_matches_when_the_release_track_id_is_missing() -> None
 
 
 def test_tier_counts_sum_to_flagged() -> None:
-    report = _run([_f(1, album="Wrong", releasecountry="RU"), _f(2, release_track_id="rt-9")])
+    report = _run([_f(1, album="Wrong", releasecountry="RU"), _f(2, release_track_mbid="rt-9")])
 
     assert report.high + report.medium + report.low == report.flagged
 
@@ -337,8 +337,8 @@ def test_limit_caps_the_releases_fetched_and_reports_the_remainder() -> None:
         },
     )
     files = [
-        _f(1, release_id="rel-a", album="Wrong A"),
-        _f(2, release_id="rel-b", album="Wrong B"),
+        _f(1, release_mbid="rel-a", album="Wrong A"),
+        _f(2, release_mbid="rel-b", album="Wrong B"),
     ]
     report = _classify(files, source, release_limit=1)
 
@@ -362,7 +362,7 @@ def test_groups_summarize_one_folder_each() -> None:
     assert group.file_ids == [1, 2]
     assert group.fields == {"album": 1, "title": 1}
     assert group.releases == [
-        {"release_id": _RELEASE_ID, "release_title": "Real Album", "file_count": 2},
+        {"release_mbid": _RELEASE_ID, "release_title": "Real Album", "file_count": 2},
     ]
 
 
@@ -374,8 +374,8 @@ def test_one_group_per_folder_even_with_two_releases() -> None:
         },
     )
     files = [
-        _f(1, release_id="rel-a", album="Wrong A"),
-        _f(2, release_id="rel-b", album="Wrong B"),
+        _f(1, release_mbid="rel-a", album="Wrong A"),
+        _f(2, release_mbid="rel-b", album="Wrong B"),
     ]
 
     report = _classify(files, source, release_limit=None)
@@ -383,7 +383,7 @@ def test_one_group_per_folder_even_with_two_releases() -> None:
     assert len(report.groups) == 1
     group = report.groups[0]
     assert group.flagged == 2
-    assert [r["release_id"] for r in group.releases] == ["rel-a", "rel-b"]
+    assert [r["release_mbid"] for r in group.releases] == ["rel-a", "rel-b"]
 
 
 def test_group_file_ids_exclude_fill_only_files() -> None:
@@ -409,7 +409,7 @@ def test_groups_ship_only_in_the_grouped_view() -> None:
 def test_grouped_view_respects_tier() -> None:
     report = _run(
         [
-            _f(1, folder=r"C:\m\Band\High", release_track_id="rt-99", recording_id="rec-99"),
+            _f(1, folder=r"C:\m\Band\High", release_track_mbid="rt-99", recording_mbid="rec-99"),
             _f(2, folder=r"C:\m\Band\Low", releasecountry="GB"),
         ],
     )
@@ -423,10 +423,10 @@ def test_grouped_view_respects_tier() -> None:
     assert (view.flagged, view.high, view.low) == (2, 1, 1)  # run counts unchanged
 
 
-def test_the_recording_id_still_matches_when_the_release_track_id_is_wrong() -> None:
+def test_the_recording_mbid_still_matches_when_the_release_track_mbid_is_wrong() -> None:
     # A file carrying a stale release-track id but the right recording id is still placed,
     # so its track-level fields are checked rather than skipped.
-    report = _run([_f(release_track_id="rt-99", title="Wrong Title")])
+    report = _run([_f(release_track_mbid="rt-99", title="Wrong Title")])
 
     fields = {r.field for r in report.rows}
     assert fields == {"title"}
@@ -517,13 +517,13 @@ def _scan_two_releases(music_dir: Path, settings: Settings) -> tuple[Path, Path]
     """Scan one wrong-album file on ``rel-a`` under ``A/X`` and one on ``rel-b`` under ``B/Y``."""
     folder_a = music_dir / "A" / "X"
     folder_b = music_dir / "B" / "Y"
-    for folder, release_id in ((folder_a, "rel-a"), (folder_b, "rel-b")):
+    for folder, release_mbid in ((folder_a, "rel-a"), (folder_b, "rel-b")):
         make_track(
             folder / "a.mp3",
             {
                 "album": ["Wrong Album"],
                 "title": ["Song One"],
-                "musicbrainz_albumid": [release_id],
+                "musicbrainz_albumid": [release_mbid],
                 "musicbrainz_releasetrackid": ["rt-1"],
             },
         )
@@ -623,8 +623,8 @@ def test_the_track_credit_wins_over_the_release_credit() -> None:
     report = _run(
         [
             _f(
-                release_track_id="rt-2",
-                recording_id="rec-2",
+                release_track_mbid="rt-2",
+                recording_mbid="rec-2",
                 title="Song Two",
                 tracknumber="2",
                 artist="Band",
@@ -640,7 +640,7 @@ def test_the_track_credit_wins_over_the_release_credit() -> None:
 
 def test_the_artist_is_not_checked_without_a_matched_track() -> None:
     # The credit is per track, so with no track matched there is nothing to compare against.
-    report = _run([_f(release_track_id=None, recording_id=None, artist="Somebody Else")])
+    report = _run([_f(release_track_mbid=None, recording_mbid=None, artist="Somebody Else")])
 
     assert "artist" not in {r.field for r in report.rows}
 
@@ -757,7 +757,7 @@ def test_releases_checked_counts_what_was_actually_fetched() -> None:
             return _release(_track("1", "Song One"), mbid="rel-b")
 
     report = _classify(
-        [_f(1, release_id="rel-a"), _f(2, release_id="rel-b", album="Wrong")],
+        [_f(1, release_mbid="rel-a"), _f(2, release_mbid="rel-b", album="Wrong")],
         Raiser(),
         release_limit=None,
     )
@@ -787,7 +787,7 @@ def test_a_multi_disc_release_still_proposes_the_disc_number() -> None:
         ),
     )
     report = _run(
-        [_f(release_track_id="rt-9", recording_id="rec-9", discnumber=None, title="Song Two")],
+        [_f(release_track_mbid="rt-9", recording_mbid="rec-9", discnumber=None, title="Song Two")],
         two_discs,
     )
 

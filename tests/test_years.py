@@ -1,11 +1,11 @@
-"""Integration tests for the album-year fill (:mod:`tagmend.engine.years`).
+"""Integration tests for the year fill (:mod:`tagmend.engine.years`).
 
 These use real temp audio files (the silent templates) across all four formats and a real
 temp ledger via the ``engine_settings`` fixture, so they exercise the full loop end to end
-— scan → ``resolve_years`` → ``diff_tags`` → ``commit_tags`` → ``read_tags`` /
-``revert_commit`` — with **no network**: a fake :class:`MBAlbumSource` is injected at the
-``resolve_years(client=...)`` signature, mapping ``(artist, album)`` → ``MBAlbum`` (or
-``None`` for "no usable release group").
+(scan → ``resolve_years`` → ``diff_tags`` → ``commit_tags`` → ``read_tags`` /
+``revert_commit``) with **no network**. A fake :class:`MBReleaseGroupSource` is injected at
+the ``resolve_years(client=...)`` signature, mapping ``(artist, album)`` → ``MBReleaseGroup``
+(or ``None`` for "no usable release group").
 
 ``tagmend.engine.tags`` is imported FIRST so its module-load ``RegisterFreeformKey`` runs
 before ``make_track`` writes any ``originaldate`` via raw mutagen easy mode (the M4A
@@ -24,7 +24,7 @@ from tagmend.engine import staging, store, versioning, years
 from tagmend.engine.db import connect
 from tagmend.engine.library import list_files as library_list
 from tagmend.engine.library import scan_library
-from tagmend.engine.musicbrainz import MBAlbum, MusicBrainzError
+from tagmend.engine.musicbrainz import MBReleaseGroup, MusicBrainzError
 from tagmend.engine.schema import apply_schema
 
 # Import tags so its module-load RegisterFreeformKey runs before make_track writes an
@@ -39,24 +39,26 @@ if TYPE_CHECKING:
 _FORMATS = [".mp3", ".flac", ".m4a", ".ogg"]
 
 
-class FakeMBAlbumSource:
-    """An in-memory :class:`tagmend.engine.musicbrainz.MBAlbumSource` for DI in tests.
+class FakeMBReleaseGroupSource:
+    """An in-memory :class:`tagmend.engine.musicbrainz.MBReleaseGroupSource` for DI in tests.
 
-    Maps ``(artist, album)`` → :class:`MBAlbum` (or ``None`` for "no usable release group").
+    Maps ``(artist, album)`` → :class:`MBReleaseGroup` (or ``None`` for "no usable release group").
     A pair absent from the map also yields ``None``. Records the lookups it received.
     """
 
-    def __init__(self, table: dict[tuple[str, str], MBAlbum | None]) -> None:
+    def __init__(self, table: dict[tuple[str, str], MBReleaseGroup | None]) -> None:
         self._table = table
         self.lookups: list[tuple[str, str]] = []
 
-    def album_first_release(self, artist: str, album: str) -> MBAlbum | None:
+    def album_first_release(self, artist: str, album: str) -> MBReleaseGroup | None:
         self.lookups.append((artist, album))
         return self._table.get((artist, album))
 
 
-def _mb(date: str, *, title: str = "Album", rgid: str = "rg-1") -> MBAlbum:
-    return MBAlbum(album_title=title, original_date=date, release_group_id=rgid, release_mbid=None)
+def _mb(date: str, *, title: str = "Album", rgid: str = "rg-1") -> MBReleaseGroup:
+    return MBReleaseGroup(
+        album_title=title, original_date=date, release_group_mbid=rgid, release_mbid=None
+    )
 
 
 def _file_id(settings: Settings, folder: Path, filename: str) -> int:
@@ -83,7 +85,7 @@ def test_blank_fill_stages_originaldate_only(
     )
     scan_library(engine_settings)
 
-    fake = FakeMBAlbumSource({("Black Sabbath", "Paranoid"): _mb("1970")})
+    fake = FakeMBReleaseGroupSource({("Black Sabbath", "Paranoid"): _mb("1970")})
     result = years.resolve_years(engine_settings, client=fake)
 
     assert result.staged_files == 1
@@ -110,7 +112,7 @@ def test_commit_then_read_fills_originaldate_and_keeps_date(
     )
     scan_library(engine_settings)
 
-    fake = FakeMBAlbumSource({("Black Sabbath", "Paranoid"): _mb("1970")})
+    fake = FakeMBReleaseGroupSource({("Black Sabbath", "Paranoid"): _mb("1970")})
     years.resolve_years(engine_settings, client=fake)
     staging.commit_tags(engine_settings)
 
@@ -132,7 +134,7 @@ def test_existing_originaldate_is_skipped_present(
     )
     scan_library(engine_settings)
 
-    fake = FakeMBAlbumSource({("Black Sabbath", "Paranoid"): _mb("1971")})
+    fake = FakeMBReleaseGroupSource({("Black Sabbath", "Paranoid"): _mb("1971")})
     result = years.resolve_years(engine_settings, client=fake)
 
     assert result.skipped_present == 1
@@ -152,7 +154,7 @@ def test_resolve_years_never_overwrites_a_disk_value_the_mirror_lacks(
     audio["originaldate"] = ["1969"]
     audio.save()  # on disk only: no rescan, so the mirror still reads it as blank
 
-    fake = FakeMBAlbumSource({("Black Sabbath", "Paranoid"): _mb("1970")})
+    fake = FakeMBReleaseGroupSource({("Black Sabbath", "Paranoid"): _mb("1970")})
     result = years.resolve_years(engine_settings, client=fake)
 
     assert result.staged_files == 0
@@ -171,7 +173,7 @@ def test_file_without_album_is_skipped(
     make_track(music_dir / "a.mp3", {"artist": ["Solo"]})
     scan_library(engine_settings)
 
-    fake = FakeMBAlbumSource({})
+    fake = FakeMBReleaseGroupSource({})
     result = years.resolve_years(engine_settings, client=fake)
     assert result.skipped_no_album == 1
     assert result.staged_files == 0
@@ -184,7 +186,7 @@ def test_file_without_artist_is_skipped(
     make_track(music_dir / "a.mp3", {"album": ["Orphan Album"]})
     scan_library(engine_settings)
 
-    fake = FakeMBAlbumSource({})
+    fake = FakeMBReleaseGroupSource({})
     result = years.resolve_years(engine_settings, client=fake)
     assert result.skipped_no_identity == 1
     assert result.staged_files == 0
@@ -202,7 +204,7 @@ def test_groups_by_album_identity_one_lookup_per_group(
     make_track(music_dir / "o.mp3", {"artist": ["Pink Floyd"], "album": ["Animals"]})
     scan_library(engine_settings)
 
-    fake = FakeMBAlbumSource(
+    fake = FakeMBReleaseGroupSource(
         {
             ("Black Sabbath", "Paranoid"): _mb("1970"),
             ("Pink Floyd", "Animals"): _mb("1977"),
@@ -227,7 +229,7 @@ def test_albumartist_else_artist_identity(
     )
     scan_library(engine_settings)
 
-    fake = FakeMBAlbumSource({("Black Sabbath", "Paranoid"): _mb("1970")})
+    fake = FakeMBReleaseGroupSource({("Black Sabbath", "Paranoid"): _mb("1970")})
     result = years.resolve_years(engine_settings, client=fake)
     assert result.staged_files == 1
     assert fake.lookups == [("Black Sabbath", "Paranoid")]
@@ -243,7 +245,7 @@ def test_album_scope_narrows_to_that_album(
     scan_library(engine_settings)
     paranoid_id = _file_id(engine_settings, music_dir, "p.mp3")
 
-    fake = FakeMBAlbumSource(
+    fake = FakeMBReleaseGroupSource(
         {
             ("Black Sabbath", "Paranoid"): _mb("1970"),
             ("Pink Floyd", "Animals"): _mb("1977"),
@@ -269,7 +271,7 @@ def test_no_match_recorded_and_reported(
     scan_library(engine_settings)
     file_id = _file_id(engine_settings, music_dir, "a.mp3")
 
-    fake = FakeMBAlbumSource({("Obscure", "Demos"): None})
+    fake = FakeMBReleaseGroupSource({("Obscure", "Demos"): None})
     result = years.resolve_years(engine_settings, client=fake)
 
     assert result.no_match == 1
@@ -281,10 +283,10 @@ def test_no_match_recorded_and_reported(
     assert view.year_source_album == "Demos"
 
 
-class _RaisingAlbumSource(FakeMBAlbumSource):
+class _RaisingAlbumSource(FakeMBReleaseGroupSource):
     """A fake whose lookup fails for one pair, as during a MusicBrainz outage."""
 
-    def album_first_release(self, artist: str, album: str) -> MBAlbum | None:
+    def album_first_release(self, artist: str, album: str) -> MBReleaseGroup | None:
         if (artist, album) == ("Band", "Album"):
             self.lookups.append((artist, album))
             message = "503 Service Unavailable"
@@ -319,7 +321,7 @@ def test_held_no_match_is_counted_in_skipped_no_match(
     make_track(music_dir / "a.mp3", {"artist": ["Obscure"], "album": ["Demos"]})
     make_track(music_dir / "b.mp3", {"artist": ["Obscure"], "album": ["Demos"]})
     scan_library(engine_settings)
-    fake = FakeMBAlbumSource({("Obscure", "Demos"): None})
+    fake = FakeMBReleaseGroupSource({("Obscure", "Demos"): None})
     first = years.resolve_years(engine_settings, client=fake)
     assert first.no_match == 2
 
@@ -331,7 +333,7 @@ def test_held_no_match_is_counted_in_skipped_no_match(
 
 
 def test_result_names_its_processed_unit(engine_settings: Settings) -> None:
-    result = years.resolve_years(engine_settings, client=FakeMBAlbumSource({}))
+    result = years.resolve_years(engine_settings, client=FakeMBReleaseGroupSource({}))
 
     assert result.to_dict()["processed_unit"] == "album_groups"
 
@@ -344,7 +346,7 @@ def test_no_match_skipped_on_rerun_until_identity_changes(
     scan_library(engine_settings)
     file_id = _file_id(engine_settings, music_dir, "a.mp3")
 
-    fake = FakeMBAlbumSource({("Obscure", "Demos"): None})
+    fake = FakeMBReleaseGroupSource({("Obscure", "Demos"): None})
     years.resolve_years(engine_settings, client=fake)
 
     # Re-run: the non-stale no_match is held back (not re-looked-up).
@@ -362,7 +364,7 @@ def test_no_match_skipped_on_rerun_until_identity_changes(
     finally:
         conn.close()
 
-    fake2 = FakeMBAlbumSource({("Obscure", "New Demos"): _mb("1990")})
+    fake2 = FakeMBReleaseGroupSource({("Obscure", "New Demos"): _mb("1990")})
     third = years.resolve_years(engine_settings, client=fake2)
     assert third.staged_files == 1
 
@@ -376,7 +378,7 @@ def test_no_match_reopens_on_artist_fallback_change(
     scan_library(engine_settings)
     file_id = _file_id(engine_settings, music_dir, "a.mp3")
 
-    fake = FakeMBAlbumSource({("Wrong Name", "Paranoid"): None})
+    fake = FakeMBReleaseGroupSource({("Wrong Name", "Paranoid"): None})
     years.resolve_years(engine_settings, client=fake)
 
     conn = connect(engine_settings.db_path)
@@ -392,7 +394,7 @@ def test_no_match_reopens_on_artist_fallback_change(
     finally:
         conn.close()
 
-    fake2 = FakeMBAlbumSource({("Black Sabbath", "Paranoid"): _mb("1970")})
+    fake2 = FakeMBReleaseGroupSource({("Black Sabbath", "Paranoid"): _mb("1970")})
     result = years.resolve_years(engine_settings, client=fake2)
     assert result.staged_files == 1
 
@@ -412,7 +414,7 @@ def test_manual_excluded_file_is_skipped(
 
     assert years.set_year_status(engine_settings, file_ids=[excluded_id], status="manual") == 1
 
-    fake = FakeMBAlbumSource({("Black Sabbath", "Paranoid"): _mb("1970")})
+    fake = FakeMBReleaseGroupSource({("Black Sabbath", "Paranoid"): _mb("1970")})
     result = years.resolve_years(engine_settings, client=fake)
 
     assert result.skipped_manual == 1
@@ -444,7 +446,7 @@ def test_reset_year_status_requeues(
     years.set_year_status(engine_settings, file_ids=[file_id], status="manual")
 
     assert years.reset_year_status(engine_settings, file_ids=[file_id]) == 1
-    fake = FakeMBAlbumSource({("Black Sabbath", "Paranoid"): _mb("1970")})
+    fake = FakeMBReleaseGroupSource({("Black Sabbath", "Paranoid"): _mb("1970")})
     result = years.resolve_years(engine_settings, client=fake)
     assert result.skipped_manual == 0
     assert result.staged_files == 1
@@ -466,7 +468,7 @@ def test_dry_run_returns_mappings_but_stages_nothing(
     make_track(music_dir / "b.flac", {"artist": ["Black Sabbath"], "album": ["Paranoid"]})
     scan_library(engine_settings)
 
-    fake = FakeMBAlbumSource({("Black Sabbath", "Paranoid"): _mb("1970")})
+    fake = FakeMBReleaseGroupSource({("Black Sabbath", "Paranoid"): _mb("1970")})
     result = years.resolve_years(engine_settings, client=fake, dry_run=True)
 
     assert result.staged_files == 2  # would-stage count
@@ -492,7 +494,7 @@ def test_dry_run_ignores_empty_staging_precondition(
         origin="manual",
     )
 
-    fake = FakeMBAlbumSource({("Black Sabbath", "Paranoid"): _mb("1970")})
+    fake = FakeMBReleaseGroupSource({("Black Sabbath", "Paranoid"): _mb("1970")})
     result = years.resolve_years(engine_settings, client=fake, dry_run=True)
     assert result.staged_files == 1
 
@@ -511,7 +513,7 @@ def test_non_dry_run_requires_empty_staging(
         origin="manual",
     )
 
-    fake = FakeMBAlbumSource({})
+    fake = FakeMBReleaseGroupSource({})
     with pytest.raises(ValueError, match="commit or unstage pending changes first"):
         years.resolve_years(engine_settings, client=fake)
 
@@ -528,7 +530,7 @@ def test_limit_caps_groups_and_reports_pending(
     make_track(music_dir / "c.mp3", {"artist": ["C"], "album": ["Three"]})
     scan_library(engine_settings)
 
-    fake = FakeMBAlbumSource(
+    fake = FakeMBReleaseGroupSource(
         {
             ("A", "One"): _mb("1991"),
             ("B", "Two"): _mb("1992"),
@@ -549,7 +551,7 @@ def test_two_identical_dry_runs_reprocess_the_same_groups(
     make_track(music_dir / "b.mp3", {"artist": ["B"], "album": ["Two"]})
     scan_library(engine_settings)
 
-    fake = FakeMBAlbumSource({("A", "One"): _mb("1991"), ("B", "Two"): _mb("1992")})
+    fake = FakeMBReleaseGroupSource({("A", "One"): _mb("1991"), ("B", "Two"): _mb("1992")})
     first = years.resolve_years(engine_settings, client=fake, limit=1, dry_run=True)
     second = years.resolve_years(engine_settings, client=fake, limit=1, dry_run=True)
 
@@ -576,7 +578,7 @@ def test_summary_labels_group_and_file_counts(
     scan_library(engine_settings)
 
     # ("B", "Two") is absent from the table → a no_match on that group's one file.
-    fake = FakeMBAlbumSource({("A", "One"): _mb("1991")})
+    fake = FakeMBReleaseGroupSource({("A", "One"): _mb("1991")})
     result = years.resolve_years(engine_settings, client=fake)
 
     assert result.processed == 2  # album groups
@@ -602,7 +604,7 @@ def test_rerun_after_commit_is_idempotent(
     make_track(music_dir / "a.mp3", {"artist": ["Black Sabbath"], "album": ["Paranoid"]})
     scan_library(engine_settings)
 
-    fake = FakeMBAlbumSource({("Black Sabbath", "Paranoid"): _mb("1970")})
+    fake = FakeMBReleaseGroupSource({("Black Sabbath", "Paranoid"): _mb("1970")})
     years.resolve_years(engine_settings, client=fake)
     staging.commit_tags(engine_settings)
     scan_library(engine_settings)
@@ -628,7 +630,7 @@ def test_commit_then_revert_commit_restores_blank_originaldate(
     )
     scan_library(engine_settings)
 
-    fake = FakeMBAlbumSource({("Black Sabbath", "Paranoid"): _mb("1970")})
+    fake = FakeMBReleaseGroupSource({("Black Sabbath", "Paranoid"): _mb("1970")})
     years.resolve_years(engine_settings, client=fake)
     commit_result = staging.commit_tags(engine_settings)
     assert commit_result.commit_id is not None
@@ -644,114 +646,6 @@ def test_commit_then_revert_commit_restores_blank_originaldate(
     assert restored["date"] == ["2015"]  # reissue year never disturbed
 
 
-# --- list_albums: blank_originaldate + limit + year_status/actionable filters -------
-
-
-def test_list_albums_reports_blank_originaldate_count(
-    engine_settings: Settings,
-    music_dir: Path,
-) -> None:
-    # Group with all files already carrying originaldate → 0 blanks.
-    make_track(
-        music_dir / "present.mp3",
-        {"artist": ["Rush"], "album": ["Moving Pictures"], "originaldate": ["1981"]},
-    )
-    # Group with some blanks → the exact blank count.
-    make_track(music_dir / "blank1.mp3", {"artist": ["Yes"], "album": ["Fragile"]})
-    make_track(
-        music_dir / "blank2.flac",
-        {"artist": ["Yes"], "album": ["Fragile"], "originaldate": ["1971"]},
-    )
-    scan_library(engine_settings)
-
-    rows = {row.album: row for row in years.list_albums(engine_settings)}
-    assert rows["Moving Pictures"].blank_originaldate == 0
-    assert rows["Fragile"].file_count == 2
-    assert rows["Fragile"].blank_originaldate == 1
-    # to_dict carries the new field.
-    assert rows["Fragile"].to_dict()["blank_originaldate"] == 1
-
-
-def test_list_albums_limit_caps_after_ordering(
-    engine_settings: Settings,
-    music_dir: Path,
-) -> None:
-    make_track(music_dir / "a.mp3", {"artist": ["Alpha"], "album": ["A1"]})
-    make_track(music_dir / "b.mp3", {"artist": ["Bravo"], "album": ["B1"]})
-    make_track(music_dir / "c.mp3", {"artist": ["Charlie"], "album": ["C1"]})
-    scan_library(engine_settings)
-
-    limited = years.list_albums(engine_settings, limit=2)
-    assert [row.artist for row in limited] == ["Alpha", "Bravo"]
-
-
-def test_list_albums_year_status_filter(
-    engine_settings: Settings,
-    music_dir: Path,
-) -> None:
-    track = make_track(music_dir / "a.mp3", {"artist": ["Alpha"], "album": ["A1"]})
-    make_track(music_dir / "b.mp3", {"artist": ["Bravo"], "album": ["B1"]})
-    scan_library(engine_settings)
-
-    file_id = _file_id(engine_settings, music_dir, track.name)
-    years.set_year_status(engine_settings, file_ids=[file_id], status="manual")
-
-    manual = years.list_albums(engine_settings, year_status="manual")
-    assert [row.album for row in manual] == ["A1"]
-
-    pending = years.list_albums(engine_settings, year_status="pending")
-    assert [row.album for row in pending] == ["B1"]
-
-
-def test_list_albums_actionable_keeps_only_groups_with_blanks(
-    engine_settings: Settings,
-    music_dir: Path,
-) -> None:
-    make_track(
-        music_dir / "full.mp3",
-        {"artist": ["Rush"], "album": ["Moving Pictures"], "originaldate": ["1981"]},
-    )
-    make_track(music_dir / "blank.mp3", {"artist": ["Yes"], "album": ["Fragile"]})
-    scan_library(engine_settings)
-
-    rows = years.list_albums(engine_settings, actionable=True)
-    assert [row.album for row in rows] == ["Fragile"]
-    assert all(row.blank_originaldate > 0 for row in rows)
-    # Unfiltered, the fully-tagged group is still listed.
-    assert len(years.list_albums(engine_settings)) == 2
-
-
-def test_list_albums_actionable_composes_with_year_status_and_precedes_limit(
-    engine_settings: Settings,
-    music_dir: Path,
-) -> None:
-    # Alpha: blank but manual. Bravo: pending, no blanks. Charlie/Delta: pending + blank.
-    manual_track = make_track(music_dir / "a.mp3", {"artist": ["Alpha"], "album": ["A1"]})
-    make_track(
-        music_dir / "b.mp3",
-        {"artist": ["Bravo"], "album": ["B1"], "originaldate": ["1999"]},
-    )
-    make_track(music_dir / "c.mp3", {"artist": ["Charlie"], "album": ["C1"]})
-    make_track(music_dir / "d.mp3", {"artist": ["Delta"], "album": ["D1"]})
-    scan_library(engine_settings)
-
-    manual_id = _file_id(engine_settings, music_dir, manual_track.name)
-    years.set_year_status(engine_settings, file_ids=[manual_id], status="manual")
-
-    both = years.list_albums(engine_settings, year_status="pending", actionable=True)
-    assert [row.album for row in both] == ["C1", "D1"]
-
-    # The filters run BEFORE limit: limit=1 keeps the first ACTIONABLE pending group,
-    # not the first pending group (B1, which has no blanks).
-    limited = years.list_albums(
-        engine_settings,
-        year_status="pending",
-        actionable=True,
-        limit=1,
-    )
-    assert [row.album for row in limited] == ["C1"]
-
-
 def test_dry_run_counts_no_match_without_recording_it(
     engine_settings: Settings,
     music_dir: Path,
@@ -763,7 +657,7 @@ def test_dry_run_counts_no_match_without_recording_it(
     scan_library(engine_settings)
     file_id = _file_id(engine_settings, music_dir, "a.mp3")
 
-    fake = FakeMBAlbumSource({("Obscure", "Demos"): None})
+    fake = FakeMBReleaseGroupSource({("Obscure", "Demos"): None})
     result = years.resolve_years(engine_settings, client=fake, dry_run=True)
 
     assert result.no_match == 1
@@ -802,7 +696,7 @@ def test_resolve_years_keeps_disk_values_the_mirror_lacks(
     scan_library(engine_settings)
     _edit_title_on_disk(track, "Title Edited In Picard")
 
-    fake = FakeMBAlbumSource({("Black Sabbath", "Paranoid"): _mb("1970")})
+    fake = FakeMBReleaseGroupSource({("Black Sabbath", "Paranoid"): _mb("1970")})
     years.resolve_years(engine_settings, client=fake)
     result = staging.commit_tags(engine_settings)
 
@@ -821,7 +715,7 @@ def test_resolve_years_skips_missing_files(
     gone.unlink()
     scan_library(engine_settings)  # flags the deleted file missing
 
-    fake = FakeMBAlbumSource({("Black Sabbath", "Paranoid"): _mb("1970")})
+    fake = FakeMBReleaseGroupSource({("Black Sabbath", "Paranoid"): _mb("1970")})
     result = years.resolve_years(engine_settings, client=fake)
 
     assert result.skipped_missing == 1

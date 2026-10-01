@@ -102,7 +102,7 @@ def _identity(tags: dict[str, list[str]]) -> _Identity:
 
 
 @dataclass(frozen=True, slots=True)
-class StageGenresResult:
+class ResolveGenresResult:
     """Immutable summary of one :func:`resolve_genres` call, JSON-ready for the MCP tool."""
 
     processed: int
@@ -234,7 +234,7 @@ def resolve_genres(  # noqa: PLR0913 - cohesive keyword-only scope + injection p
     limit: int | None = None,
     dry_run: bool = False,
     client: TagSource | None = None,
-) -> StageGenresResult:
+) -> ResolveGenresResult:
     """Look up Last.fm genres for the in-scope, not-yet-done files and stage the result.
 
     Selects the files in scope that are present on disk, not already done (a committed
@@ -465,8 +465,8 @@ def _build_result(
     processed: int,
     pending_remaining: int,
     dry_run: bool,
-) -> StageGenresResult:
-    """Freeze the run's tally + counts into the public :class:`StageGenresResult`."""
+) -> ResolveGenresResult:
+    """Freeze the run's tally + counts into the public :class:`ResolveGenresResult`."""
     skipped = {
         "done": tally.skipped_done,
         "no_match": tally.skipped_no_match,
@@ -482,7 +482,7 @@ def _build_result(
         skipped=skipped,
         dry_run=dry_run,
     )
-    return StageGenresResult(
+    return ResolveGenresResult(
         processed=processed,
         processed_unit="files",
         staged=tally.staged,
@@ -621,35 +621,3 @@ def reset_genre_status(
 
     logger.info("reset genre status for %d file(s)", len(scoped))
     return len(scoped)
-
-
-@dataclass(frozen=True, slots=True)
-class ArtistRow:
-    """One distinct ``artist`` tag value with its file count, for ``list_artists``."""
-
-    artist: str
-    file_count: int
-
-    def to_dict(self) -> dict[str, object]:
-        """JSON-serializable form for the MCP tool."""
-        return {"artist": self.artist, "file_count": self.file_count}
-
-
-def list_artists(settings: Settings, *, limit: int | None = None) -> list[ArtistRow]:
-    """Return each distinct ``artist`` tag value with its file count (value order).
-
-    A discovery aid for scoping ``resolve_genres`` by artist. Read-only. *limit* (when given)
-    caps the number of rows returned, applied AFTER the value ordering so the cap is
-    deterministic. Raises :class:`ValueError` for a negative *limit*.
-    """
-    check_limit(limit)
-    connection = db.connect(settings.db_path)
-    try:
-        schema.apply_schema(connection)
-        rows = store.distinct_artists(connection)
-    finally:
-        connection.close()
-    result = [ArtistRow(artist=value, file_count=count) for value, count in rows]
-    if limit is not None:
-        result = result[:limit]
-    return result

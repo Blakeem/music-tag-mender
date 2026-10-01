@@ -148,7 +148,7 @@ def _commit(settings: Settings, commit_id: int) -> commits.Commit | None:
     conn = connect(settings.db_path)
     try:
         apply_schema(conn)
-        return commits.get_commit(conn, commit_id)
+        return commits.get_commit_in(conn, commit_id)
     finally:
         conn.close()
 
@@ -171,7 +171,7 @@ def test_revert_restores_file_and_live_snapshot(
     # The edit really changed the bytes on disk.
     assert read_tags(track).tags["genre"] == ["Synthwave"]
 
-    result = versioning.revert(engine_settings, file_id, 0)
+    result = versioning.revert_tags(engine_settings, file_id, 0)
     assert result.new_version == 2
 
     reverted = read_tags(track).tags
@@ -184,7 +184,7 @@ def test_revert_restores_file_and_live_snapshot(
     revisions = _revisions(engine_settings, file_id)
     assert [r.version for r in revisions] == [0, 1, 2]
     assert revisions[-1].origin == "revert"
-    assert revisions[-1].reverted_from == 0
+    assert revisions[-1].reverted_to_version == 0
     assert revisions[-1].managed_tags == {"genre": ["Electronic"]}
 
     # The revert is recorded under its own origin='revert' commit (not NULL).
@@ -232,7 +232,7 @@ def test_revert_to_pre_widening_baseline_preserves_new_fields(
     # what it simulates, a snapshot taken when only the original 5 tags were managed.
     _stamp_managed_set(engine_settings, file_id, version=0, managed_set=1)
 
-    versioning.revert(engine_settings, file_id, 0)
+    versioning.revert_tags(engine_settings, file_id, 0)
 
     reverted = read_tags(track).tags
     # Original 5-field values restored from the baseline (delete-on-revert intact).
@@ -258,17 +258,17 @@ def test_revert_a_revert_rolls_back_and_forward(
     _baseline(engine_settings, file_id, {"genre": ["Electronic"]})
     _edit(engine_settings, track, file_id, {"genre": ["Synthwave"]})  # v1
 
-    back = versioning.revert(engine_settings, file_id, 0)  # back to Electronic
+    back = versioning.revert_tags(engine_settings, file_id, 0)  # back to Electronic
     assert back.new_version == 2
     assert read_tags(track).tags["genre"] == ["Electronic"]
 
-    forward = versioning.revert(engine_settings, file_id, 1)  # forward to Synthwave
+    forward = versioning.revert_tags(engine_settings, file_id, 1)  # forward to Synthwave
     assert forward.new_version == 3
     assert read_tags(track).tags["genre"] == ["Synthwave"]
 
     revisions = _revisions(engine_settings, file_id)
     assert [r.version for r in revisions] == [0, 1, 2, 3]  # append-only; nothing lost
-    assert revisions[-1].reverted_from == 1
+    assert revisions[-1].reverted_to_version == 1
     assert revisions[-1].managed_tags == {"genre": ["Synthwave"]}
 
 
@@ -284,7 +284,7 @@ def test_revert_with_no_change_still_appends(
 
     # Reverting to v0 while already at v0 content still records an audited revert row, but
     # reports 'noop': nothing on disk moved, so the caller is never told a change happened.
-    result = versioning.revert(engine_settings, file_id, 0)
+    result = versioning.revert_tags(engine_settings, file_id, 0)
     assert result.new_version == 1
     assert result.status == "noop"
     revisions = _revisions(engine_settings, file_id)
@@ -303,7 +303,7 @@ def test_noop_revert_does_not_rewrite_the_file(
     before_bytes = track.read_bytes()
     before_mtime = track.stat().st_mtime_ns
 
-    result = versioning.revert(engine_settings, file_id, 0)
+    result = versioning.revert_tags(engine_settings, file_id, 0)
 
     assert result.status == "noop"
     assert track.read_bytes() == before_bytes
@@ -327,7 +327,7 @@ def test_revert_to_empty_baseline_clears_every_managed_tag(
     assert _edit(engine_settings, track, file_id, _ALL_MANAGED_TAGS) == 1
     assert set(read_tags(track).tags) >= MANAGED_TAGS  # all 25 really landed on disk
 
-    result = versioning.revert(engine_settings, file_id, 0)
+    result = versioning.revert_tags(engine_settings, file_id, 0)
 
     assert result.status == "reverted"
     assert set(read_tags(track).tags) & MANAGED_TAGS == set()
@@ -342,7 +342,7 @@ def test_revert_unknown_target_raises(engine_settings: Settings, music_dir: Path
     _baseline(engine_settings, file_id, {"genre": ["Electronic"]})
 
     with pytest.raises(ValueError, match="no revision 5"):
-        versioning.revert(engine_settings, file_id, 5)
+        versioning.revert_tags(engine_settings, file_id, 5)
 
 
 def test_revert_missing_file_raises(engine_settings: Settings, music_dir: Path) -> None:
@@ -355,7 +355,7 @@ def test_revert_missing_file_raises(engine_settings: Settings, music_dir: Path) 
     scan_library(engine_settings)  # flags the file missing
 
     with pytest.raises(ValueError, match="missing file"):
-        versioning.revert(engine_settings, file_id, 0)
+        versioning.revert_tags(engine_settings, file_id, 0)
 
 
 def test_revert_with_staged_change_raises(engine_settings: Settings, music_dir: Path) -> None:
@@ -370,7 +370,7 @@ def test_revert_with_staged_change_raises(engine_settings: Settings, music_dir: 
     staging.stage_tags(engine_settings, file_id=file_id, tags={"genre": ["Synthwave"]})
 
     with pytest.raises(ValueError, match="staged change"):
-        versioning.revert(engine_settings, file_id, 0)
+        versioning.revert_tags(engine_settings, file_id, 0)
 
 
 def _committed_track(settings: Settings, music_dir: Path) -> tuple[Path, int]:
@@ -388,9 +388,9 @@ def _committed_track(settings: Settings, music_dir: Path) -> tuple[Path, int]:
 def test_revert_dry_run_touches_nothing(engine_settings: Settings, music_dir: Path) -> None:
     track, file_id = _committed_track(engine_settings, music_dir)
     history_before = len(_revisions(engine_settings, file_id))
-    commits_before = len(commits.list_commits_for(engine_settings))
+    commits_before = len(commits.list_commits(engine_settings))
 
-    result = versioning.revert(engine_settings, file_id, 0, dry_run=True)
+    result = versioning.revert_tags(engine_settings, file_id, 0, dry_run=True)
 
     assert result.status == "reverted"
     assert result.commit_id is None
@@ -398,13 +398,13 @@ def test_revert_dry_run_touches_nothing(engine_settings: Settings, music_dir: Pa
     assert result.to_dict()["dry_run"] is True
     assert read_tags(track).tags["genre"] == ["Synthwave"]
     assert len(_revisions(engine_settings, file_id)) == history_before
-    assert len(commits.list_commits_for(engine_settings)) == commits_before
+    assert len(commits.list_commits(engine_settings)) == commits_before
 
 
 def test_revert_dry_run_reports_noop(engine_settings: Settings, music_dir: Path) -> None:
     _, file_id = _committed_track(engine_settings, music_dir)
 
-    result = versioning.revert(engine_settings, file_id, 1, dry_run=True)
+    result = versioning.revert_tags(engine_settings, file_id, 1, dry_run=True)
 
     assert result.status == "noop"
 
@@ -416,7 +416,7 @@ def test_revert_dry_run_refuses_a_staged_file(engine_settings: Settings, music_d
     staging.stage_tags(engine_settings, file_id=file_id, tags={"genre": ["Ambient"]})
 
     with pytest.raises(ValueError, match="staged change"):
-        versioning.revert(engine_settings, file_id, 0, dry_run=True)
+        versioning.revert_tags(engine_settings, file_id, 0, dry_run=True)
 
 
 def test_write_managed_tags_preserves_unmanaged_and_deletes_omitted(tmp_path: Path) -> None:
@@ -473,7 +473,7 @@ def test_revert_to_version_2_baseline_preserves_release_stamp(
     _baseline(engine_settings, file_id, {"artist": ["Original"], "album": ["Original Album"]})
     _stamp_managed_set(engine_settings, file_id, version=0, managed_set=2)
 
-    versioning.revert(engine_settings, file_id, 0)
+    versioning.revert_tags(engine_settings, file_id, 0)
 
     reverted = read_tags(track).tags
     assert reverted["artist"] == ["Original"]

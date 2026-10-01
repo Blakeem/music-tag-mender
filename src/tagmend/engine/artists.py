@@ -27,8 +27,8 @@ Design notes (the spec):
   see. A correction MusicBrainz does not corroborate (no MBID) is held for review. Held
   values are reported, never written.
 * **"Done" is derived**, never stored — re-running after commit is a no-op because an
-  already-canonical value yields no change. No new table; getCorrection results live in
-  the generic ``lastfm_cache``.
+  already-canonical value yields no change. getCorrection results live in
+  ``lastfm_correction_cache``.
 
 Like the rest of the conn-owning layer, the public function here owns its connection and
 commits; the building blocks in :mod:`tagmend.engine.store` never commit.
@@ -44,6 +44,7 @@ from typing import TYPE_CHECKING, Final
 from tagmend.engine import axis, db, schema, staging, store
 from tagmend.engine.lastfm import LastfmClient, LastfmError
 from tagmend.engine.musicbrainz import MusicBrainzClient, MusicBrainzError
+from tagmend.engine.text_keys import artist_name_key
 from tagmend.engine.validation import check_limit, require_choice
 from tagmend.log import get_logger
 
@@ -99,31 +100,6 @@ _SORT_FIELDS: Final[Mapping[str, str]] = {
     "albumartist": "albumartistsort",
 }
 
-# Characters that separate the same name into different spellings. MusicBrainz writes real
-# typography (``Static\u2010X`` carries U+2010, not a hyphen-minus) while taggers and
-# filesystems substitute ASCII, and a word break is written as a dash by one source and a
-# space by another (``Mindless Self\u2010Indulgence`` against MusicBrainz's spaced
-# spelling). Folding decides SAMENESS only, and only against names MusicBrainz records for
-# the id the file already carries, so it can never merge two different artists. The staged
-# value is always MusicBrainz's own spelling.
-_NAME_FOLD_MAP: Final[Mapping[str, str]] = {
-    "-": " ",
-    "\u2010": " ",
-    "\u2011": " ",
-    "\u2012": " ",
-    "\u2013": " ",
-    "\u2014": " ",
-    "\u2212": " ",
-    "\u2018": "'",
-    "\u2019": "'",
-    "\u201a": "'",
-    "\u201c": '"',
-    "\u201d": '"',
-    "\u00a0": " ",
-    "\u2009": " ",
-    "\u202f": " ",
-}
-
 # The three ways a value can reach `tally.corrections`, reported per mapping so a reviewer
 # can tell an id-backed MusicBrainz fact from a Last.fm suggestion.
 _SOURCE_MB: Final = "musicbrainz"
@@ -163,15 +139,6 @@ def _is_case_only(value: str, canonical: str) -> bool:
     fix, not a casing opinion, and must stay eligible for staging.
     """
     return value.casefold() == canonical.casefold()
-
-
-def _name_fold(value: str) -> str:
-    """Fold *value* to a key ignoring casing, typography and dash-vs-space word breaks.
-
-    Used only to decide whether two spellings are the same name. Never used as a value.
-    """
-    folded = "".join(_NAME_FOLD_MAP.get(ch, ch) for ch in value)
-    return " ".join(folded.casefold().split())
 
 
 def _shrinks_credit(value: str, canonical: str) -> bool:
@@ -556,8 +523,8 @@ def _classify_against_mb(value: str, artist: MBArtist, tally: _Tally) -> None:
         tally.already_canonical_values.append(value)
         return
 
-    folded = _name_fold(value)
-    if folded == _name_fold(artist.name):
+    folded = artist_name_key(value)
+    if folded == artist_name_key(artist.name):
         tally.corrections[value] = _Resolution(
             artist.name,
             artist.mbid,
@@ -566,7 +533,7 @@ def _classify_against_mb(value: str, artist: MBArtist, tally: _Tally) -> None:
         )
         return
 
-    if any(folded == _name_fold(alias) for alias in artist.aliases):
+    if any(folded == artist_name_key(alias) for alias in artist.aliases):
         tally.corrections[value] = _Resolution(
             artist.name,
             artist.mbid,

@@ -53,9 +53,9 @@ ledger upgrades in place with no data loss):
   ``file_genre_status`` (same identity: ``(albumartist-else-artist, album)`` →
   ``source_artist``/``source_album``), storing the ``'no_match'`` / ``'manual'`` decisions;
   "done"/"staged" are *derived* field-awarely (keyed on ``originaldate``).
-* ``musicbrainz_cache`` — a persistent cache of MusicBrainz release-group lookups keyed by a
-  request hash. ``found`` is the negative-cache sentinel (0 = no usable Album release group),
-  mirroring ``lastfm_cache``.
+* ``musicbrainz_release_group_cache`` (named ``musicbrainz_cache`` until v20) is a persistent
+  cache of MusicBrainz release-group lookups keyed by a request hash. ``found`` is the
+  negative-cache sentinel (0 = no usable Album release group), mirroring ``lastfm_cache``.
 
 The mismatch-fix re-pend path adds one more side table (schema v9, purely additive — a v8
 ledger upgrades in place with no data loss):
@@ -83,7 +83,7 @@ The album-gaps MusicBrainz recording-search tier adds one more side table (schem
 additive — a v10 ledger upgrades in place with no data loss):
 
 * ``musicbrainz_recording_cache`` — a persistent cache of MusicBrainz recording-search
-  lookups keyed by a request hash (the ``(artist, title)`` twin of ``musicbrainz_cache``,
+  lookups keyed by a request hash (the ``(artist, title)`` twin of the release-group cache,
   mirroring ``lastfm_cache``). ``found`` is the negative-cache sentinel (0 = no usable Album
   release group for the recording; 1 = found). The found columns hold the selected recording's
   release-group title/id + the recording MBID. Feeds ``detect_album_gaps``' review-only tier;
@@ -96,7 +96,7 @@ place with no data loss):
   (it fills ``originaldate``, never the ``album`` tag), so its status table follows the axis
   name. :func:`apply_schema` performs a SQLite-native ``ALTER TABLE ... RENAME TO`` before the
   DDL runs, so every stored ``'no_match'`` / ``'manual'`` disposition is preserved. Nothing
-  about the album *entity* changes (``musicbrainz_cache``, the ``album`` tag, ``list_albums``).
+  about the album *entity* changes (the release-group cache, the ``album`` tag, ``list_albums``).
 
 The revert-fidelity pass adds one column (schema v13, no new tables — a v12 ledger upgrades in
 place with every row preserved):
@@ -146,10 +146,26 @@ row preserved):
   only when every change in it came from a resolver. Earlier builds stamped every MCP commit
   ``manual``. :func:`_migrate_commit_origin` restamps each ``manual`` commit whose revisions
   are all ``auto``.
+
+The naming and schema-hygiene pass renames, moves and drops in place (schema v20. A v19 ledger
+upgrades in place with every row preserved):
+
+* ``tag_revisions.reverted_from`` becomes ``reverted_to_version``, since it holds the version a
+  revert restored. ``commits.reverted_from`` keeps its name, since it holds the undone commit.
+* ``musicbrainz_cache`` becomes ``musicbrainz_release_group_cache``, and ``release_group_id``
+  becomes ``release_group_mbid`` in both MusicBrainz caches that carry it.
+* ``files.status`` is dropped. Only its DEFAULT ever wrote it, and nothing read it.
+* ``lastfm_correction_cache`` holds ``artist.getCorrection`` answers in typed columns.
+  :func:`_migrate_lastfm_correction_cache` moves the library's correction rows out of
+  ``lastfm_cache``, which now holds top tags only.
+* The ``tag_revisions_managed_set_required`` trigger refuses a revision without a managed set.
+  :func:`_migrate_managed_set_required` refuses to upgrade a ledger already holding one.
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
 from typing import TYPE_CHECKING, Final
 
 from tagmend.engine import path_keys
@@ -160,7 +176,7 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
-SCHEMA_VERSION: Final = 19
+SCHEMA_VERSION: Final = 20
 
 _FILES_DDL: Final = """
 CREATE TABLE IF NOT EXISTS files (
@@ -174,7 +190,6 @@ CREATE TABLE IF NOT EXISTS files (
   first_seen_at   TEXT NOT NULL,
   updated_at      TEXT NOT NULL,
   tags_updated_at TEXT,
-  status          TEXT NOT NULL DEFAULT 'scanned',
   reader_version  INTEGER NOT NULL DEFAULT 0,
   path_key        TEXT,
   UNIQUE (folder, filename)
@@ -232,7 +247,7 @@ CREATE TABLE IF NOT EXISTS tag_revisions (
   commit_id     INTEGER REFERENCES commits(id),
   created_at    TEXT NOT NULL,
   origin        TEXT NOT NULL,
-  reverted_from INTEGER,
+  reverted_to_version INTEGER,
   managed_tags  TEXT NOT NULL,
   diff          TEXT NOT NULL,
   note          TEXT,
@@ -292,17 +307,30 @@ CREATE TABLE IF NOT EXISTS path_revisions_staged (
 )
 """
 
-# Persistent cache of parsed Last.fm tag lists, keyed by a request hash (so it survives
-# MCP restarts and inspector re-launches). ``found`` is the negative-cache sentinel
+# Persistent cache of parsed Last.fm top-tag lists only, keyed by a request hash (so it
+# survives MCP restarts and inspector re-launches). ``found`` is the negative-cache sentinel
 # (0 = artist/album genuinely absent from Last.fm; 1 = found), distinct from ``found=1``
 # with an empty ``tags`` array. ``tags`` is a JSON array of ``[name, weight]`` pairs
-# (``[]`` when found-but-empty, or when not found). See PLAN — Last.fm genre tagging §
+# (``[]`` when found-but-empty, or when not found). See PLAN, Last.fm genre tagging,
 # "Caching & pacing".
 _LASTFM_CACHE_DDL: Final = """
 CREATE TABLE IF NOT EXISTS lastfm_cache (
   request_key TEXT PRIMARY KEY,
   found       INTEGER NOT NULL,
   tags        TEXT NOT NULL,
+  fetched_at  TEXT NOT NULL
+)
+"""
+
+# Persistent cache of ``artist.getCorrection`` answers, keyed like ``lastfm_cache``. ``found``
+# is the negative-cache sentinel (0 = no correction). A found row carries the canonical
+# ``name`` and the ``mbid`` when Last.fm gives one.
+_LASTFM_CORRECTION_CACHE_DDL: Final = """
+CREATE TABLE IF NOT EXISTS lastfm_correction_cache (
+  request_key TEXT PRIMARY KEY,
+  found       INTEGER NOT NULL,
+  name        TEXT,
+  mbid        TEXT,
   fetched_at  TEXT NOT NULL
 )
 """
@@ -361,16 +389,17 @@ CREATE TABLE IF NOT EXISTS file_year_status (
 # Persistent cache of MusicBrainz release-group lookups, keyed by a request hash (so it
 # survives MCP restarts), mirroring ``lastfm_cache``. ``found`` is the negative-cache
 # sentinel (0 = no usable Album release group; 1 = found). The found columns hold the
-# selected release group's original ``first-release-date`` and ids. See PLAN — year axis.
-_MUSICBRAINZ_CACHE_DDL: Final = """
-CREATE TABLE IF NOT EXISTS musicbrainz_cache (
-  request_key      TEXT PRIMARY KEY,
-  found            INTEGER NOT NULL,
-  album_title      TEXT,
-  original_date    TEXT,
-  release_mbid     TEXT,
-  release_group_id TEXT,
-  fetched_at       TEXT NOT NULL
+# selected release group's original ``first-release-date`` and MBIDs. Named
+# ``musicbrainz_cache`` before v20. See PLAN, year axis.
+_MUSICBRAINZ_RELEASE_GROUP_CACHE_DDL: Final = """
+CREATE TABLE IF NOT EXISTS musicbrainz_release_group_cache (
+  request_key        TEXT PRIMARY KEY,
+  found              INTEGER NOT NULL,
+  album_title        TEXT,
+  original_date      TEXT,
+  release_mbid       TEXT,
+  release_group_mbid TEXT,
+  fetched_at         TEXT NOT NULL
 )
 """
 
@@ -407,19 +436,20 @@ CREATE TABLE IF NOT EXISTS musicbrainz_artist_cache (
 """
 
 # Persistent cache of MusicBrainz recording-search lookups, keyed by a request hash (so it
-# survives MCP restarts), mirroring ``musicbrainz_cache`` for the ``(artist, title)`` axis.
+# survives MCP restarts), mirroring ``musicbrainz_release_group_cache`` for the
+# ``(artist, title)`` axis.
 # ``found`` is the negative-cache sentinel (0 = no usable Album release group for the
 # recording; 1 = found). The found columns hold the selected recording's release-group
 # title/id + the recording MBID. Feeds ``detect_album_gaps``' review-only tier. See PLAN —
 # album-gaps recording tier.
 _MUSICBRAINZ_RECORDING_CACHE_DDL: Final = """
 CREATE TABLE IF NOT EXISTS musicbrainz_recording_cache (
-  request_key      TEXT PRIMARY KEY,
-  found            INTEGER NOT NULL,
-  album_title      TEXT,
-  release_group_id TEXT,
-  recording_mbid   TEXT,
-  fetched_at       TEXT NOT NULL
+  request_key        TEXT PRIMARY KEY,
+  found              INTEGER NOT NULL,
+  album_title        TEXT,
+  release_group_mbid TEXT,
+  recording_mbid     TEXT,
+  fetched_at         TEXT NOT NULL
 )
 """
 
@@ -464,12 +494,21 @@ _REVISIONS_COMMIT_INDEX_DDL: Final = (
 
 _APPEND_ONLY_LOGS: Final = ("tag_revisions", "path_revisions")
 
+# Revert reads an omitted tag by the revision's managed set, so a NULL would silently change
+# what a revert deletes. SQLite cannot add NOT NULL to an existing column, so a trigger does.
+_MANAGED_SET_REQUIRED_TRIGGER_DDL: Final = (
+    "CREATE TRIGGER IF NOT EXISTS tag_revisions_managed_set_required "
+    "BEFORE INSERT ON tag_revisions WHEN NEW.managed_set IS NULL "
+    "BEGIN SELECT RAISE(ABORT, 'tag_revisions.managed_set is required'); END"
+)
+
 
 def apply_append_only_triggers(connection: sqlite3.Connection) -> None:
     """Create the triggers that abort any ``UPDATE`` or ``DELETE`` on the two revision logs.
 
     A BEFORE DELETE trigger also blocks the ``ON DELETE CASCADE`` from ``files``, so deleting a
-    file row can never erase its history. Idempotent.
+    file row can never erase its history. One more trigger aborts a ``tag_revisions`` insert
+    that carries no ``managed_set``. Idempotent.
     """
     for log in _APPEND_ONLY_LOGS:
         for event in ("update", "delete"):
@@ -478,6 +517,7 @@ def apply_append_only_triggers(connection: sqlite3.Connection) -> None:
                 f"BEFORE {event.upper()} ON {log} "
                 f"BEGIN SELECT RAISE(ABORT, '{log} is append-only'); END",
             )
+    connection.execute(_MANAGED_SET_REQUIRED_TRIGGER_DDL)
 
 
 def _table_exists(connection: sqlite3.Connection, name: str) -> bool:
@@ -674,6 +714,194 @@ def _migrate_commit_origin(connection: sqlite3.Connection) -> None:
     logger.info("schema v19: restamped %d all-auto commit(s) as auto", restamped)
 
 
+def _migrate_reverted_to_version(connection: sqlite3.Connection) -> None:
+    """v20: rename ``tag_revisions.reverted_from`` to ``reverted_to_version``, keeping every row.
+
+    Runs BEFORE the DDL, so a fresh ledger skips this and takes the column from
+    :data:`_TAG_REVISIONS_DDL`. Idempotent: it fires only while the old column exists and the
+    new one does not. A rename fires no UPDATE trigger, so the append-only triggers stay.
+    """
+    if not _table_exists(connection, "tag_revisions"):
+        return
+    if _column_exists(connection, "tag_revisions", "reverted_to_version"):
+        return
+    if not _column_exists(connection, "tag_revisions", "reverted_from"):
+        return
+    connection.execute(
+        "ALTER TABLE tag_revisions RENAME COLUMN reverted_from TO reverted_to_version",
+    )
+    logger.info("schema v20: renamed tag_revisions.reverted_from to reverted_to_version")
+
+
+# How many offending ``(file_id, version)`` pairs the managed-set refusal names.
+_NULL_MANAGED_SET_SAMPLE: Final = 5
+
+
+def _migrate_managed_set_required(connection: sqlite3.Connection) -> None:
+    """v20: refuse a ledger holding a ``tag_revisions`` row with no ``managed_set``. No writes.
+
+    Runs after :func:`_migrate_v13_managed_set`, so a pre-v13 row is already stamped. A NULL
+    here means that stamp was lost, and only the owner can say which set governed the row, so
+    the upgrade raises :class:`RuntimeError` naming the count and the first few rows.
+    """
+    if not _table_exists(connection, "tag_revisions"):
+        return
+    if not _column_exists(connection, "tag_revisions", "managed_set"):
+        return
+    count = int(
+        connection.execute(
+            "SELECT COUNT(*) FROM tag_revisions WHERE managed_set IS NULL",
+        ).fetchone()[0],
+    )
+    if count == 0:
+        return
+    sample = connection.execute(
+        """
+        SELECT file_id, version FROM tag_revisions
+        WHERE managed_set IS NULL ORDER BY file_id, version LIMIT ?
+        """,
+        (_NULL_MANAGED_SET_SAMPLE,),
+    ).fetchall()
+    pairs = ", ".join(f"({int(row[0])}, {int(row[1])})" for row in sample)
+    message = (
+        f"schema v20: {count} tag_revisions row(s) carry no managed_set, so a revert cannot "
+        f"tell which tags they governed. Stamp each one, then restart. "
+        f"First (file_id, version) pairs: {pairs}"
+    )
+    raise RuntimeError(message)
+
+
+def _migrate_release_group_cache_name(connection: sqlite3.Connection) -> None:
+    """v20: rename ``musicbrainz_cache`` to ``musicbrainz_release_group_cache``, keeping rows.
+
+    Runs BEFORE the DDL so the ``CREATE TABLE IF NOT EXISTS`` finds the renamed table and does
+    not create an empty second one. Idempotent: it fires only when the old table exists and
+    the new one does not. Every request key already starts with ``release-group``, so no
+    cached row is invalidated.
+    """
+    if not _table_exists(connection, "musicbrainz_cache"):
+        return
+    if _table_exists(connection, "musicbrainz_release_group_cache"):
+        return
+    connection.execute("ALTER TABLE musicbrainz_cache RENAME TO musicbrainz_release_group_cache")
+    logger.info("schema v20: renamed musicbrainz_cache to musicbrainz_release_group_cache")
+
+
+# Every cache that has carried a ``release_group_id`` column, under each name it has had.
+_RELEASE_GROUP_ID_TABLES: Final = (
+    "musicbrainz_release_group_cache",
+    "musicbrainz_cache",
+    "musicbrainz_recording_cache",
+)
+
+
+def _migrate_mbid_columns(connection: sqlite3.Connection) -> None:
+    """v20: rename ``release_group_id`` to ``release_group_mbid`` in each cache, keeping rows.
+
+    Runs after :func:`_migrate_release_group_cache_name`. Idempotent: each table renames only
+    while it has the old column and lacks the new one.
+    """
+    for table in _RELEASE_GROUP_ID_TABLES:
+        if not _table_exists(connection, table):
+            continue
+        if not _column_exists(connection, table, "release_group_id"):
+            continue
+        if _column_exists(connection, table, "release_group_mbid"):
+            continue
+        connection.execute(
+            f"ALTER TABLE {table} RENAME COLUMN release_group_id TO release_group_mbid",
+        )
+        logger.info("schema v20: renamed %s.release_group_id to release_group_mbid", table)
+
+
+def _migrate_drop_files_status(connection: sqlite3.Connection) -> None:
+    """v20: drop ``files.status``, which only its DEFAULT ever wrote and nothing read.
+
+    Runs BEFORE the DDL, so a fresh ledger skips this and its DDL has no such column.
+    Idempotent: it fires only while the column exists. No index, constraint, view or trigger
+    names the column, so ``DROP COLUMN`` applies.
+    """
+    if not _table_exists(connection, "files"):
+        return
+    if not _column_exists(connection, "files", "status"):
+        return
+    connection.execute("ALTER TABLE files DROP COLUMN status")
+    logger.info("schema v20: dropped files.status")
+
+
+def _legacy_correction_key(artist: str) -> str:
+    """Return the version-1 ``lastfm._request_key`` bytes for ``artist.getcorrection``.
+
+    Frozen history like :data:`_MANAGED_SET_WIDENING_DATE`: the migration must find the rows
+    the old key wrote, whatever the live key formula becomes.
+    """
+    payload = f"artist.getcorrection\x00artist={artist}"
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()  # noqa: S324 - cache key, not security
+
+
+def _decode_legacy_correction(raw_tags: str) -> tuple[str | None, str | None]:
+    """Return ``(name, mbid)`` from a correction stored as ``[[name, 0], [mbid, 0]]`` pairs."""
+    pairs = json.loads(raw_tags)
+    name = str(pairs[0][0]) if pairs else None
+    mbid = str(pairs[1][0]) if len(pairs) > 1 and pairs[1][0] else None
+    return name, mbid
+
+
+def _move_correction_rows(connection: sqlite3.Connection) -> int:
+    """Move each library artist's correction row out of ``lastfm_cache``. Returns the count."""
+    values: list[str] = []
+    if _table_exists(connection, "file_tags"):
+        cursor = connection.execute(
+            "SELECT DISTINCT value FROM file_tags WHERE name IN ('artist', 'albumartist')",
+        )
+        values = [str(row[0]) for row in cursor.fetchall()]
+
+    moved = 0
+    for request_key in sorted({_legacy_correction_key(value) for value in values}):
+        row = connection.execute(
+            "SELECT found, tags, fetched_at FROM lastfm_cache WHERE request_key = ?",
+            (request_key,),
+        ).fetchone()
+        if row is None:
+            continue
+        name, mbid = _decode_legacy_correction(str(row[1]))
+        connection.execute(
+            """
+            INSERT INTO lastfm_correction_cache (request_key, found, name, mbid, fetched_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (request_key, int(row[0]), name, mbid, str(row[2])),
+        )
+        connection.execute("DELETE FROM lastfm_cache WHERE request_key = ?", (request_key,))
+        moved += 1
+    return moved
+
+
+def _migrate_lastfm_correction_cache(connection: sqlite3.Connection) -> None:
+    """v20: create ``lastfm_correction_cache`` and move the library's correction rows into it.
+
+    Runs BEFORE the DDL. A fresh ledger has no ``lastfm_cache`` and takes the table from
+    :data:`_LASTFM_CORRECTION_CACHE_DDL`. Idempotent: an existing ``lastfm_correction_cache``
+    stops a second run. The CREATE and the row moves land in one transaction. A correction
+    row for a value the library no longer carries stays behind unreachable, which costs only
+    a re-fetch if that value returns.
+    """
+    if not _table_exists(connection, "lastfm_cache"):
+        return
+    if _table_exists(connection, "lastfm_correction_cache"):
+        return
+
+    connection.execute("BEGIN")
+    try:
+        connection.execute(_LASTFM_CORRECTION_CACHE_DDL)
+        moved = _move_correction_rows(connection)
+    except BaseException:
+        connection.rollback()
+        raise
+    connection.commit()
+    logger.info("schema v20: moved %d correction row(s) to lastfm_correction_cache", moved)
+
+
 def apply_schema(connection: sqlite3.Connection) -> None:
     """Upgrade the ledger to :data:`SCHEMA_VERSION` when its stamp is older, else do nothing.
 
@@ -688,9 +916,13 @@ def apply_schema(connection: sqlite3.Connection) -> None:
     (:func:`_migrate_v13_managed_set`), v14 adds ``files.reader_version``
     (:func:`_migrate_v14_reader_version`), v17 adds the staged base signature
     (:func:`_migrate_staged_base_signature`), v18 adds and backfills ``files.path_key``
-    (:func:`_migrate_files_path_key`) and v19 restamps all-auto commits
-    (:func:`_migrate_commit_origin`). The triggers come after every migration, so a
-    migration that updates a log runs before they exist.
+    (:func:`_migrate_files_path_key`), v19 restamps all-auto commits
+    (:func:`_migrate_commit_origin`) and v20 renames, moves and drops in place
+    (:func:`_migrate_reverted_to_version`, :func:`_migrate_managed_set_required`,
+    :func:`_migrate_release_group_cache_name`, :func:`_migrate_mbid_columns`,
+    :func:`_migrate_drop_files_status`, :func:`_migrate_lastfm_correction_cache`). The
+    triggers come after every migration, so a migration that updates a log runs before they
+    exist.
 
     ``commits`` is created before the revision/staging tables that reference it.
     """
@@ -711,6 +943,12 @@ def apply_schema(connection: sqlite3.Connection) -> None:
     _migrate_staged_base_signature(connection)
     _migrate_files_path_key(connection)
     _migrate_commit_origin(connection)
+    _migrate_reverted_to_version(connection)
+    _migrate_managed_set_required(connection)
+    _migrate_release_group_cache_name(connection)
+    _migrate_mbid_columns(connection)
+    _migrate_drop_files_status(connection)
+    _migrate_lastfm_correction_cache(connection)
     connection.execute(_FILES_DDL)
     connection.execute(_FILES_PATH_KEY_INDEX_DDL)
     connection.execute(_FILE_TAGS_DDL)
@@ -721,10 +959,11 @@ def apply_schema(connection: sqlite3.Connection) -> None:
     connection.execute(_TAG_REVISIONS_STAGED_DDL)
     connection.execute(_PATH_REVISIONS_STAGED_DDL)
     connection.execute(_LASTFM_CACHE_DDL)
+    connection.execute(_LASTFM_CORRECTION_CACHE_DDL)
     connection.execute(_FILE_GENRE_STATUS_DDL)
     connection.execute(_FILE_ARTIST_STATUS_DDL)
     connection.execute(_FILE_YEAR_STATUS_DDL)
-    connection.execute(_MUSICBRAINZ_CACHE_DDL)
+    connection.execute(_MUSICBRAINZ_RELEASE_GROUP_CACHE_DDL)
     connection.execute(_MUSICBRAINZ_RECORDING_CACHE_DDL)
     connection.execute(_MUSICBRAINZ_ARTIST_CACHE_DDL)
     connection.execute(_MUSICBRAINZ_RELEASE_CACHE_DDL)

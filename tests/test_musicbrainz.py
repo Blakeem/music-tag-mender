@@ -21,7 +21,11 @@ from tagmend.engine.musicbrainz import (
     _release_request_key,
     _request_key,
 )
-from tagmend.engine.store import get_cached_mb_album, get_cached_mb_recording, get_cached_mb_release
+from tagmend.engine.store import (
+    get_cached_mb_recording,
+    get_cached_mb_release,
+    get_cached_mb_release_group,
+)
 
 if TYPE_CHECKING:
     import sqlite3
@@ -111,7 +115,7 @@ def test_returns_album_original_year(db_conn: sqlite3.Connection) -> None:
     assert album is not None
     assert album.original_date == "1970"  # normalized to the four-digit year
     assert album.album_title == "Paranoid"
-    assert album.release_group_id == "rg-1"
+    assert album.release_group_mbid == "rg-1"
     assert album.release_mbid == "rel-1"
     assert len(calls) == 1
 
@@ -126,7 +130,7 @@ def test_picks_highest_scoring_album(db_conn: sqlite3.Connection) -> None:
         album = client.album_first_release("Artist", "Paranoid")
     assert album is not None
     assert album.original_date == "1970"
-    assert album.release_group_id == "rg-hi"
+    assert album.release_group_mbid == "rg-hi"
 
 
 def test_skips_non_album_primary_type(db_conn: sqlite3.Connection) -> None:
@@ -200,7 +204,7 @@ def test_edition_suffix_in_request_still_matches_plain_release_group(
         album = client.album_first_release("Dark Tranquillity", "Fiction (Deluxe Edition)")
     assert album is not None
     assert album.original_date == "2007"
-    assert album.release_group_id == "rg-fiction"
+    assert album.release_group_mbid == "rg-fiction"
 
 
 def test_rejects_candidate_carrying_content_the_request_lacks(
@@ -221,7 +225,7 @@ def test_non_ascii_title_matches_itself(db_conn: sqlite3.Connection) -> None:
         album = client.album_first_release("Artist", "Спутник")
     assert album is not None
     assert album.original_date == "1985"
-    assert album.release_group_id == "rg-nonascii"
+    assert album.release_group_mbid == "rg-nonascii"
 
 
 def test_different_non_ascii_titles_do_not_match(db_conn: sqlite3.Connection) -> None:
@@ -257,7 +261,7 @@ def test_live_run_album_years_stay_pinned(
         resolved = client.album_first_release(artist, album)
     assert resolved is not None
     assert resolved.original_date == year
-    assert resolved.release_group_id == "rg-real"
+    assert resolved.release_group_mbid == "rg-real"
 
 
 def test_empty_results_is_no_match(db_conn: sqlite3.Connection) -> None:
@@ -279,7 +283,7 @@ def test_found_result_is_positive_cached(db_conn: sqlite3.Connection) -> None:
     assert again.original_date == "1970"
     assert len(calls) == 1
 
-    cached = get_cached_mb_album(db_conn, _request_key("Black Sabbath", "Paranoid"))
+    cached = get_cached_mb_release_group(db_conn, _request_key("Black Sabbath", "Paranoid"))
     assert cached is not None
     assert cached[0] is True
 
@@ -290,7 +294,7 @@ def test_no_match_is_negative_cached(db_conn: sqlite3.Connection) -> None:
         client.album_first_release("Nobody", "Nothing")
         client.album_first_release("Nobody", "Nothing")
     assert len(calls) == 1  # the negative result is cached, not re-fetched
-    cached = get_cached_mb_album(db_conn, _request_key("Nobody", "Nothing"))
+    cached = get_cached_mb_release_group(db_conn, _request_key("Nobody", "Nothing"))
     assert cached is not None
     assert cached[0] is False
 
@@ -317,7 +321,7 @@ def test_http_error_raises_and_caches_nothing(db_conn: sqlite3.Connection) -> No
     with client, pytest.raises(MusicBrainzError):
         client.album_first_release("Artist", "Album")
     # Nothing cached → a re-run would retry.
-    assert get_cached_mb_album(db_conn, _request_key("Artist", "Album")) is None
+    assert get_cached_mb_release_group(db_conn, _request_key("Artist", "Album")) is None
 
 
 def test_non_json_body_raises_musicbrainz_error(db_conn: sqlite3.Connection) -> None:
@@ -333,7 +337,7 @@ def test_non_json_body_raises_musicbrainz_error(db_conn: sqlite3.Connection) -> 
             client.release_by_mbid("rel-1")
 
     assert len(calls) == 2
-    assert get_cached_mb_album(db_conn, _request_key("Artist", "Album")) is None
+    assert get_cached_mb_release_group(db_conn, _request_key("Artist", "Album")) is None
     assert get_cached_mb_release(db_conn, _release_request_key("rel-1")) is None
 
 
@@ -420,7 +424,7 @@ def test_recording_search_returns_album(db_conn: sqlite3.Connection) -> None:
 
     assert recording is not None
     assert recording.album_title == "Paranoid"
-    assert recording.release_group_id == "rg-1"
+    assert recording.release_group_mbid == "rg-1"
     assert recording.recording_mbid == "rec-1"
     assert len(calls) == 1
 
@@ -435,7 +439,7 @@ def test_recording_search_picks_highest_scoring(db_conn: sqlite3.Connection) -> 
         recording = client.recording_search("Artist", "Title")
     assert recording is not None
     assert recording.album_title == "High"
-    assert recording.release_group_id == "rg-hi"
+    assert recording.release_group_mbid == "rg-hi"
     assert recording.recording_mbid == "rec-hi"
 
 

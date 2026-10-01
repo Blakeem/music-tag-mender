@@ -463,7 +463,7 @@ def get_file(file_id: int) -> dict[str, object]:
     year_source_album, mismatch_status, mismatch_source_field, mismatch_source_value}}``,
     or ``{"ok": False, "error": ...}`` if the id is unknown.
     """
-    view = library.get_file_view(load_settings(), file_id)
+    view = library.get_file(load_settings(), file_id)
     if view is None:
         return {"ok": False, "error": f"unknown file_id={file_id}"}
     return {"ok": True, "file": view.to_dict()}
@@ -701,12 +701,12 @@ def detect_disagreements(  # noqa: PLR0913 - one parameter per scope/view knob, 
     Returns:
         ``{"ok": True, rows, fill_rows, total_files, flagged, flagged_fields, high, medium, low,
         fills, releases_attempted, releases_checked, releases_remaining, more,
-        skipped_no_release_id, unknown_releases, unmatched_tracks, errors, error_items, groups,
+        skipped_no_release_mbid, unknown_releases, unmatched_tracks, errors, error_items, groups,
         summary}``, where ``error_items`` is ``{key, message}`` keyed by the release id. Each
-        row is ``{file_id, folder, filename, release_id, release_title, field, have, want,
+        row is ``{file_id, folder, filename, release_mbid, release_title, field, have, want,
         tier, reason}``. Each group is ``{folder, file_count, flagged,
         folder_context, tiers, file_ids, flagged_fields, fills, fields, releases}``, where
-        ``file_ids`` names the flagged files only and ``releases`` lists ``{release_id,
+        ``file_ids`` names the flagged files only and ``releases`` lists ``{release_mbid,
         release_title, file_count}``. On failure, ``{"ok": False, "error": ...}``.
     """
     report = disagreements.detect_disagreements(
@@ -797,7 +797,7 @@ def detect_album_conflicts(
     Returns:
         ``{"ok": True, rows, total_files, flagged, high, medium, low, folder_context,
         folder_context_rows, groups, summary}``. Each row is ``{file_id, folder, filename,
-        album, albumartist, release_id, date, identity, majority_identity, tier, reason}``.
+        album, albumartist, release_mbid, date, identity, majority_identity, tier, reason}``.
         Each group is ``{folder, file_count, flagged, folder_context, tiers, file_ids,
         identities, majority_identity, majority_files}``, sorted by folder, where
         ``file_count`` counts every present file in the folder and ``file_ids`` names the
@@ -902,11 +902,11 @@ def history_tags(file_id: int) -> dict[str, object]:
     ``commit_id`` that grouped it, the full ``managed_tags`` snapshot at that version, and
     the ``diff`` from the prior version. Use a ``version`` here with ``revert_tags``.
 
-    Returns ``{"ok": True, "history": [{version, created_at, origin, reverted_from,
+    Returns ``{"ok": True, "history": [{version, created_at, origin, reverted_to_version,
     commit_id, managed_tags, diff, note}, ...]}`` (empty if the file has no history), or
     ``{"ok": False, "error": ...}`` if the file id is unknown.
     """
-    revisions = versioning.history_for(load_settings(), file_id)
+    revisions = versioning.history_tags(load_settings(), file_id)
     return {"ok": True, "history": [r.to_dict() for r in revisions]}
 
 
@@ -941,7 +941,7 @@ def revert_tags(
         or version is unknown, the file is missing on disk, or the file has a pending staged
         change.
     """
-    result = versioning.revert(load_settings(), file_id, version, note=note, dry_run=dry_run)
+    result = versioning.revert_tags(load_settings(), file_id, version, note=note, dry_run=dry_run)
     return {"ok": True, **result.to_dict()}
 
 
@@ -998,7 +998,7 @@ def list_commits(limit: int | None = None) -> dict[str, object]:
     status}, ...]}``. ``status`` is ``applied`` (clean), ``applying`` (in flight), or
     ``interrupted`` (a crashed run whose leftovers were swept into a later commit).
     """
-    rows = commits.list_commits_for(load_settings(), limit=limit)
+    rows = commits.list_commits(load_settings(), limit=limit)
     return {"ok": True, "commits": [c.to_dict() for c in rows]}
 
 
@@ -1010,7 +1010,7 @@ def get_commit(commit_id: int) -> dict[str, object]:
     Returns ``{"ok": True, "commit": {commit_id, created_at, origin, message, reverted_from,
     status}}``, or ``{"ok": False, "error": ...}`` if the id is unknown.
     """
-    commit = commits.get_commit_for(load_settings(), commit_id)
+    commit = commits.get_commit(load_settings(), commit_id)
     if commit is None:
         return {"ok": False, "error": f"unknown commit_id={commit_id}"}
     return {"ok": True, "commit": commit.to_dict()}
@@ -1171,7 +1171,7 @@ def list_artists(limit: int | None = None) -> dict[str, object]:
         limit: Cap the number of artists returned (applied after the value ordering).
             Keeps the payload context-cheap on a large library.
     """
-    rows = genres.list_artists(load_settings(), limit=limit)
+    rows = library.list_artists(load_settings(), limit=limit)
     return {"ok": True, "artists": [row.to_dict() for row in rows]}
 
 
@@ -1395,7 +1395,7 @@ def resolve_years(
     Args:
         album: Limit to files whose ``album`` tag equals this value.
         file_ids: Limit to these specific file ids (overrides ``album``).
-        limit: Max album groups to process this call (default ``album_stage_limit``).
+        limit: Max album groups to process this call (default ``year_stage_limit``).
             Remaining groups are reported via ``pending_remaining`` / ``more``.
         dry_run: Preview the album → original-year mappings + would-stage count without
             staging anything (works from cache, no precondition).
@@ -1448,7 +1448,7 @@ def list_albums(
         limit: Cap the number of groups returned (applied after ordering + filtering).
             Keeps the payload context-cheap on a large library.
     """
-    rows = years.list_albums(
+    rows = library.list_albums(
         load_settings(),
         year_status=year_status,
         actionable=actionable,
@@ -1464,7 +1464,7 @@ def set_year_status(
     file_ids: list[int] | None = None,
     value: str | None = None,
 ) -> dict[str, object]:
-    """Exclude files from album-year fill (``manual``) or re-queue them (``pending``).
+    """Exclude files from the year fill (``manual``) or re-queue them (``pending``).
 
     ``manual`` marks the in-scope files as a deliberate human/LLM choice: ``resolve_years``
     skips them until you reset. ``pending`` removes any status row, re-queuing them.

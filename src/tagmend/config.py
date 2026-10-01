@@ -17,12 +17,15 @@ import tempfile
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Final
+from typing import TYPE_CHECKING, Final
 
 import platformdirs
 
 from tagmend import __version__
 from tagmend.log import get_logger
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
 
 _APP_NAME: Final = "tagmend"
 _SETTINGS_FILENAME: Final = "settings.json"
@@ -39,10 +42,13 @@ _KNOWN_KEYS: Final[frozenset[str]] = frozenset(
         "genre_stage_limit",
         "musicbrainz_rate_per_sec",
         "musicbrainz_contact",
-        "album_stage_limit",
+        "year_stage_limit",
         "container_folders",
     },
 )
+
+# A settings file written before the album axis became the year axis still carries the old key.
+_LEGACY_KEYS: Final[Mapping[str, str]] = {"album_stage_limit": "year_stage_limit"}
 
 # Defaults for the M2 genre-tagging settings (used by the coercion helpers below).
 _GENRE_MIN_WEIGHT_DEFAULT: Final = 2
@@ -57,7 +63,7 @@ _GENRE_STAGE_LIMIT_DEFAULT: Final = 300
 # defaults to the public project URL rather than a personal address.
 _MUSICBRAINZ_RATE_PER_SEC_DEFAULT: Final = 1.0
 _MUSICBRAINZ_CONTACT_DEFAULT: Final = "https://github.com/Blakeem/music-tag-mender"
-_ALBUM_STAGE_LIMIT_DEFAULT: Final = 300
+_YEAR_STAGE_LIMIT_DEFAULT: Final = 300
 
 # Tokens (case-insensitive) that mean "no limit" for ``genre_max_count``.
 _NONE_TOKENS: Final[frozenset[str]] = frozenset({"", "0", "none", "null"})
@@ -117,11 +123,11 @@ class Settings:
     genre_use_album_tags: bool = True
     lastfm_rate_per_sec: float = _LASTFM_RATE_PER_SEC_DEFAULT
     genre_stage_limit: int = _GENRE_STAGE_LIMIT_DEFAULT
-    # Album-axis MusicBrainz settings carry defaults so direct construction (tests,
+    # Year-axis MusicBrainz settings carry defaults so direct construction (tests,
     # fixtures) needn't restate them; ``load_settings`` always passes the coerced values.
     musicbrainz_rate_per_sec: float = _MUSICBRAINZ_RATE_PER_SEC_DEFAULT
     musicbrainz_contact: str = _MUSICBRAINZ_CONTACT_DEFAULT
-    album_stage_limit: int = _ALBUM_STAGE_LIMIT_DEFAULT
+    year_stage_limit: int = _YEAR_STAGE_LIMIT_DEFAULT
     # Top-level container folders whose path signal the mismatch detector suppresses; a
     # semicolon-delimited string on disk, coerced to a tuple here.
     container_folders: tuple[str, ...] = ()
@@ -180,10 +186,10 @@ def load_settings() -> Settings:
         ),
         musicbrainz_contact=_resolve_raw("musicbrainz_contact", raw)
         or _MUSICBRAINZ_CONTACT_DEFAULT,
-        album_stage_limit=_coerce_non_negative_int(
-            "album_stage_limit",
-            _resolve_raw("album_stage_limit", raw),
-            _ALBUM_STAGE_LIMIT_DEFAULT,
+        year_stage_limit=_coerce_non_negative_int(
+            "year_stage_limit",
+            _resolve_raw("year_stage_limit", raw),
+            _YEAR_STAGE_LIMIT_DEFAULT,
         ),
         container_folders=_coerce_folder_list(_resolve_raw("container_folders", raw)),
     )
@@ -353,7 +359,22 @@ def _read_raw_settings() -> dict[str, str]:
         logger.warning("settings at %s is not a JSON object; ignoring", path)
         return {}
 
-    return {str(k): str(v) for k, v in parsed.items() if v is not None}
+    raw = {str(k): str(v) for k, v in parsed.items() if v is not None}
+    return _rename_legacy_keys(raw)
+
+
+def _rename_legacy_keys(raw: dict[str, str]) -> dict[str, str]:
+    """Move each :data:`_LEGACY_KEYS` value to its new key unless that key is set, then drop it.
+
+    :func:`set_settings` merges over this map, so the next save rewrites the file without the
+    legacy key.
+    """
+    renamed = dict(raw)
+    for legacy_key, new_key in _LEGACY_KEYS.items():
+        legacy_value = renamed.pop(legacy_key, None)
+        if legacy_value is not None and new_key not in renamed:
+            renamed[new_key] = legacy_value
+    return renamed
 
 
 def _restrict_permissions(path: Path) -> None:

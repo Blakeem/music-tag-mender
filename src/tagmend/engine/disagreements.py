@@ -38,7 +38,6 @@ from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Final
 
 from tagmend.engine import db, path_keys, schema, store
-from tagmend.engine.album_conflicts import group_key
 from tagmend.engine.detector_core import (
     TIER_RANK,
     Tier,
@@ -49,6 +48,7 @@ from tagmend.engine.detector_core import (
     validate_tier,
 )
 from tagmend.engine.musicbrainz import MusicBrainzClient, MusicBrainzError
+from tagmend.engine.text_keys import display_key
 from tagmend.engine.validation import check_limit
 from tagmend.log import get_logger
 
@@ -102,9 +102,9 @@ class _FileInput:
     file_id: int
     folder: str
     filename: str
-    release_id: str | None = None
-    release_track_id: str | None = None
-    recording_id: str | None = None
+    release_mbid: str | None = None
+    release_track_mbid: str | None = None
+    recording_mbid: str | None = None
     album: str | None = None
     albumartist: str | None = None
     artist: str | None = None
@@ -126,7 +126,7 @@ class DisagreementRow:
     file_id: int
     folder: str
     filename: str
-    release_id: str
+    release_mbid: str
     release_title: str
     field: str
     have: str
@@ -145,7 +145,7 @@ class DisagreementRow:
             "file_id": self.file_id,
             "folder": self.folder,
             "filename": self.filename,
-            "release_id": self.release_id,
+            "release_mbid": self.release_mbid,
             "release_title": self.release_title,
             "field": self.field,
             "have": self.have,
@@ -213,7 +213,7 @@ class DisagreementsReport:
     releases_checked: int
     releases_remaining: int
     more: bool
-    skipped_no_release_id: int
+    skipped_no_release_mbid: int
     unknown_releases: int
     unmatched_tracks: int
     errors: int
@@ -238,7 +238,7 @@ class DisagreementsReport:
             "releases_checked": self.releases_checked,
             "releases_remaining": self.releases_remaining,
             "more": self.more,
-            "skipped_no_release_id": self.skipped_no_release_id,
+            "skipped_no_release_mbid": self.skipped_no_release_mbid,
             "unknown_releases": self.unknown_releases,
             "unmatched_tracks": self.unmatched_tracks,
             "errors": self.errors,
@@ -254,13 +254,14 @@ class DisagreementsReport:
 def _text_key(value: str) -> str:
     """Return the comparison key for a free-text tag.
 
-    Shares :func:`tagmend.engine.album_conflicts.group_key`, so the two detectors agree on
-    what is cosmetic: casing, typographic character choice and whitespace runs. MusicBrainz
+    Shares :func:`tagmend.engine.text_keys.display_key` with the album-conflict detector, so
+    the two agree on what is cosmetic: casing, typographic character choice and whitespace
+    runs. MusicBrainz
     writes typographic punctuation and taggers write ASCII, and no consumer distinguishes the
     two, so a curly apostrophe against a straight one is not a finding. Other punctuation
     stays significant: a colon against a hyphen is a real difference.
     """
-    return group_key(value)
+    return display_key(value)
 
 
 def _position(value: str | None) -> str:
@@ -314,12 +315,12 @@ def _match_track(file: _FileInput, release: MBRelease) -> MBTrack | None:
     Position is deliberately not a fallback: a wrong track number is one of the defects this
     detector reports, so matching on it would hide exactly what it exists to find.
     """
-    if file.release_track_id:
-        found = release.track_by_release_track_mbid(file.release_track_id)
+    if file.release_track_mbid:
+        found = release.track_by_release_track_mbid(file.release_track_mbid)
         if found is not None:
             return found
-    if file.recording_id:
-        return release.track_by_recording_mbid(file.recording_id)
+    if file.recording_mbid:
+        return release.track_by_recording_mbid(file.recording_mbid)
     return None
 
 
@@ -356,7 +357,7 @@ def _compare_one(
                 file_id=file.file_id,
                 folder=file.folder,
                 filename=file.filename,
-                release_id=release.mbid,
+                release_mbid=release.mbid,
                 release_title=release.title,
                 field=field_name,
                 have=have,
@@ -366,10 +367,10 @@ def _compare_one(
             ),
         )
 
-    if file.release_track_id and track is None:
+    if file.release_track_mbid and track is None:
         add(
             "musicbrainz_releasetrackid",
-            file.release_track_id,
+            file.release_track_mbid,
             "",
             Tier.HIGH,
             _REASON_UNMATCHED,
@@ -412,7 +413,7 @@ def _compare_track(
                 file_id=file.file_id,
                 folder=file.folder,
                 filename=file.filename,
-                release_id=release.mbid,
+                release_mbid=release.mbid,
                 release_title=release.title,
                 field=field_name,
                 have=have,
@@ -484,11 +485,11 @@ def _classify(
     by_release: dict[str, list[_FileInput]] = defaultdict(list)
     skipped = 0
     for f in files:
-        release_id = (f.release_id or "").strip()
-        if not release_id:
+        release_mbid = (f.release_mbid or "").strip()
+        if not release_mbid:
             skipped += 1
             continue
-        by_release[release_id].append(f)
+        by_release[release_mbid].append(f)
 
     order = list(by_release)
     cap = release_limit if release_limit is not None else len(order)
@@ -501,19 +502,19 @@ def _classify(
     unmatched = 0
     fetched = 0
     titles: dict[str, str] = {}
-    for release_id in to_check:
+    for release_mbid in to_check:
         try:
-            release = client.release_by_mbid(release_id)
+            release = client.release_by_mbid(release_mbid)
         except MusicBrainzError as exc:
-            logger.warning("musicbrainz release error for mbid=%r: %s", release_id, exc)
-            errors.append({"key": release_id, "message": str(exc)})
+            logger.warning("musicbrainz release error for mbid=%r: %s", release_mbid, exc)
+            errors.append({"key": release_mbid, "message": str(exc)})
             continue
         fetched += 1
         if release is None:
             unknown += 1
             continue
-        titles[release_id] = release.title
-        for f in by_release[release_id]:
+        titles[release_mbid] = release.title
+        for f in by_release[release_mbid]:
             track = _match_track(f, release)
             if track is None:
                 unmatched += 1
@@ -536,7 +537,7 @@ def _classify(
         releases_checked=fetched,
         releases_remaining=len(order) - len(to_check),
         more=len(order) > len(to_check),
-        skipped_no_release_id=skipped,
+        skipped_no_release_mbid=skipped,
         unknown_releases=unknown,
         unmatched_tracks=unmatched,
         errors=len(errors),
@@ -575,11 +576,15 @@ def _tiers_by_file(contradictions: list[DisagreementRow]) -> Counter[str]:
 def _releases_in(folder_files: list[_FileInput], titles: dict[str, str]) -> list[dict[str, object]]:
     """Return every release one folder's files name, with its title and file count."""
     counts = Counter(
-        release_id for f in folder_files if (release_id := (f.release_id or "").strip())
+        release_mbid for f in folder_files if (release_mbid := (f.release_mbid or "").strip())
     )
     return [
-        {"release_id": release_id, "release_title": titles.get(release_id, ""), "file_count": n}
-        for release_id, n in sorted(counts.items())
+        {
+            "release_mbid": release_mbid,
+            "release_title": titles.get(release_mbid, ""),
+            "file_count": n,
+        }
+        for release_mbid, n in sorted(counts.items())
     ]
 
 
@@ -719,9 +724,9 @@ def _load_inputs(
                 file_id=row.id,
                 folder=row.folder,
                 filename=row.filename,
-                release_id=values.get("musicbrainz_albumid"),
-                release_track_id=values.get("musicbrainz_releasetrackid"),
-                recording_id=values.get("musicbrainz_trackid"),
+                release_mbid=values.get("musicbrainz_albumid"),
+                release_track_mbid=values.get("musicbrainz_releasetrackid"),
+                recording_mbid=values.get("musicbrainz_trackid"),
                 album=values.get("album"),
                 albumartist=values.get("albumartist"),
                 artist=values.get("artist"),

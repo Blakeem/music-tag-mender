@@ -82,6 +82,13 @@ def test_build_seed_exposes_musicbrainz_contact() -> None:
     assert "musicbrainz_user_agent" not in values
 
 
+def test_build_seed_names_the_year_stage_limit() -> None:
+    values = configui.build_seed(_settings())["values"]
+    assert isinstance(values, dict)
+    assert "year_stage_limit" in values
+    assert "album_stage_limit" not in values
+
+
 # --- validate_and_normalize ----------------------------------------------------------
 
 

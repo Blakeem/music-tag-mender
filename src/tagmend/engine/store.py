@@ -16,9 +16,9 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Final, SupportsInt, cast
+from typing import TYPE_CHECKING, Final, cast
 
-from tagmend.engine import axis, path_keys
+from tagmend.engine import axis, db, path_keys
 from tagmend.engine.tags import MANAGED_SET_VERSION, TAG_READER_VERSION
 from tagmend.log import get_logger
 
@@ -26,11 +26,6 @@ if TYPE_CHECKING:
     import sqlite3
 
 logger = get_logger(__name__)
-
-
-def _as_int(value: object) -> int:
-    """Coerce a sqlite-returned ``Any``/``object`` scalar to ``int`` for strict typing."""
-    return int(cast("SupportsInt", value))
 
 
 def _dump_json(obj: object) -> str:
@@ -71,15 +66,15 @@ _FILE_COLUMNS = (
 def _row_to_file(row: tuple[object, ...]) -> FileRow:
     """Build a typed :class:`FileRow` from a raw sqlite tuple."""
     return FileRow(
-        id=_as_int(row[0]),
+        id=db.as_int(row[0]),
         folder=str(row[1]),
         filename=str(row[2]),
         ext=str(row[3]),
-        size_bytes=None if row[4] is None else _as_int(row[4]),
-        mtime_ns=None if row[5] is None else _as_int(row[5]),
+        size_bytes=None if row[4] is None else db.as_int(row[4]),
+        mtime_ns=None if row[5] is None else db.as_int(row[5]),
         is_missing=bool(row[6]),
         tags_updated_at=None if row[7] is None else str(row[7]),
-        reader_version=_as_int(row[8]),
+        reader_version=db.as_int(row[8]),
     )
 
 
@@ -289,7 +284,7 @@ def compute_stats(conn: sqlite3.Connection) -> dict[str, object]:
 
     by_ext: dict[str, int] = {}
     for row in conn.execute("SELECT ext, COUNT(*) FROM files GROUP BY ext ORDER BY ext"):
-        by_ext[str(row[0])] = _as_int(row[1])
+        by_ext[str(row[0])] = db.as_int(row[1])
 
     return {
         "total_files": total_files,
@@ -308,7 +303,7 @@ def compute_stats(conn: sqlite3.Connection) -> dict[str, object]:
 def _scalar_int(conn: sqlite3.Connection, sql: str) -> int:
     """Run a single-value COUNT query and return it as an ``int``."""
     row = conn.execute(sql).fetchone()
-    return 0 if row is None else _as_int(row[0])
+    return 0 if row is None else db.as_int(row[0])
 
 
 # --- tag_revisions (append-only history; PLAN.md §7) -------------------------------
@@ -318,13 +313,9 @@ def _scalar_int(conn: sqlite3.Connection, sql: str) -> int:
 _REVISION_ORIGINS: Final = frozenset({"scan", "auto", "manual", "revert"})
 
 _REVISION_COLUMNS = (
-    "file_id, version, created_at, origin, reverted_from, commit_id, managed_tags, diff, note, "
-    "managed_set"
+    "file_id, version, created_at, origin, reverted_to_version, commit_id, managed_tags, diff, "
+    "note, managed_set"
 )
-
-# Rows written before schema v13 that the migration somehow missed carry no marker. Falling
-# back to the pre-widening set keeps revert conservative (preserve, never delete).
-_FALLBACK_MANAGED_SET: Final = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -335,7 +326,7 @@ class Revision:
     version: int
     created_at: str
     origin: str
-    reverted_from: int | None
+    reverted_to_version: int | None
     commit_id: int | None
     managed_tags: dict[str, list[str]]
     diff: dict[str, dict[str, list[str]]]
@@ -348,7 +339,7 @@ class Revision:
             "version": self.version,
             "created_at": self.created_at,
             "origin": self.origin,
-            "reverted_from": self.reverted_from,
+            "reverted_to_version": self.reverted_to_version,
             "commit_id": self.commit_id,
             "managed_tags": self.managed_tags,
             "diff": self.diff,
@@ -359,16 +350,16 @@ class Revision:
 def _row_to_revision(row: tuple[object, ...]) -> Revision:
     """Build a typed :class:`Revision` from a raw sqlite tuple."""
     return Revision(
-        file_id=_as_int(row[0]),
-        version=_as_int(row[1]),
+        file_id=db.as_int(row[0]),
+        version=db.as_int(row[1]),
         created_at=str(row[2]),
         origin=str(row[3]),
-        reverted_from=None if row[4] is None else _as_int(row[4]),
-        commit_id=None if row[5] is None else _as_int(row[5]),
+        reverted_to_version=None if row[4] is None else db.as_int(row[4]),
+        commit_id=None if row[5] is None else db.as_int(row[5]),
         managed_tags=_parse_tag_map(str(row[6])),
         diff=_parse_diff(str(row[7])),
         note=None if row[8] is None else str(row[8]),
-        managed_set=_FALLBACK_MANAGED_SET if row[9] is None else _as_int(row[9]),
+        managed_set=db.as_int(row[9]),
     )
 
 
@@ -381,7 +372,7 @@ def insert_revision(  # noqa: PLR0913 - cohesive append-only revision payload
     managed_tags: dict[str, list[str]],
     diff: dict[str, dict[str, list[str]]],
     now: str,
-    reverted_from: int | None = None,
+    reverted_to_version: int | None = None,
     commit_id: int | None = None,
     note: str | None = None,
 ) -> None:
@@ -402,7 +393,7 @@ def insert_revision(  # noqa: PLR0913 - cohesive append-only revision payload
     conn.execute(
         """
         INSERT INTO tag_revisions (
-            file_id, version, created_at, origin, reverted_from,
+            file_id, version, created_at, origin, reverted_to_version,
             commit_id, managed_tags, diff, note, managed_set
         )
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -412,7 +403,7 @@ def insert_revision(  # noqa: PLR0913 - cohesive append-only revision payload
             version,
             now,
             origin,
-            reverted_from,
+            reverted_to_version,
             commit_id,
             _dump_json(managed_tags),
             _dump_json(diff),
@@ -466,7 +457,7 @@ def max_version(conn: sqlite3.Connection, file_id: int) -> int | None:
     ).fetchone()
     if row is None or row[0] is None:
         return None
-    return _as_int(row[0])
+    return db.as_int(row[0])
 
 
 # --- staged tags (the git "index"; PLAN.md §7) --------------------------------------
@@ -498,13 +489,13 @@ class StagedTag:
 def _row_to_staged_tag(row: tuple[object, ...]) -> StagedTag:
     """Build a typed :class:`StagedTag` from a raw sqlite tuple."""
     return StagedTag(
-        file_id=_as_int(row[0]),
+        file_id=db.as_int(row[0]),
         managed_tags=_parse_tag_map(str(row[1])),
         origin=str(row[2]),
         note=None if row[3] is None else str(row[3]),
         staged_at=str(row[4]),
-        base_size_bytes=None if row[5] is None else _as_int(row[5]),
-        base_mtime_ns=None if row[6] is None else _as_int(row[6]),
+        base_size_bytes=None if row[5] is None else db.as_int(row[5]),
+        base_mtime_ns=None if row[6] is None else db.as_int(row[6]),
     )
 
 
@@ -652,26 +643,83 @@ def put_cached_tags(
 def _parse_tag_pairs(raw: str) -> list[tuple[str, int]]:
     """Parse a stored ``tags`` blob (JSON ``[name, weight]`` array) into typed pairs."""
     parsed = cast("list[list[object]]", json.loads(raw))
-    return [(str(name), _as_int(weight)) for name, weight in parsed]
+    return [(str(name), db.as_int(weight)) for name, weight in parsed]
 
 
-# --- musicbrainz_cache (persistent release-group lookup cache; PLAN — year axis) -----
+# --- lastfm_correction_cache (persistent artist.getCorrection cache) ------------------
 
 
 @dataclass(frozen=True, slots=True)
-class MBAlbumRow:
+class LastfmCorrectionRow:
+    """One cached ``artist.getCorrection`` answer: the canonical name and its MBID."""
+
+    name: str | None
+    mbid: str | None
+
+
+def get_cached_correction(
+    conn: sqlite3.Connection,
+    request_key: str,
+) -> tuple[bool, LastfmCorrectionRow] | None:
+    """Return the cached correction for *request_key*, or ``None`` on a cache miss.
+
+    A hit is ``(found, row)``. ``found=False`` is the negative-cache sentinel (no correction),
+    while ``found=True`` carries the canonical name and optional MBID on *row*.
+    """
+    cursor = conn.execute(
+        "SELECT found, name, mbid FROM lastfm_correction_cache WHERE request_key = ?",
+        (request_key,),
+    )
+    row = cursor.fetchone()
+    if row is None:
+        return None
+    correction = LastfmCorrectionRow(
+        name=None if row[1] is None else str(row[1]),
+        mbid=None if row[2] is None else str(row[2]),
+    )
+    return (bool(row[0]), correction)
+
+
+def put_cached_correction(  # noqa: PLR0913 - cohesive keyword-only cache payload
+    conn: sqlite3.Connection,
+    *,
+    request_key: str,
+    found: bool,
+    name: str | None,
+    mbid: str | None,
+    now: str,
+) -> None:
+    """Insert or replace the cached correction for *request_key*.
+
+    Pass ``found=False`` with *name* and *mbid* ``None`` to negative-cache.
+    """
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO lastfm_correction_cache
+          (request_key, found, name, mbid, fetched_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (request_key, 1 if found else 0, name, mbid, now),
+    )
+
+
+# --- musicbrainz_release_group_cache (persistent release-group lookup cache) ----------
+
+
+@dataclass(frozen=True, slots=True)
+class MBReleaseGroupRow:
     """One cached MusicBrainz release-group lookup (a found album's resolved fields)."""
 
     album_title: str | None
     original_date: str | None
     release_mbid: str | None
-    release_group_id: str | None
+    release_group_mbid: str | None
 
 
-def get_cached_mb_album(
+def get_cached_mb_release_group(
     conn: sqlite3.Connection,
     request_key: str,
-) -> tuple[bool, MBAlbumRow] | None:
+) -> tuple[bool, MBReleaseGroupRow] | None:
     """Return the cached MusicBrainz lookup for *request_key*, or ``None`` on a cache miss.
 
     ``None`` distinguishes a never-cached key from a cached negative result. A hit is
@@ -680,8 +728,8 @@ def get_cached_mb_album(
     """
     cursor = conn.execute(
         """
-        SELECT found, album_title, original_date, release_mbid, release_group_id
-        FROM musicbrainz_cache WHERE request_key = ?
+        SELECT found, album_title, original_date, release_mbid, release_group_mbid
+        FROM musicbrainz_release_group_cache WHERE request_key = ?
         """,
         (request_key,),
     )
@@ -689,16 +737,16 @@ def get_cached_mb_album(
     if row is None:
         return None
     found = bool(row[0])
-    album = MBAlbumRow(
+    album = MBReleaseGroupRow(
         album_title=None if row[1] is None else str(row[1]),
         original_date=None if row[2] is None else str(row[2]),
         release_mbid=None if row[3] is None else str(row[3]),
-        release_group_id=None if row[4] is None else str(row[4]),
+        release_group_mbid=None if row[4] is None else str(row[4]),
     )
     return (found, album)
 
 
-def put_cached_mb_album(  # noqa: PLR0913 - cohesive keyword-only cache payload
+def put_cached_mb_release_group(  # noqa: PLR0913 - cohesive keyword-only cache payload
     conn: sqlite3.Connection,
     *,
     request_key: str,
@@ -706,7 +754,7 @@ def put_cached_mb_album(  # noqa: PLR0913 - cohesive keyword-only cache payload
     album_title: str | None,
     original_date: str | None,
     release_mbid: str | None,
-    release_group_id: str | None,
+    release_group_mbid: str | None,
     now: str,
 ) -> None:
     """Insert or replace the cached MusicBrainz lookup for *request_key*.
@@ -716,9 +764,9 @@ def put_cached_mb_album(  # noqa: PLR0913 - cohesive keyword-only cache payload
     """
     conn.execute(
         """
-        INSERT OR REPLACE INTO musicbrainz_cache (
+        INSERT OR REPLACE INTO musicbrainz_release_group_cache (
             request_key, found, album_title, original_date,
-            release_mbid, release_group_id, fetched_at
+            release_mbid, release_group_mbid, fetched_at
         )
         VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
@@ -728,7 +776,7 @@ def put_cached_mb_album(  # noqa: PLR0913 - cohesive keyword-only cache payload
             album_title,
             original_date,
             release_mbid,
-            release_group_id,
+            release_group_mbid,
             now,
         ),
     )
@@ -742,7 +790,7 @@ class MBRecordingRow:
     """One cached MusicBrainz recording-search lookup (a found recording's resolved fields)."""
 
     album_title: str | None
-    release_group_id: str | None
+    release_group_mbid: str | None
     recording_mbid: str | None
 
 
@@ -758,7 +806,7 @@ def get_cached_mb_recording(
     """
     cursor = conn.execute(
         """
-        SELECT found, album_title, release_group_id, recording_mbid
+        SELECT found, album_title, release_group_mbid, recording_mbid
         FROM musicbrainz_recording_cache WHERE request_key = ?
         """,
         (request_key,),
@@ -769,7 +817,7 @@ def get_cached_mb_recording(
     found = bool(row[0])
     recording = MBRecordingRow(
         album_title=None if row[1] is None else str(row[1]),
-        release_group_id=None if row[2] is None else str(row[2]),
+        release_group_mbid=None if row[2] is None else str(row[2]),
         recording_mbid=None if row[3] is None else str(row[3]),
     )
     return (found, recording)
@@ -781,7 +829,7 @@ def put_cached_mb_recording(  # noqa: PLR0913 - cohesive keyword-only cache payl
     request_key: str,
     found: bool,
     album_title: str | None,
-    release_group_id: str | None,
+    release_group_mbid: str | None,
     recording_mbid: str | None,
     now: str,
 ) -> None:
@@ -793,7 +841,7 @@ def put_cached_mb_recording(  # noqa: PLR0913 - cohesive keyword-only cache payl
     conn.execute(
         """
         INSERT OR REPLACE INTO musicbrainz_recording_cache (
-            request_key, found, album_title, release_group_id, recording_mbid, fetched_at
+            request_key, found, album_title, release_group_mbid, recording_mbid, fetched_at
         )
         VALUES (?, ?, ?, ?, ?, ?)
         """,
@@ -801,7 +849,7 @@ def put_cached_mb_recording(  # noqa: PLR0913 - cohesive keyword-only cache payl
             request_key,
             1 if found else 0,
             album_title,
-            release_group_id,
+            release_group_mbid,
             recording_mbid,
             now,
         ),
@@ -1213,7 +1261,7 @@ def status_counts(conn: sqlite3.Connection, axis_: axis.Axis) -> dict[str, int]:
     """
     counts = dict.fromkeys(sorted(axis_.workflow_statuses), 0)
     for row in conn.execute("SELECT id FROM files"):
-        counts[derived_status(conn, axis_, _as_int(row[0]))] += 1
+        counts[derived_status(conn, axis_, db.as_int(row[0]))] += 1
     return counts
 
 
@@ -1460,7 +1508,7 @@ def load_mismatch_statuses(conn: sqlite3.Connection) -> dict[int, MismatchStatus
     )
     result: dict[int, MismatchStatusRow] = {}
     for row in cursor.fetchall():
-        result[_as_int(row[0])] = MismatchStatusRow(
+        result[db.as_int(row[0])] = MismatchStatusRow(
             status=str(row[1]),
             source_field=None if row[2] is None else str(row[2]),
             source_value=None if row[3] is None else str(row[3]),
@@ -1491,7 +1539,7 @@ def mismatch_status_counts(conn: sqlite3.Connection) -> dict[str, int]:
     rows = 0
     for row in conn.execute("SELECT status, COUNT(*) FROM file_mismatch_status GROUP BY status"):
         status = str(row[0])
-        count = _as_int(row[1])
+        count = db.as_int(row[1])
         rows += count
         if status in counts:
             counts[status] = count
@@ -1510,7 +1558,7 @@ def distinct_artists(conn: sqlite3.Connection) -> list[tuple[str, int]]:
         ORDER BY value
         """,
     )
-    return [(str(row[0]), _as_int(row[1])) for row in cursor.fetchall()]
+    return [(str(row[0]), db.as_int(row[1])) for row in cursor.fetchall()]
 
 
 def distinct_albumartists(conn: sqlite3.Connection) -> list[tuple[str, int]]:
@@ -1524,7 +1572,7 @@ def distinct_albumartists(conn: sqlite3.Connection) -> list[tuple[str, int]]:
         ORDER BY value
         """,
     )
-    return [(str(row[0]), _as_int(row[1])) for row in cursor.fetchall()]
+    return [(str(row[0]), db.as_int(row[1])) for row in cursor.fetchall()]
 
 
 def load_tag_values(
@@ -1549,7 +1597,7 @@ def load_tag_values(
     )
     result: dict[int, dict[str, str]] = {}
     for row in cursor.fetchall():
-        result.setdefault(_as_int(row[0]), {})[str(row[1])] = str(row[2])
+        result.setdefault(db.as_int(row[0]), {})[str(row[1])] = str(row[2])
     return result
 
 
@@ -1564,13 +1612,13 @@ def files_by_tag_value(conn: sqlite3.Connection, name: str, value: str) -> list[
         """,
         (name, value),
     )
-    return [_as_int(row[0]) for row in cursor.fetchall()]
+    return [db.as_int(row[0]) for row in cursor.fetchall()]
 
 
 def missing_file_ids(conn: sqlite3.Connection) -> set[int]:
     """Return the ids of every file the last scan flagged missing from disk."""
     cursor = conn.execute("SELECT id FROM files WHERE is_missing = 1")
-    return {_as_int(row[0]) for row in cursor.fetchall()}
+    return {db.as_int(row[0]) for row in cursor.fetchall()}
 
 
 def files_in_scope(
@@ -1596,7 +1644,7 @@ def files_in_scope(
     if artist is not None:
         return _files_in_scope_by_tags(conn, artist=artist, album=album)
     cursor = conn.execute("SELECT id FROM files ORDER BY id")
-    return [_as_int(row[0]) for row in cursor.fetchall()]
+    return [db.as_int(row[0]) for row in cursor.fetchall()]
 
 
 def require_known_file_ids(conn: sqlite3.Connection, file_ids: list[int]) -> None:
@@ -1608,7 +1656,7 @@ def require_known_file_ids(conn: sqlite3.Connection, file_ids: list[int]) -> Non
         f"SELECT id FROM files WHERE id IN ({placeholders})",  # noqa: S608
         tuple(file_ids),
     )
-    known = {_as_int(row[0]) for row in cursor.fetchall()}
+    known = {db.as_int(row[0]) for row in cursor.fetchall()}
     unknown = sorted(set(file_ids) - known)
     if unknown:
         message = f"unknown file_id(s): {unknown}"
@@ -1624,7 +1672,7 @@ def _files_in_scope_by_ids(conn: sqlite3.Connection, file_ids: list[int]) -> lis
         f"SELECT id FROM files WHERE id IN ({placeholders}) ORDER BY id",  # noqa: S608
         tuple(file_ids),
     )
-    return [_as_int(row[0]) for row in cursor.fetchall()]
+    return [db.as_int(row[0]) for row in cursor.fetchall()]
 
 
 def _files_in_scope_by_tags(
@@ -1644,7 +1692,7 @@ def _files_in_scope_by_tags(
             """,
             (artist,),
         )
-        return [_as_int(row[0]) for row in cursor.fetchall()]
+        return [db.as_int(row[0]) for row in cursor.fetchall()]
     cursor = conn.execute(
         """
         SELECT DISTINCT a.file_id
@@ -1656,4 +1704,4 @@ def _files_in_scope_by_tags(
         """,
         (artist, album),
     )
-    return [_as_int(row[0]) for row in cursor.fetchall()]
+    return [db.as_int(row[0]) for row in cursor.fetchall()]

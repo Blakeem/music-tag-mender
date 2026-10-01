@@ -12,7 +12,7 @@ const FIELDS = [
   { key: "genre_stage_limit", label: "Genre stage limit", group: "advanced", type: "text" },
   { key: "musicbrainz_rate_per_sec", label: "MusicBrainz requests/sec", group: "advanced", type: "text" },
   { key: "musicbrainz_contact", label: "MusicBrainz contact (email or URL)", group: "advanced", type: "text" },
-  { key: "album_stage_limit", label: "Album stage limit", group: "advanced", type: "text" },
+  { key: "year_stage_limit", label: "Year stage limit", group: "advanced", type: "text" },
 ];
 
 const csrfToken = document.querySelector('meta[name="csrf-token"]').content;

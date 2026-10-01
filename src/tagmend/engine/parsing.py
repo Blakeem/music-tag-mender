@@ -10,7 +10,7 @@ it directly (decision-r2 sub-decision (c)).
 The two folder patterns are **fixed** (``Artist - Year - Album`` and ``Artist - Album``,
 year ``(19|20)\d\d``); code only ever *validates* a parsed candidate against known-good
 rows (sibling values / filename self-corroboration) — it never authors patterns. The
-fold-key reuses :func:`tagmend.engine.classify.fold` (lowercase + strip non-``[a-z0-9]``)
+fold-key reuses :func:`tagmend.engine.text_keys.alnum_key` (lowercase + strip non-``[a-z0-9]``)
 so a match/dedup key stays a single definition across the engine; it is never written to
 disk.
 """
@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
 
-from tagmend.engine.classify import fold
+from tagmend.engine.text_keys import alnum_key
 
 # The folder/filename field separator: space-hyphen-space.
 _FOLDER_YEAR_RE: Final = re.compile(r"^(?P<artist>.+?) - (?P<year>(?:19|20)\d\d) - (?P<album>.+)$")
@@ -109,7 +109,7 @@ def fold_contains(text: str, token: str) -> bool:
     test substring containment, so spacing/punctuation/case differences between an album
     token and a filename never defeat the match. An empty folded *token* never matches.
     """
-    folded_token = fold(token)
+    folded_token = alnum_key(token)
     if not folded_token:
         return False
-    return folded_token in fold(text)
+    return folded_token in alnum_key(text)

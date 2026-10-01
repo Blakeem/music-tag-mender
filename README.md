@@ -20,7 +20,7 @@ Pull community top-tags for each artist (optionally each album), fold them throu
 
 Resolve name variants to a single canonical spelling across both `artist` and `albumartist`. A file that already carries a MusicBrainz artist ID is settled by a direct lookup of that ID, against the artist's canonical name and registered aliases. A rewritten name carries MusicBrainz's sort name to its own sort field, `artistsort` for `artist` and `albumartistsort` for `albumartist`. Values with no ID fall through to Last.fm `artist.getCorrection`. That tier leaves the sort field alone, because Last.fm publishes no sort name. Feat/sentinel/empty values and multi-value fields are guarded so nothing ambiguous gets rewritten. A name that disagrees with the ID its own file carries is reported, never rewritten.
 
-### 📅 Album year fill (MusicBrainz)
+### 📅 Year fill (MusicBrainz)
 
 Blank-fill each album's original release year (`originaldate`) from MusicBrainz without overwriting values you already have.
 
@@ -172,13 +172,13 @@ The MCP server exposes 34 tools. All tag edits are staged in memory and only wri
 | `set_artist_status` | Exclude files from artist-name normalization (`manual`) or re-queue them (`pending`) |
 | `reset_artist_status` | Clear any artist status row for in-scope files, returning them to `pending` |
 
-### Album Year (MusicBrainz)
+### Year (MusicBrainz)
 
 | Tool | Description |
 |------|-------------|
 | `list_albums` | List distinct album groups with file counts and status (to scope a run) |
 | `resolve_years` | Blank-fill the original release year (`originaldate`) from MusicBrainz (no disk write) |
-| `set_year_status` | Exclude files from album-year fill (`manual`) or re-queue them (`pending`) |
+| `set_year_status` | Exclude files from the year fill (`manual`) or re-queue them (`pending`) |
 | `reset_year_status` | Clear any year status row for in-scope files, returning them to `pending` |
 
 ### Mismatch fixing

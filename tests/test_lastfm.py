@@ -7,12 +7,14 @@ asserted without any real waiting.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from typing import TYPE_CHECKING
 
 import httpx
 import pytest
 
+from tagmend.engine import lastfm
 from tagmend.engine.lastfm import (
     ArtistCorrection,
     LastfmClient,
@@ -20,7 +22,7 @@ from tagmend.engine.lastfm import (
     Tag,
     _request_key,
 )
-from tagmend.engine.store import get_cached_tags
+from tagmend.engine.store import LastfmCorrectionRow, get_cached_correction, get_cached_tags
 
 if TYPE_CHECKING:
     import sqlite3
@@ -171,6 +173,20 @@ def test_artist_correction_parses_name_and_mbid_and_caches(db_conn: sqlite3.Conn
     assert len(calls) == 1
 
 
+def test_positive_correction_is_cached_with_typed_columns(db_conn: sqlite3.Connection) -> None:
+    client, _calls = _client(db_conn, [_json_response(_correction("Daft Punk", "mbid-1"))])
+    with client:
+        client.artist_correction("daft punk")
+
+    key = _request_key("artist.getcorrection", {"artist": "daft punk"})
+    row = db_conn.execute(
+        "SELECT found, name, mbid FROM lastfm_correction_cache WHERE request_key = ?",
+        (key,),
+    ).fetchone()
+    assert row == (1, "Daft Punk", "mbid-1")
+    assert get_cached_tags(db_conn, key) is None
+
+
 def test_artist_correction_without_mbid(db_conn: sqlite3.Connection) -> None:
     body = _correction("Canonical Name")  # no mbid key
     client, _calls = _client(db_conn, [_json_response(body)])
@@ -197,7 +213,7 @@ def test_artist_correction_error_6_is_none_and_negative_cached(db_conn: sqlite3.
     assert second is None
     assert len(calls) == 1  # negative-cached: no second network hit
     key = _request_key("artist.getcorrection", {"artist": "No Such Artist"})
-    assert get_cached_tags(db_conn, key) == (False, [])
+    assert get_cached_correction(db_conn, key) == (False, LastfmCorrectionRow(None, None))
 
 
 def test_artist_correction_empty_corrections_is_none_and_negative_cached(
@@ -213,7 +229,7 @@ def test_artist_correction_empty_corrections_is_none_and_negative_cached(
     assert second is None
     assert len(calls) == 1
     key = _request_key("artist.getcorrection", {"artist": "Plain"})
-    assert get_cached_tags(db_conn, key) == (False, [])
+    assert get_cached_correction(db_conn, key) == (False, LastfmCorrectionRow(None, None))
 
 
 def test_artist_correction_absent_corrections_is_none(db_conn: sqlite3.Connection) -> None:
@@ -232,7 +248,7 @@ def test_artist_correction_non_six_error_raises_and_does_not_cache(
     with client, pytest.raises(LastfmError):
         client.artist_correction("Anybody")
     key = _request_key("artist.getcorrection", {"artist": "Anybody"})
-    assert get_cached_tags(db_conn, key) is None
+    assert get_cached_correction(db_conn, key) is None
 
 
 def test_artist_correction_http_500_raises_and_does_not_cache(db_conn: sqlite3.Connection) -> None:
@@ -241,7 +257,7 @@ def test_artist_correction_http_500_raises_and_does_not_cache(db_conn: sqlite3.C
     with client, pytest.raises(LastfmError):
         client.artist_correction("Anybody")
     key = _request_key("artist.getcorrection", {"artist": "Anybody"})
-    assert get_cached_tags(db_conn, key) is None
+    assert get_cached_correction(db_conn, key) is None
 
 
 # --- transient errors are raised and NOT cached --------------------------------------
@@ -457,6 +473,28 @@ def test_name_and_mbid_queries_get_different_keys() -> None:
     by_name = _request_key("artist.gettoptags", {"artist": "Ours"})
     by_mbid = _request_key("artist.gettoptags", {"mbid": "some-mbid"})
     assert by_name != by_mbid
+
+
+def test_request_key_version_one_matches_legacy_bytes() -> None:
+    # Version 1 keeps the key bytes every row cached before parse versions existed was stored
+    # under, so those rows stay reachable.
+    legacy = hashlib.sha1(b"artist.gettoptags\x00artist=X").hexdigest()  # noqa: S324 - cache key
+
+    assert _request_key("artist.gettoptags", {"artist": "X"}) == legacy
+
+
+def test_parse_version_bump_refetches(
+    db_conn: sqlite3.Connection,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    body = _toptags(("rock", 100))
+    client, calls = _client(db_conn, [_json_response(body), _json_response(body)])
+    with client:
+        client.artist_top_tags("Band")
+        monkeypatch.setitem(lastfm._PARSE_VERSIONS, "artist.gettoptags", 2)
+        client.artist_top_tags("Band")
+
+    assert len(calls) == 2
 
 
 def test_method_distinguishes_keys() -> None:

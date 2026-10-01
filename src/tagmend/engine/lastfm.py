@@ -8,8 +8,9 @@ the classifier later filters against the controlled vocabulary (see
 * ``album.getTopTags``  — ranked community tags for one album (by artist + album).
 
 Each response's parsed ``(name, weight)`` list is cached persistently in ``lastfm_cache``
-so every unique entity is queried at most once ever and re-runs are free. The negative
-result (genuinely absent — Last.fm ``error 6``) is cached too, distinct from a found
+so every unique entity is queried at most once ever and re-runs are free. Each
+``artist.getCorrection`` answer is cached the same way in ``lastfm_correction_cache``. The
+negative result (genuinely absent, Last.fm ``error 6``) is cached too, distinct from a found
 result that simply has no tags. Transient/auth failures (HTTP non-2xx, any other error
 code) raise :class:`LastfmError` and are **never** cached, so a re-run retries them.
 A transport error, an HTTP 429 or 5xx, or a temporary Last.fm error code (11, 16, 29) is
@@ -32,12 +33,17 @@ from typing import TYPE_CHECKING, Final, Protocol, Self, cast
 
 import httpx
 
-from tagmend.engine.store import get_cached_tags, put_cached_tags
+from tagmend.engine.store import (
+    get_cached_correction,
+    get_cached_tags,
+    put_cached_correction,
+    put_cached_tags,
+)
 from tagmend.log import get_logger
 
 if TYPE_CHECKING:
     import sqlite3
-    from collections.abc import Callable
+    from collections.abc import Callable, Mapping
     from types import TracebackType
 
 logger = get_logger(__name__)
@@ -56,6 +62,14 @@ _HTTP_TOO_MANY_REQUESTS: Final = 429
 _HTTP_SERVER_ERROR: Final = 500
 _RETRY_ATTEMPTS: Final = 3
 _RETRY_BACKOFF_SECONDS: Final = 1.0
+
+# A cache hit never re-parses, so bump a method's entry when its parse changes and its cached
+# rows are re-fetched instead of replayed. Version 1 keeps the original key bytes.
+_PARSE_VERSIONS: Final[Mapping[str, int]] = {
+    "artist.gettoptags": 1,
+    "album.gettoptags": 1,
+    "artist.getcorrection": 1,
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -202,12 +216,12 @@ class LastfmClient:
         """
         request_key = _request_key("artist.getcorrection", {"artist": name})
 
-        cached = get_cached_tags(self._conn, request_key)
+        cached = get_cached_correction(self._conn, request_key)
         if cached is not None:
-            found, pairs = cached
-            if not found:
+            found, row = cached
+            if not found or row.name is None:
                 return None
-            return _decode_correction(pairs)
+            return ArtistCorrection(name=row.name, mbid=row.mbid)
 
         return self._fetch_and_cache_correction(name, request_key)
 
@@ -277,22 +291,15 @@ class LastfmClient:
         error = body.get("error")
         if error is not None:
             if error == _ERROR_NOT_FOUND:
-                self._store(request_key, found=False, tags=[])
+                self._store_correction(request_key, None)
                 return None
             message = f"Last.fm error {error}: {body.get('message', 'unknown')}"
             raise LastfmError(message)
 
         correction = _parse_correction(body)
-        if correction is None:
-            self._store(request_key, found=False, tags=[])
-            return None
 
-        # Output: positive-cache the canonical name + MBID as two weight-0 pairs.
-        self._store(
-            request_key,
-            found=True,
-            tags=[(correction.name, 0), (correction.mbid or "", 0)],
-        )
+        # Output: cache the answer (a missing correction negative-cached), then return it.
+        self._store_correction(request_key, correction)
         return correction
 
     def _request(self, method: str, identity: dict[str, str]) -> dict[str, object]:
@@ -344,6 +351,18 @@ class LastfmClient:
         )
         self._conn.commit()
 
+    def _store_correction(self, request_key: str, correction: ArtistCorrection | None) -> None:
+        """Cache a parsed correction (``None`` = no correction) and commit immediately."""
+        put_cached_correction(
+            self._conn,
+            request_key=request_key,
+            found=correction is not None,
+            name=None if correction is None else correction.name,
+            mbid=None if correction is None else correction.mbid,
+            now=_utc_now(),
+        )
+        self._conn.commit()
+
     def _pace(self) -> None:
         """Sleep just enough so consecutive network requests honor ``rate_per_sec``.
 
@@ -364,14 +383,18 @@ class LastfmClient:
 
 
 def _request_key(method: str, identity: dict[str, str]) -> str:
-    """Return a stable ``sha1`` over *method* + the entity-identifying params.
+    """Return a stable ``sha1`` over *method* + the entity-identifying params + parse version.
 
     ``api_key``/``format`` are excluded (they do not identify the entity), and the
     identity params are sorted so insertion order never changes the key. A name-based and
-    an mbid-based artist query therefore get distinct keys.
+    an mbid-based artist query therefore get distinct keys. A method missing from
+    :data:`_PARSE_VERSIONS` raises :class:`KeyError`.
     """
+    parse_version = _PARSE_VERSIONS[method]
     parts = [method]
     parts.extend(f"{key}={value}" for key, value in sorted(identity.items()))
+    if parse_version > 1:
+        parts.append(f"parse={parse_version}")
     payload = "\x00".join(parts)
     return hashlib.sha1(payload.encode("utf-8")).hexdigest()  # noqa: S324 - cache key, not security
 
@@ -450,13 +473,6 @@ def _parse_correction(body: dict[str, object]) -> ArtistCorrection | None:
     raw_mbid = artist.get("mbid")
     mbid = raw_mbid if isinstance(raw_mbid, str) and raw_mbid else None
     return ArtistCorrection(name=raw_name, mbid=mbid)
-
-
-def _decode_correction(pairs: list[tuple[str, int]]) -> ArtistCorrection:
-    """Rebuild an :class:`ArtistCorrection` from its cached ``[(name,0),(mbid,0)]`` pairs."""
-    name = pairs[0][0]
-    mbid = pairs[1][0] if len(pairs) > 1 else ""
-    return ArtistCorrection(name=name, mbid=mbid or None)
 
 
 def _utc_now() -> str:

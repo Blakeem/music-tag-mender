@@ -1,6 +1,6 @@
 """Tests for mislabeled-file detection (:mod:`tagmend.engine.mismatch`).
 
-Pure-function tests for ``fold`` / ``_top_artist`` / ``_primary_artist`` / ``_disagrees``
+Pure-function tests for ``_top_artist`` / ``_primary_artist`` / ``_disagrees``
 and the pure ``_classify`` core over constructed inputs covering every labeled class
 (HIGH/MEDIUM/LOW, the diacritic/alias/VA/non-album false-positive classes, the reliability
 guard, the artist fallback, and a library-root file that must not crash), plus an
@@ -19,7 +19,7 @@ from conftest import FOLDER_SPELLINGS, make_track, spell_folder
 from tagmend import config, mcp_server
 from tagmend.cli import app
 from tagmend.config import Settings
-from tagmend.engine import artists, detector_core, mismatch, path_keys, staging, store, versioning
+from tagmend.engine import artists, mismatch, path_keys, staging, store, text_keys, versioning
 from tagmend.engine.db import connect
 from tagmend.engine.library import scan_library
 from tagmend.engine.mismatch import detect_mismatches
@@ -71,20 +71,6 @@ def _find_context(
     file_id: int,
 ) -> mismatch.MismatchRow | None:
     return next((r for r in report.folder_context_rows if r.file_id == file_id), None)
-
-
-# --- fold ---------------------------------------------------------------------------
-
-
-def test_fold_folds_ligatures_and_diacritics_equal() -> None:
-    assert detector_core.fold("Leæther Strip") == detector_core.fold("Leaether Strip")
-    assert detector_core.fold("Dååth") == detector_core.fold("Daath")
-    assert detector_core.fold("Röyksopp") == detector_core.fold("Royksopp")
-
-
-def test_fold_strips_case_space_punctuation() -> None:
-    assert detector_core.fold("  Ozzy  Osbourne! ") == "ozzyosbourne"
-    assert detector_core.fold("A.B. & C") == "abc"
 
 
 # --- _top_artist --------------------------------------------------------------------
@@ -1085,7 +1071,7 @@ def test_mcp_reopen_axes_rejects_auto_commit(music_dir: Path) -> None:
 
 # --- container-folder path-signal suppression ---------------------------------------
 
-_CONTAINER = frozenset({detector_core.fold("Soundtracks")})
+_CONTAINER = frozenset({text_keys.alnum_ascii_key("Soundtracks")})
 
 
 def _container_library() -> list[mismatch._FileInput]:

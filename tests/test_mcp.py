@@ -21,7 +21,7 @@ from mcp.types import TextContent
 from conftest import make_track
 from tagmend import mcp_server
 from tagmend.config import load_settings
-from tagmend.engine import health, staging, store
+from tagmend.engine import commits, genres, health, library, staging, store, versioning
 from tagmend.engine.db import connect
 from tagmend.engine.lastfm import LastfmError
 from tagmend.engine.musicbrainz import MusicBrainzError
@@ -103,6 +103,16 @@ def _enum_values(schema: object) -> list[object]:
             return enum
     message = f"no enum found in schema: {schema!r}"
     raise AssertionError(message)
+
+
+def test_mcp_tools_call_same_named_engine_functions() -> None:
+    # One operation carries one name in the engine and the MCP layer.
+    assert hasattr(library, "get_file")
+    assert hasattr(versioning, "revert_tags")
+    assert hasattr(versioning, "history_tags")
+    assert hasattr(commits, "list_commits")
+    assert hasattr(commits, "get_commit")
+    assert hasattr(genres, "ResolveGenresResult")
 
 
 def test_list_tools_exposes_expected_tools_and_schema() -> None:
@@ -434,6 +444,21 @@ def test_history_and_revert_roundtrip(music_dir: Path) -> None:
 
     # An unknown version is an error, not a crash.
     assert mcp_server.revert_tags(file_id, 99)["ok"] is False
+
+
+def test_history_names_the_version_a_revert_restored(music_dir: Path) -> None:
+    file_id = _scanned_track_id(music_dir)
+    mcp_server.stage_tags(file_id, {"genre": ["Synthwave"]})
+    mcp_server.commit_tags()
+    mcp_server.revert_tags(file_id, 0)
+
+    history = mcp_server.history_tags(file_id)["history"]
+
+    assert isinstance(history, list)
+    latest = history[-1]
+    assert latest["origin"] == "revert"
+    assert latest["reverted_to_version"] == 0
+    assert "reverted_from" not in latest
 
 
 def test_list_commits_and_get_commit(music_dir: Path) -> None:

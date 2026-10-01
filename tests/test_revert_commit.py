@@ -69,7 +69,7 @@ def _commit(settings: Settings, commit_id: int) -> commits.Commit | None:
     conn = connect(settings.db_path)
     try:
         apply_schema(conn)
-        return commits.get_commit(conn, commit_id)
+        return commits.get_commit_in(conn, commit_id)
     finally:
         conn.close()
 
@@ -78,7 +78,7 @@ def _commit_count(settings: Settings) -> int:
     conn = connect(settings.db_path)
     try:
         apply_schema(conn)
-        return len(commits.list_commits(conn))
+        return len(commits.list_commits_in(conn))
     finally:
         conn.close()
 
@@ -158,7 +158,7 @@ def test_revert_commit_restores_all_files(
         assert [r.version for r in revisions] == [0, 1, 2]
         latest = revisions[-1]
         assert latest.origin == "revert"
-        assert latest.reverted_from == 0
+        assert latest.reverted_to_version == 0
         assert latest.commit_id == result.commit_id
 
     # The new commit row: origin='revert', reverted_from=target, applied.
@@ -578,4 +578,4 @@ def test_single_file_revert_blocked_by_staged_change(
     staging.stage_tags(engine_settings, file_id=file_id, tags={"genre": ["Darksynth"]})
 
     with pytest.raises(ValueError, match="staged change"):
-        versioning.revert(engine_settings, file_id, 0)
+        versioning.revert_tags(engine_settings, file_id, 0)

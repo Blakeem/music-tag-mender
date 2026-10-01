@@ -16,10 +16,11 @@ tag changes).
 The chosen design (see ``aipg/workflows/decide/runs/detect-mislabeled-tags/decision-r1.md``):
 
 * **Primary signal** — ``albumartist`` vs the file path, **bidirectional containment** over a
-  normalization ladder (:func:`fold`: casefold + strip non-alphanumerics + Unicode/ligature
-  fold). A file disagrees when the folded ``albumartist`` is not contained in the folded path
-  AND the folded top-level artist folder and the folded ``albumartist`` are not substrings of
-  each other (the bidirectional check is what lets ``Lusine ICL`` in a ``Lusine`` folder pass).
+  normalization ladder (:func:`tagmend.engine.text_keys.alnum_ascii_key`: casefold + strip
+  non-alphanumerics + Unicode/ligature fold). A file disagrees when the folded
+  ``albumartist`` is not contained in the folded path AND the folded top-level artist folder
+  and the folded ``albumartist`` are not substrings of each other (the bidirectional check is
+  what lets ``Lusine ICL`` in a ``Lusine`` folder pass).
 * **Confidence tiers** keyed on per-folder distinct-``albumartist`` variance: HIGH (path
   disagreement in a folder with mixed ``albumartist`` values), MEDIUM (path disagreement in a
   uniformly mis-stamped folder), LOW (folder-consistency fallback, a non-album-guarded path
@@ -51,12 +52,12 @@ from tagmend.engine import axis, db, path_keys, schema, store
 from tagmend.engine.detector_core import (
     TIER_RANK,
     Tier,
-    fold,
     group_by_folder,
     is_non_album_folder,
     rows_in_tier,
     validate_tier,
 )
+from tagmend.engine.text_keys import alnum_ascii_key
 from tagmend.engine.validation import check_limit, require_choice
 from tagmend.log import get_logger
 
@@ -163,12 +164,12 @@ def _disagrees(value: str, path: str, top_artist: str | None) -> bool:
     """
     if top_artist is None:
         return False
-    folded_value = fold(value)
+    folded_value = alnum_ascii_key(value)
     if not folded_value:
         return False
-    if folded_value in fold(path):
+    if folded_value in alnum_ascii_key(path):
         return False
-    folded_top = fold(top_artist)
+    folded_top = alnum_ascii_key(top_artist)
     return not (folded_top and (folded_top in folded_value or folded_value in folded_top))
 
 
@@ -187,7 +188,7 @@ class _FileInput:
 
     @property
     def path(self) -> str:
-        """The full file path (folder + filename); only ever compared via :func:`fold`."""
+        """The full file path (folder + filename), compared only via :func:`alnum_ascii_key`."""
         return str(Path(self.folder) / self.filename)
 
 
@@ -370,7 +371,7 @@ def _analyze(
     ``container_folder`` for the reliability filter and the visible count map.
     """
     top = _top_artist(f.folder, music_path)
-    container = top if top is not None and fold(top) in container_folders else None
+    container = top if top is not None and alnum_ascii_key(top) in container_folders else None
     if container is not None:
         top = None
     disagrees = (
@@ -837,7 +838,7 @@ def detect_mismatches(
     folder_key = None if folder is None else path_keys.folder_arg_key(settings, folder)
 
     music_path = settings.music_path
-    container_folders = frozenset(fold(name) for name in settings.container_folders)
+    container_folders = frozenset(alnum_ascii_key(name) for name in settings.container_folders)
     connection = db.connect(settings.db_path)
     try:
         schema.apply_schema(connection)

@@ -21,11 +21,11 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final
 
 import mutagen
 
-from tagmend.engine import db, path_keys, scan, schema, store, versioning
+from tagmend.engine import axis, db, genres, path_keys, scan, schema, store, versioning
 from tagmend.engine.tags import TAG_READER_VERSION, read_tags
 from tagmend.engine.validation import check_limit, require_choice
 from tagmend.log import get_logger
@@ -36,6 +36,9 @@ if TYPE_CHECKING:
     from tagmend.config import Settings
 
 logger = get_logger(__name__)
+
+# The year axis manages one field, the one ``list_albums`` counts blanks of.
+_YEAR_FIELD: Final = axis.YEAR_AXIS.fields[0]
 
 
 @dataclass(frozen=True, slots=True)
@@ -249,7 +252,7 @@ def list_files(  # noqa: PLR0913 - cohesive keyword-only discovery filters
         connection.close()
 
 
-def get_file_view(settings: Settings, file_id: int) -> FileView | None:
+def get_file(settings: Settings, file_id: int) -> FileView | None:
     """Return one tracked file with its managed tags, or ``None`` if unknown. Read-only."""
     connection = db.connect(settings.db_path)
     try:
@@ -258,6 +261,119 @@ def get_file_view(settings: Settings, file_id: int) -> FileView | None:
         return None if row is None else _to_view(connection, row)
     finally:
         connection.close()
+
+
+@dataclass(frozen=True, slots=True)
+class ArtistRow:
+    """One distinct ``artist`` tag value with its file count, for ``list_artists``."""
+
+    artist: str
+    file_count: int
+
+    def to_dict(self) -> dict[str, object]:
+        """JSON-serializable form for the MCP tool."""
+        return {"artist": self.artist, "file_count": self.file_count}
+
+
+def list_artists(settings: Settings, *, limit: int | None = None) -> list[ArtistRow]:
+    """Return each distinct ``artist`` tag value with its file count (value order).
+
+    A discovery aid for scoping ``resolve_genres`` by artist. Read-only. *limit* (when given)
+    caps the number of rows returned, applied AFTER the value ordering so the cap is
+    deterministic. Raises :class:`ValueError` for a negative *limit*.
+    """
+    check_limit(limit)
+    connection = db.connect(settings.db_path)
+    try:
+        schema.apply_schema(connection)
+        rows = store.distinct_artists(connection)
+    finally:
+        connection.close()
+    result = [ArtistRow(artist=value, file_count=count) for value, count in rows]
+    if limit is not None:
+        result = result[:limit]
+    return result
+
+
+@dataclass(frozen=True, slots=True)
+class AlbumRow:
+    """One distinct ``(albumartist-else-artist, album)`` group with its status, for listing."""
+
+    artist: str | None
+    album: str
+    file_count: int
+    year_status: str
+    blank_originaldate: int
+
+    def to_dict(self) -> dict[str, object]:
+        """JSON-serializable form for the MCP tool."""
+        return {
+            "artist": self.artist,
+            "album": self.album,
+            "file_count": self.file_count,
+            "year_status": self.year_status,
+            "blank_originaldate": self.blank_originaldate,
+        }
+
+
+def list_albums(
+    settings: Settings,
+    *,
+    year_status: str | None = None,
+    actionable: bool = False,
+    limit: int | None = None,
+) -> list[AlbumRow]:
+    """Return each distinct album group with its file count + a representative status.
+
+    Groups in-scope files by ``(albumartist-else-artist, album)`` (the album identity) and
+    reports the derived year status of the group's first file plus ``blank_originaldate``,
+    the count of the group's files whose ``originaldate`` tag is empty. Those are the files
+    :func:`tagmend.engine.years.resolve_years` can fill, and ``> 0`` marks an actionable
+    group. A discovery aid for scoping ``resolve_years``. Read-only.
+
+    *year_status* (when given) keeps only groups whose derived status matches. *actionable*
+    keeps only the actionable groups, those with ``blank_originaldate > 0``. The two
+    compose, and both are applied AFTER ordering and BEFORE *limit*. *limit* (when given)
+    caps the number of rows returned so a large library stays context-cheap. Raises
+    :class:`ValueError` for a negative *limit*.
+    """
+    check_limit(limit)
+    connection = db.connect(settings.db_path)
+    try:
+        schema.apply_schema(connection)
+        groups: dict[tuple[str | None, str], list[int]] = {}
+        blanks: dict[tuple[str | None, str], int] = {}
+        for fid in store.files_in_scope(connection):
+            tags = store.get_tags(connection, fid)
+            identity = genres._identity(tags)  # noqa: SLF001
+            if identity.album is None:
+                continue
+            key = (identity.artist, identity.album)
+            groups.setdefault(key, []).append(fid)
+            if not tags.get(_YEAR_FIELD):
+                blanks[key] = blanks.get(key, 0) + 1
+
+        rows = [
+            AlbumRow(
+                artist=artist,
+                album=album,
+                file_count=len(fids),
+                year_status=store.derived_year_status(connection, fids[0]),
+                blank_originaldate=blanks.get((artist, album), 0),
+            )
+            for (artist, album), fids in groups.items()
+        ]
+    finally:
+        connection.close()
+
+    ordered = sorted(rows, key=lambda r: (r.artist or "", r.album))
+    if year_status is not None:
+        ordered = [row for row in ordered if row.year_status == year_status]
+    if actionable:
+        ordered = [row for row in ordered if row.blank_originaldate > 0]
+    if limit is not None:
+        ordered = ordered[:limit]
+    return ordered
 
 
 class ScanMode(StrEnum):

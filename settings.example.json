@@ -1,5 +1,4 @@
 {
-  "album_stage_limit": "300",
   "db_path": "",
   "genre_max_count": "4",
   "genre_min_weight": "2",
@@ -9,5 +8,6 @@
   "lastfm_rate_per_sec": "1.0",
   "music_path": "/path/to/your/music",
   "musicbrainz_contact": "https://github.com/Blakeem/music-tag-mender",
-  "musicbrainz_rate_per_sec": "1.0"
+  "musicbrainz_rate_per_sec": "1.0",
+  "year_stage_limit": "300"
 }

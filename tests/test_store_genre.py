@@ -815,25 +815,25 @@ def test_compute_stats_includes_year_block(db_conn: sqlite3.Connection) -> None:
     assert stats["year"] == store.year_status_counts(db_conn)
 
 
-# --- musicbrainz_cache --------------------------------------------------------------
+# --- musicbrainz_release_group_cache ------------------------------------------------
 
 
 def test_mb_cache_miss_returns_none(db_conn: sqlite3.Connection) -> None:
-    assert store.get_cached_mb_album(db_conn, "missing") is None
+    assert store.get_cached_mb_release_group(db_conn, "missing") is None
 
 
 def test_mb_cache_negative_round_trip(db_conn: sqlite3.Connection) -> None:
-    store.put_cached_mb_album(
+    store.put_cached_mb_release_group(
         db_conn,
         request_key="k",
         found=False,
         album_title=None,
         original_date=None,
         release_mbid=None,
-        release_group_id=None,
+        release_group_mbid=None,
         now=_NOW,
     )
-    cached = store.get_cached_mb_album(db_conn, "k")
+    cached = store.get_cached_mb_release_group(db_conn, "k")
     assert cached is not None
     found, row = cached
     assert found is False
@@ -841,24 +841,24 @@ def test_mb_cache_negative_round_trip(db_conn: sqlite3.Connection) -> None:
 
 
 def test_mb_cache_found_round_trip(db_conn: sqlite3.Connection) -> None:
-    store.put_cached_mb_album(
+    store.put_cached_mb_release_group(
         db_conn,
         request_key="k",
         found=True,
         album_title="Paranoid",
         original_date="1970",
         release_mbid="rel-1",
-        release_group_id="rg-1",
+        release_group_mbid="rg-1",
         now=_NOW,
     )
-    cached = store.get_cached_mb_album(db_conn, "k")
+    cached = store.get_cached_mb_release_group(db_conn, "k")
     assert cached is not None
     found, row = cached
     assert found is True
     assert row.album_title == "Paranoid"
     assert row.original_date == "1970"
     assert row.release_mbid == "rel-1"
-    assert row.release_group_id == "rg-1"
+    assert row.release_group_mbid == "rg-1"
 
 
 # --- voided_auto watermark (the NN7 re-pend primitive) ------------------------------

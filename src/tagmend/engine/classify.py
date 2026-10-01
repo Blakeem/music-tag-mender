@@ -11,20 +11,20 @@ genre names spelled against the bundled **MusicBrainz** vocabulary. It owns two 
   canonical name, drop sub-threshold weights, merge artist + album by *max* weight, order
   by weight desc then name asc, and optionally cap at ``genre_max_count``.
 
-The **fold-key** (``fold``) is a match/dedup key only; the **canonical spelling** (the
-vocabulary ``name``) is what gets written to files. Conflating the two is the main source
-of bugs — see spec §3.
+The **fold-key** (:func:`tagmend.engine.text_keys.alnum_key`) is a match/dedup key only. The
+**canonical spelling** (the vocabulary ``name``) is what gets written to files. Conflating
+the two is the main source of bugs (see spec §3).
 """
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from importlib import resources
 from typing import TYPE_CHECKING, Final
 
 import yaml
 
+from tagmend.engine.text_keys import alnum_key
 from tagmend.log import get_logger
 
 if TYPE_CHECKING:
@@ -40,17 +40,6 @@ _DATA_PACKAGE: Final = "tagmend"
 _VOCABULARY_RESOURCE: Final = "genre_vocabulary.yml"
 _OVERLAY_RESOURCE: Final = "genre_overlay.yml"
 
-_FOLD_STRIP: Final = re.compile(r"[^a-z0-9]+")
-
-
-def fold(s: str) -> str:
-    """Return the fold-key for *s*: lowercase, then strip everything non-``[a-z0-9]``.
-
-    The canonical definition from ``docs/genre-tagging-spec.md`` §3. Used only to compare
-    spelling/spacing/punctuation variants as equal — never written to disk.
-    """
-    return _FOLD_STRIP.sub("", s.lower())
-
 
 @dataclass(frozen=True, slots=True)
 class Vocabulary:
@@ -64,7 +53,7 @@ class Vocabulary:
 
     def match(self, tag_name: str) -> str | None:
         """Return the canonical genre name for *tag_name*, or ``None`` if not in vocab."""
-        return self.index.get(fold(tag_name))
+        return self.index.get(alnum_key(tag_name))
 
     def __len__(self) -> int:
         """Return the number of distinct fold-keys (matchable spellings) in the index."""
@@ -113,9 +102,9 @@ def _build_base_index(entries: Iterable[Mapping[str, object]]) -> dict[str, str]
         name = _entry_name(entry)
         if name is None:
             continue
-        _claim_or_raise(index, fold(name), name, label="name")
+        _claim_or_raise(index, alnum_key(name), name, label="name")
         for alias in _entry_aliases(entry):
-            key = fold(alias)
+            key = alnum_key(alias)
             if key in index and index[key] != name:
                 _claim_or_raise(index, key, name, label="alias", source=alias)
             index.setdefault(key, name)
@@ -158,7 +147,7 @@ def _merge_overlay(
         if name is None:
             continue
 
-        name_key = fold(name)
+        name_key = alnum_key(name)
         owner = index.get(name_key)
         if owner is not None and owner != name:
             logger.warning(
@@ -173,7 +162,7 @@ def _merge_overlay(
         canonical = owner if owner is not None else name
         index.setdefault(name_key, canonical)
         for alias in _entry_aliases(entry):
-            _merge_overlay_alias(index, fold(alias), alias, canonical)
+            _merge_overlay_alias(index, alnum_key(alias), alias, canonical)
 
 
 def _merge_overlay_alias(

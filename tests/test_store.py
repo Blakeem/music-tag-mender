@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from tagmend.engine import path_keys, store
+from tagmend.engine import db, path_keys, store
 from tagmend.engine.tags import MANAGED_SET_VERSION, TAG_READER_VERSION
 
 if TYPE_CHECKING:
@@ -16,6 +16,13 @@ if TYPE_CHECKING:
 
 _NOW = "2026-06-02T00:00:00+00:00"
 _LATER = "2026-06-02T01:00:00+00:00"
+
+
+def test_as_int_coerces_sqlite_scalars() -> None:
+    assert db.as_int(7) == 7
+    assert db.as_int("12") == 12
+    with pytest.raises(TypeError):
+        db.as_int(None)
 
 
 def _insert(  # noqa: PLR0913 - thin keyword-only wrapper mirroring insert_file
@@ -258,7 +265,7 @@ def _insert_revision(  # noqa: PLR0913 - thin keyword-only wrapper over insert_r
     origin: str = "manual",
     managed_tags: dict[str, list[str]] | None = None,
     diff: dict[str, dict[str, list[str]]] | None = None,
-    reverted_from: int | None = None,
+    reverted_to_version: int | None = None,
 ) -> None:
     store.insert_revision(
         conn,
@@ -268,7 +275,7 @@ def _insert_revision(  # noqa: PLR0913 - thin keyword-only wrapper over insert_r
         managed_tags={} if managed_tags is None else managed_tags,
         diff={} if diff is None else diff,
         now=_NOW,
-        reverted_from=reverted_from,
+        reverted_to_version=reverted_to_version,
     )
 
 
@@ -305,7 +312,7 @@ def test_insert_and_get_revision_round_trip(db_conn: sqlite3.Connection) -> None
     assert rev is not None
     assert rev.version == 0
     assert rev.origin == "scan"
-    assert rev.reverted_from is None
+    assert rev.reverted_to_version is None
     assert rev.commit_id is None
     assert rev.note is None
     # JSON columns come back as parsed, typed maps — not raw strings.
@@ -328,7 +335,7 @@ def test_revision_to_dict_keys(db_conn: sqlite3.Connection) -> None:
         "version",
         "created_at",
         "origin",
-        "reverted_from",
+        "reverted_to_version",
         "commit_id",
         "managed_tags",
         "diff",

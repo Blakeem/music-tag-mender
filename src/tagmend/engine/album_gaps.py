@@ -42,6 +42,7 @@ from typing import TYPE_CHECKING, Final
 from tagmend.engine import classify, db, genres, parsing, path_keys, schema, store
 from tagmend.engine.detector_core import group_by_folder
 from tagmend.engine.musicbrainz import MusicBrainzClient, MusicBrainzError
+from tagmend.engine.text_keys import alnum_key
 from tagmend.engine.validation import check_limit
 from tagmend.log import get_logger
 
@@ -244,7 +245,7 @@ def _sibling_reason(value: str, witnesses: int, vocab: Vocabulary) -> str | None
     """
     if _is_genre_like(value, vocab):
         return _REASON_GENRE_LIKE
-    if classify.fold(value) in _PLACEHOLDER_DENYLIST:
+    if alnum_key(value) in _PLACEHOLDER_DENYLIST:
         return _REASON_PLACEHOLDER
     if witnesses < _GREEN_MIN_WITNESSES:
         return _REASON_N1_WEAK

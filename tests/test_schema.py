@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import sqlite3
 import sys
 from typing import TYPE_CHECKING
@@ -10,7 +11,7 @@ import pytest
 
 from tagmend.engine import path_keys
 from tagmend.engine.schema import SCHEMA_VERSION, apply_append_only_triggers, apply_schema
-from tagmend.engine.tags import TAG_READER_VERSION
+from tagmend.engine.tags import MANAGED_SET_VERSION, TAG_READER_VERSION
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -25,7 +26,7 @@ def test_apply_schema_stamps_current_version(db_conn: sqlite3.Connection) -> Non
     # db_conn already applied the schema; the stamp must match the constant the code ships.
     version = db_conn.execute("PRAGMA user_version").fetchone()[0]
     assert version == SCHEMA_VERSION
-    assert SCHEMA_VERSION == 19
+    assert SCHEMA_VERSION == 20
 
 
 def test_apply_schema_creates_genre_tables(db_conn: sqlite3.Connection) -> None:
@@ -41,7 +42,7 @@ def test_apply_schema_creates_artist_status_table(db_conn: sqlite3.Connection) -
 def test_apply_schema_creates_year_tables(db_conn: sqlite3.Connection) -> None:
     tables = _table_names(db_conn)
     assert "file_year_status" in tables
-    assert "musicbrainz_cache" in tables
+    assert "musicbrainz_release_group_cache" in tables
 
 
 def test_apply_schema_creates_recording_cache_table(db_conn: sqlite3.Connection) -> None:
@@ -55,7 +56,7 @@ def test_musicbrainz_recording_cache_columns(db_conn: sqlite3.Connection) -> Non
     assert columns["request_key"] == ("TEXT", False, True)
     assert columns["found"] == ("INTEGER", True, False)
     assert columns["album_title"] == ("TEXT", False, False)
-    assert columns["release_group_id"] == ("TEXT", False, False)
+    assert columns["release_group_mbid"] == ("TEXT", False, False)
     assert columns["recording_mbid"] == ("TEXT", False, False)
     assert columns["fetched_at"] == ("TEXT", True, False)
 
@@ -138,7 +139,7 @@ def test_v10_ledger_gains_the_recording_cache_in_place() -> None:
         conn.execute("DROP TABLE musicbrainz_recording_cache")  # the v11-only table
         conn.execute(
             """
-            INSERT INTO musicbrainz_cache (request_key, found, fetched_at)
+            INSERT INTO musicbrainz_release_group_cache (request_key, found, fetched_at)
             VALUES ('k', 1, '2026-07-06T00:00:00+00:00')
             """,
         )
@@ -149,7 +150,7 @@ def test_v10_ledger_gains_the_recording_cache_in_place() -> None:
         assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
         assert "musicbrainz_recording_cache" in _table_names(conn)
         # Pre-existing data survives the additive upgrade.
-        kept = conn.execute("SELECT COUNT(*) FROM musicbrainz_cache").fetchone()[0]
+        kept = conn.execute("SELECT COUNT(*) FROM musicbrainz_release_group_cache").fetchone()[0]
         assert kept == 1
     finally:
         conn.close()
@@ -193,18 +194,36 @@ def test_v11_ledger_upgrades_to_v12_in_place() -> None:
 def _downgrade_to_v12(conn: sqlite3.Connection) -> None:
     """Turn a freshly-applied ledger back into a v12 one (no ``managed_set`` column)."""
     conn.execute("PRAGMA user_version = 12")
+    # A real v12 ledger has no trigger, and SQLite refuses to drop a column a trigger names.
+    conn.execute("DROP TRIGGER tag_revisions_managed_set_required")
     conn.execute("ALTER TABLE tag_revisions DROP COLUMN managed_set")
 
 
 def _insert_revision_row(
-    conn: sqlite3.Connection, file_id: int, version: int, created_at: str
+    conn: sqlite3.Connection,
+    file_id: int,
+    version: int,
+    created_at: str,
+    *,
+    managed_set: int | None = None,
 ) -> None:
+    if managed_set is None:
+        conn.execute(
+            """
+            INSERT INTO tag_revisions (file_id, version, created_at, origin, managed_tags, diff)
+            VALUES (?, ?, ?, 'manual', '{}', '{}')
+            """,
+            (file_id, version, created_at),
+        )
+        return
     conn.execute(
         """
-        INSERT INTO tag_revisions (file_id, version, created_at, origin, managed_tags, diff)
-        VALUES (?, ?, ?, 'manual', '{}', '{}')
+        INSERT INTO tag_revisions (
+            file_id, version, created_at, origin, managed_tags, diff, managed_set
+        )
+        VALUES (?, ?, ?, 'manual', '{}', '{}', ?)
         """,
-        (file_id, version, created_at),
+        (file_id, version, created_at, managed_set),
     )
 
 
@@ -388,7 +407,9 @@ def _insert_path_revision_row(conn: sqlite3.Connection, file_id: int) -> None:
 
 def test_tag_revisions_reject_update_and_delete(db_conn: sqlite3.Connection) -> None:
     file_id = _insert_file(db_conn)
-    _insert_revision_row(db_conn, file_id, 0, "2026-06-08T00:00:00+00:00")
+    _insert_revision_row(
+        db_conn, file_id, 0, "2026-06-08T00:00:00+00:00", managed_set=MANAGED_SET_VERSION
+    )
 
     with pytest.raises(sqlite3.IntegrityError, match="append-only"):
         db_conn.execute("UPDATE tag_revisions SET note = 'rewritten'")
@@ -438,7 +459,9 @@ def test_v16_ledger_gains_the_triggers_and_indexes_in_place() -> None:
         for index in _COMMIT_ID_INDEXES:
             conn.execute(f"DROP INDEX {index}")
         conn.execute("PRAGMA user_version = 16")
-        _insert_revision_row(conn, file_id, 0, "2026-06-08T00:00:00+00:00")
+        _insert_revision_row(
+            conn, file_id, 0, "2026-06-08T00:00:00+00:00", managed_set=MANAGED_SET_VERSION
+        )
         conn.commit()
 
         apply_schema(conn)  # the in-place upgrade
@@ -592,11 +615,11 @@ def _insert_commit_revision(
     conn.execute(
         """
         INSERT INTO tag_revisions (
-            file_id, version, created_at, origin, commit_id, managed_tags, diff
+            file_id, version, created_at, origin, commit_id, managed_tags, diff, managed_set
         )
-        VALUES (?, ?, '2026-08-01T00:00:00+00:00', ?, ?, '{}', '{}')
+        VALUES (?, ?, '2026-08-01T00:00:00+00:00', ?, ?, '{}', '{}', ?)
         """,
-        (file_id, version, origin, commit_id),
+        (file_id, version, origin, commit_id, MANAGED_SET_VERSION),
     )
 
 
@@ -632,6 +655,233 @@ def test_migrate_commit_origin_restamps_all_auto_commits() -> None:
             revert: "revert",
         }
         assert conn.execute("SELECT COUNT(*) FROM tag_revisions").fetchone()[0] == 6
+    finally:
+        conn.close()
+
+
+_PREVIOUS_VERSION = SCHEMA_VERSION - 1
+
+
+def _columns(conn: sqlite3.Connection, table: str) -> list[str]:
+    return [str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})")]
+
+
+def test_reverted_from_column_is_renamed_in_place() -> None:
+    conn = sqlite3.connect(":memory:")
+    try:
+        apply_schema(conn)
+        file_id = _insert_file(conn)
+        conn.execute("ALTER TABLE tag_revisions RENAME COLUMN reverted_to_version TO reverted_from")
+        conn.execute(f"PRAGMA user_version = {_PREVIOUS_VERSION}")
+        conn.execute(
+            """
+            INSERT INTO tag_revisions (
+                file_id, version, created_at, origin, reverted_from, managed_tags, diff,
+                managed_set
+            )
+            VALUES (?, 1, '2026-08-01T00:00:00+00:00', 'revert', 0, '{}', '{}', ?)
+            """,
+            (file_id, MANAGED_SET_VERSION),
+        )
+        conn.commit()
+
+        apply_schema(conn)  # the in-place upgrade
+
+        columns = _columns(conn, "tag_revisions")
+        assert "reverted_to_version" in columns
+        assert "reverted_from" not in columns
+        kept = conn.execute("SELECT reverted_to_version FROM tag_revisions").fetchone()[0]
+        assert kept == 0
+    finally:
+        conn.close()
+
+
+def test_musicbrainz_cache_is_renamed_in_place() -> None:
+    conn = sqlite3.connect(":memory:")
+    try:
+        apply_schema(conn)
+        conn.execute("ALTER TABLE musicbrainz_release_group_cache RENAME TO musicbrainz_cache")
+        conn.execute(f"PRAGMA user_version = {_PREVIOUS_VERSION}")
+        conn.execute(
+            """
+            INSERT INTO musicbrainz_cache (request_key, found, fetched_at)
+            VALUES ('release-group k', 1, '2026-07-06T00:00:00+00:00')
+            """,
+        )
+        conn.commit()
+
+        apply_schema(conn)  # the in-place upgrade
+
+        tables = _table_names(conn)
+        assert "musicbrainz_cache" not in tables
+        kept = conn.execute(
+            "SELECT request_key FROM musicbrainz_release_group_cache",
+        ).fetchall()
+        assert kept == [("release-group k",)]
+    finally:
+        conn.close()
+
+
+def test_release_group_id_columns_are_renamed_in_place() -> None:
+    # The previous shape names the release-group cache musicbrainz_cache, and both caches
+    # carry release_group_id.
+    conn = sqlite3.connect(":memory:")
+    try:
+        apply_schema(conn)
+        conn.execute("ALTER TABLE musicbrainz_release_group_cache RENAME TO musicbrainz_cache")
+        for table in ("musicbrainz_cache", "musicbrainz_recording_cache"):
+            conn.execute(
+                f"ALTER TABLE {table} RENAME COLUMN release_group_mbid TO release_group_id",
+            )
+            conn.execute(
+                f"INSERT INTO {table} (request_key, found, release_group_id, fetched_at) "  # noqa: S608
+                "VALUES ('k', 1, 'rg-1', '2026-07-06T00:00:00+00:00')",
+            )
+        conn.execute(f"PRAGMA user_version = {_PREVIOUS_VERSION}")
+        conn.commit()
+
+        apply_schema(conn)  # the in-place upgrade
+
+        for table in ("musicbrainz_release_group_cache", "musicbrainz_recording_cache"):
+            assert "release_group_id" not in _columns(conn, table)
+            kept = conn.execute(f"SELECT release_group_mbid FROM {table}").fetchone()[0]  # noqa: S608
+            assert kept == "rg-1"
+    finally:
+        conn.close()
+
+
+def test_files_status_column_is_dropped_in_place() -> None:
+    conn = sqlite3.connect(":memory:")
+    try:
+        apply_schema(conn)
+        file_id = _insert_file(conn)
+        conn.execute("ALTER TABLE files ADD COLUMN status TEXT NOT NULL DEFAULT 'scanned'")
+        conn.execute(f"PRAGMA user_version = {_PREVIOUS_VERSION}")
+        conn.commit()
+
+        apply_schema(conn)  # the in-place upgrade
+
+        assert "status" not in _files_columns(conn)
+        row = conn.execute(
+            "SELECT id, folder, filename FROM files WHERE id = ?",
+            (file_id,),
+        ).fetchone()
+        assert row == (file_id, "/lib", "a.mp3")
+    finally:
+        conn.close()
+
+
+def test_fresh_ledger_has_no_files_status(db_conn: sqlite3.Connection) -> None:
+    assert "status" not in _files_columns(db_conn)
+
+
+def _correction_key(artist: str) -> str:
+    payload = f"artist.getcorrection\x00artist={artist}"
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()  # noqa: S324 - cache key
+
+
+def _build_previous_lastfm_cache(conn: sqlite3.Connection) -> None:
+    """A previous-version ledger: one Daft Punk file, its correction row and a top-tags row."""
+    apply_schema(conn)
+    file_id = _insert_file(conn)
+    conn.execute("DROP TABLE lastfm_correction_cache")
+    conn.execute(
+        "INSERT INTO file_tags (file_id, name, ordinal, value) VALUES (?, 'artist', 0, ?)",
+        (file_id, "Daft Punk"),
+    )
+    conn.executemany(
+        """
+        INSERT INTO lastfm_cache (request_key, found, tags, fetched_at)
+        VALUES (?, 1, ?, '2026-07-06T00:00:00+00:00')
+        """,
+        [
+            (_correction_key("Daft Punk"), '[["Daft Punk",0],["mbid-1",0]]'),
+            ("top-tags-key", '[["electronic",100]]'),
+        ],
+    )
+    conn.execute(f"PRAGMA user_version = {_PREVIOUS_VERSION}")
+    conn.commit()
+
+
+def _lastfm_rows(conn: sqlite3.Connection) -> tuple[list[tuple[object, ...]], ...]:
+    corrections = conn.execute(
+        "SELECT request_key, found, name, mbid FROM lastfm_correction_cache",
+    ).fetchall()
+    top_tags = conn.execute("SELECT request_key, tags FROM lastfm_cache").fetchall()
+    return corrections, top_tags
+
+
+def test_correction_rows_move_out_of_lastfm_cache_in_place() -> None:
+    conn = sqlite3.connect(":memory:")
+    try:
+        _build_previous_lastfm_cache(conn)
+
+        apply_schema(conn)  # the in-place upgrade
+
+        corrections, top_tags = _lastfm_rows(conn)
+        assert corrections == [(_correction_key("Daft Punk"), 1, "Daft Punk", "mbid-1")]
+        assert top_tags == [("top-tags-key", '[["electronic",100]]')]
+    finally:
+        conn.close()
+
+
+def test_correction_migration_is_idempotent() -> None:
+    conn = sqlite3.connect(":memory:")
+    try:
+        _build_previous_lastfm_cache(conn)
+        apply_schema(conn)
+        upgraded = _lastfm_rows(conn)
+
+        conn.execute(f"PRAGMA user_version = {_PREVIOUS_VERSION}")
+        apply_schema(conn)  # the migration finds its table and moves nothing
+
+        assert _lastfm_rows(conn) == upgraded
+    finally:
+        conn.close()
+
+
+def test_revision_insert_without_managed_set_is_refused(db_conn: sqlite3.Connection) -> None:
+    file_id = _insert_file(db_conn)
+
+    with pytest.raises(sqlite3.IntegrityError, match="managed_set is required"):
+        _insert_revision_row(db_conn, file_id, 0, "2026-06-08T00:00:00+00:00")
+
+
+def test_previous_ledger_gains_the_managed_set_trigger() -> None:
+    conn = sqlite3.connect(":memory:")
+    try:
+        apply_schema(conn)
+        file_id = _insert_file(conn)
+        conn.execute("DROP TRIGGER tag_revisions_managed_set_required")
+        conn.execute(f"PRAGMA user_version = {_PREVIOUS_VERSION}")
+        _insert_revision_row(
+            conn, file_id, 0, "2026-06-08T00:00:00+00:00", managed_set=MANAGED_SET_VERSION
+        )
+        conn.commit()
+
+        apply_schema(conn)  # the in-place upgrade
+
+        assert "tag_revisions_managed_set_required" in _schema_objects(conn, "trigger")
+        kept = conn.execute("SELECT file_id, version, managed_set FROM tag_revisions").fetchall()
+        assert kept == [(file_id, 0, MANAGED_SET_VERSION)]
+    finally:
+        conn.close()
+
+
+def test_upgrade_refuses_a_null_managed_set() -> None:
+    conn = sqlite3.connect(":memory:")
+    try:
+        apply_schema(conn)
+        file_id = _insert_file(conn)
+        conn.execute("DROP TRIGGER tag_revisions_managed_set_required")
+        conn.execute(f"PRAGMA user_version = {_PREVIOUS_VERSION}")
+        _insert_revision_row(conn, file_id, 0, "2026-06-08T00:00:00+00:00")
+        conn.commit()
+
+        with pytest.raises(RuntimeError, match=rf"1 tag_revisions row.*\({file_id}, 0\)"):
+            apply_schema(conn)
+
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == _PREVIOUS_VERSION
     finally:
         conn.close()
 

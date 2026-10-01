@@ -675,38 +675,8 @@ def test_revert_restores_original_genre(
     assert read_tags(track).tags["genre"] == _EXPECTED_DAFT_PUNK
 
     # Revert to the version-0 baseline restores the original genre.
-    versioning.revert(engine_settings, file_id, 0)
+    versioning.revert_tags(engine_settings, file_id, 0)
     assert read_tags(track).tags["genre"] == ["Old"]
-
-
-# --- list_artists --------------------------------------------------------------------
-
-
-def test_list_artists_reports_distinct_values_with_counts(
-    engine_settings: Settings,
-    music_dir: Path,
-) -> None:
-    make_track(music_dir / "a.mp3", {"artist": ["Daft Punk"]})
-    make_track(music_dir / "b.flac", {"artist": ["Daft Punk"]})
-    make_track(music_dir / "c.m4a", {"artist": ["Justice"]})
-    scan_library(engine_settings)
-
-    rows = genres.list_artists(engine_settings)
-    counts = {row.artist: row.file_count for row in rows}
-    assert counts == {"Daft Punk": 2, "Justice": 1}
-
-
-def test_list_artists_limit_caps_rows_after_ordering(
-    engine_settings: Settings,
-    music_dir: Path,
-) -> None:
-    make_track(music_dir / "a.mp3", {"artist": ["Alpha"]})
-    make_track(music_dir / "b.mp3", {"artist": ["Bravo"]})
-    make_track(music_dir / "c.mp3", {"artist": ["Charlie"]})
-    scan_library(engine_settings)
-
-    rows = genres.list_artists(engine_settings, limit=2)
-    assert [row.artist for row in rows] == ["Alpha", "Bravo"]
 
 
 # --- genre-status visibility: end-to-end coherence -----------------------------------

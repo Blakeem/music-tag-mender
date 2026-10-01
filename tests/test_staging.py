@@ -129,7 +129,7 @@ def test_list_staged_tags_under_filters_by_folder(db_conn: sqlite3.Connection) -
 def test_commit_lifecycle(db_conn: sqlite3.Connection) -> None:
     commit_id = commits.create_commit(db_conn, origin="manual", message="msg", now=_NOW)
 
-    commit = commits.get_commit(db_conn, commit_id)
+    commit = commits.get_commit_in(db_conn, commit_id)
     assert commit is not None
     assert commit.status == "applying"
     assert commit.message == "msg"
@@ -137,14 +137,14 @@ def test_commit_lifecycle(db_conn: sqlite3.Connection) -> None:
 
     commits.set_commit_status(db_conn, commit_id, "applied")
 
-    assert commits.get_commit(db_conn, commit_id).status == "applied"  # type: ignore[union-attr]
+    assert commits.get_commit_in(db_conn, commit_id).status == "applied"  # type: ignore[union-attr]
     assert commits.get_applying_commits(db_conn) == []  # no longer interrupted
 
 
 def test_commit_to_dict_keys(db_conn: sqlite3.Connection) -> None:
     commit_id = commits.create_commit(db_conn, origin="manual", message="msg", now=_NOW)
 
-    commit = commits.get_commit(db_conn, commit_id)
+    commit = commits.get_commit_in(db_conn, commit_id)
 
     assert commit is not None
     payload = commit.to_dict()
@@ -174,8 +174,8 @@ def test_mark_interrupted_flips_lingering_applying(db_conn: sqlite3.Connection) 
     flipped = commits.mark_interrupted(db_conn)
 
     assert flipped == 1  # only the lingering 'applying' row
-    assert commits.get_commit(db_conn, lingering).status == "interrupted"  # type: ignore[union-attr]
-    assert commits.get_commit(db_conn, applied).status == "applied"  # type: ignore[union-attr]
+    assert commits.get_commit_in(db_conn, lingering).status == "interrupted"  # type: ignore[union-attr]
+    assert commits.get_commit_in(db_conn, applied).status == "applied"  # type: ignore[union-attr]
     assert commits.get_applying_commits(db_conn) == []
 
 
@@ -184,8 +184,8 @@ def test_list_commits_newest_first_with_limit(db_conn: sqlite3.Connection) -> No
     second = commits.create_commit(db_conn, origin="manual", message="2", now=_LATER)
     third = commits.create_commit(db_conn, origin="manual", message="3", now=_LATER)
 
-    assert [c.id for c in commits.list_commits(db_conn)] == [third, second, first]
-    assert [c.id for c in commits.list_commits(db_conn, limit=2)] == [third, second]
+    assert [c.id for c in commits.list_commits_in(db_conn)] == [third, second, first]
+    assert [c.id for c in commits.list_commits_in(db_conn, limit=2)] == [third, second]
 
 
 # --- append_revision threads commit_id (versioning unchanged) ----------------------

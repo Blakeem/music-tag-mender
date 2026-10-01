@@ -13,13 +13,14 @@ reissue *release* ``date`` (the edition year). One endpoint is used:
   ``(artist, title)`` → album lookup feeding ``detect_album_gaps``' recording tier. Ranked
   candidate recordings; we keep only the highest-scoring recording that has a release whose
   release group is a usable Album (same ``primary-type``/secondary-type gate) and return that
-  release group's title (+ recording MBID + release-group id).
+  release group's title (+ recording MBID + release-group MBID).
 
-Each release-group lookup's parsed result is cached persistently in ``musicbrainz_cache`` and
-each recording lookup's in ``musicbrainz_recording_cache`` so every unique album/recording is
-queried at most once. Both cache keys carry a selection-rule version, so tightening those
-rules re-fetches instead of replaying a pick made under the old ones. A no-match (no
-usable Album release group) is negative-cached too.
+Each release-group lookup's parsed result is cached persistently in
+``musicbrainz_release_group_cache`` and each recording lookup's in
+``musicbrainz_recording_cache`` so every unique album/recording is queried at most once. Both
+cache keys carry a selection-rule version, so tightening those rules re-fetches instead of
+replaying a pick made under the old ones. A no-match (no usable Album release group) is
+negative-cached too.
 Transient/HTTP failures raise :class:`MusicBrainzError` and are **never** cached, so a re-run
 retries them (the caller leaves the group pending, like the genre path).
 
@@ -35,24 +36,23 @@ import hashlib
 import json
 import re
 import time
-import unicodedata
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Final, Protocol, Self, cast
 
 import httpx
 
-from tagmend.engine.classify import fold
 from tagmend.engine.store import (
-    get_cached_mb_album,
     get_cached_mb_artist,
     get_cached_mb_recording,
     get_cached_mb_release,
-    put_cached_mb_album,
+    get_cached_mb_release_group,
     put_cached_mb_artist,
     put_cached_mb_recording,
     put_cached_mb_release,
+    put_cached_mb_release_group,
 )
+from tagmend.engine.text_keys import title_key
 from tagmend.log import get_logger
 
 if TYPE_CHECKING:
@@ -120,12 +120,12 @@ _THROTTLE_BACKOFF_SECONDS: Final = 1.0
 
 
 @dataclass(frozen=True, slots=True)
-class MBAlbum:
+class MBReleaseGroup:
     """A MusicBrainz release group's original-year resolution for the year axis."""
 
     album_title: str
     original_date: str
-    release_group_id: str
+    release_group_mbid: str
     release_mbid: str | None
 
 
@@ -134,11 +134,11 @@ class MBRecording:
     """A MusicBrainz recording's resolved album for the review-only album-gaps tier.
 
     ``album_title`` is the release group's title (the proposed ``album`` fill);
-    ``release_group_id`` and ``recording_mbid`` are carried for provenance/audit.
+    ``release_group_mbid`` and ``recording_mbid`` are carried for provenance/audit.
     """
 
     album_title: str
-    release_group_id: str
+    release_group_mbid: str
     recording_mbid: str | None
 
 
@@ -233,24 +233,24 @@ class MusicBrainzError(RuntimeError):
     """
 
 
-class MBAlbumSource(Protocol):
-    """The album lookup the orchestrator depends on (so it can use a fake in tests).
+class MBReleaseGroupSource(Protocol):
+    """The release-group lookup the orchestrator depends on (so it can use a fake in tests).
 
-    Returns an :class:`MBAlbum` when a usable Album release group is found, or ``None`` when
+    Returns an :class:`MBReleaseGroup` when a usable Album release group is found, or ``None`` when
     nothing usable exists (genuinely no first-release year for the year axis to fill).
     """
 
-    def album_first_release(self, artist: str, album: str) -> MBAlbum | None:
+    def album_first_release(self, artist: str, album: str) -> MBReleaseGroup | None:
         """Return the album's original first-release resolution, or ``None`` if none usable."""
 
 
 class MBRecordingSource(Protocol):
     """The recording lookup the album-gaps detector depends on (so it can use a fake in tests).
 
-    Deliberately separate from :class:`MBAlbumSource`: an ``album_first_release``-only fake
-    stays a valid ``MBAlbumSource`` without gaining a ``recording_search`` obligation. Returns
-    an :class:`MBRecording` when a usable Album release group is found for the recording, or
-    ``None`` when nothing usable exists.
+    Deliberately separate from :class:`MBReleaseGroupSource`: an ``album_first_release``-only
+    fake stays a valid ``MBReleaseGroupSource`` without gaining a ``recording_search``
+    obligation. Returns an :class:`MBRecording` when a usable Album release group is found for
+    the recording, or ``None`` when nothing usable exists.
     """
 
     def recording_search(self, artist: str, title: str) -> MBRecording | None:
@@ -278,7 +278,7 @@ class MBReleaseSource(Protocol):
 class MusicBrainzClient:
     """Cached, paced MusicBrainz client for the album + recording endpoints.
 
-    Implements both :class:`MBAlbumSource` (release-group year lookups) and
+    Implements both :class:`MBReleaseGroupSource` (release-group year lookups) and
     :class:`MBRecordingSource` (``(artist, title)`` → album, the album-gaps review tier).
 
     Owns one :class:`httpx.Client` for its lifetime via the context-manager protocol; use it
@@ -335,7 +335,7 @@ class MusicBrainzClient:
 
     # --- public API ------------------------------------------------------------------
 
-    def album_first_release(self, artist: str, album: str) -> MBAlbum | None:
+    def album_first_release(self, artist: str, album: str) -> MBReleaseGroup | None:
         """Return *album* by *artist*'s original first-release resolution, or ``None``.
 
         Cache first (positive or negative), else one paced network query. Raises
@@ -343,15 +343,15 @@ class MusicBrainzClient:
         """
         request_key = _request_key(artist, album)
 
-        cached = get_cached_mb_album(self._conn, request_key)
+        cached = get_cached_mb_release_group(self._conn, request_key)
         if cached is not None:
             found, row = cached
             if not found or row.original_date is None or row.album_title is None:
                 return None
-            return MBAlbum(
+            return MBReleaseGroup(
                 album_title=row.album_title,
                 original_date=row.original_date,
-                release_group_id=row.release_group_id or "",
+                release_group_mbid=row.release_group_mbid or "",
                 release_mbid=row.release_mbid,
             )
 
@@ -373,7 +373,7 @@ class MusicBrainzClient:
                 return None
             return MBRecording(
                 album_title=row.album_title,
-                release_group_id=row.release_group_id or "",
+                release_group_mbid=row.release_group_mbid or "",
                 recording_mbid=row.recording_mbid,
             )
 
@@ -424,7 +424,7 @@ class MusicBrainzClient:
 
     # --- internals -------------------------------------------------------------------
 
-    def _fetch_and_cache(self, artist: str, album: str, request_key: str) -> MBAlbum | None:
+    def _fetch_and_cache(self, artist: str, album: str, request_key: str) -> MBReleaseGroup | None:
         """Fetch one release-group query over the network (paced), then cache eagerly."""
         # Input: one paced network request.
         body = self._request(artist, album)
@@ -458,28 +458,28 @@ class MusicBrainzClient:
 
     def _store_negative(self, request_key: str) -> None:
         """Negative-cache a no-match and commit immediately."""
-        put_cached_mb_album(
+        put_cached_mb_release_group(
             self._conn,
             request_key=request_key,
             found=False,
             album_title=None,
             original_date=None,
             release_mbid=None,
-            release_group_id=None,
+            release_group_mbid=None,
             now=_utc_now(),
         )
         self._conn.commit()
 
-    def _store_positive(self, request_key: str, album: MBAlbum) -> None:
+    def _store_positive(self, request_key: str, album: MBReleaseGroup) -> None:
         """Positive-cache a resolved album and commit immediately."""
-        put_cached_mb_album(
+        put_cached_mb_release_group(
             self._conn,
             request_key=request_key,
             found=True,
             album_title=album.album_title,
             original_date=album.original_date,
             release_mbid=album.release_mbid,
-            release_group_id=album.release_group_id,
+            release_group_mbid=album.release_group_mbid,
             now=_utc_now(),
         )
         self._conn.commit()
@@ -528,7 +528,7 @@ class MusicBrainzClient:
             request_key=request_key,
             found=False,
             album_title=None,
-            release_group_id=None,
+            release_group_mbid=None,
             recording_mbid=None,
             now=_utc_now(),
         )
@@ -541,7 +541,7 @@ class MusicBrainzClient:
             request_key=request_key,
             found=True,
             album_title=recording.album_title,
-            release_group_id=recording.release_group_id,
+            release_group_mbid=recording.release_group_mbid,
             recording_mbid=recording.recording_mbid,
             now=_utc_now(),
         )
@@ -868,10 +868,10 @@ def _parse_release(mbid: str, body: dict[str, object]) -> MBRelease | None:
             ]
             media.append(
                 MBMedium(
-                    position=_as_int(raw_medium.get("position")),
+                    position=_int_or_zero(raw_medium.get("position")),
                     title=_as_str(raw_medium.get("title")),
                     format=_as_str(raw_medium.get("format")),
-                    track_count=_as_int(raw_medium.get("track-count")),
+                    track_count=_int_or_zero(raw_medium.get("track-count")),
                     tracks=tuple(tracks),
                 ),
             )
@@ -894,7 +894,7 @@ def _as_str(value: object) -> str:
     return value if isinstance(value, str) else ""
 
 
-def _as_int(value: object) -> int:
+def _int_or_zero(value: object) -> int:
     """Return *value* as an int, or 0 when it is absent or not an int."""
     return value if isinstance(value, int) else 0
 
@@ -981,7 +981,7 @@ def _escape(value: str) -> str:
     return value.replace("\\", "\\\\").replace('"', '\\"')
 
 
-def _select_album(body: dict[str, object], requested_album: str) -> MBAlbum | None:
+def _select_album(body: dict[str, object], requested_album: str) -> MBReleaseGroup | None:
     """Pick the best usable Album release group from a release-group query response.
 
     Keeps only ``primary-type == "Album"`` groups with no excluded secondary type, a title
@@ -993,7 +993,7 @@ def _select_album(body: dict[str, object], requested_album: str) -> MBAlbum | No
     if not isinstance(raw_groups, list):
         return None
 
-    best: MBAlbum | None = None
+    best: MBReleaseGroup | None = None
     best_score = -1
     for entry in raw_groups:
         candidate = _candidate(entry, requested_album)
@@ -1006,21 +1006,6 @@ def _select_album(body: dict[str, object], requested_album: str) -> MBAlbum | No
     return best
 
 
-def _loose_fold(value: str) -> str:
-    """Return an NFKC casefold key with whitespace removed, for titles :func:`fold` empties.
-
-    :func:`fold` strips everything outside ``[a-z0-9]``, so a title written wholly in a
-    non-Latin script or in symbols (``Спутник``, ``東京事変``, ``+``) folds to ``""`` and could
-    never match itself. This keeps those characters instead of dropping them.
-    """
-    return "".join(unicodedata.normalize("NFKC", value).casefold().split())
-
-
-def _title_key(title: str) -> str:
-    """Return *title*'s comparison key: its :func:`fold` key, or the loose one when empty."""
-    return fold(title) or _loose_fold(title)
-
-
 def _title_matches(requested_album: str, candidate_title: str) -> bool:
     """Return whether *candidate_title* can be the release group for *requested_album*.
 
@@ -1029,17 +1014,17 @@ def _title_matches(requested_album: str, candidate_title: str) -> bool:
     content the request lacks (``Replicas: The First Recordings`` for ``Replicas``) is a
     different album rather than an edition of the one asked for.
     """
-    requested_key = _title_key(requested_album)
-    candidate_key = _title_key(candidate_title)
+    requested_key = title_key(requested_album)
+    candidate_key = title_key(candidate_title)
     if not requested_key or not candidate_key:
         return False
     if requested_key == candidate_key:
         return True
-    return _title_key(_EDITION_SUFFIX.sub("", requested_album)) == candidate_key
+    return title_key(_EDITION_SUFFIX.sub("", requested_album)) == candidate_key
 
 
-def _candidate(entry: object, requested_album: str) -> tuple[int, MBAlbum] | None:
-    """Return ``(score, MBAlbum)`` for a usable Album release group matching the request."""
+def _candidate(entry: object, requested_album: str) -> tuple[int, MBReleaseGroup] | None:
+    """Return ``(score, MBReleaseGroup)`` for a usable Album release group matching the request."""
     if not isinstance(entry, dict):
         return None
     if entry.get("primary-type") != "Album":
@@ -1063,13 +1048,13 @@ def _candidate(entry: object, requested_album: str) -> tuple[int, MBAlbum] | Non
     score = raw_score if isinstance(raw_score, int) else 0
 
     rgid = entry.get("id")
-    release_group_id = rgid if isinstance(rgid, str) else ""
+    release_group_mbid = rgid if isinstance(rgid, str) else ""
     return (
         score,
-        MBAlbum(
+        MBReleaseGroup(
             album_title=title,
             original_date=original_date,
-            release_group_id=release_group_id,
+            release_group_mbid=release_group_mbid,
             release_mbid=_first_release_mbid(entry),
         ),
     )
@@ -1120,7 +1105,7 @@ def _recording_candidate(entry: object) -> tuple[int, MBRecording] | None:
     release_group = _usable_release_group(entry)
     if release_group is None:
         return None
-    title, release_group_id = release_group
+    title, release_group_mbid = release_group
 
     raw_score = entry.get("score")
     score = raw_score if isinstance(raw_score, int) else 0
@@ -1131,14 +1116,14 @@ def _recording_candidate(entry: object) -> tuple[int, MBRecording] | None:
         score,
         MBRecording(
             album_title=title,
-            release_group_id=release_group_id,
+            release_group_mbid=release_group_mbid,
             recording_mbid=recording_mbid,
         ),
     )
 
 
 def _usable_release_group(entry: dict[str, object]) -> tuple[str, str] | None:
-    """Return ``(title, release_group_id)`` for the first usable Album release, or ``None``.
+    """Return ``(title, release_group_mbid)`` for the first usable Album release, or ``None``.
 
     Scans the recording's ``releases``; a release's ``release-group`` qualifies when its
     ``primary-type == "Album"``, it carries no excluded secondary type, and it has a non-empty
@@ -1162,8 +1147,8 @@ def _usable_release_group(entry: dict[str, object]) -> tuple[str, str] | None:
         if not isinstance(title, str) or not title:
             continue
         rgid = group.get("id")
-        release_group_id = rgid if isinstance(rgid, str) else ""
-        return (title, release_group_id)
+        release_group_mbid = rgid if isinstance(rgid, str) else ""
+        return (title, release_group_mbid)
     return None
 
 

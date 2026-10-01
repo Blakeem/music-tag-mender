@@ -4,7 +4,7 @@ This module owns everything about a *commit* that does not depend on whether the
 is a tag edit or a future file move:
 
 * the ``commits`` table data access (``create_commit`` / ``set_commit_status`` /
-  ``get_commit`` / ``get_applying_commits`` / ``list_commits`` / ``mark_interrupted``);
+  ``get_commit_in`` / ``get_applying_commits`` / ``list_commits_in`` / ``mark_interrupted``);
 * the immutable result dataclasses a commit returns (:class:`CommitResult` and friends);
 * the :class:`RevisionDomain` seam plus the one shared :func:`run_commit` loop that
   carries the delicate disk-first / append-then-delete-in-one-tx crash invariant.
@@ -23,7 +23,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Final, Protocol, SupportsInt, cast
+from typing import TYPE_CHECKING, Final, Protocol
 
 from tagmend.engine import db, schema
 from tagmend.engine.validation import check_limit
@@ -36,11 +36,6 @@ if TYPE_CHECKING:
     from tagmend.config import Settings
 
 logger = get_logger(__name__)
-
-
-def _as_int(value: object) -> int:
-    """Coerce a sqlite-returned ``Any``/``object`` scalar to ``int`` for strict typing."""
-    return int(cast("SupportsInt", value))
 
 
 def _utc_now() -> str:
@@ -84,11 +79,11 @@ class Commit:
 def _row_to_commit(row: tuple[object, ...]) -> Commit:
     """Build a typed :class:`Commit` from a raw sqlite tuple."""
     return Commit(
-        id=_as_int(row[0]),
+        id=db.as_int(row[0]),
         created_at=str(row[1]),
         origin=str(row[2]),
         message=None if row[3] is None else str(row[3]),
-        reverted_from=None if row[4] is None else _as_int(row[4]),
+        reverted_from=None if row[4] is None else db.as_int(row[4]),
         status=str(row[5]),
     )
 
@@ -124,7 +119,7 @@ def set_commit_status(conn: sqlite3.Connection, commit_id: int, status: str) -> 
     conn.execute("UPDATE commits SET status = ? WHERE id = ?", (status, commit_id))
 
 
-def get_commit(conn: sqlite3.Connection, commit_id: int) -> Commit | None:
+def get_commit_in(conn: sqlite3.Connection, commit_id: int) -> Commit | None:
     """Return the commit with the given id, or ``None``."""
     cursor = conn.execute(
         f"SELECT {_COMMIT_COLUMNS} FROM commits WHERE id = ?",  # noqa: S608
@@ -142,7 +137,7 @@ def get_applying_commits(conn: sqlite3.Connection) -> list[Commit]:
     return [_row_to_commit(tuple(row)) for row in cursor.fetchall()]
 
 
-def list_commits(conn: sqlite3.Connection, *, limit: int | None = None) -> list[Commit]:
+def list_commits_in(conn: sqlite3.Connection, *, limit: int | None = None) -> list[Commit]:
     """Return commits newest first, optionally capped at *limit* rows."""
     sql = f"SELECT {_COMMIT_COLUMNS} FROM commits ORDER BY id DESC"  # noqa: S608
     cursor = conn.execute(sql) if limit is None else conn.execute(f"{sql} LIMIT ?", (limit,))
@@ -162,8 +157,8 @@ def mark_interrupted(conn: sqlite3.Connection) -> int:
     return cursor.rowcount
 
 
-def list_commits_for(settings: Settings, *, limit: int | None = None) -> list[Commit]:
-    """Conn-owning :func:`list_commits`: open the ledger and return commits. Read-only.
+def list_commits(settings: Settings, *, limit: int | None = None) -> list[Commit]:
+    """Conn-owning :func:`list_commits_in`: open the ledger and return commits. Read-only.
 
     Raises :class:`ValueError` for a negative *limit*.
     """
@@ -171,17 +166,17 @@ def list_commits_for(settings: Settings, *, limit: int | None = None) -> list[Co
     connection = db.connect(settings.db_path)
     try:
         schema.apply_schema(connection)
-        return list_commits(connection, limit=limit)
+        return list_commits_in(connection, limit=limit)
     finally:
         connection.close()
 
 
-def get_commit_for(settings: Settings, commit_id: int) -> Commit | None:
-    """Conn-owning :func:`get_commit`: open the ledger and return one commit. Read-only."""
+def get_commit(settings: Settings, commit_id: int) -> Commit | None:
+    """Conn-owning :func:`get_commit_in`: open the ledger and return one commit. Read-only."""
     connection = db.connect(settings.db_path)
     try:
         schema.apply_schema(connection)
-        return get_commit(connection, commit_id)
+        return get_commit_in(connection, commit_id)
     finally:
         connection.close()
 

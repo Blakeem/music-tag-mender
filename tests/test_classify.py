@@ -14,8 +14,9 @@ from pathlib import Path
 import pytest
 
 from tagmend.config import Settings
-from tagmend.engine.classify import Vocabulary, classify_genres, fold, load_vocabulary
+from tagmend.engine.classify import Vocabulary, classify_genres, load_vocabulary
 from tagmend.engine.lastfm import Tag
+from tagmend.engine.text_keys import alnum_key
 
 # A sane lower bound for the generated MusicBrainz vocabulary (about 2,156 genres, plus
 # aliases and the overlay). Keeps the assertion robust to refreshes that grow the list.
@@ -53,17 +54,6 @@ def _settings(*, min_weight: int = 2, max_count: int | None = None) -> Settings:
     )
 
 
-# --- fold ----------------------------------------------------------------------------
-
-
-def test_fold_strips_case_space_and_punctuation() -> None:
-    assert fold("Synth Pop") == "synthpop"
-    assert fold("synth-pop") == "synthpop"
-    assert fold("R&B") == "rb"
-    assert fold("rnb") == "rnb"  # does NOT fold to "rb" — that's why aliases exist
-    assert fold("8-Bit") == "8bit"
-
-
 # --- load_vocabulary (real bundled files) --------------------------------------------
 
 
@@ -98,7 +88,7 @@ def test_load_vocabulary_index_is_single_valued_and_large() -> None:
     assert len(vocab) > _MIN_GENRE_COUNT
     # Every fold-key maps to a value whose own fold matches the key's canonical (sanity).
     for key, name in vocab.index.items():
-        assert key == fold(key)  # keys are already folded
+        assert key == alnum_key(key)  # keys are already folded
         assert isinstance(name, str)
 
 

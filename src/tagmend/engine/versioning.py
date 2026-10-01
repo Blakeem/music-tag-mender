@@ -5,9 +5,9 @@ row to ``tag_revisions`` keyed ``(file_id, version)`` — version 0 is the origi
 as-found baseline, +1 per change — storing a FULL snapshot of the managed tags plus a
 human-readable diff. History is never mutated or deleted.
 
-**Revert is itself an append, not a pointer move.** ``revert(file, target)`` reads the
+**Revert is itself an append, not a pointer move.** ``revert_tags(file, target)`` reads the
 target revision's snapshot, writes it back to the file, refreshes the live ``file_tags``
-snapshot, and appends a *new* revision (``origin='revert'``, ``reverted_from=target``)
+snapshot, and appends a *new* revision (``origin='revert'``, ``reverted_to_version=target``)
 copying that state forward. So there is no mutable "current version" pointer: the
 current state is always ``MAX(version)`` and is already materialized in the live
 ``files``/``file_tags`` tables. Nothing is ever destroyed, you can revert a revert, and
@@ -19,7 +19,7 @@ files that are never edited get no revision rows, so the log stays proportional 
 
 Transaction ownership mirrors the rest of the engine: :func:`ensure_baseline`,
 :func:`append_revision`, and :func:`history` take an open connection and never commit
-(building blocks a future cascade can batch inside one transaction). :func:`revert`
+(building blocks a future cascade can batch inside one transaction). :func:`revert_tags`
 owns its own connection/commit — like :func:`tagmend.engine.library.scan_library` —
 because it pairs a disk write with DB writes as one atomic user-facing action.
 
@@ -229,7 +229,7 @@ def _revert_file(
     The shared per-file revert core (single-file revert = a group revert of one).
     Validates, writes the target snapshot to disk FIRST, refreshes the live
     ``file_tags`` snapshot from the re-read file, then appends a new
-    ``origin='revert'`` revision (``reverted_from=target_version``) under *commit_id*.
+    ``origin='revert'`` revision (``reverted_to_version=target_version``) under *commit_id*.
     Unlike :func:`append_revision`, a revert is **always** recorded even when the
     managed tags did not change — it is an explicit, audited action and is what makes
     "revert a revert" work. Returns ``(new version, changed)``, where *changed* is
@@ -286,7 +286,7 @@ def _revert_file(
         managed_tags=reverted_snapshot,
         diff=diff,
         now=now,
-        reverted_from=target_version,
+        reverted_to_version=target_version,
         commit_id=commit_id,
         note=note,
     )
@@ -319,7 +319,7 @@ class RevertResult:
         }
 
 
-def revert(
+def revert_tags(
     settings: Settings,
     file_id: int,
     version: int,
@@ -541,7 +541,7 @@ def revert_commit(
 ) -> RevertCommitResult:
     """Undo an entire commit as a unit: revert every file it changed to its pre-commit state.
 
-    The group counterpart of :func:`revert` (PLAN.md §7: "reverting a whole
+    The group counterpart of :func:`revert_tags` (PLAN.md §7: "reverting a whole
     ``commit_id`` undoes an entire run"). For each revision the target commit created,
     the file is restored to the snapshot just before it (``version - 1`` — the
     baseline when the commit created version 1), appended as a new revision under ONE
@@ -577,7 +577,7 @@ def revert_commit(
     try:
         schema.apply_schema(connection)
 
-        target = commits.get_commit(connection, commit_id)
+        target = commits.get_commit_in(connection, commit_id)
         if target is None:
             message = f"unknown commit_id={commit_id}"
             raise ValueError(message)
@@ -704,7 +704,7 @@ def history(conn: sqlite3.Connection, file_id: int) -> list[Revision]:
     return store.get_revisions(conn, file_id)
 
 
-def history_for(settings: Settings, file_id: int) -> list[Revision]:
+def history_tags(settings: Settings, file_id: int) -> list[Revision]:
     """Conn-owning :func:`history`: open the ledger and return *file_id*'s log. Read-only.
 
     Raises :class:`ValueError` for an unknown *file_id*, so a typo does not read as a file

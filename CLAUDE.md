@@ -91,7 +91,7 @@ checked even for a file carrying no track id. Track-level fields (`title`, `trac
 `discnumber`) need a matched track and are skipped without one. A blank field is a **fill**,
 not a disagreement: `flagged` counts only fields where the file says one thing and the release
 says another, while `fill_rows` collects what the release can supply for free.
-34 MCP tools total. Schema is **v19** (additive: v11 adds
+34 MCP tools total. Schema is **v20** (additive: v11 adds
 `musicbrainz_recording_cache`, v12 renames `file_album_status` → `file_year_status` in place —
 dispositions preserved; v13 adds `tag_revisions.managed_set`, stamping which managed-tag set
 governed each revision so a revert can restore emptiness on the widened fields; v14 adds
@@ -104,8 +104,11 @@ UNIQUE index. `path_keys.py` is the one place that decides when two paths name t
 every folder argument resolves through `path_keys.resolve_folder_arg` (`folder_arg_key` for its
 key). An older ledger upgrades in place, except that the v18 upgrade refuses one where two file
 rows share a path key and names them. v19 restamps a `manual` commit whose revisions are all `auto`
-as `auto`, since a commit's origin is now derived from the rows it sweeps. A newer ledger is
-refused). M6 organize/paths (`paths.py`)
+as `auto`, since a commit's origin is now derived from the rows it sweeps. v20 renames in place
+(`musicbrainz_cache` to `musicbrainz_release_group_cache`, `*_id` MBID columns to `*_mbid`,
+`tag_revisions.reverted_from` to `reverted_to_version`), gives `lastfm_correction_cache` typed
+columns, drops the unused `files.status`, and makes `tag_revisions.managed_set` required. A newer
+ledger is refused). M6 organize/paths (`paths.py`)
 is a paper sketch (its DDL ships in v6; logic deferred).
 
 **The canonical tag namespace is TagMend's, not mutagen's.** mutagen's "easy" layer is an
@@ -281,8 +284,9 @@ src/tagmend/
   mcp_server.py     FastMCP server (thin) — 34 tools
   engine/
     db.py           SQLite connection (WAL)
-    schema.py       all DDL + PRAGMA user_version (v19)
+    schema.py       all DDL + PRAGMA user_version (v20)
     path_keys.py    path identity keys, subtree key ranges, the folder-argument normalizer
+    text_keys.py    the shared text fold keys (alnum, display, artist name, loose, title)
     scan.py         filesystem discovery + signatures
     health.py       check_health / readiness + interrupted-commit report
     store.py        pure data access: files/file_tags + tag_revisions[_staged] + genre/artist status

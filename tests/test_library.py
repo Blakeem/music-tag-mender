@@ -14,12 +14,14 @@ import pytest
 
 from conftest import make_track
 from tagmend.config import Settings
-from tagmend.engine import artists, mismatch, staging, store, versioning
+from tagmend.engine import artists, mismatch, staging, store, versioning, years
 from tagmend.engine.db import connect
 from tagmend.engine.library import (
     ScanMode,
-    get_file_view,
+    get_file,
     get_library_stats,
+    list_albums,
+    list_artists,
     list_files,
     scan_library,
 )
@@ -192,16 +194,16 @@ def test_list_files_relative_path_resolves_under_music_path(
     assert [v.filename for v in views] == ["a.mp3"]
 
 
-def test_get_file_view(engine_settings: Settings, music_dir: Path) -> None:
+def test_get_file(engine_settings: Settings, music_dir: Path) -> None:
     track = _populate(music_dir, 1)[0]
     scan_library(engine_settings)
     file_id = _file_row(engine_settings, music_dir, track.name).id
 
-    view = get_file_view(engine_settings, file_id)
+    view = get_file(engine_settings, file_id)
     assert view is not None
     assert view.file_id == file_id
     assert view.managed_tags["genre"] == ["Synthwave"]
-    assert get_file_view(engine_settings, 9999) is None
+    assert get_file(engine_settings, 9999) is None
 
 
 def test_first_scan_adds_and_reads(engine_settings: Settings, music_dir: Path) -> None:
@@ -503,11 +505,11 @@ def test_case_only_folder_rename_keeps_the_id_and_history(
     assert result.respelled == 1
     assert result.missing_flagged == 0
     assert result.added == 0
-    view = get_file_view(engine_settings, file_id)
+    view = get_file(engine_settings, file_id)
     assert view is not None
     assert Path(view.folder).name == "ALBUM"
     assert view.is_missing is False
-    assert [r.version for r in versioning.history_for(engine_settings, file_id)] == [0, 1]
+    assert [r.version for r in versioning.history_tags(engine_settings, file_id)] == [0, 1]
 
 
 # --- genre_status filter + new FileView fields --------------------------------------
@@ -918,3 +920,141 @@ def test_get_library_stats_includes_mismatch_block(
     assert set(block) == store.MISMATCH_WORKFLOW_STATUSES
     assert block["misfiled_deferred"] == 1
     assert block["pending"] == _N - 1
+
+
+# --- list_artists --------------------------------------------------------------------
+
+
+def test_list_artists_reports_distinct_values_with_counts(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    make_track(music_dir / "a.mp3", {"artist": ["Daft Punk"]})
+    make_track(music_dir / "b.flac", {"artist": ["Daft Punk"]})
+    make_track(music_dir / "c.m4a", {"artist": ["Justice"]})
+    scan_library(engine_settings)
+
+    rows = list_artists(engine_settings)
+    counts = {row.artist: row.file_count for row in rows}
+    assert counts == {"Daft Punk": 2, "Justice": 1}
+
+
+def test_list_artists_limit_caps_rows_after_ordering(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    make_track(music_dir / "a.mp3", {"artist": ["Alpha"]})
+    make_track(music_dir / "b.mp3", {"artist": ["Bravo"]})
+    make_track(music_dir / "c.mp3", {"artist": ["Charlie"]})
+    scan_library(engine_settings)
+
+    rows = list_artists(engine_settings, limit=2)
+    assert [row.artist for row in rows] == ["Alpha", "Bravo"]
+
+
+# --- list_albums: blank_originaldate + limit + year_status/actionable filters -------
+
+
+def test_list_albums_reports_blank_originaldate_count(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    # Group with all files already carrying originaldate → 0 blanks.
+    make_track(
+        music_dir / "present.mp3",
+        {"artist": ["Rush"], "album": ["Moving Pictures"], "originaldate": ["1981"]},
+    )
+    # Group with some blanks → the exact blank count.
+    make_track(music_dir / "blank1.mp3", {"artist": ["Yes"], "album": ["Fragile"]})
+    make_track(
+        music_dir / "blank2.flac",
+        {"artist": ["Yes"], "album": ["Fragile"], "originaldate": ["1971"]},
+    )
+    scan_library(engine_settings)
+
+    rows = {row.album: row for row in list_albums(engine_settings)}
+    assert rows["Moving Pictures"].blank_originaldate == 0
+    assert rows["Fragile"].file_count == 2
+    assert rows["Fragile"].blank_originaldate == 1
+    # to_dict carries the new field.
+    assert rows["Fragile"].to_dict()["blank_originaldate"] == 1
+
+
+def test_list_albums_limit_caps_after_ordering(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    make_track(music_dir / "a.mp3", {"artist": ["Alpha"], "album": ["A1"]})
+    make_track(music_dir / "b.mp3", {"artist": ["Bravo"], "album": ["B1"]})
+    make_track(music_dir / "c.mp3", {"artist": ["Charlie"], "album": ["C1"]})
+    scan_library(engine_settings)
+
+    limited = list_albums(engine_settings, limit=2)
+    assert [row.artist for row in limited] == ["Alpha", "Bravo"]
+
+
+def test_list_albums_year_status_filter(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    track = make_track(music_dir / "a.mp3", {"artist": ["Alpha"], "album": ["A1"]})
+    make_track(music_dir / "b.mp3", {"artist": ["Bravo"], "album": ["B1"]})
+    scan_library(engine_settings)
+
+    file_id = _file_row(engine_settings, music_dir, track.name).id
+    years.set_year_status(engine_settings, file_ids=[file_id], status="manual")
+
+    manual = list_albums(engine_settings, year_status="manual")
+    assert [row.album for row in manual] == ["A1"]
+
+    pending = list_albums(engine_settings, year_status="pending")
+    assert [row.album for row in pending] == ["B1"]
+
+
+def test_list_albums_actionable_keeps_only_groups_with_blanks(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    make_track(
+        music_dir / "full.mp3",
+        {"artist": ["Rush"], "album": ["Moving Pictures"], "originaldate": ["1981"]},
+    )
+    make_track(music_dir / "blank.mp3", {"artist": ["Yes"], "album": ["Fragile"]})
+    scan_library(engine_settings)
+
+    rows = list_albums(engine_settings, actionable=True)
+    assert [row.album for row in rows] == ["Fragile"]
+    assert all(row.blank_originaldate > 0 for row in rows)
+    # Unfiltered, the fully-tagged group is still listed.
+    assert len(list_albums(engine_settings)) == 2
+
+
+def test_list_albums_actionable_composes_with_year_status_and_precedes_limit(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    # Alpha: blank but manual. Bravo: pending, no blanks. Charlie/Delta: pending + blank.
+    manual_track = make_track(music_dir / "a.mp3", {"artist": ["Alpha"], "album": ["A1"]})
+    make_track(
+        music_dir / "b.mp3",
+        {"artist": ["Bravo"], "album": ["B1"], "originaldate": ["1999"]},
+    )
+    make_track(music_dir / "c.mp3", {"artist": ["Charlie"], "album": ["C1"]})
+    make_track(music_dir / "d.mp3", {"artist": ["Delta"], "album": ["D1"]})
+    scan_library(engine_settings)
+
+    manual_id = _file_row(engine_settings, music_dir, manual_track.name).id
+    years.set_year_status(engine_settings, file_ids=[manual_id], status="manual")
+
+    both = list_albums(engine_settings, year_status="pending", actionable=True)
+    assert [row.album for row in both] == ["C1", "D1"]
+
+    # The filters run BEFORE limit: limit=1 keeps the first ACTIONABLE pending group,
+    # not the first pending group (B1, which has no blanks).
+    limited = list_albums(
+        engine_settings,
+        year_status="pending",
+        actionable=True,
+        limit=1,
+    )
+    assert [row.album for row in limited] == ["C1"]

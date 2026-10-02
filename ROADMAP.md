@@ -3,9 +3,10 @@
 Updated 2026-10-02. This file lists only the remaining work, in order. `CLAUDE.md` maps what
 shipped. `PLAN.md` holds the design.
 
-The final run on a fresh copy of `E:\Music` is done. The working copy (`music/`) holds 11,233
-files. Every audio payload matches `E:\Music`, and the mismatch gate is open. The file ids below
-name files in the fresh ledger.
+The final run on a fresh copy of `E:\Music` is done. The working copy (`music/`) holds 11,206
+files, since the owner removed 26 one-off files and one duplicate. Every audio payload matches
+`E:\Music`, and the mismatch gate is open. The file ids below name files in the fresh ledger. A
+file the owner moved by hand has a new id.
 
 ## 1. Owner questions
 
@@ -14,19 +15,15 @@ The owner decides each one. TagMend never deletes a file.
 - Duplicates. Pendulum "(2010) - Immersion" holds every track twice (files 6882 to 6896 and
   6897 to 6911). The remaining copy then takes a stamp onto release a8515645. Imperative
   Reaction "(1999)" and "(2006) Eulogy For The Sick Child" are the same 14 files. KMFDM 4732 is
-  a second "Love Is Like". VAST 10496 is a second "You". Velvet Acid Christ 10526 holds
-  the audio of Apoptygma Berzerk 437. Killswitch Engage 4674 holds the audio of 4687. Blue
+  a second "Love Is Like". Velvet Acid Christ 10526 holds the audio of Apoptygma Berzerk 437. Killswitch Engage 4674 holds the audio of 4687. Blue
   Stahli 1268 holds the audio of Celldweller 1637. Neon Hitch holds three single pairs (6171
   and 6181, 6174 and 6179, 6175 and 6180). The path planner holds the Pendulum, Imperative
-  Reaction, KMFDM, VAST and Velvet Acid Christ albums until the owner decides.
+  Reaction, KMFDM and Velvet Acid Christ albums until the owner decides.
 - Cue sheets. 86 files sit in folders whose cue sheet names the audio files, so a rename would
   break the cue. The folders are Beck "Morning Phase", Code 64 "Departure" and "Trialogue",
   Taylor Swift "1989" and "Best Of", and The Postal Service "2 Give Up_".
-- Long paths. 31 files render to a path over 259 characters. They are The Crow "City of
-  Angels", Hackers 2 and 3, one My Chemical Romance track and the two Tool root files.
-- Tool root files. Files 10267 "Them Bones" and 10268 "Man in the Box" sit in "Tool
-  [Discography]" but are credited to Alice in Chains feat. Maynard James Keenan (a 2005 live
-  concert).
+- Long paths. 29 files render to a path over 259 characters. They are The Crow "City of
+  Angels", Hackers 2 and 3, and one My Chemical Romance track.
 - Folder casing. 1,126 files sit in folders whose name differs from the render only in case,
   such as "ASURA" for the tag "Asura". TagMend keeps an existing folder's casing. A fix would
   rename through a temporary name, tracked like any move.
@@ -38,7 +35,7 @@ The owner decides each one. TagMend never deletes a file.
   version.
 - White Stripes file 10119 (Roskilde) is off its tagged release. It is a bootleg with no
   candidate release.
-- The Faint file 9663 moved to "Danse Macabre Remixes" as 11/11 "Let the Poison Spill
+- The Faint file 11246 sits in "Danse Macabre Remixes" as 11/11 "Let the Poison Spill
   (Remix)", with low confidence. Its 252 s audio matches no MusicBrainz recording. It needs a
   listening check.
 - Calyx file 1430 "Follow the Leader" is 282 s against the release's 385 s. It may be an edit or
@@ -53,11 +50,10 @@ The owner decides each one. TagMend never deletes a file.
   "B********", which would render the filename "B". The owner may revert it.
 - Neikka RPM "(2011) Chain Letters" carries the Last.fm genre "psytrance" on 22 files. A
   `deny:` rule in the genre overlay keeps a wrong genre off those files in the final run.
-- Curated folders such as Blue Stahli "Singles", Maphra "YouTube" and Scott Weiland "MP3" hold
-  mixed `date` values. Navidrome shows no album year when the tracks disagree.
-- Wrong credits. Stone Temple Pilots file 8759 "Cumbersome" is Seven Mary Three's song. Its
-  blank album holds it in the path planner. Tool "Unreleased" file 10322 is Joe Satriani's "Drum
-  Solo". File 10320 may be Pink Floyd's "Comfortably Numb" demo.
+- Curated folders such as Blue Stahli "Singles" and Maphra "YouTube" hold mixed `date` values.
+  Navidrome shows no album year when the tracks disagree.
+- Wrong credits. Tool "Unreleased" file 10322 is Joe Satriani's "Drum Solo". File 10320 may be
+  Pink Floyd's "Comfortably Numb" demo.
 - Extras off their release. Rank 1 file 7454 is an unidentified second "Cosmomatic". Skrillex "My
   Name Is Skrillex" holds 6 extras that carry the EP id but sit on no release. Neon Hitch file 6134
   carries the "301 to Paradise" release id, which does not list it. VNV Nation file 10668 is the
@@ -99,6 +95,9 @@ command mirrors its MCP name with `-` for `_`.
   `resolve_artists` writes the artist's canonical name. The value left on disk depends on which
   ran last. The fix candidate is a stamp that writes the canonical name of each credited artist
   id.
+- L21: no decision keeps a file name. The owner keeps the names of the two Alice in Chains covers
+  in "Tool\Other" (files 11251 and 11252), so a library-wide `stage_paths` stages a rename the
+  owner must unstage. The fix candidate is a keep that also holds the file names.
 - L20: TagLib reads an MP3's APEv2 tag before ID3v1, and `read_tags` does not model APEv2. The
   live library holds no MP3 this affects, since all 550 MP3s with an APEv2 tag also hold ID3v2
   frames. A write that creates the first ID3v2 frame also leaves the ID3v1 comment out of ID3v2,

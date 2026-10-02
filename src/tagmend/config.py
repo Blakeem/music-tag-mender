@@ -84,7 +84,7 @@ _YEAR_STAGE_LIMIT_DEFAULT: Final = 300
 # second, so a configured rate above it is clamped rather than trusted.
 _ACOUSTID_RATE_PER_SEC_DEFAULT: Final = 2.0
 _ACOUSTID_RATE_PER_SEC_MAX: Final = 3.0
-_SONG_STAGE_LIMIT_DEFAULT: Final = 25
+_SONG_STAGE_LIMIT_DEFAULT: Final = 150
 
 # Tokens (case-insensitive) that mean "no limit" for ``genre_max_count``.
 _NONE_TOKENS: Final[frozenset[str]] = frozenset({"", "0", "none", "null"})

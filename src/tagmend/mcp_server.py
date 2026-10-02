@@ -2098,9 +2098,9 @@ def resolve_songs(  # noqa: PLR0913 - cohesive scope, release path and run knobs
             required).
         assignments: A list of ``{"file_id": <int>, "release_track_mbid": <str>}`` objects.
             Accepted only with ``release_mbid``.
-        limit: Max cold folders this call (default ``song_stage_limit``). A cold folder needs
-            fpcalc or an AcoustID request. Warm folders always run, so ``limit=0`` costs no
-            request and no fpcalc run.
+        limit: Max cold folders this call (default ``song_stage_limit``, 150). A cold folder
+            needs fpcalc or an AcoustID request. Warm folders always run, so ``limit=0`` costs
+            no request and no fpcalc run.
         dry_run: Write the caches and nothing else. Per-file ``mappings`` appear when
             ``folder`` or ``file_ids`` scopes the call. A dry run skips the empty-staging
             precondition.

@@ -293,7 +293,7 @@ def test_song_settings_default_when_unset() -> None:
     assert settings.acoustid_api_key is None
     assert settings.fpcalc_path is None
     assert settings.acoustid_rate_per_sec == 2.0
-    assert settings.song_stage_limit == 25
+    assert settings.song_stage_limit == 150
 
 
 def test_acoustid_api_key_env_override_wins_over_the_file(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -319,7 +319,7 @@ def test_acoustid_rate_is_held_inside_the_published_limit(raw: str, expected: fl
     assert config.load_settings().acoustid_rate_per_sec == expected
 
 
-@pytest.mark.parametrize(("raw", "expected"), [("10", 10), ("0", 0), ("-3", 25), ("abc", 25)])
+@pytest.mark.parametrize(("raw", "expected"), [("10", 10), ("0", 0), ("-3", 150), ("abc", 150)])
 def test_song_stage_limit_is_coerced_like_the_other_limits(raw: str, expected: int) -> None:
     config.set_setting("song_stage_limit", raw)
     assert config.load_settings().song_stage_limit == expected

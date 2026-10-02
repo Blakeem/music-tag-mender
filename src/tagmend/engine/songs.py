@@ -7,8 +7,10 @@ its tags. One :func:`resolve_songs` call runs these stages, top to bottom:
    a selected folder votes, whatever its status, and only the pending in-scope files receive an
    outcome. A folder is cold when a voter needs fpcalc or an AcoustID request. ``limit`` counts
    cold folders only, and warm folders run on every call.
-2. Fingerprint stage. A ``fingerprint_cache`` row at the files-row signature, else fpcalc.
-3. Lookup stage. An ``acoustid_cache`` row, else one AcoustID request.
+2. Fingerprint stage. A ``fingerprint_cache`` row at the files-row signature, else fpcalc. The
+   call's fpcalc runs share one thread pool and finish before any folder is routed.
+3. Lookup stage. An ``acoustid_cache`` row, else one AcoustID request. The call's requests share
+   a second pool and its one paced client, after the fingerprint stage.
 4. Recording gate stage. Per voter, the dominant recordings its audio names, or no contribution.
 5. Stamp check stage. A gated pending voter whose tagged release its audio is absent from sends
    the folder to the rebind route.
@@ -33,9 +35,11 @@ their connection and commit. The building blocks in :mod:`tagmend.engine.store` 
 from __future__ import annotations
 
 import math
+import os
 import re
 from collections import Counter
-from contextlib import ExitStack
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from fractions import Fraction
@@ -79,7 +83,8 @@ from tagmend.log import get_logger
 
 if TYPE_CHECKING:
     import sqlite3
-    from collections.abc import Iterable, Sequence
+    from collections.abc import Iterable, Iterator, Sequence
+    from concurrent.futures import Future
 
     from tagmend.config import Settings
     from tagmend.engine.musicbrainz import MBMedium, MBRelease, MBReleaseSource, MBTrack
@@ -105,6 +110,10 @@ _LENGTH_GUARD_SECONDS: Final = 10
 # A folder converges only when 3 voters in 5, and at least 3 (all of a smaller folder), agree.
 _FLOOR_SHARE: Final = Fraction(3, 5)
 _FLOOR_VOTERS: Final = 3
+
+# A live run with these pool sizes behind the one paced client measured no AcoustID errors.
+_FPCALC_WORKERS_MAX: Final = 8
+_LOOKUP_WORKERS: Final = 5
 
 # The confirm fetch stage stops after this many release lookups per folder.
 _CONFIRM_FETCHES: Final = 3
@@ -620,32 +629,102 @@ def _cached_evidence(
     return _Evidence(duration=stored.fingerprint.duration, result=cached)
 
 
-def _fresh_evidence(
+def _prefetch(
     conn: sqlite3.Connection,
-    row: store.FileRow,
+    rows: Sequence[store.FileRow],
     lookups: _Lookups,
     now: datetime,
-) -> _Evidence:
-    """Return *row*'s evidence, running fpcalc only on a signature miss.
+) -> dict[int, _Evidence]:
+    """Return every row's evidence, running its cold fpcalc runs, then its lookups, in parallel.
 
-    A lookup re-query reuses the stored fingerprint. Every cache write commits at once, so a
-    failure later in the call never loses it.
+    fpcalc runs only on a signature miss, and a lookup re-query reuses the stored fingerprint.
+    Workers only compute. Every cache read and write stays on *conn*, so SQLite sees one writer.
     """
-    cached = _cached_evidence(conn, row, now)
-    if cached is not None:
-        return cached
-    stored = _stored_fingerprint(conn, row)
-    fingerprint = None if stored is None else stored.fingerprint
-    if fingerprint is None:
+    evidence: dict[int, _Evidence] = {}
+    unprinted: list[store.FileRow] = []
+    fingerprints: dict[int, Fingerprint] = {}
+
+    for row in rows:
+        cached = _cached_evidence(conn, row, now)
+        stored = _stored_fingerprint(conn, row) if cached is None else None
+        if cached is not None:
+            evidence[row.id] = cached
+        elif stored is not None and stored.fingerprint is not None:
+            fingerprints[row.id] = stored.fingerprint
+        else:
+            unprinted.append(row)
+    if not unprinted and not fingerprints:
+        return evidence
+
+    # Both clients are built on this thread before either pool starts, so no worker builds one
+    # and the call holds one AcoustID client and its one pacer.
+    fingerprinter = lookups.fingerprinter() if unprinted else None
+    client = lookups.acoustid()
+    printed = (
+        {} if fingerprinter is None else _fingerprint_cold(conn, unprinted, fingerprinter, now)
+    )
+    for file_id, outcome in printed.items():
+        if isinstance(outcome, _Evidence):
+            evidence[file_id] = outcome
+        else:
+            fingerprints[file_id] = outcome
+    evidence.update(_look_up_cold(conn, fingerprints, client, now))
+    return evidence
+
+
+@contextmanager
+def _pool(workers: int) -> Iterator[ThreadPoolExecutor]:
+    """Yield a thread pool whose queued jobs are cancelled when the block raises.
+
+    A rejected key or a missing fpcalc fails every queued job alike, so the call stops at once.
+    """
+    with ThreadPoolExecutor(max_workers=workers) as pool:
         try:
-            fingerprint = lookups.fingerprinter().fingerprint(Path(row.folder) / row.filename)
-        except (FingerprintTimeout, FingerprintUnreadableError) as exc:
-            return _Evidence(error=str(exc))
-        except FingerprintError as exc:
-            _store_fingerprint(conn, row, exc.exit_code, None, now)
-            return _Evidence(error=str(exc))
-        _store_fingerprint(conn, row, 0, fingerprint, now)
-    return _lookup(conn, fingerprint, lookups, now)
+            yield pool
+        except BaseException:
+            pool.shutdown(wait=False, cancel_futures=True)
+            raise
+
+
+def _fingerprint_cold(
+    conn: sqlite3.Connection,
+    rows: list[store.FileRow],
+    fingerprinter: Fingerprinter,
+    now: datetime,
+) -> dict[int, Fingerprint | _Evidence]:
+    """Run fpcalc on every row in parallel. Return each row's fingerprint or its error evidence."""
+    outcomes: dict[int, Fingerprint | _Evidence] = {}
+    workers = min(_FPCALC_WORKERS_MAX, os.cpu_count() or 1)
+    with _pool(workers) as pool:
+        futures = {
+            pool.submit(fingerprinter.fingerprint, Path(row.folder) / row.filename): row
+            for row in rows
+        }
+        for future in as_completed(futures):
+            row = futures[future]
+            outcomes[row.id] = _fingerprint_outcome(conn, row, future, now)
+    return outcomes
+
+
+def _fingerprint_outcome(
+    conn: sqlite3.Connection,
+    row: store.FileRow,
+    future: Future[Fingerprint],
+    now: datetime,
+) -> Fingerprint | _Evidence:
+    """Store one finished fpcalc run and return its fingerprint, or its error as evidence.
+
+    Every cache write commits at once, so a failure later in the call never loses it.
+    """
+    try:
+        fingerprint = future.result()
+    except (FingerprintTimeout, FingerprintUnreadableError) as exc:
+        return _Evidence(error=str(exc))
+    except FingerprintError as exc:
+        _store_fingerprint(conn, row, exc.exit_code, None, now)
+        return _Evidence(error=str(exc))
+    _store_fingerprint(conn, row, 0, fingerprint, now)
+    return fingerprint
 
 
 def _stored_fingerprint(conn: sqlite3.Connection, row: store.FileRow) -> StoredFingerprint | None:
@@ -677,18 +756,47 @@ def _store_fingerprint(
     conn.commit()
 
 
-def _lookup(
+def _look_up_cold(
+    conn: sqlite3.Connection,
+    fingerprints: dict[int, Fingerprint],
+    client: AcoustidClient,
+    now: datetime,
+) -> dict[int, _Evidence]:
+    """Return each file's AcoustID evidence, sending each uncached fingerprint once, in parallel.
+
+    Files sharing a fingerprint share its one answer, as the cache keyed on it would give them.
+    """
+    evidence: dict[int, _Evidence] = {}
+    owners: dict[Fingerprint, list[int]] = {}
+
+    for file_id, fingerprint in fingerprints.items():
+        cached = get_lookup(conn, fingerprint, now)
+        if cached is None:
+            owners.setdefault(fingerprint, []).append(file_id)
+        else:
+            evidence[file_id] = _Evidence(duration=fingerprint.duration, result=cached)
+
+    with _pool(_LOOKUP_WORKERS) as pool:
+        futures = {pool.submit(client.lookup, fingerprint): fingerprint for fingerprint in owners}
+        for future in as_completed(futures):
+            fingerprint = futures[future]
+            answer = _lookup_outcome(conn, fingerprint, future, now)
+            evidence.update(dict.fromkeys(owners[fingerprint], answer))
+    return evidence
+
+
+def _lookup_outcome(
     conn: sqlite3.Connection,
     fingerprint: Fingerprint,
-    lookups: _Lookups,
+    future: Future[AcoustidResult],
     now: datetime,
 ) -> _Evidence:
-    """Return the AcoustID answer for *fingerprint*, cached or fetched. An error is never cached."""
-    cached = get_lookup(conn, fingerprint, now)
-    if cached is not None:
-        return _Evidence(duration=fingerprint.duration, result=cached)
+    """Cache one finished lookup and return its evidence. An error is never cached.
+
+    A rejected key fails every lookup alike, so it propagates and stops the call.
+    """
     try:
-        result = lookups.acoustid().lookup(fingerprint)
+        result = future.result()
     except AcoustidKeyError:
         raise
     except AcoustidError as exc:
@@ -1384,7 +1492,10 @@ class _AutoRun:
         *,
         limit: int,
     ) -> None:
-        """Process every warm selected folder and the first *limit* cold ones, in order."""
+        """Process every warm selected folder and the first *limit* cold ones, in order.
+
+        Every voter of those cold folders is prefetched before the first folder is routed.
+        """
         rows_by_id = {row.id: row for rows in index.values() for row in rows}
         statuses = {
             file_id: store.derived_status(self._conn, axis.SONG_AXIS, file_id)
@@ -1393,22 +1504,27 @@ class _AutoRun:
         }
         pending = [file_id for file_id, status in statuses.items() if status == "pending"]
         targets = frozenset(pending)
+        taken: list[str] = []
+        evidence: dict[int, _Evidence] = {}
+        cold_rows: list[store.FileRow] = []
+        cold_taken = 0
         self._tally.skipped_manual = sum(1 for status in statuses.values() if status == "manual")
 
-        cold_taken = 0
         for key in _selected_folders(pending, rows_by_id):
-            rows = index[key]
-            evidence = self._warm_evidence(rows)
-            if evidence is None:
-                if cold_taken >= limit:
-                    self._tally.cold_folders_remaining += 1
-                    continue
+            warm = self._warm_evidence(index[key])
+            if warm is None and cold_taken >= limit:
+                self._tally.cold_folders_remaining += 1
+                continue
+            if warm is None:
                 cold_taken += 1
-                evidence = {
-                    r.id: _fresh_evidence(self._conn, r, self._lookups, self._now) for r in rows
-                }
-            ballots = self._ballots(rows, evidence, targets)
-            self._settle(ballots)
+                cold_rows.extend(index[key])
+            else:
+                evidence.update(warm)
+            taken.append(key)
+
+        evidence.update(_prefetch(self._conn, cold_rows, self._lookups, self._now))
+        for key in taken:
+            self._settle(self._ballots(index[key], evidence, targets))
 
     def _warm_evidence(self, rows: list[store.FileRow]) -> dict[int, _Evidence] | None:
         """Return every voter's cached evidence, or ``None`` at the first cold voter."""
@@ -1563,12 +1679,12 @@ def _resolve_release(  # noqa: PLR0913 - cohesive keyword-only run inputs
     rows = _present_rows(conn, scoped_ids)
     operator_slots = _operator_slots(release, assigned, scoped_ids)
 
-    now = datetime.now(UTC)
+    evidence = _prefetch(conn, rows, lookups, datetime.now(UTC))
     ballots: list[_Ballot] = []
     for row in rows:
-        evidence = _fresh_evidence(conn, row, lookups, now)
         voter = _Voter(row=row, tags=store.get_tags(conn, row.id), target=True, unsettled=True)
-        ballots.append(_Ballot(voter=voter, evidence=evidence, gate=_gate(evidence, voter.stem)))
+        found = evidence[row.id]
+        ballots.append(_Ballot(voter=voter, evidence=found, gate=_gate(found, voter.stem)))
     placement = _place(release, ballots, operator_slots)
 
     unassigned: list[dict[str, object]] = []

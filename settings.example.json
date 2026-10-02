@@ -14,6 +14,6 @@
   "musicbrainz_contact": "https://github.com/Blakeem/music-tag-mender",
   "musicbrainz_rate_per_sec": "1.0",
   "naming_pattern": "",
-  "song_stage_limit": "25",
+  "song_stage_limit": "150",
   "year_stage_limit": "300"
 }

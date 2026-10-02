@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import gzip
 import json
+import os
+import threading
 import urllib.parse
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
@@ -22,7 +24,12 @@ import pytest
 
 from conftest import make_track
 from tagmend.engine import axis, library, songs, staging, store, versioning
-from tagmend.engine.acoustid import AcoustidClient, Fingerprinter
+from tagmend.engine.acoustid import (
+    AcoustidClient,
+    AcoustidKeyError,
+    Fingerprinter,
+    FpcalcUnavailableError,
+)
 from tagmend.engine.db import connect
 from tagmend.engine.musicbrainz import MBMedium, MBRelease, MBTrack, MusicBrainzError
 from tagmend.engine.schema import apply_schema
@@ -1409,6 +1416,139 @@ def test_limit_counts_cold_folders_and_warm_folders_run_free(
     assert warm.held_unconverged == 3  # every folder ran, each holding a release lookup failure
     assert len(kit.fpcalc.calls) == fpcalc_before
     assert len(kit.acoustid.requests) == requests_before
+
+
+# --- prefetch ------------------------------------------------------------------------
+
+
+class OverlappingFpcalc(FakeFpcalc):
+    """A fake fpcalc runner that records the most calls in flight at once.
+
+    Each call waits up to 5 s for a second one to start, so a serial run still finishes.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._lock = threading.Lock()
+        self._overlap = threading.Event()
+        self._in_flight = 0
+        self.peak = 0
+
+    def __call__(self, argv: Sequence[str], _timeout: float) -> tuple[int, str, str]:
+        with self._lock:
+            self._in_flight += 1
+            self.peak = max(self.peak, self._in_flight)
+            if self._in_flight > 1:
+                self._overlap.set()
+        self._overlap.wait(timeout=5)
+        try:
+            return super().__call__(argv, _timeout)
+        finally:
+            with self._lock:
+                self._in_flight -= 1
+
+
+def test_three_cold_folders_in_one_call_settle_as_each_alone_would(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    folders = ("LP A", "LP B", "LP C")
+    for folder in folders:
+        _make_folder(music_dir / folder, _blank_tracknumbers())
+    library.scan_library(engine_settings)
+    kit = _converging_kit()
+
+    result = _resolve(engine_settings, kit)
+
+    # Each folder lands as the one folder of the convergence route test does.
+    assert result.staged_files == 9
+    assert result.verified_files == 3
+    assert result.settled == 12
+    assert result.errors == 0
+    assert result.cold_folders_remaining == 0
+    by_folder: dict[str, dict[str, object]] = {}
+    for view in staging.diff_tags(engine_settings):
+        by_folder.setdefault(Path(view.folder).name, {})[view.filename] = view.diff
+    assert sorted(by_folder) == list(folders)
+    assert by_folder["LP A"] == by_folder["LP B"] == by_folder["LP C"]
+    assert by_folder["LP A"][_NAMES[0]] == {"tracknumber": {"from": [], "to": ["1/4"]}}
+    assert by_folder["LP A"][_NAMES[1]] == {
+        "title": {"from": [], "to": ["Song Two"]},
+        "tracknumber": {"from": [], "to": ["2/4"]},
+    }
+    assert _NAMES[3] not in by_folder["LP A"]
+    # Every file runs fpcalc once, and the four fingerprint values the folders share go out once.
+    assert sorted(kit.fpcalc.calls) == sorted(_NAMES * 3)
+    assert sorted(kit.acoustid.requests) == sorted(f"fp-{name}" for name in _NAMES)
+
+
+def test_the_prefetch_runs_fpcalc_calls_concurrently(
+    engine_settings: Settings,
+    music_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(os, "cpu_count", lambda: 4)
+    _make_folder(music_dir / "LP", _blank_tracknumbers())
+    library.scan_library(engine_settings)
+    fpcalc = OverlappingFpcalc()
+    kit = Kit(
+        acoustid=FakeAcoustid(_lp_bodies(_NAMES)),
+        releases=FakeReleases(_release(_LP)),
+        fpcalc=fpcalc,
+    )
+
+    result = _resolve(engine_settings, kit)
+
+    assert fpcalc.peak > 1
+    assert result.settled == 4
+
+
+def test_a_rejected_key_in_one_lookup_worker_stops_the_call(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    _make_folder(music_dir / "LP", [{}] * 4)
+    library.scan_library(engine_settings)
+    ids = _ids(engine_settings)
+    kit = _converging_kit()
+    kit.acoustid.bodies[f"fp-{_NAMES[2]}"] = {
+        "status": "error",
+        "error": {"code": 4, "message": "invalid API key"},
+    }
+
+    with pytest.raises(AcoustidKeyError, match="acoustid_api_key"):
+        _resolve(engine_settings, kit)
+
+    assert staging.diff_tags(engine_settings) == []
+    assert {_status(engine_settings, ids[name]) for name in _NAMES} == {"pending"}
+
+
+def test_fpcalc_failing_to_start_in_one_worker_stops_the_call(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    def no_fpcalc(_argv: Sequence[str], _timeout: float) -> tuple[int, str, str]:
+        message = "fpcalc: no such file"
+        raise OSError(message)
+
+    _make_folder(music_dir / "LP", [{}] * 4)
+    library.scan_library(engine_settings)
+    kit = _converging_kit()
+
+    transport = httpx.MockTransport(kit.acoustid.handle)
+    with (
+        AcoustidClient("test-key", transport=transport, sleep=lambda _s: None) as client,
+        pytest.raises(FpcalcUnavailableError),
+    ):
+        songs.resolve_songs(
+            engine_settings,
+            fingerprinter=Fingerprinter("fpcalc", runner=no_fpcalc, is_windows=False),
+            acoustid_client=client,
+            releases=kit.releases,
+        )
+
+    assert kit.acoustid.requests == []
+    assert _scalar(engine_settings, "SELECT COUNT(*) FROM fingerprint_cache") == 0
 
 
 # --- voters --------------------------------------------------------------------------

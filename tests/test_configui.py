@@ -103,7 +103,7 @@ def test_build_seed_names_the_song_settings() -> None:
     assert values["acoustid_api_key"] == ""
     assert values["fpcalc_path"] == ""
     assert values["acoustid_rate_per_sec"] == "2.0"
-    assert values["song_stage_limit"] == "25"
+    assert values["song_stage_limit"] == "150"
 
 
 # --- validate_and_normalize ----------------------------------------------------------

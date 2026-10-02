@@ -9,11 +9,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Final, Protocol
 
 from tagmend.engine import path_keys
-from tagmend.engine.text_keys import alnum_ascii_key
+from tagmend.engine.text_keys import alnum_ascii_key, display_key
 from tagmend.engine.validation import require_choice
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Hashable, Iterable
+    from collections.abc import Callable, Hashable, Iterable, Mapping
 
     from _typeshed import DataclassInstance
 
@@ -38,6 +38,12 @@ NON_ALBUM_FOLDERS: Final = frozenset(
 # A tracknumber/discnumber may be stored as "7" or as the "7/12" slash form. Only the part
 # before the slash is the position.
 _SLASH: Final = "/"
+
+# The values Go's ``strconv.ParseBool`` accepts, which is what a server actually tests the
+# compilation tag with. ``yes`` is a real tag value in the wild and reads as false.
+COMPILATION_TRUE: Final = frozenset({"1", "t", "T", "true", "TRUE", "True"})
+VARIOUS_ARTISTS: Final = "Various Artists"
+_UNKNOWN_ARTIST: Final = "[Unknown Artist]"
 
 
 class _HasFolder(Protocol):
@@ -83,6 +89,48 @@ _NON_ALBUM_KEYS: Final = frozenset(alnum_ascii_key(name) for name in NON_ALBUM_F
 def is_non_album_folder(folder: str) -> bool:
     """Return whether *folder*'s leaf name marks a collection rather than one album."""
     return alnum_ascii_key(Path(folder).name) in _NON_ALBUM_KEYS
+
+
+def display_album_artist(
+    albumartist: str | None,
+    compilation: str | None,
+    artist: str | None,
+) -> str:
+    """Return the album artist a server would group a file under.
+
+    The compilation marker outranks the track artist, so a various-artists release with no
+    album artist stays one album instead of scattering across every track's artist.
+    """
+    if albumartist and albumartist.strip():
+        return albumartist.strip()
+    if (compilation or "").strip() in COMPILATION_TRUE:
+        return VARIOUS_ARTISTS
+    if artist and artist.strip():
+        return artist.strip()
+    return _UNKNOWN_ARTIST
+
+
+def album_identity(
+    release_mbid: str | None,
+    album_artist: str,
+    album: str | None,
+    date: str | None,
+) -> tuple[str, ...]:
+    """Return the tuple that decides which album a file belongs to.
+
+    *album_artist* is the :func:`display_album_artist` of the file. A release id settles the
+    file on its own. A date is compared verbatim, since ``2005`` and ``2005-06-01`` group apart.
+    """
+    release = (release_mbid or "").strip()
+    if release:
+        return ("release", release)
+    return ("name", display_key(album_artist), display_key(album or ""), (date or "").strip())
+
+
+def release_date(values: Mapping[str, str]) -> str | None:
+    """Return the release date :func:`album_identity` compares, from one file's tag values."""
+    # A raw Vorbis YEAR is the only release-date spelling no alias maps to ``date``.
+    return (values.get("date") or "").strip() or values.get("year")
 
 
 def group_by_key[T, K](items: Iterable[T], key: Callable[[T], K]) -> dict[K, list[T]]:

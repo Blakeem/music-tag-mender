@@ -49,11 +49,16 @@ from typing import TYPE_CHECKING, Final
 
 from tagmend.engine import db, path_keys, schema, store
 from tagmend.engine.detector_core import (
+    COMPILATION_TRUE,
     TIER_RANK,
+    VARIOUS_ARTISTS,
     Tier,
+    album_identity,
+    display_album_artist,
     group_by_folder,
     is_non_album_folder,
     narrow,
+    release_date,
     validate_tier,
 )
 from tagmend.engine.serialize import FieldDict
@@ -80,18 +85,11 @@ _DETECT_FIELDS: Final = (
     "compilation",
 )
 
-# The values Go's ``strconv.ParseBool`` accepts, which is what a server actually tests the
-# compilation tag with. ``yes`` is a real tag value in the wild and reads as false.
-_COMPILATION_TRUE: Final = frozenset({"1", "t", "T", "true", "TRUE", "True"})
-
 # Picard writes a titled multi-disc medium into ``album`` as ``<release> (disc N: <title>)``,
 # and a ``(bonus disc: <title>)`` for an unnumbered one. The suffix is deliberate, so the
 # folder is reported at the low tier rather than as an error. It is only ever consulted
 # once the two base titles already match, so a real title carrying the word cannot trip it.
 _DISC_SUFFIX: Final = re.compile(r"\s*[(\[][^()\[\]]*\bdisc\b[^()\[\]]*[)\]]\s*$", re.IGNORECASE)
-
-_UNKNOWN_ARTIST: Final = "[Unknown Artist]"
-_VARIOUS_ARTISTS: Final = "Various Artists"
 
 
 _REASON_HIGH: Final = (
@@ -129,34 +127,13 @@ class _FileInput:
 
     @property
     def display_album_artist(self) -> str:
-        """Return the album artist a server would group this file under.
-
-        The fallback chain every scheme shares: the album artist, else a various-artists
-        marker when the compilation flag is set, else the track artist, else an
-        unknown-artist placeholder. The compilation marker outranks the track artist, so a
-        various-artists release with no album artist stays one album instead of scattering
-        across every track's artist.
-        """
-        if self.albumartist and self.albumartist.strip():
-            return self.albumartist.strip()
-        if (self.compilation or "").strip() in _COMPILATION_TRUE:
-            return _VARIOUS_ARTISTS
-        if self.artist and self.artist.strip():
-            return self.artist.strip()
-        return _UNKNOWN_ARTIST
+        """Return the album artist a server would group this file under."""
+        return display_album_artist(self.albumartist, self.compilation, self.artist)
 
     @property
     def identity(self) -> tuple[str, ...]:
         """Return the tuple that decides which album this file belongs to."""
-        release_mbid = (self.release_mbid or "").strip()
-        if release_mbid:
-            return ("release", release_mbid)
-        return (
-            "name",
-            display_key(self.display_album_artist),
-            display_key(self.album or ""),
-            (self.date or "").strip(),
-        )
+        return album_identity(self.release_mbid, self.display_album_artist, self.album, self.date)
 
     @property
     def identity_label(self) -> str:
@@ -254,7 +231,7 @@ def _is_compilation_missing_its_album_artist(files: list[_FileInput]) -> bool:
         return False
     if any((f.albumartist or "").strip() for f in files):
         return False
-    if any((f.compilation or "").strip() in _COMPILATION_TRUE for f in files):
+    if any((f.compilation or "").strip() in COMPILATION_TRUE for f in files):
         return False
     if len({_base_title(f.album) for f in files}) != 1:
         return False
@@ -363,7 +340,7 @@ def _compilation_identity(files: list[_FileInput]) -> str:
 
     The files may differ only in a disc suffix, so the label drops it rather than name one disc.
     """
-    return _VARIOUS_ARTISTS + " - " + _DISC_SUFFIX.sub("", files[0].album or "").strip()
+    return VARIOUS_ARTISTS + " - " + _DISC_SUFFIX.sub("", files[0].album or "").strip()
 
 
 def _first_index(files: list[_FileInput], identity: tuple[str, ...]) -> int:
@@ -488,8 +465,7 @@ def _load_inputs(connection: sqlite3.Connection) -> list[_FileInput]:
                 albumartist=values.get("albumartist"),
                 artist=values.get("artist"),
                 release_mbid=values.get("musicbrainz_albumid"),
-                # A raw Vorbis YEAR is the only release-date spelling no alias maps to ``date``.
-                date=(values.get("date") or "").strip() or values.get("year"),
+                date=release_date(values),
                 compilation=values.get("compilation"),
             ),
         )

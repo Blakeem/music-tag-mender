@@ -28,6 +28,9 @@ AUDIO_EXTENSIONS: Final[frozenset[str]] = frozenset(
     }
 )
 
+# A tag or cover write's temp copy, which the writer moves over its target. Discovery skips it.
+TEMP_SUFFIX: Final = ".tagmend.tmp"
+
 
 def is_audio_file(path: Path) -> bool:
     """Return ``True`` if *path* is a regular file with a known audio extension."""

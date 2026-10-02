@@ -46,6 +46,7 @@ from mutagen.id3 import (  # type: ignore[attr-defined]
 from mutagen.mp4 import MP4, MP4Tags
 from mutagen.ogg import OggFileType
 
+from tagmend.engine.scan import TEMP_SUFFIX
 from tagmend.log import get_logger
 
 if TYPE_CHECKING:
@@ -403,6 +404,28 @@ def _normalized_tags(path: Path, audio: FileType | None) -> TrackTags:
 
     # Output
     return TrackTags(normalized)
+
+
+def has_embedded_picture(path: Path) -> bool:
+    """Whether *path* holds a picture Navidrome can show as its album's cover.
+
+    That is an ID3v2 ``APIC`` frame, a FLAC picture block, an MP4 ``covr`` atom or an Ogg
+    ``metadata_block_picture`` comment. mutagen loads an ID3v2.2 ``PIC`` frame as ``APIC``.
+    Raises as :func:`read_tags` does for an unreadable file.
+    """
+    audio: Any = mutagen.File(path)  # type: ignore[attr-defined]
+    if audio is None:
+        return False
+    if isinstance(audio, FLAC):
+        return bool(audio.pictures)
+    tags = audio.tags
+    if isinstance(tags, ID3):
+        return bool(tags.getall("APIC"))  # type: ignore[no-untyped-call]
+    if isinstance(tags, MP4Tags):
+        return bool(tags.get("covr"))  # type: ignore[no-untyped-call]
+    if isinstance(tags, VCommentDict):
+        return "metadata_block_picture" in tags
+    return False
 
 
 class TagWriteError(ValueError):
@@ -1040,7 +1063,7 @@ def write_managed_tags(
     dropped_frames: tuple[str, ...] = ()
 
     # Output: apply the plan to a temp copy, verify it, then atomically swap it in.
-    tmp = path.with_name(f"{path.name}.tagmend.tmp")
+    tmp = path.with_name(path.name + TEMP_SUFFIX)
     shutil.copy2(path, tmp)
     replaced = False
     try:

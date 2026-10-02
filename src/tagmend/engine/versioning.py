@@ -39,7 +39,7 @@ from typing import TYPE_CHECKING, Final
 
 import mutagen
 
-from tagmend.engine import acoustid, clock, commits, db, paths, schema, store
+from tagmend.engine import acoustid, clock, commits, covers, db, paths, schema, store, trash
 from tagmend.engine.serialize import FieldDict
 from tagmend.engine.tags import (
     MANAGED_SET_VERSION,
@@ -649,14 +649,40 @@ def _require_tag_commit(
     logs: dict[str, int],
     path: str | os.PathLike[str] | None,
 ) -> None:
-    """Refuse a commit holding no log row, and a *path* scope, which only a path commit has."""
-    if not logs:
-        message = f"commit {commit_id} holds no change in the tag or path log to revert"
+    """Refuse a commit holding no tag log row, and a *path* scope, which only a path commit has."""
+    if "tag_revisions" not in logs:
+        message = f"commit {commit_id} holds no change in the tag, path or cover log to revert"
         raise ValueError(message)
     if path is not None:
         message = (
             f"commit {commit_id} changed tags, and path= selects the files of a path commit "
             "only. Revert it whole, or one file with revert_tags"
+        )
+        raise ValueError(message)
+
+
+def _require_revertable(conn: sqlite3.Connection, commit_id: int) -> None:
+    """Refuse an unknown commit, one still ``applying``, and any staged row of any domain."""
+    target = commits.get_commit_in(conn, commit_id)
+    if target is None:
+        message = f"unknown commit_id={commit_id}"
+        raise ValueError(message)
+    if target.status == "applying":
+        message = (
+            f"commit {commit_id} is still applying (interrupted run?) - "
+            "run commit_tags, commit_paths or commit_covers to recover, then retry"
+        )
+        raise ValueError(message)
+    if store.any_staged(conn):
+        raise ValueError(paths.STAGING_NOT_EMPTY)
+
+
+def _require_whole_cover_commit(commit_id: int, path: str | os.PathLike[str] | None) -> None:
+    """Refuse a *path* scope on a cover commit, since only a path commit has one."""
+    if path is not None:
+        message = (
+            f"commit {commit_id} wrote covers, and path= selects the files of a path commit "
+            "only. Revert it whole"
         )
         raise ValueError(message)
 
@@ -674,8 +700,11 @@ def revert_commit(
     Domain-neutral: a commit whose rows sit in ``path_revisions`` or ``sidecar_moves`` is undone
     by :func:`tagmend.engine.paths.revert_commit_moves`, which moves each file and sidecar back
     to its source. *path* applies to such a commit only and keeps the files and sidecars sitting
-    at or under it now. A commit with rows in no log raises :class:`ValueError`, and so does
-    *path* on a tag commit. The rest of this docstring describes a tag commit.
+    at or under it now. A commit whose rows sit in ``cover_writes`` is undone by
+    :func:`tagmend.engine.covers.revert_cover_commit`, which sends each cover it created to the
+    OS trash (:func:`tagmend.engine.trash.send_to_trash`) and writes each cover it removed again.
+    A commit with no tag, path or cover row raises :class:`ValueError`, and so does *path* on a
+    tag or cover commit. The rest of this docstring describes a tag commit.
 
     The group counterpart of :func:`revert_tags` (PLAN.md §7: "reverting a whole
     ``commit_id`` undoes an entire run"). For each revision the target commit created,
@@ -692,11 +721,11 @@ def revert_commit(
     reported, a per-file disk failure is recorded as ``error`` and the rest of the group
     still completes.
 
-    Guards: the target must exist and not be ``status='applying'`` (run ``commit_tags`` or
-    ``commit_paths`` to recover an interrupted run first). ``interrupted`` targets are allowed
-    (reverts whatever they durably committed). The staging area, tag and path rows alike, must
-    be EMPTY: commit or unstage pending work before rolling back (git's "commit or stash
-    first").
+    Guards: the target must exist and not be ``status='applying'`` (run ``commit_tags``,
+    ``commit_paths`` or ``commit_covers`` to recover an interrupted run first). ``interrupted``
+    targets are allowed (reverts whatever they durably committed). The staging area, tag, path
+    and cover rows alike, must be EMPTY: commit or unstage pending work before rolling back
+    (git's "commit or stash first").
 
     A file already holding its pre-commit state is reported ``noop``: the revert revision
     is still appended (revert is always audited), but it is not counted as ``reverted``,
@@ -715,23 +744,21 @@ def revert_commit(
     connection = db.connect(settings.db_path)
     try:
         schema.apply_schema(connection)
-
-        target = commits.get_commit_in(connection, commit_id)
-        if target is None:
-            message = f"unknown commit_id={commit_id}"
-            raise ValueError(message)
-        if target.status == "applying":
-            message = (
-                f"commit {commit_id} is still applying (interrupted run?) - "
-                "run commit_tags or commit_paths to recover, then retry"
-            )
-            raise ValueError(message)
-        if store.any_staged(connection):
-            raise ValueError(paths.STAGING_NOT_EMPTY)
+        _require_revertable(connection, commit_id)
         logs = store.commit_log_counts(connection, commit_id)
         if "path_revisions" in logs or "sidecar_moves" in logs:
             return paths.revert_commit_moves(
                 connection, settings, commit_id, note=note, dry_run=dry_run, path=path
+            )
+        if "cover_writes" in logs:
+            _require_whole_cover_commit(commit_id, path)
+            return covers.revert_cover_commit(
+                connection,
+                settings,
+                commit_id,
+                note=note,
+                dry_run=dry_run,
+                trash=trash.send_to_trash,
             )
         _require_tag_commit(commit_id, logs, path)
 

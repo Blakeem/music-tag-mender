@@ -48,6 +48,10 @@ A git-like flow: stage → commit → revert. Files are only written on commit, 
 
 File moves are opt-in. Each file moves to the path a naming pattern builds from its tags. Moves are staged and committed like tag edits. A move never overwrites a file. Cover art, cue sheets and other non-audio files move with their album.
 
+### 🖼️ Cover art (Cover Art Archive)
+
+Find the albums a music server shows without a cover with the `detect_cover_gaps` MCP tool. `stage_covers` picks one image for each album. It takes an image you name, else a front image already in the album folder, else the album's front cover from the Cover Art Archive. `commit_covers` writes it as `cover.jpg` or `cover.png` in the album folder. A cover never overwrites a file, and a revert sends it to the OS trash.
+
 ### 🗂️ Per-file status workflow
 
 Mark files as `manual` to exclude them from an axis (genre, artist, year, or song), or reset them to `pending`. A `manual` mark stays until you reset it. A file a resolver settled returns to `pending` on its own when a tag it was settled on changes.
@@ -135,7 +139,7 @@ Edits apply on the next tool call. Every command and MCP tool re-reads `settings
 
 ## Tools
 
-The MCP server exposes 46 tools. Tag edits and file moves are staged first and written to disk only by `commit_tags`, `commit_paths` or a revert tool. Every change is revertible.
+The MCP server exposes 51 tools. Tag edits, file moves and covers are staged first and written to disk only by `commit_tags`, `commit_paths`, `commit_covers` or a revert tool. Every change is revertible.
 
 ### Core & Library
 
@@ -171,7 +175,7 @@ The MCP server exposes 46 tools. Tag edits and file moves are staged first and w
 |------|-------------|
 | `history_tags` | Show the append-only tag-revision log for one file, oldest first |
 | `revert_tags` | Restore a file's managed tags to a prior version (append-only, revertible) |
-| `revert_commit` | Undo an entire commit as a unit. Every file it changed goes back to its pre-commit tags or path |
+| `revert_commit` | Undo an entire commit as a unit. Every file it changed goes back to its pre-commit tags or path, and every cover it wrote goes to the OS trash |
 
 ### Genre (Last.fm)
 
@@ -231,6 +235,18 @@ A naming pattern renders each file's path from its tags. A move is staged from t
 | `commit_paths` | Move every staged file as one revertible commit and remove the folders it empties |
 | `history_paths` | Show every location one file has had, oldest first |
 | `revert_paths` | Move one file back to the location of a prior path version |
+
+### Cover Art
+
+Navidrome shows an album's cover from an image named `cover.*`, `folder.*` or `front.*` in the album folder, or else from a picture embedded in a track. `detect_cover_gaps` reports the albums with neither. `stage_covers` tries an image you name, then a front image already under the album folder, then the front cover of the release and of its release group in the Cover Art Archive. The staged image is written as one revertible commit. A folder holding several albums, or an album spread over unrelated folders, gets no cover.
+
+| Tool | Description |
+|------|-------------|
+| `detect_cover_gaps` | Report the albums that have no cover image file and no embedded picture (read-only report) |
+| `stage_covers` | Stage one cover image for each album without a cover. `image` names your own file. No disk write |
+| `unstage_covers` | Drop the staged covers under a folder, or all of them |
+| `diff_covers` | Show the staged covers with their source, size and dimensions, and whether each can still be written |
+| `commit_covers` | Write every staged cover as one revertible commit. A cover never overwrites a file |
 
 ## Development
 

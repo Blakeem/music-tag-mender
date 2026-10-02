@@ -29,7 +29,7 @@ def test_apply_schema_stamps_current_version(db_conn: sqlite3.Connection) -> Non
     # db_conn already applied the schema; the stamp must match the constant the code ships.
     version = db_conn.execute("PRAGMA user_version").fetchone()[0]
     assert version == SCHEMA_VERSION
-    assert SCHEMA_VERSION == 27
+    assert SCHEMA_VERSION == 29
 
 
 def test_apply_schema_creates_genre_tables(db_conn: sqlite3.Connection) -> None:
@@ -1666,5 +1666,102 @@ def test_v26_ledger_renames_the_path_revert_columns_in_place() -> None:
         assert staged == [(1,)]
         with pytest.raises(sqlite3.IntegrityError, match="append-only"):
             conn.execute("UPDATE path_revisions SET reverted_to_version = 1")
+    finally:
+        conn.close()
+
+
+# --- v28: the Cover Art Archive listing cache -------------------------------------------
+
+_COVERART_CACHE_COLUMNS = ["request_key", "found", "payload", "fetched_at"]
+
+
+def test_fresh_ledger_has_the_coverart_cache(db_conn: sqlite3.Connection) -> None:
+    assert _columns(db_conn, "coverart_cache") == _COVERART_CACHE_COLUMNS
+
+
+def test_v27_ledger_gains_the_coverart_cache_in_place() -> None:
+    conn = sqlite3.connect(":memory:")
+    try:
+        apply_schema(conn)
+        file_id = _insert_file(conn)
+        conn.execute("DROP TABLE coverart_cache")
+        conn.execute("PRAGMA user_version = 27")
+        conn.commit()
+
+        apply_schema(conn)  # the in-place upgrade
+
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        assert _columns(conn, "coverart_cache") == _COVERART_CACHE_COLUMNS
+        assert conn.execute("SELECT id FROM files").fetchall() == [(file_id,)]
+    finally:
+        conn.close()
+
+
+# --- v29: the cover tables ---------------------------------------------------------------
+
+_COVER_TABLES = ("cover_writes", "cover_writes_staged")
+_COVER_INDEXES = ("idx_cover_writes_commit_id", "idx_cover_writes_path_key")
+
+
+def _insert_cover_write(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        "INSERT INTO commits (created_at, origin, status) "
+        "VALUES ('2026-10-02T00:00:00+00:00', 'auto', 'applied')"
+    )
+    conn.execute(
+        """
+        INSERT INTO cover_writes
+          (commit_id, created_at, origin, action, path, path_key, sha256, size_bytes,
+           source_kind, source_ref, content)
+        VALUES (1, '2026-10-02T00:00:00+00:00', 'auto', 'create', 'A/cover.jpg', 'a/cover.jpg',
+                'abc', 3, 'release', 'https://caa.test/front.jpg', x'010203')
+        """
+    )
+
+
+def test_cover_writes_reject_update_and_delete(db_conn: sqlite3.Connection) -> None:
+    _insert_cover_write(db_conn)
+
+    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+        db_conn.execute("UPDATE cover_writes SET note = 'rewritten'")
+    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+        db_conn.execute("DELETE FROM cover_writes")
+
+    assert db_conn.execute("SELECT path, note FROM cover_writes").fetchall() == [
+        ("A/cover.jpg", None),
+    ]
+
+
+def test_cover_writes_accept_only_create_and_remove(db_conn: sqlite3.Connection) -> None:
+    _insert_cover_write(db_conn)
+
+    with pytest.raises(sqlite3.IntegrityError, match="CHECK"):
+        db_conn.execute(
+            "INSERT INTO cover_writes (commit_id, created_at, origin, action, path, path_key, "
+            "sha256, size_bytes, source_kind, source_ref) VALUES (1, '2026', 'auto', 'rename', "
+            "'A/cover.jpg', 'a/cover.jpg', 'abc', 3, 'release', 'x')"
+        )
+
+
+def test_v28_ledger_gains_the_cover_tables_in_place() -> None:
+    conn = sqlite3.connect(":memory:")
+    try:
+        apply_schema(conn)
+        file_id = _insert_file(conn)
+        for table in _COVER_TABLES:
+            conn.execute(f"DROP TABLE {table}")
+        conn.execute("PRAGMA user_version = 28")
+        conn.commit()
+        assert not set(_COVER_TABLES) & _table_names(conn)
+
+        apply_schema(conn)  # the in-place upgrade
+
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        assert set(_COVER_TABLES) <= _table_names(conn)
+        assert set(_COVER_INDEXES) <= _schema_objects(conn, "index")
+        assert {"cover_writes_no_update", "cover_writes_no_delete"} <= _schema_objects(
+            conn, "trigger"
+        )
+        assert conn.execute("SELECT id FROM files").fetchall() == [(file_id,)]
     finally:
         conn.close()

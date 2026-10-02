@@ -20,20 +20,24 @@ The tables, by role:
   are keyed by their own paths, not by ``files.id``. Its ``unit_key`` is the key of the album
   folder the file sat under before the move. A revert finds the album's current folder from it
   by depth. ``sidecar_moves_staged`` holds the pending sidecar moves.
+* Covers: ``cover_writes_staged`` holds one pending cover image per album folder, bytes
+  included. ``cover_writes`` logs each cover file a commit created or removed.
 * Axis status: ``file_genre_status``, ``file_artist_status``, ``file_year_status`` and
   ``file_song_status`` each hold at most one outcome row per file (:mod:`tagmend.engine.axis`).
   Each axis names its own two identity columns. ``file_mismatch_status`` holds one path decision
   per file as a JSON snapshot.
 * Lookup caches: ``lastfm_cache``, ``lastfm_correction_cache``,
   ``musicbrainz_release_group_cache``, ``musicbrainz_recording_cache``,
-  ``musicbrainz_artist_cache``, ``musicbrainz_release_cache`` and ``acoustid_cache`` are each
-  keyed by a request hash. Their ``found`` column is the negative-cache sentinel.
+  ``musicbrainz_artist_cache``, ``musicbrainz_release_cache``, ``acoustid_cache`` and
+  ``coverart_cache`` are each keyed by a request hash. Their ``found`` column is the
+  negative-cache sentinel.
   ``fingerprint_cache`` holds one fpcalc result per file at the signature it was taken at.
 
-Every path in ``path_revisions``, ``path_revisions_staged``, ``sidecar_moves`` and
-``sidecar_moves_staged`` is relative to ``music_path``.
+Every path in ``path_revisions``, ``path_revisions_staged``, ``sidecar_moves``,
+``sidecar_moves_staged``, ``cover_writes`` and ``cover_writes_staged`` is relative to
+``music_path``.
 
-``tag_revisions``, ``path_revisions`` and ``sidecar_moves`` are append-only.
+``tag_revisions``, ``path_revisions``, ``sidecar_moves`` and ``cover_writes`` are append-only.
 :func:`apply_append_only_triggers` creates the triggers that abort an ``UPDATE`` or ``DELETE`` on
 them. It also creates one that aborts a ``tag_revisions`` insert with no ``managed_set``.
 
@@ -62,7 +66,7 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
-SCHEMA_VERSION: Final = 27
+SCHEMA_VERSION: Final = 29
 
 _FILES_DDL: Final = """
 CREATE TABLE IF NOT EXISTS files (
@@ -261,6 +265,58 @@ _SIDECAR_DDL: Final = (
     _SIDECAR_MOVES_STAGED_UNIT_INDEX_DDL,
 )
 
+# ``folder_key`` finds an album folder's row whatever the image format, since ``cover.jpg`` and
+# ``cover.png`` differ in ``target_key``. The row holds the bytes the commit writes.
+_COVER_WRITES_STAGED_DDL: Final = """
+CREATE TABLE IF NOT EXISTS cover_writes_staged (
+  target_key   TEXT PRIMARY KEY,
+  target_path  TEXT NOT NULL,
+  folder_key   TEXT NOT NULL,
+  album_label  TEXT NOT NULL,
+  file_ids     TEXT NOT NULL,
+  source_kind  TEXT NOT NULL
+    CHECK (source_kind IN ('owner_file', 'folder_image', 'release', 'release_group')),
+  source_ref   TEXT NOT NULL,
+  content      BLOB NOT NULL,
+  sha256       TEXT NOT NULL,
+  size_bytes   INTEGER NOT NULL,
+  image_format TEXT NOT NULL,
+  width        INTEGER NOT NULL,
+  height       INTEGER NOT NULL,
+  origin       TEXT NOT NULL,
+  note         TEXT,
+  staged_at    TEXT NOT NULL
+)
+"""
+
+# A ``create`` row keeps its bytes, so a revert of a revert can write the file again.
+_COVER_WRITES_DDL: Final = """
+CREATE TABLE IF NOT EXISTS cover_writes (
+  id            INTEGER PRIMARY KEY,
+  commit_id     INTEGER NOT NULL REFERENCES commits(id),
+  created_at    TEXT NOT NULL,
+  origin        TEXT NOT NULL,
+  action        TEXT NOT NULL CHECK (action IN ('create', 'remove')),
+  reverted_from INTEGER REFERENCES cover_writes(id),
+  path          TEXT NOT NULL,
+  path_key      TEXT NOT NULL,
+  sha256        TEXT NOT NULL,
+  size_bytes    INTEGER NOT NULL,
+  source_kind   TEXT NOT NULL,
+  source_ref    TEXT NOT NULL,
+  content       BLOB,
+  note          TEXT
+)
+"""
+
+# Each table precedes its indexes.
+_COVER_DDL: Final = (
+    _COVER_WRITES_STAGED_DDL,
+    _COVER_WRITES_DDL,
+    "CREATE INDEX IF NOT EXISTS idx_cover_writes_commit_id ON cover_writes(commit_id)",
+    "CREATE INDEX IF NOT EXISTS idx_cover_writes_path_key ON cover_writes(path_key)",
+)
+
 # Persistent cache of parsed Last.fm top-tag lists only, keyed by a request hash (so it
 # survives MCP restarts and inspector re-launches). ``found`` is the negative-cache sentinel
 # (0 = artist/album genuinely absent from Last.fm; 1 = found), distinct from ``found=1``
@@ -435,6 +491,18 @@ CREATE TABLE IF NOT EXISTS acoustid_cache (
 )
 """
 
+# Persistent cache of Cover Art Archive listings, keyed by a hash of the kind, a parse version
+# and the MBID. ``found`` is the negative-cache sentinel (0 = no approved front), served only
+# while young because CAA gains art over time. ``payload`` holds the front's URLs as JSON.
+_COVERART_CACHE_DDL: Final = """
+CREATE TABLE IF NOT EXISTS coverart_cache (
+  request_key TEXT PRIMARY KEY,
+  found       INTEGER NOT NULL,
+  payload     TEXT,
+  fetched_at  TEXT NOT NULL
+)
+"""
+
 # One path decision per file. ``legit_ignore`` keeps the file's folder, and
 # ``misfiled_deferred`` lets the tags render the entire path. ``source_value`` is the JSON
 # snapshot that binds the decision to its tags and location
@@ -455,7 +523,7 @@ _REVISIONS_COMMIT_INDEX_DDL: Final = (
     "CREATE INDEX IF NOT EXISTS idx_path_revisions_commit_id ON path_revisions(commit_id)",
 )
 
-_APPEND_ONLY_LOGS: Final = ("tag_revisions", "path_revisions", "sidecar_moves")
+_APPEND_ONLY_LOGS: Final = ("tag_revisions", "path_revisions", "sidecar_moves", "cover_writes")
 
 # Revert reads an omitted tag by the revision's managed set, so a NULL would silently change
 # what a revert deletes. SQLite cannot add NOT NULL to an existing column, so a trigger does.
@@ -467,7 +535,7 @@ _MANAGED_SET_REQUIRED_TRIGGER_DDL: Final = (
 
 
 def apply_append_only_triggers(connection: sqlite3.Connection) -> None:
-    """Create the triggers that abort any ``UPDATE`` or ``DELETE`` on the three append-only logs.
+    """Create the triggers that abort any ``UPDATE`` or ``DELETE`` on each append-only log.
 
     A BEFORE DELETE trigger also blocks the ``ON DELETE CASCADE`` from ``files``, so deleting a
     file row can never erase its history. One more trigger aborts a ``tag_revisions`` insert
@@ -1189,7 +1257,8 @@ def apply_schema(connection: sqlite3.Connection) -> None:
     connection.execute(_FILE_MISMATCH_STATUS_DDL)
     connection.execute(_FINGERPRINT_CACHE_DDL)
     connection.execute(_ACOUSTID_CACHE_DDL)
-    for ddl in (*_SIDECAR_DDL, *_REVISIONS_COMMIT_INDEX_DDL):
+    connection.execute(_COVERART_CACHE_DDL)
+    for ddl in (*_SIDECAR_DDL, *_COVER_DDL, *_REVISIONS_COMMIT_INDEX_DDL):
         connection.execute(ddl)
     apply_append_only_triggers(connection)
     connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")

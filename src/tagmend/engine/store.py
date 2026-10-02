@@ -1,10 +1,11 @@
 """Pure data access for the snapshot, the revision logs, and the staging areas (M1 + M3).
 
 Covers the ``files`` / ``file_tags`` snapshot, the append-only ``tag_revisions``,
-``path_revisions`` and ``sidecar_moves`` histories, and the ``tag_revisions_staged``,
-``path_revisions_staged`` and ``sidecar_moves_staged`` staging areas (git's index). Every
-function takes an open :class:`sqlite3.Connection` and does one focused thing, with no scanning,
-tag reading or commit policy. That orchestration lives in :mod:`tagmend.engine.library`,
+``path_revisions``, ``sidecar_moves`` and ``cover_writes`` histories, and the
+``tag_revisions_staged``, ``path_revisions_staged``, ``sidecar_moves_staged`` and
+``cover_writes_staged`` staging areas (git's index). Every function takes an open
+:class:`sqlite3.Connection` and does one focused thing, with no scanning, tag reading or commit
+policy. That orchestration lives in :mod:`tagmend.engine.library`,
 :mod:`tagmend.engine.versioning`, :mod:`tagmend.engine.staging` and :mod:`tagmend.engine.paths`.
 The ``commits``-table ops and the shared commit loop live in :mod:`tagmend.engine.commits`.
 SQLite hands back ``Any``, so this module casts at the boundary and the rest of the engine stays
@@ -1047,6 +1048,44 @@ def put_cached_mb_release(
     )
 
 
+# --- coverart_cache (persistent Cover Art Archive listing lookups) --------------------
+
+
+def get_cached_coverart(
+    conn: sqlite3.Connection,
+    request_key: str,
+) -> tuple[bool, str | None, str] | None:
+    """Return the cached listing lookup for *request_key*, or ``None`` on a miss.
+
+    A hit is ``(found, payload, fetched_at)``. The caller expires a not-found row by its age.
+    """
+    row = conn.execute(
+        "SELECT found, payload, fetched_at FROM coverart_cache WHERE request_key = ?",
+        (request_key,),
+    ).fetchone()
+    if row is None:
+        return None
+    return (bool(row[0]), None if row[1] is None else str(row[1]), str(row[2]))
+
+
+def put_cached_coverart(
+    conn: sqlite3.Connection,
+    *,
+    request_key: str,
+    found: bool,
+    payload: str | None,
+    now: str,
+) -> None:
+    """Insert or replace the cached listing lookup for *request_key*."""
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO coverart_cache (request_key, found, payload, fetched_at)
+        VALUES (?, ?, ?, ?)
+        """,
+        (request_key, 1 if found else 0, payload, now),
+    )
+
+
 # --- file_<axis>_status: the tag-axis classifier (genre, artist, year) ----------------
 #
 # The row access lives in :mod:`tagmend.engine.axis`. This section derives the user-facing
@@ -1063,7 +1102,7 @@ def is_staged(conn: sqlite3.Connection, file_id: int) -> bool:
 
 
 def any_staged(conn: sqlite3.Connection) -> bool:
-    """Return whether ANY file has a pending tag or path change, or any sidecar a pending move.
+    """Return whether ANY tag change, file move, sidecar move or cover is staged.
 
     The clean-staging-area guard for commit-level revert and the resolvers: rolling back with
     work still staged would interleave a revert with half-staged intent, so the revert refuses
@@ -1072,6 +1111,16 @@ def any_staged(conn: sqlite3.Connection) -> bool:
     row = conn.execute(
         "SELECT EXISTS(SELECT 1 FROM tag_revisions_staged) "
         "OR EXISTS(SELECT 1 FROM path_revisions_staged) "
+        "OR EXISTS(SELECT 1 FROM sidecar_moves_staged) "
+        "OR EXISTS(SELECT 1 FROM cover_writes_staged)",
+    ).fetchone()
+    return bool(row[0])
+
+
+def any_move_staged(conn: sqlite3.Connection) -> bool:
+    """Return whether any file or sidecar has a pending move."""
+    row = conn.execute(
+        "SELECT EXISTS(SELECT 1 FROM path_revisions_staged) "
         "OR EXISTS(SELECT 1 FROM sidecar_moves_staged)",
     ).fetchone()
     return bool(row[0])
@@ -1401,13 +1450,15 @@ def commit_log_counts(conn: sqlite3.Connection, commit_id: int) -> dict[str, int
     row = conn.execute(
         "SELECT (SELECT COUNT(*) FROM tag_revisions WHERE commit_id = ?), "
         "(SELECT COUNT(*) FROM path_revisions WHERE commit_id = ?), "
-        "(SELECT COUNT(*) FROM sidecar_moves WHERE commit_id = ?)",
-        (commit_id, commit_id, commit_id),
+        "(SELECT COUNT(*) FROM sidecar_moves WHERE commit_id = ?), "
+        "(SELECT COUNT(*) FROM cover_writes WHERE commit_id = ?)",
+        (commit_id, commit_id, commit_id, commit_id),
     ).fetchone()
     counts = {
         "tag_revisions": db.as_int(row[0]),
         "path_revisions": db.as_int(row[1]),
         "sidecar_moves": db.as_int(row[2]),
+        "cover_writes": db.as_int(row[3]),
     }
     return {log: count for log, count in counts.items() if count}
 
@@ -1692,6 +1743,238 @@ def delete_staged_sidecar(conn: sqlite3.Connection, from_key: str) -> None:
     conn.execute("DELETE FROM sidecar_moves_staged WHERE from_key = ?", (from_key,))
 
 
+# --- cover_writes_staged (one pending cover image per album folder) ----------------------
+
+_STAGED_COVER_FIELDS: Final = (
+    "target_key",
+    "target_path",
+    "folder_key",
+    "album_label",
+    "file_ids",
+    "source_kind",
+    "source_ref",
+    "sha256",
+    "size_bytes",
+    "image_format",
+    "width",
+    "height",
+    "origin",
+    "note",
+    "staged_at",
+)
+_STAGED_COVER_COLUMNS: Final = ", ".join(_STAGED_COVER_FIELDS)
+
+
+@dataclass(frozen=True, slots=True)
+class StagedCover:
+    """One pending cover image, without its bytes. Paths and keys are relative to ``music_path``.
+
+    ``folder_key`` is the key of the album's target folder. ``file_ids`` are the album's files
+    when it was staged.
+    """
+
+    target_key: str
+    target_path: str
+    folder_key: str
+    album_label: str
+    file_ids: tuple[int, ...]
+    source_kind: str
+    source_ref: str
+    sha256: str
+    size_bytes: int
+    image_format: str
+    width: int
+    height: int
+    origin: str
+    note: str | None
+    staged_at: str
+
+
+def _row_to_staged_cover(row: tuple[object, ...]) -> StagedCover:
+    """Build a typed :class:`StagedCover` from a raw sqlite tuple."""
+    file_ids = cast("list[int]", json.loads(str(row[4])))
+    return StagedCover(
+        target_key=str(row[0]),
+        target_path=str(row[1]),
+        folder_key=str(row[2]),
+        album_label=str(row[3]),
+        file_ids=tuple(file_ids),
+        source_kind=str(row[5]),
+        source_ref=str(row[6]),
+        sha256=str(row[7]),
+        size_bytes=db.as_int(row[8]),
+        image_format=str(row[9]),
+        width=db.as_int(row[10]),
+        height=db.as_int(row[11]),
+        origin=str(row[12]),
+        note=None if row[13] is None else str(row[13]),
+        staged_at=str(row[14]),
+    )
+
+
+def insert_staged_cover(conn: sqlite3.Connection, staged: StagedCover, content: bytes) -> None:
+    """Stage one cover image with its *content*. A second row with the same target raises."""
+    placeholders = ", ".join("?" for _ in (*_STAGED_COVER_FIELDS, "content"))
+    conn.execute(
+        f"INSERT INTO cover_writes_staged ({_STAGED_COVER_COLUMNS}, content) "  # noqa: S608
+        f"VALUES ({placeholders})",
+        (
+            staged.target_key,
+            staged.target_path,
+            staged.folder_key,
+            staged.album_label,
+            _dump_json(list(staged.file_ids)),
+            staged.source_kind,
+            staged.source_ref,
+            staged.sha256,
+            staged.size_bytes,
+            staged.image_format,
+            staged.width,
+            staged.height,
+            staged.origin,
+            staged.note,
+            staged.staged_at,
+            content,
+        ),
+    )
+
+
+def list_staged_covers(conn: sqlite3.Connection) -> list[StagedCover]:
+    """Return every pending cover, without its bytes, in target-key order."""
+    cursor = conn.execute(
+        f"SELECT {_STAGED_COVER_COLUMNS} FROM cover_writes_staged ORDER BY target_key",  # noqa: S608
+    )
+    return [_row_to_staged_cover(tuple(row)) for row in cursor.fetchall()]
+
+
+def delete_staged_cover(conn: sqlite3.Connection, target_key: str) -> None:
+    """Remove the pending cover keyed *target_key* (no-op if none)."""
+    conn.execute("DELETE FROM cover_writes_staged WHERE target_key = ?", (target_key,))
+
+
+def staged_cover_content(conn: sqlite3.Connection, target_key: str) -> bytes | None:
+    """Return the image bytes of the pending cover keyed *target_key*, ``None`` if none."""
+    row = conn.execute(
+        "SELECT content FROM cover_writes_staged WHERE target_key = ?", (target_key,)
+    ).fetchone()
+    return None if row is None else bytes(row[0])
+
+
+# --- cover_writes (the append-only log of cover files created or removed) ---------------
+
+
+@dataclass(frozen=True, slots=True)
+class CoverWrite:
+    """One ``cover_writes`` row to append. ``path`` and ``path_key`` are relative to ``music_path``.
+
+    ``content`` holds the bytes a ``create`` row wrote, and is ``None`` on a ``remove`` row.
+    """
+
+    commit_id: int
+    created_at: str
+    origin: str
+    action: str
+    reverted_from: int | None
+    path: str
+    path_key: str
+    sha256: str
+    size_bytes: int
+    source_kind: str
+    source_ref: str
+    content: bytes | None
+    note: str | None
+
+
+def insert_cover_write(conn: sqlite3.Connection, write: CoverWrite) -> None:
+    """Append one ``cover_writes`` row. The append-only triggers refuse rewrites."""
+    conn.execute(
+        """
+        INSERT INTO cover_writes
+          (commit_id, created_at, origin, action, reverted_from, path, path_key, sha256,
+           size_bytes, source_kind, source_ref, content, note)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            write.commit_id,
+            write.created_at,
+            write.origin,
+            write.action,
+            write.reverted_from,
+            write.path,
+            write.path_key,
+            write.sha256,
+            write.size_bytes,
+            write.source_kind,
+            write.source_ref,
+            write.content,
+            write.note,
+        ),
+    )
+
+
+_COVER_WRITE_ROW_COLUMNS: Final = (
+    "id, commit_id, action, reverted_from, path, path_key, sha256, size_bytes, source_kind, "
+    "source_ref"
+)
+
+
+@dataclass(frozen=True, slots=True)
+class CoverWriteRow:
+    """One logged ``cover_writes`` row, without its bytes. Paths are relative to ``music_path``."""
+
+    id: int
+    commit_id: int
+    action: str
+    reverted_from: int | None
+    path: str
+    path_key: str
+    sha256: str
+    size_bytes: int
+    source_kind: str
+    source_ref: str
+
+
+def _row_to_cover_write(row: tuple[object, ...]) -> CoverWriteRow:
+    """Build a typed :class:`CoverWriteRow` from a raw sqlite tuple."""
+    return CoverWriteRow(
+        id=db.as_int(row[0]),
+        commit_id=db.as_int(row[1]),
+        action=str(row[2]),
+        reverted_from=None if row[3] is None else db.as_int(row[3]),
+        path=str(row[4]),
+        path_key=str(row[5]),
+        sha256=str(row[6]),
+        size_bytes=db.as_int(row[7]),
+        source_kind=str(row[8]),
+        source_ref=str(row[9]),
+    )
+
+
+def cover_writes_for_commit(conn: sqlite3.Connection, commit_id: int) -> list[CoverWriteRow]:
+    """Return every ``cover_writes`` row *commit_id* appended, without bytes, in path-key order."""
+    cursor = conn.execute(
+        f"SELECT {_COVER_WRITE_ROW_COLUMNS} FROM cover_writes "  # noqa: S608
+        "WHERE commit_id = ? ORDER BY path_key",
+        (commit_id,),
+    )
+    return [_row_to_cover_write(tuple(row)) for row in cursor.fetchall()]
+
+
+def cover_written_later(conn: sqlite3.Connection, write_id: int, path_key: str) -> bool:
+    """Whether a ``cover_writes`` row after *write_id* has the path key *path_key*."""
+    row = conn.execute(
+        "SELECT EXISTS(SELECT 1 FROM cover_writes WHERE id > ? AND path_key = ?)",
+        (write_id, path_key),
+    ).fetchone()
+    return bool(row[0])
+
+
+def cover_write_content(conn: sqlite3.Connection, write_id: int) -> bytes | None:
+    """Return the bytes the ``cover_writes`` row *write_id* holds, ``None`` when it holds none."""
+    row = conn.execute("SELECT content FROM cover_writes WHERE id = ?", (write_id,)).fetchone()
+    return None if row is None or row[0] is None else bytes(row[0])
+
+
 _SIDECAR_MOVE_COLUMNS: Final = (
     "id, commit_id, created_at, origin, reverted_from, from_path, to_path, from_key, to_key, "
     "unit_key, size_bytes, mtime_ns, note"
@@ -1783,6 +2066,15 @@ def sidecar_moved_later(conn: sqlite3.Connection, move_id: int, key: str) -> boo
     row = conn.execute(
         "SELECT EXISTS(SELECT 1 FROM sidecar_moves WHERE id > ? AND (from_key = ? OR to_key = ?))",
         (move_id, key, key),
+    ).fetchone()
+    return bool(row[0])
+
+
+def sidecar_moved_from_after(conn: sqlite3.Connection, commit_id: int, key: str) -> bool:
+    """Whether a ``sidecar_moves`` row of a commit after *commit_id* moved a sidecar from *key*."""
+    row = conn.execute(
+        "SELECT EXISTS(SELECT 1 FROM sidecar_moves WHERE commit_id > ? AND from_key = ?)",
+        (commit_id, key),
     ).fetchone()
     return bool(row[0])
 

@@ -33,6 +33,7 @@ dependencies = [
     "typer>=0.12",       # CLI framework (type-hint driven)
     "platformdirs>=4.0", # OS-correct config/data dirs for settings.json + ledger
     "pyyaml>=6.0",       # genre vocabulary file
+    "send2trash>=1.8",   # a reverted cover goes to the OS trash, never a permanent delete
 ]
 
 [project.optional-dependencies]
@@ -122,6 +123,11 @@ files = ["src", "tests"]
 [[tool.mypy.overrides]]
 # mutagen does not ship complete type information.
 module = ["mutagen.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# send2trash ships no type information.
+module = ["send2trash.*"]
 ignore_missing_imports = true
 
 # ─────────────────────────────────────────────────────────────────────────────

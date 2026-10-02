@@ -33,6 +33,7 @@ from tagmend.engine import (
     versioning,
 )
 from tagmend.engine.acoustid import AcoustidKeyError, FpcalcUnavailableError
+from tagmend.engine.coverart import CoverArtError
 from tagmend.engine.db import connect
 from tagmend.engine.lastfm import LastfmError
 from tagmend.engine.musicbrainz import MusicBrainzError
@@ -655,6 +656,7 @@ def test_unknown_ids_return_the_error_envelope() -> None:
         sqlite3.OperationalError("database is locked"),
         LastfmError("Last.fm artist.gettoptags failed after 3 attempt(s)"),
         MusicBrainzError("MusicBrainz HTTP 500 for release lookup"),
+        CoverArtError("Cover Art Archive HTTP 400 for release listing"),
         AcoustidKeyError("AcoustID rejected the API key. Check the acoustid_api_key setting."),
         FpcalcUnavailableError("fpcalc is not on PATH and fpcalc_path is not set"),
     ],
@@ -690,7 +692,7 @@ def test_error_envelope_lets_a_bug_raise(monkeypatch: pytest.MonkeyPatch) -> Non
 def test_every_tool_is_enveloped() -> None:
     tools = mcp_server.mcp._tool_manager.list_tools()
 
-    assert len(tools) == 46
+    assert len(tools) == 51
     assert [tool.name for tool in tools if not hasattr(tool.fn, "__wrapped__")] == []
 
 
@@ -757,6 +759,7 @@ _NEGATIVE_LIMIT_CALLS = [
     ("detect_track_conflicts", {"limit": -1}),
     ("detect_album_conflicts", {"limit": -1}),
     ("detect_album_gaps", {"limit": -1}),
+    ("detect_cover_gaps", {"limit": -1}),
     ("detect_release_disagreements", {"limit": -1}),
     ("detect_release_disagreements", {"release_limit": -1}),
     ("detect_year_disagreements", {"limit": -1}),

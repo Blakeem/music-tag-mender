@@ -641,9 +641,6 @@ def _move_back(target: Path, source: Path) -> None:
 
 # --- sidecars: the non-audio files that move with their album folder -------------------
 
-# A tag write's temp copy, which the writer swaps back over its file.
-_TAG_TEMP_SUFFIX: Final = ".tagmend.tmp"
-
 # What the sidecar step did with one row, besides the problem states it shares with audio.
 SIDECAR_MOVED: Final = "moved"
 SIDECAR_WAITING: Final = "waiting"
@@ -730,7 +727,7 @@ def _is_link(entry: os.DirEntry[str]) -> bool:
     return entry.is_symlink() or entry.is_junction()
 
 
-def _sidecar_files(folder: Path) -> tuple[list[Path], bool]:
+def sidecar_files(folder: Path) -> tuple[list[Path], bool]:
     """Return the non-audio files under *folder*, and whether any audio file sits under it.
 
     A subfolder holding audio is another album's folder, so it stays whole. An audio file the
@@ -749,13 +746,13 @@ def _sidecar_files(folder: Path) -> tuple[list[Path], bool]:
             continue
         path = Path(entry.path)
         if entry.is_dir(follow_symlinks=False):
-            inner, inner_audio = _sidecar_files(path)
+            inner, inner_audio = sidecar_files(path)
             holds_audio = holds_audio or inner_audio
             if not inner_audio:
                 files.extend(inner)
         elif path.suffix.lower() in scan.AUDIO_EXTENSIONS:
             holds_audio = True
-        elif entry.is_file(follow_symlinks=False) and not entry.name.endswith(_TAG_TEMP_SUFFIX):
+        elif entry.is_file(follow_symlinks=False) and not entry.name.endswith(scan.TEMP_SUFFIX):
             files.append(path)
     return files, holds_audio
 
@@ -1011,7 +1008,7 @@ def _carry(  # noqa: PLR0913 - cohesive keyword-only claim state and row payload
     inserts: list[store.StagedSidecar] = []
     held: list[SidecarHold] = []
     destination_key = path_keys.path_key(unit.destination)
-    found, _ = _sidecar_files(music_path / unit.folder)
+    found, _ = sidecar_files(music_path / unit.folder)
     for source in found:
         from_path = _relative(music_path, source)
         from_key = path_keys.path_key(from_path)
@@ -1281,7 +1278,7 @@ def _left_behind(conn: sqlite3.Connection, music_path: Path, folders: set[Path])
         key = path_keys.path_key(folder)
         if key == root_key or key in present:
             continue
-        for source in _sidecar_files(folder)[0]:
+        for source in sidecar_files(folder)[0]:
             relative = _relative(music_path, source)
             relative_key = path_keys.path_key(relative)
             if relative_key not in staged:
@@ -1300,7 +1297,7 @@ def _emptied_release_folders(settings: Settings, folders: set[Path]) -> set[Path
     for folder in folders:
         if mismatch.layout_of(settings, str(folder), "").disc_folder is None:
             continue
-        _, holds_audio = _sidecar_files(folder.parent)
+        _, holds_audio = sidecar_files(folder.parent)
         if not holds_audio:
             releases.add(folder.parent)
     return releases
@@ -3122,7 +3119,8 @@ class PathRevertCommitResult(commits.RevertCommitResult):
     """A path commit's revert, with what happened to each of its sidecars.
 
     ``sidecars`` holds one outcome per sidecar the commit moved, from where it sits now to
-    where the revert puts it. ``reverted`` marks a sidecar moved back.
+    where the revert puts it. ``reverted`` marks a sidecar moved back. A cover commit's revert
+    lists each cover there, at its own path.
     """
 
     sidecars: tuple[SidecarOutcome, ...] = ()
@@ -3137,7 +3135,7 @@ class PathRevertCommitResult(commits.RevertCommitResult):
         }
 
 
-def _with_sidecars(
+def with_sidecars(
     result: commits.RevertCommitResult,
     sidecars: Sequence[SidecarOutcome],
 ) -> PathRevertCommitResult:
@@ -3316,7 +3314,7 @@ def revert_commit_moves(  # noqa: PLR0913 - the revert_commit surface plus its o
         summary = commits.summarize_revert(
             commit_id=None, reverted_from=commit_id, dry_run=dry_run, outcomes=outcomes
         )
-        return _with_sidecars(
+        return with_sidecars(
             summary,
             [_sidecar_revert_outcome(move, kind, detail, None) for move, kind, detail in sidecars],
         )
@@ -3355,7 +3353,7 @@ def revert_commit_moves(  # noqa: PLR0913 - the revert_commit surface plus its o
         for revision, kind, detail, _ in planned
     ]
     by_source = {outcome.from_path: outcome for outcome in step.outcomes}
-    result = _with_sidecars(
+    result = with_sidecars(
         commits.summarize_revert(
             commit_id=new_commit, reverted_from=commit_id, dry_run=False, outcomes=outcomes
         ),

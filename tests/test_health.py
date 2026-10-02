@@ -160,6 +160,7 @@ def test_interrupted_commit_is_reported_but_not_a_failure(
     assert report.ready  # informational only, it never flips overall readiness
     commits_check = next(c for c in report.checks if c.name == "commits")
     assert "interrupted" in commits_check.detail
+    assert "commit_covers" in commits_check.detail
     assert commits_check.ok
 
 

@@ -26,6 +26,7 @@ from tagmend.engine import (
     axis,
     axis_status,
     commits,
+    covers,
     genres,
     health,
     library,
@@ -41,6 +42,7 @@ from tagmend.engine import (
     years,
 )
 from tagmend.engine.acoustid import AcoustidError, FpcalcUnavailableError
+from tagmend.engine.coverart import CoverArtError
 from tagmend.engine.lastfm import LastfmError
 from tagmend.engine.library import ScanMode
 from tagmend.engine.musicbrainz import MusicBrainzError
@@ -62,6 +64,7 @@ _ENVELOPED_ERRORS: Final = (
     sqlite3.OperationalError,
     LastfmError,
     MusicBrainzError,
+    CoverArtError,
     AcoustidError,
     FpcalcUnavailableError,
 )
@@ -900,6 +903,168 @@ def detect_album_conflicts(
 
 @mcp.tool()
 @_error_envelope
+def detect_cover_gaps(
+    folder: str | None = None,
+    limit: int | None = None,
+) -> dict[str, object]:
+    """Find the albums Navidrome shows without a cover.
+
+    Navidrome takes an album's cover from an image file in the album's folders whose lowercased
+    name matches ``cover.*``, ``folder.*`` or ``front.*`` (its default ``CoverArtPriority``), and
+    then from a picture embedded in a track. Albums are grouped by the identity
+    ``detect_album_conflicts`` compares. Pure read over the snapshot: writes nothing, stages
+    nothing, no network. Run ``scan_library`` first.
+
+    Each album takes the first status that holds:
+
+    * ``covered_by_file``: a cover image sits in one of its folders. The one parent of its
+      folders also counts when it is not ``music_path``, holds no other album's audio, and the
+      album has two or more folders or its one folder holds no image.
+    * ``covered_by_picture``: one of its files embeds a picture.
+    * ``library_root``: its one folder is ``music_path``.
+    * ``shared_folder``: its one folder holds another album's audio, so one folder image would
+      show for both.
+    * ``scattered``: its folders are not all disc folders of one release folder that holds only
+      this album's audio.
+    * ``gap``: otherwise. ``target_folder`` is its one folder, or the release folder above its
+      disc folders, and ``images`` lists the image files under it.
+
+    Args:
+        folder: Keep the albums with a file at or under this folder. Compared as a path, and a
+            relative folder resolves under ``music_path``.
+        limit: Cap the rows returned. Counts are unaffected.
+
+    Returns:
+        ``{"ok": True, albums, covered_by_file, covered_by_picture, gap, shared_folder,
+        scattered, library_root, rows, summary}``. ``rows`` holds every album that shows no
+        cover, sorted by ``target_folder`` (else its first folder), then album. Each row is
+        ``{identity, album, album_artist, file_ids, folders, status, target_folder,
+        release_mbid, release_group_mbid, images}``. On failure, ``{"ok": False, "error": ...}``.
+    """
+    report = covers.detect_cover_gaps(load_settings(), folder=folder, limit=limit)
+    return {"ok": True, **report.to_dict()}
+
+
+@mcp.tool()
+@_error_envelope
+def stage_covers(
+    folder: str | None = None,
+    image: str | None = None,
+    limit: int | None = None,
+    dry_run: bool = False,  # noqa: FBT001, FBT002 - MCP tool surface, not a Python API
+) -> dict[str, object]:
+    """Stage a cover image for each album ``detect_cover_gaps`` reports as ``gap``. Writes no file.
+
+    The source is the first that yields:
+
+    1. ``image``, the owner's chosen file (origin ``manual``).
+    2. A front image under the album's target folder (origin ``auto``). Its ``.jpg``, ``.jpeg``
+       and ``.png`` files are tried in tiers: a name holding ``front``, then a name holding
+       ``cover`` and not ``back``, then the one image directly in the folder. Its bytes are
+       copied and the owner's file never moves. Two or more images with no single front skip
+       the album as ``ambiguous_images``, with no download.
+    3. The Cover Art Archive front of the album's release (``release_mbid``).
+    4. The Cover Art Archive front of its release group (``release_group_mbid``).
+
+    A CAA original that is not a JPEG or PNG within 32 MiB gives way to its 1200 px thumbnail,
+    then its 500 px one. The target is ``cover.jpg`` or ``cover.png`` in the target folder.
+    Nothing is written to the library until ``commit_covers``.
+
+    Every album that is not ``gap`` is skipped with its status as the reason. A gap album is
+    skipped as ``already_staged`` (its folder holds a staged cover), ``ambiguous_images``,
+    ``no_source``, ``lookup_error``, ``invalid_image`` or ``target_taken`` (its folder holds
+    a file of the target's name or an image Navidrome reads as a cover). Refused while a path
+    move is staged, except with ``dry_run``.
+
+    Args:
+        folder: Only albums with a file at or under this folder. Compared as a path, and a
+            relative folder resolves under ``music_path``.
+        image: The owner's image for the one gap album ``folder`` selects. Replaces that
+            album's staged cover. A relative path resolves under ``music_path``.
+        limit: Cap the gap albums sourced. ``more`` is true when it cut.
+        dry_run: When true, look up CAA listings but download nothing and stage nothing.
+
+    Returns:
+        ``{"ok": True, staged: [{target_path, album, source_kind, source_ref, origin, format,
+        width, height, size_bytes}, ...], skipped: [{folder, album, reason, detail}, ...], more,
+        dry_run, summary}``. A dry run's CAA rows leave the last four ``None``. Paths are relative
+        to ``music_path``. On failure, ``{"ok": False, "error": ...}``.
+    """
+    result = covers.stage_covers(
+        load_settings(), folder=folder, image=image, limit=limit, dry_run=dry_run
+    )
+    return {"ok": True, **result.to_dict()}
+
+
+@mcp.tool()
+@_error_envelope
+def unstage_covers(folder: str | None = None) -> dict[str, object]:
+    """Drop the staged covers whose target sits at or under a folder, or every one. Writes no file.
+
+    Args:
+        folder: Compared as a path, and a relative folder resolves under ``music_path``. Omit
+            to drop every staged cover.
+
+    Returns:
+        ``{"ok": True, "removed": <count>}``, or ``{"ok": False, "error": ...}``.
+    """
+    removed = covers.unstage_covers(load_settings(), folder=folder)
+    return {"ok": True, "removed": removed}
+
+
+@mcp.tool()
+@_error_envelope
+def diff_covers(folder: str | None = None, limit: int | None = None) -> dict[str, object]:
+    """Show the staged covers, each with its state on disk now. Read-only.
+
+    The sources ``stage_covers`` tries, in order: the owner's ``image``, a front image under the
+    album folder, the release's Cover Art Archive front, the release group's front. ``state`` is
+    the first that holds: ``target_taken`` (a file sits at the target: move it away or
+    ``unstage_covers``), ``covered_since_stage`` (an image Navidrome reads as a cover now sits
+    in the folder), ``album_moved`` (a file staged with the cover is gone, or sits outside the
+    target folder and its disc folders: rescan and stage again), else ``ready``.
+
+    Args:
+        folder: Only covers whose target sits at or under this folder. Compared as a path.
+        limit: Cap the rows returned.
+
+    Returns:
+        ``{"ok": True, "changes": [{target_path, album, file_ids, source_kind, source_ref, origin,
+        format, width, height, size_bytes, sha256, note, staged_at, state}, ...]}``, every path
+        relative to ``music_path``.
+    """
+    views = covers.diff_covers(load_settings(), folder=folder, limit=limit)
+    return {"ok": True, "changes": [view.to_dict() for view in views]}
+
+
+@mcp.tool()
+@_error_envelope
+def commit_covers() -> dict[str, object]:
+    """Write every staged cover into its album folder as one commit.
+
+    Each cover is a new ``cover.jpg`` or ``cover.png``, and a write never overwrites a file. A
+    cover stays staged and is listed under ``errors`` when a file staged with it left the
+    target folder (``album_moved``: rescan and stage again), a file sits at its target
+    (``target_taken``), the folder now holds an image Navidrome reads as a cover
+    (``covered_since_stage``) or the write failed (``error``). Each ``detail`` names the next
+    step. A cover whose staged bytes already sit at its target, left by a crash, is logged with
+    no write. Each cover written appends a ``create`` row to ``cover_writes``. A commit left
+    ``applying`` by a crash is marked interrupted first. Refused while a file or sidecar move
+    is staged. ``revert_commit`` undoes a cover commit. It sends each cover the commit wrote to
+    the OS trash.
+
+    Returns:
+        ``{"ok": True, commit_id, written: [{target_path, source_kind, size_bytes}, ...],
+        errors: [{target_path, reason, detail}, ...], summary}``. ``commit_id`` is ``null``
+        when nothing was staged. Paths are relative to ``music_path``. On failure,
+        ``{"ok": False, "error": ...}``.
+    """
+    result = covers.commit_covers(load_settings())
+    return {"ok": True, **result.to_dict()}
+
+
+@mcp.tool()
+@_error_envelope
 def detect_album_gaps(
     limit: int | None = None,
     folder: str | None = None,
@@ -1044,10 +1209,12 @@ def revert_commit(
 ) -> dict[str, object]:
     """Undo an entire commit as a unit. Every file it changed goes back to its pre-commit state.
 
-    Works on both logs. A tag commit restores each file's pre-commit tags. A path commit
+    Works on every log. A tag commit restores each file's pre-commit tags. A path commit
     (from ``commit_paths``) moves each file and each sidecar (cover art, cue sheet, log) back
-    to the path it left, and a revert of that revert moves them forward again. ``get_commit``
-    names the logs a commit changed.
+    to the path it left, and a revert of that revert moves them forward again. A cover commit
+    (from ``commit_covers``) sends each cover it wrote to the OS trash (the Windows Recycle
+    Bin), never a permanent delete, and a revert of that revert writes each cover again from
+    its logged bytes. ``get_commit`` names the logs a commit changed.
 
     The group counterpart of ``revert_tags`` and ``revert_paths``. All reverts land under ONE
     new ``origin='revert'`` commit whose ``reverted_from`` records the undone commit, so the
@@ -1056,11 +1223,11 @@ def revert_commit(
 
     Safety rules. A file changed again by a LATER commit, or edited outside TagMend, is skipped
     and reported as ``skipped_later_changes``. Revert it per file with ``revert_tags`` or
-    ``revert_paths`` if that is really wanted. The staging area must be empty, tag and path
-    rows alike, so commit or unstage pending work first, and run ``commit_paths`` to finish an
-    interrupted path revert. Missing files are reported, not fatal. A path whose old location
-    is taken now is reported as an ``error``. Use ``dry_run=true`` to preview the exact
-    per-file plan without touching anything.
+    ``revert_paths`` if that is really wanted. The staging area must be empty, tag, path and
+    cover rows alike, so commit or unstage pending work first, and run ``commit_paths`` to
+    finish an interrupted path revert. Missing files are reported, not fatal. A path whose old
+    location is taken now is reported as an ``error``. Use ``dry_run=true`` to preview the
+    exact per-file plan without touching anything.
 
     Args:
         commit_id: The commit to undo (from ``list_commits``).
@@ -1079,9 +1246,14 @@ def revert_commit(
         the audited revert revision was appended but nothing on disk moved). A path commit's
         result adds ``"sidecars_reverted"`` and ``"sidecars": [{from_path, to_path, status,
         detail}, ...]``, one per sidecar it moved. A sidecar a later move left or reached is
-        ``skipped_later_changes``. Returns ``{"ok": False, "error": ...}`` if the commit id is
-        unknown, the commit is still ``applying``, the commit holds no change in any log,
-        ``path`` is given for a tag commit, or the staging area is not empty.
+        ``skipped_later_changes``. A cover commit's result has no file outcomes and lists each
+        cover under ``"sidecars"`` with its own path as both paths. A cover is
+        ``skipped_later_changes`` when a later commit wrote its path or moved it, ``missing``
+        when gone, ``changed`` when its bytes differ (it stays), and ``error`` when the trash
+        refuses it (a drive with no Recycle Bin) or a file sits where a cover goes back.
+        Returns ``{"ok": False, "error": ...}`` if the commit id is unknown, the commit is
+        still ``applying``, the commit holds no change in any log, ``path`` is given for a tag
+        or cover commit, or the staging area is not empty.
     """
     result = versioning.revert_commit(
         load_settings(),
@@ -1113,9 +1285,9 @@ def get_commit(commit_id: int) -> dict[str, object]:
 
     Returns ``{"ok": True, "commit": {commit_id, created_at, origin, message, reverted_from,
     status}, "logs": {"tag_revisions": <count>, "path_revisions": <count>, "sidecar_moves":
-    <count>}}``, where ``logs`` names only the logs holding rows of this commit (a tag commit,
-    or a path commit with its moved files and sidecars), or ``{"ok": False, "error": ...}`` if
-    the id is unknown.
+    <count>, "cover_writes": <count>}}``, where ``logs`` names only the logs holding rows of
+    this commit (a tag commit, a path commit with its moved files and sidecars, or a cover
+    commit), or ``{"ok": False, "error": ...}`` if the id is unknown.
     """
     settings = load_settings()
     commit = commits.get_commit(settings, commit_id)

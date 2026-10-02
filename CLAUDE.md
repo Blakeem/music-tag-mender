@@ -21,7 +21,7 @@ Each entry names a subsystem, its MCP tools and its modules under `src/tagmend/e
   name, id, sort or stamp field.
 - Commit ledger: `list_commits`, `get_commit`, `revert_commit`. `commits.py` holds the `commits`
   table, the `RevisionDomain` seam and the crash-safe, resume-free `run_commit` loop.
-  `versioning.revert_commit` undoes a tag or path commit as one new `revert` commit.
+  `versioning.revert_commit` undoes a tag, path or cover commit as one new `revert` commit.
 - Path staging: `stage_paths_batch`, `unstage_paths`, `diff_paths`, `commit_paths`,
   `history_paths`, `revert_paths`. Module `paths.py` (`PathDomain`). A file keeps one `files.id`
   across every move. The next `commit_paths` finishes a move that landed before a crash.
@@ -38,6 +38,17 @@ Each entry names a subsystem, its MCP tools and its modules under `src/tagmend/e
   `DEFAULT_PATTERN`. The settings keys are `naming_pattern` (empty for the default) and
   `container_folders`. `paths.plan_library` is the one planner. It applies every hold.
   `diff_paths` flags an `auto` row `stale` when its render moved.
+- Cover art: `detect_cover_gaps`, `stage_covers`, `unstage_covers`, `diff_covers`,
+  `commit_covers`. Module `covers.py`. An album is grouped by `detector_core.album_identity`,
+  the identity `detect_album_conflicts` uses. It is covered when an image in its folders matches
+  Navidrome's `cover.*`, `folder.*` or `front.*`, or a track holds an embedded picture. A gap
+  album's cover goes in its one folder, or in the release folder above its disc folders. A
+  folder shared by two albums and an album scattered over unrelated folders get none.
+  `stage_covers` takes the owner's `image`, else one front image under the album folder
+  (copied), else the Cover Art Archive front of the release, then of the release group. A staged
+  row holds the image bytes, and `commit_covers` writes them with no overwrite. `cover_writes`
+  logs each write with its bytes. `revert_commit` sends a written cover to the OS trash through
+  `trash.py`, and a revert of that revert writes it again.
 - Tag axes (genre, artist, year, song): `resolve_<axis>s`, `set_<axis>_status` and
   `reset_<axis>_status`, 12 tools. `axis.py` defines each `Axis`, `MISMATCH_AXIS` included.
   `axis_status.py` is the one set and reset implementation. `axis_resolver.py` runs the group
@@ -80,22 +91,23 @@ Each entry names a subsystem, its MCP tools and its modules under `src/tagmend/e
 - Lookup clients: `lastfm.py` fetches top tags and `artist.getCorrection`. `musicbrainz.py`
   looks up a release group's first-release date, a recording, an artist by MBID and a release
   by MBID. `acoustid.py` holds the fpcalc `Fingerprinter` and the `AcoustidClient`, which sends
-  a gzip POST lookup. `lookup_clients.py` holds the injected-or-owned client seam and the one
-  `PacedHttp` transport every client sends through. `PacedHttp` paces, retries and decodes JSON
-  objects. Each client caches its answers in its own `*_cache` tables.
+  a gzip POST lookup. `coverart.py` fetches Cover Art Archive listings and images, and keeps a
+  not-found listing for 7 days. `lookup_clients.py` holds the injected-or-owned client seam and
+  the one `PacedHttp` transport every client sends through. `PacedHttp` paces, retries and
+  decodes JSON objects. Each client caches its answers in its own `*_cache` tables.
 - Result serialization: `serialize.py`. `FieldDict` gives a result dataclass a `to_dict` that
   serializes its fields in field order. A class whose payload renames, omits, rounds or adds a
   key keeps its own `to_dict`.
 
 ## Invariants
 
-- `tag_revisions`, `path_revisions` and `sidecar_moves` are append-only. Triggers abort every
-  `UPDATE` or `DELETE` on them, the cascade from `files` included.
+- `tag_revisions`, `path_revisions`, `sidecar_moves` and `cover_writes` are append-only. Triggers
+  abort every `UPDATE` or `DELETE` on them, the cascade from `files` included.
 - `schema.apply_schema` upgrades an older ledger in place and refuses a newer one.
-- Every forward change to a music file or its path is staged, reviewed with `diff_tags` or
-  `diff_paths`, and written by `commit_tags` or `commit_paths`. A resolver or `stage_*` tool only
-  stages. `revert_tags`, `revert_paths` and `revert_commit` write their restore directly, each as
-  its own `revert` commit.
+- Every forward change to a music file, its path or a cover is staged, reviewed with `diff_tags`,
+  `diff_paths` or `diff_covers`, and written by `commit_tags`, `commit_paths` or `commit_covers`.
+  A resolver or `stage_*` tool only stages. `revert_tags`, `revert_paths` and `revert_commit`
+  write their restore directly, each as its own `revert` commit.
 - Every commit is revertible. A resolver's real run and `revert_commit` are refused while
   anything is staged.
 - `commit_tags` refuses a file whose size or mtime changed since staging (`changed_since_stage`),
@@ -148,8 +160,10 @@ Each entry names a subsystem, its MCP tools and its modules under `src/tagmend/e
   frame, such as `RVAD` or `NCON`. `tags.ensure_writable` makes staging refuse the same files.
   A frame whose id the `id3_droppable_frames` setting names is dropped instead, and no revert
   can restore it.
-- A move never overwrites a target. TagMend never deletes a library file. A commit prunes only
-  the folders its moves empty.
+- A move or a cover write never overwrites a target. TagMend never deletes a library file for
+  good. A revert of a cover commit sends each cover it wrote to the OS trash, and refuses a
+  volume without one, since Windows deletes there for good. A commit prunes only the folders its
+  moves empty.
 - A sidecar waits until every audio file under its album folder has moved. Of two folders whose
   sidecars claim one target, the folder whose audio holds the lower file id wins.
   `sidecars_held` reports the other sidecar.
@@ -162,9 +176,9 @@ Each entry names a subsystem, its MCP tools and its modules under `src/tagmend/e
 - A rendered path never flags in `detect_mismatches`. A round-trip test checks it.
 - Never log an API key. `log.py` holds the `httpx` and `httpcore` loggers at WARNING, since their
   INFO lines carry the Last.fm key in the request URL.
-- Unit tests never touch `music/` and use generated files only. Snapshot tests use `tmp_path` or
-  the `temp_library` fixture. Real-audio tests use `make_track`, which copies a silent `.mp3`,
-  `.flac`, `.m4a` or `.ogg` template and writes tags.
+- Unit tests never touch `music/` or the OS trash, and use generated files only. Snapshot tests
+  use `tmp_path` or the `temp_library` fixture. Real-audio tests use `make_track`, which copies a
+  silent `.mp3`, `.flac`, `.m4a` or `.ogg` template and writes tags.
 
 ## Python
 
@@ -215,7 +229,7 @@ A new verb requires an operation no existing verb covers.
 | readiness / ingest | `check_health` · `scan_library` |
 | enumerate / fetch | `list_<plural>` · `get_<singular>` · `get_library_stats` |
 | read-only findings | `detect_[<field>_]<plural finding noun>` |
-| stage→commit cycle | `stage_/unstage_/diff_/commit_/history_/revert_<domain>` (domains `tags`, `paths`) |
+| stage→commit cycle | `stage_/unstage_/diff_/commit_/history_/revert_<domain>` (domains `tags`, `paths`, `covers`. `covers` reverts only through `revert_commit`) |
 | atomic multi-target | `<stage-verb>_<domain>_batch` (`_batch` reserved, reusable) |
 | commit ledger | `list_commits` · `get_commit` · `revert_commit` (bare: one `commits` table, no domain column) |
 | lookup → stage | `resolve_<axis>s` |
@@ -247,7 +261,7 @@ Rules, in order:
    module/function/class names, `Axis.name` values, status tables, and prose.
 
 Glossary (the comparison behind each finding noun): `mismatch` = tags ↔ path (folders and
-filename) · `gap` = tag ↔ absent · `disagreement` = tag ↔ external source (MusicBrainz) ·
+filename) · `gap` = tag or cover ↔ absent · `disagreement` = tag ↔ external source (MusicBrainz) ·
 `conflict` = tag ↔ sibling tags in the same folder (coined) · `deviation` = current path ↔
 canonical path generated from tags by the naming pattern (coined).
 
@@ -316,11 +330,11 @@ src/tagmend/
   config.py         settings.json (platformdirs) + typed Settings
   cli.py            Typer CLI (thin)
   configui.py       loopback config web UI that edits settings.json
-  mcp_server.py     FastMCP server (thin), 46 tools
+  mcp_server.py     FastMCP server (thin), 51 tools
   data/             genre_vocabulary.yml, genre_overlay.yml, web/ (the config UI page)
   engine/
     db.py           SQLite connection (WAL)
-    schema.py       all DDL + PRAGMA user_version (v27)
+    schema.py       all DDL + PRAGMA user_version (v29)
     path_keys.py    path identity keys, subtree key ranges, the folder-argument normalizer
     text_keys.py    the shared text fold keys (alnum, display, artist name, loose, title)
     clock.py        the engine's one source of the current time
@@ -359,6 +373,9 @@ src/tagmend/
     naming.py
     path_deviations.py  detect_path_deviations: current path vs the rendered path, plus the discovery header
     paths.py
+    covers.py       detect_cover_gaps and the cover stage, commit and revert
+    coverart.py     the Cover Art Archive client
+    trash.py        sends a file to the OS trash, refusing a volume without one
 tests/              pytest; conftest isolates config + builds temp libraries (make_track)
 ```
 

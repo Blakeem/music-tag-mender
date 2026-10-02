@@ -87,3 +87,35 @@ def test_regroup_matches_rows_to_groups_by_the_given_key() -> None:
     regrouped = detector_core.regroup(groups, rows, refold, key=lambda i: (i.folder, i.name))
 
     assert regrouped == [_Item("a", "y1"), _Item("b", "x2")]
+
+
+@pytest.mark.parametrize(
+    ("albumartist", "compilation", "artist", "expected"),
+    [
+        (" Band ", "1", "Guest", "Band"),
+        (None, "1", "Guest", "Various Artists"),
+        ("", "yes", "Guest", "Guest"),
+        (None, None, " ", "[Unknown Artist]"),
+    ],
+)
+def test_display_album_artist_falls_back_in_server_order(
+    albumartist: str | None,
+    compilation: str | None,
+    artist: str | None,
+    expected: str,
+) -> None:
+    assert detector_core.display_album_artist(albumartist, compilation, artist) == expected
+
+
+def test_album_identity_is_the_release_id_else_the_folded_names_and_date() -> None:
+    by_id = detector_core.album_identity(" rel-1 ", "Band", "Album", "2001")
+    by_name = detector_core.album_identity(None, "BAND", "Album", " 2001 ")
+
+    assert by_id == ("release", "rel-1")
+    assert by_name == detector_core.album_identity("", "band", "album", "2001")
+    assert by_name != detector_core.album_identity(None, "band", "album", "2001-01-01")
+
+
+def test_release_date_falls_back_to_a_raw_year() -> None:
+    assert detector_core.release_date({"date": " ", "year": "1999"}) == "1999"
+    assert detector_core.release_date({"date": "2001", "year": "1999"}) == "2001"

@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING
 import httpx
 import mutagen
 import pytest
+import send2trash
 from mutagen.id3 import ID3, RVAD, TIT2  # type: ignore[attr-defined]
 
 from tagmend import config
@@ -143,6 +144,17 @@ def _block_external_network(monkeypatch: pytest.MonkeyPatch) -> None:
         return real_handle(self, request)
 
     monkeypatch.setattr(httpx.HTTPTransport, "handle_request", guarded)
+
+
+@pytest.fixture(autouse=True)
+def _block_os_trash(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fail any test that reaches the real OS trash instead of a fake ``send_to_trash``."""
+
+    def refuse(path: object) -> None:
+        message = f"a test sent {path} to the real OS trash; replace trash.send_to_trash"
+        raise RuntimeError(message)
+
+    monkeypatch.setattr(send2trash, "send2trash", refuse)
 
 
 @pytest.fixture(autouse=True)

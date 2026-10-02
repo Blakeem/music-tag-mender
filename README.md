@@ -1,6 +1,6 @@
 # TagMend
 
-TagMend cleans up the **genre** and **artist-name** tags in your music library using **Last.fm**, **MusicBrainz**, and **AcoustID**, and fills in album original-release years. Every change is staged first and committed as a revertible unit, so nothing touches your files until you say so, and any change can be rolled back. It ships as both a command-line tool and an MCP server, so you can drive it yourself or hand it to an AI assistant like Claude. Built to make [Navidrome MCP](https://github.com/Blakeem/Navidrome-MCP) more useful by giving it accurate names and genres.
+TagMend cleans up the tags of your music library and organizes its files. It fills genres from **Last.fm**, normalizes artist names against **MusicBrainz** and Last.fm, fills original release dates from MusicBrainz, and identifies songs by their audio with **AcoustID**. Every change is staged first and committed as a revertible unit. Nothing touches your files until you say so. Any change can be rolled back. It ships as both a command-line tool and an MCP server, so you can drive it yourself or hand it to an AI assistant like Claude. Built to make [Navidrome MCP](https://github.com/Blakeem/Navidrome-MCP) more useful by giving it accurate names and genres.
 
 ## Table of Contents
 
@@ -14,7 +14,7 @@ TagMend cleans up the **genre** and **artist-name** tags in your music library u
 
 ### 🎵 Genre cleanup (Last.fm)
 
-Pull community top-tags for each artist (optionally each album), fold them through a curated genre vocabulary, and stage clean, consistent genres. Per-file controls let you re-run, skip, or re-queue specific tracks.
+Pull community top-tags for each artist (optionally each album), fold them through a curated genre vocabulary, and stage clean, consistent genres. A deny rule in the genre overlay keeps a genre off the files of the artists it names, or off every file. Per-file controls let you re-run, skip, or re-queue specific tracks.
 
 ### 🎤 Artist-name normalization (MusicBrainz + Last.fm)
 
@@ -22,7 +22,15 @@ Resolve name variants to a single canonical spelling across `artist`, `albumarti
 
 ### 📅 Year fill (MusicBrainz)
 
-Blank-fill each album's original release year (`originaldate`) from MusicBrainz without overwriting values you already have.
+Blank-fill each album's original release date (`originaldate`) from MusicBrainz without overwriting values you already have.
+
+### 🎧 Song identification (AcoustID + MusicBrainz)
+
+Fingerprint each file and look it up on AcoustID to find the release its audio is on. A folder whose files agree on one release gets its blank `title`, `tracknumber` and `discnumber` filled. A folder whose audio is not on the release its tags name is reported with ranked candidate releases. Stamping a folder onto the release you choose writes that release's names, ids, dates and numbers onto every file. A file the audio cannot place takes the track you name for it.
+
+### 🧭 Consistency reports
+
+Read-only reports find files that share a track slot in one folder, folders whose files describe different albums, tags that contradict the MusicBrainz release a file names, and years that contradict the album's first release.
 
 ### 🔍 Mislabeled-file detection
 
@@ -30,19 +38,23 @@ Find files whose path disagrees with their own tags with `tagmend detect-mismatc
 
 ### 🕳️ Blank-album gap detection
 
-Find files carrying no `album` tag at all — invisible to every album-scoped tool — with the `detect_album_gaps` MCP tool. Groups them by folder and proposes grounded fills (unanimous folder mates, the parsed folder name, or a review-only MusicBrainz recording lookup). A read-only report; proposals only ever fill blanks, never overwrite.
+Find files carrying no `album` tag at all (invisible to every album-scoped tool) with the `detect_album_gaps` MCP tool. Groups them by folder and proposes grounded fills (unanimous folder mates, the parsed folder name, or a review-only MusicBrainz recording lookup). A read-only report. Proposals only ever fill blanks, never overwrite.
 
 ### ↩️ Fully revertible history
 
 A git-like flow: stage → commit → revert. Files are only written on commit, each change is recorded in an append-only per-file log, and any single file or whole commit can be undone. Reverts are themselves tracked commits.
 
+### 📁 File organization
+
+File moves are opt-in. Each file moves to the path a naming pattern builds from its tags. Moves are staged and committed like tag edits. A move never overwrites a file. Cover art, cue sheets and other non-audio files move with their album.
+
 ### 🗂️ Per-file status workflow
 
-Mark files as `manual` to exclude them from an axis (genre, artist, year, or song), or re-queue them as `pending`. Status is sticky and respected on every run.
+Mark files as `manual` to exclude them from an axis (genre, artist, year, or song), or reset them to `pending`. A `manual` mark stays until you reset it. A file a resolver settled returns to `pending` on its own when a tag it was settled on changes.
 
 ### 🎚️ Multi-format and engine-first
 
-Reads and writes MP3, FLAC, M4A, and OGG through mutagen. All logic lives in one engine; the CLI and MCP server are thin wrappers over it. Settings live in a single on-disk `settings.json`, edited through a loopback-only browser form with a built-in Last.fm key test, so there are no env vars or hand-edited JSON to manage.
+Reads and writes MP3, FLAC, M4A, and OGG through mutagen. All logic lives in one engine. The CLI and MCP server are thin wrappers over it. Settings live in a single on-disk `settings.json`, edited through a loopback-only browser form with a built-in Last.fm key test, so there are no env vars or hand-edited JSON to manage.
 
 ## Installation
 
@@ -117,11 +129,11 @@ If `music_path` or your Last.fm key is missing on launch, TagMend auto-opens the
 - `TAGMEND_NO_BROWSER` starts the server but does not open a browser window.
 - `TAGMEND_NO_CONFIG_UI` never auto-launches the settings page from `tagmend mcp`.
 
-Edits apply on the next tool call; every command and MCP tool re-reads `settings.json` fresh (there is no in-process settings cache).
+Edits apply on the next tool call. Every command and MCP tool re-reads `settings.json` fresh (there is no in-process settings cache).
 
 ## Tools
 
-The MCP server exposes 46 tools. Tag edits and file moves are staged first and only written to disk on `commit_tags` or `commit_paths`, and everything is revertible.
+The MCP server exposes 46 tools. Tag edits and file moves are staged first and written to disk only by `commit_tags`, `commit_paths` or a revert tool. Every change is revertible.
 
 ### Core & Library
 
@@ -143,7 +155,7 @@ The MCP server exposes 46 tools. Tag edits and file moves are staged first and o
 
 | Tool | Description |
 |------|-------------|
-| `stage_tags` | Stage a managed-tag change for one file (the git "index"); writes nothing to disk |
+| `stage_tags` | Stage a managed-tag change for one file (the git "index"). Writes nothing to disk |
 | `stage_tags_batch` | Stage managed-tag changes for many files in one atomic, all-or-nothing call |
 | `unstage_tags` | Remove a pending staged change for one file |
 | `diff_tags` | Show staged-but-uncommitted changes, enriched with the current to target diff |
@@ -181,7 +193,7 @@ The MCP server exposes 46 tools. Tag edits and file moves are staged first and o
 | Tool | Description |
 |------|-------------|
 | `list_albums` | List distinct album groups with file counts and status (to scope a run) |
-| `resolve_years` | Blank-fill the original release year (`originaldate`) from MusicBrainz (no disk write) |
+| `resolve_years` | Blank-fill the original release date (`originaldate`) from MusicBrainz (no disk write) |
 | `set_year_status` | Exclude files from the year fill (`manual`). The exclusion is sticky until `reset_year_status` |
 | `reset_year_status` | Clear any year status row for in-scope files, returning them to `pending` |
 
@@ -189,7 +201,7 @@ The MCP server exposes 46 tools. Tag edits and file moves are staged first and o
 
 | Tool | Description |
 |------|-------------|
-| `resolve_songs` | Blank-fill `title`, `tracknumber` and `discnumber` from the release each file's audio is on (no disk write) |
+| `resolve_songs` | Blank-fill `title`, `tracknumber` and `discnumber` from the release each file's audio is on. Report each folder whose audio is on another release, with ranked candidates placed on its tracks. `release_mbid` stamps the folder onto that release. `assignments` name the track for each file the audio cannot place. No disk write. |
 | `set_song_status` | Exclude files from the song fill (`manual`). The exclusion is sticky until `reset_song_status` |
 | `reset_song_status` | Clear any song status row for in-scope files, returning them to `pending` |
 
@@ -230,7 +242,7 @@ mypy                    # strict static typing
 pytest                  # tests
 ```
 
-All logic lives in the engine (`src/tagmend/engine/`); the CLI (`cli.py`) and MCP server (`mcp_server.py`) are thin wrappers. See `CLAUDE.md` for working notes and `PLAN.md` for the full design.
+All logic lives in the engine (`src/tagmend/engine/`). The CLI (`cli.py`) and MCP server (`mcp_server.py`) are thin wrappers. See `CLAUDE.md` for working notes and `PLAN.md` for the full design.
 
 Test the MCP server non-interactively with the [MCP Inspector](https://github.com/modelcontextprotocol/inspector):
 

@@ -106,6 +106,12 @@ def test_build_seed_names_the_song_settings() -> None:
     assert values["song_stage_limit"] == "150"
 
 
+def test_build_seed_joins_the_droppable_frame_ids() -> None:
+    values = configui.build_seed(_settings(id3_droppable_frames=("RVAD", "NCON")))["values"]
+    assert isinstance(values, dict)
+    assert values["id3_droppable_frames"] == "RVAD;NCON"
+
+
 # --- validate_and_normalize ----------------------------------------------------------
 
 

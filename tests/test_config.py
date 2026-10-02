@@ -276,6 +276,31 @@ def test_container_folders_env_override(monkeypatch: pytest.MonkeyPatch) -> None
     assert config.load_settings().container_folders == ("FromEnv", "Other")
 
 
+# --- id3_droppable_frames (the ID3 frames a tag write may drop) ------------------------
+
+
+def test_id3_droppable_frames_default_empty() -> None:
+    assert config.load_settings().id3_droppable_frames == ()
+
+
+def test_id3_droppable_frames_coerce_to_unique_upper_case_ids(
+    tagmend_warnings: pytest.LogCaptureFixture,
+) -> None:
+    config.set_setting("id3_droppable_frames", " rvad ; ncon;bad!;RVAD")
+
+    assert config.load_settings().id3_droppable_frames == ("RVAD", "NCON")
+    messages = [record.getMessage() for record in tagmend_warnings.records]
+    assert len(messages) == 1
+    assert "'bad!'" in messages[0]
+
+
+@pytest.mark.parametrize("entry", ["RVA", "RVADX", "RV-D", "ÄBCD"])
+def test_id3_droppable_frames_reject_an_entry_that_is_not_a_frame_id(entry: str) -> None:
+    config.set_setting("id3_droppable_frames", f"{entry};;TXXX;")
+
+    assert config.load_settings().id3_droppable_frames == ("TXXX",)
+
+
 # --- naming_pattern (the path renderer's pattern) --------------------------------------
 
 

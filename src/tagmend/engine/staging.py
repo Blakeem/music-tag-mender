@@ -151,9 +151,11 @@ class TagDomain:
     Frozen and stateless: it reads each staged file's payload from
     :mod:`tagmend.engine.store` by ``file_id``. ``plan_order`` and ``post_commit_file``
     are identity and no-op, because tag commits have no ordering or filesystem-cleanup concerns.
+    ``droppable_frames`` is the ID3 frame id set every write is given.
     """
 
     name: str = "tags"
+    droppable_frames: frozenset[str] = frozenset()
 
     @property
     def per_file_errors(self) -> tuple[type[Exception], ...]:
@@ -247,7 +249,9 @@ class TagDomain:
         before_write = path.stat()
         audio_proven = False
         if disk_diff:
-            audio_proven = write_managed_tags(path, staged.managed_tags).audio_proven
+            audio_proven = write_managed_tags(
+                path, staged.managed_tags, droppable_frames=self.droppable_frames
+            ).audio_proven
 
         # Refresh the live snapshot, append the revision, delete the staged row.
         fresh = read_tags(path).tags
@@ -366,6 +370,7 @@ def _stage_one(  # noqa: PLR0913 - cohesive keyword-only per-file staging payloa
     origin: str,
     note: str | None,
     now: str,
+    droppable_frames: frozenset[str],
     fill_only: frozenset[str] = frozenset(),
 ) -> bool:
     """Validate + stage one file's change on an OPEN connection (no commit). Never drifts.
@@ -380,8 +385,9 @@ def _stage_one(  # noqa: PLR0913 - cohesive keyword-only per-file staging payloa
     a file edited since, and with the caller's surviving keys as its ``supplied_keys``. A file
     holding a staged path change is refused. A *fill_only* key is dropped when the file on disk
     already holds a value for it, and when that leaves no caller-supplied key, nothing is staged
-    and ``False`` is returned. Raises :class:`ValueError` naming *file_id* on any invalid input.
-    Leaves the transaction for the caller to commit or roll back.
+    and ``False`` is returned. A file the writer would refuse under *droppable_frames* is
+    refused. Raises :class:`ValueError` naming *file_id* on any invalid input. Leaves the
+    transaction for the caller to commit or roll back.
     """
     unmanaged = sorted(set(tags) - MANAGED_TAGS)
     if unmanaged:
@@ -429,7 +435,7 @@ def _stage_one(  # noqa: PLR0913 - cohesive keyword-only per-file staging payloa
     # A staged row the writer must refuse would fail every commit and block revert_commit's
     # empty-staging guard until someone unstaged it by hand.
     try:
-        ensure_writable(path)
+        ensure_writable(path, droppable_frames=droppable_frames)
     except (mutagen.MutagenError, OSError, ValueError) as exc:  # type: ignore[attr-defined]
         message = f"cannot stage file_id={file_id}: {exc}"
         raise ValueError(message) from exc
@@ -512,6 +518,7 @@ def stage_tags(  # noqa: PLR0913 - cohesive keyword-only staging payload
             origin=origin,
             note=note,
             now=clock.utc_now(),
+            droppable_frames=frozenset(settings.id3_droppable_frames),
             fill_only=fill_only,
         )
         connection.commit()
@@ -609,6 +616,7 @@ def stage_tags_batch(
                 origin="manual",
                 note=note,
                 now=now,
+                droppable_frames=frozenset(settings.id3_droppable_frames),
             )
         connection.commit()
     finally:
@@ -771,7 +779,7 @@ def commit_tags(
     """
     root_key = None if path is None else path_keys.folder_arg_key(settings, path)
 
-    domain = TagDomain()
+    domain = TagDomain(droppable_frames=frozenset(settings.id3_droppable_frames))
     connection = db.connect(settings.db_path)
     try:
         schema.apply_schema(connection)

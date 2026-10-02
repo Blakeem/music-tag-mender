@@ -13,6 +13,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
 import stat
 import tempfile
 import threading
@@ -50,6 +51,7 @@ _KNOWN_KEYS: Final[frozenset[str]] = frozenset(
         "fpcalc_path",
         "acoustid_rate_per_sec",
         "song_stage_limit",
+        "id3_droppable_frames",
     },
 )
 
@@ -58,6 +60,8 @@ SECRET_KEYS: Final[frozenset[str]] = frozenset({"lastfm_api_key", "acoustid_api_
 
 # A settings file written before the album axis became the year axis still carries the old key.
 _LEGACY_KEYS: Final[Mapping[str, str]] = {"album_stage_limit": "year_stage_limit"}
+
+_ID3_FRAME_ID: Final = re.compile(r"[A-Za-z0-9]{4}")
 
 # Defaults for the M2 genre-tagging settings (used by the coercion helpers below).
 _GENRE_MIN_WEIGHT_DEFAULT: Final = 2
@@ -160,6 +164,8 @@ class Settings:
     fpcalc_path: str | None = None
     acoustid_rate_per_sec: float = _ACOUSTID_RATE_PER_SEC_DEFAULT
     song_stage_limit: int = _SONG_STAGE_LIMIT_DEFAULT
+    # The ID3 frame ids a tag write may drop. No revert can restore a dropped frame.
+    id3_droppable_frames: tuple[str, ...] = ()
 
     @property
     def musicbrainz_user_agent(self) -> str:
@@ -237,6 +243,7 @@ def load_settings() -> Settings:
             _resolve_raw("song_stage_limit", raw),
             _SONG_STAGE_LIMIT_DEFAULT,
         ),
+        id3_droppable_frames=_coerce_frame_ids(_resolve_raw("id3_droppable_frames", raw)),
     )
 
 
@@ -340,6 +347,21 @@ def _coerce_folder_list(value: str | None) -> tuple[str, ...]:
     if value is None:
         return ()
     return tuple(stripped for part in value.split(";") if (stripped := part.strip()))
+
+
+def _coerce_frame_ids(value: str | None) -> tuple[str, ...]:
+    """Parse ``id3_droppable_frames`` like :func:`_coerce_folder_list`, upper-cased and deduped.
+
+    An entry that is not a four-character ID3 frame id warns and is dropped.
+    """
+    frame_ids: list[str] = []
+    for entry in _coerce_folder_list(value):
+        frame_id = entry.upper()
+        if not _ID3_FRAME_ID.fullmatch(entry):
+            logger.warning("invalid id3_droppable_frames entry %r; ignoring it", entry)
+        elif frame_id not in frame_ids:
+            frame_ids.append(frame_id)
+    return tuple(frame_ids)
 
 
 def set_setting(key: str, value: str) -> Path:

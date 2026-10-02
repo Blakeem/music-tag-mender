@@ -101,6 +101,8 @@ tagmend config-path     # show where settings.json lives
 tagmend check-health    # readiness check
 ```
 
+The `id3_droppable_frames` setting (such as `RVAD;NCON`) lists the ID3 frame ids a write may drop from an MP3 instead of refusing the write. No revert can restore a dropped frame.
+
 CLI commands: `check-health`, `scan-library`, `get-library-stats`, `detect-mismatches`, `config`, `config-set`, `config-path`, `mcp`, `version`.
 
 ### Use as an MCP server

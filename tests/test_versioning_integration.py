@@ -450,8 +450,10 @@ def test_a_revert_crashed_after_its_write_is_not_drift_on_rerun(
             return versioning.revert_commit(engine_settings, commit_id).outcomes[0].status
         return versioning.revert_tags(engine_settings, file_id, 0).status
 
-    def write_then_die(path: Path, tags: dict[str, list[str]]) -> None:
-        write_managed_tags(path, tags)
+    def write_then_die(
+        path: Path, tags: dict[str, list[str]], *, droppable_frames: frozenset[str] = frozenset()
+    ) -> None:
+        write_managed_tags(path, tags, droppable_frames=droppable_frames)
         raise _Crash
 
     with monkeypatch.context() as patch:

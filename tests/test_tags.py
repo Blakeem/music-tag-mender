@@ -32,7 +32,7 @@ from mutagen.id3 import (  # type: ignore[attr-defined]
 from mutagen.mp4 import MP4
 from mutagen.oggvorbis import OggVorbis
 
-from conftest import make_track
+from conftest import make_droppable_frames_mp3, make_track
 from tagmend.engine import tags
 
 # Import tags so its module-load RegisterFreeformKey runs before make_track writes any
@@ -859,6 +859,161 @@ def test_write_carries_v23_frames_the_upgrade_folds(tmp_path: Path) -> None:
     assert after["date"] == ["2013-10-04 07:30:00"]
     assert after["originaldate"] == ["1999"]
     assert ID3(track)["TIPL"].people == [["producer", "X"]]  # type: ignore[no-untyped-call]
+
+
+_BOTH_FRAMES = frozenset({"RVAD", "NCON"})
+
+
+def test_write_drops_the_frames_the_caller_names(
+    tmp_path: Path, tagmend_warnings: pytest.LogCaptureFixture
+) -> None:
+    track = make_droppable_frames_mp3(tmp_path / "loud.mp3")
+
+    result = write_managed_tags(
+        track, {**_managed(track), "genre": ["Jazz"]}, droppable_frames=_BOTH_FRAMES
+    )
+
+    assert result.written is True
+    assert result.dropped_frames == ("NCON", "RVAD")
+    after = read_tags(track).tags
+    assert after["genre"] == ["Jazz"]
+    assert after["title"] == ["Loud"]
+    raw = ID3(track, translate=False)  # type: ignore[no-untyped-call]
+    assert raw.getall("RVAD") == []  # type: ignore[no-untyped-call]
+    assert raw.unknown_frames == []
+    messages = [record.getMessage() for record in tagmend_warnings.records]
+    assert len(messages) == 1
+    assert "NCON, RVAD" in messages[0]
+    assert str(track) in messages[0]
+
+
+def test_a_write_dropping_nothing_reports_no_dropped_frames(tmp_path: Path) -> None:
+    track = make_track(tmp_path / "plain.mp3", {"genre": ["Rock"]})
+
+    result = write_managed_tags(
+        track, {**_managed(track), "genre": ["Jazz"]}, droppable_frames=_BOTH_FRAMES
+    )
+
+    assert result.written is True
+    assert result.dropped_frames == ()
+
+
+def test_a_frame_left_unnamed_still_refuses_the_write_and_the_stage_check(
+    tmp_path: Path,
+) -> None:
+    track = make_droppable_frames_mp3(tmp_path / "loud.mp3")
+    before = track.read_bytes()
+    only_rvad = frozenset({"RVAD"})
+
+    with pytest.raises(TagWriteError) as written:
+        write_managed_tags(
+            track, {**_managed(track), "genre": ["Jazz"]}, droppable_frames=only_rvad
+        )
+    with pytest.raises(TagWriteError) as staged:
+        tags.ensure_writable(track, droppable_frames=only_rvad)
+
+    assert written.value.violations == ["dropped unknown frame NCON"]
+    assert staged.value.violations == ["dropped unknown frame NCON"]
+    assert track.read_bytes() == before
+    assert not list(tmp_path.glob("*.tagmend.tmp"))
+
+
+def test_the_stage_check_accepts_a_file_once_every_dropped_frame_is_named(
+    tmp_path: Path,
+) -> None:
+    track = make_droppable_frames_mp3(tmp_path / "loud.mp3")
+
+    with pytest.raises(TagWriteError, match="dropped RVAD"):
+        tags.ensure_writable(track)
+
+    tags.ensure_writable(track, droppable_frames=_BOTH_FRAMES)
+
+
+def test_named_frames_still_refuse_a_write_that_changes_another_frame(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    track = make_droppable_frames_mp3(tmp_path / "loud.mp3")
+    # Untranslated, so the v2.3 save keeps the RVAD frame a v2.4 upgrade deletes.
+    raw = ID3(track, translate=False)  # type: ignore[no-untyped-call]
+    raw.add(TXXX(encoding=3, desc="Foo", text=["bar"]))  # type: ignore[no-untyped-call]
+    raw.save(v2_version=3)
+    assert sorted(tags._id3_entries(track)) == ["RVAD", "TXXX:Foo", "unknown frame NCON"]
+    before = track.read_bytes()
+    real_apply = tags._apply_changes
+
+    def rewrite_foo(
+        path: Path,
+        container: tags._Container,
+        kind: type[FileType],
+        changes: list[tuple[str, list[str] | None]],
+    ) -> None:
+        real_apply(path, container, kind, changes)
+        frames = ID3(path)  # type: ignore[no-untyped-call]
+        frames.add(TXXX(encoding=3, desc="Foo", text=["baz"]))  # type: ignore[no-untyped-call]
+        frames.save()
+
+    monkeypatch.setattr(tags, "_apply_changes", rewrite_foo)
+
+    with pytest.raises(TagWriteError) as refused:
+        write_managed_tags(
+            track, {**_managed(track), "genre": ["Jazz"]}, droppable_frames=_BOTH_FRAMES
+        )
+
+    assert refused.value.violations == ["changed TXXX:Foo"]
+    assert track.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    ("before_entries", "after_entries", "violation"),
+    [
+        pytest.param({"RVAD": ("a",)}, {"RVAD": ("b",)}, "changed RVAD", id="changed"),
+        pytest.param({}, {"RVAD": ("a",)}, "added RVAD", id="added"),
+        pytest.param({"EQUA": ("a",)}, {}, "dropped EQUA", id="dropped-unnamed"),
+    ],
+)
+def test_a_named_frame_id_excuses_only_its_drop(
+    before_entries: dict[str, tuple[str, ...]],
+    after_entries: dict[str, tuple[str, ...]],
+    violation: str,
+) -> None:
+    def snapshot(entries: dict[str, tuple[str, ...]]) -> tags._ContainerSnapshot:
+        return tags._ContainerSnapshot(
+            audio_digest=None, entries=entries, has_id3v1=False, has_apev2=False
+        )
+
+    violations = tags._snapshot_violations(
+        snapshot(before_entries), snapshot(after_entries), droppable_frames=frozenset({"RVAD"})
+    )
+
+    assert violations == [violation]
+
+
+def test_droppable_frames_are_ignored_off_id3(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    track = make_track(tmp_path / "vorbis.flac", {"genre": ["Rock"], "rvad": ["x"]})
+    before = track.read_bytes()
+    real_apply = tags._apply_changes
+
+    def drop_rvad(
+        path: Path,
+        container: tags._Container,
+        kind: type[FileType],
+        changes: list[tuple[str, list[str] | None]],
+    ) -> None:
+        real_apply(path, container, kind, changes)
+        audio = FLAC(path)
+        del audio["rvad"]
+        audio.save()
+
+    monkeypatch.setattr(tags, "_apply_changes", drop_rvad)
+
+    with pytest.raises(TagWriteError, match="dropped RVAD"):
+        write_managed_tags(
+            track, {**_managed(track), "genre": ["Jazz"]}, droppable_frames=frozenset({"RVAD"})
+        )
+
+    assert track.read_bytes() == before
 
 
 @pytest.mark.parametrize("with_id3v1", [False, True])

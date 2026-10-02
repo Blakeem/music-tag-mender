@@ -17,6 +17,7 @@ const FIELDS = [
   { key: "fpcalc_path", label: "fpcalc path (blank = PATH)", group: "advanced", type: "text" },
   { key: "acoustid_rate_per_sec", label: "AcoustID requests/sec (max 3)", group: "advanced", type: "text" },
   { key: "song_stage_limit", label: "Song stage limit", group: "advanced", type: "text" },
+  { key: "id3_droppable_frames", label: "ID3 frames a write may drop (semicolon-separated)", group: "advanced", type: "text" },
 ];
 
 const csrfToken = document.querySelector('meta[name="csrf-token"]').content;

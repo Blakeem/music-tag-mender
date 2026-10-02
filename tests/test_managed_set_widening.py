@@ -35,8 +35,10 @@ class _Crash(BaseException):
 
 
 def _crash_after_write(monkeypatch: pytest.MonkeyPatch) -> None:
-    def write_then_die(path: Path, tags: dict[str, list[str]]) -> None:
-        write_managed_tags(path, tags)
+    def write_then_die(
+        path: Path, tags: dict[str, list[str]], *, droppable_frames: frozenset[str] = frozenset()
+    ) -> None:
+        write_managed_tags(path, tags, droppable_frames=droppable_frames)
         raise _Crash
 
     monkeypatch.setattr(versioning, "write_managed_tags", write_then_die)

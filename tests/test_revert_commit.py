@@ -578,12 +578,17 @@ def test_revert_commit_per_file_failure_then_rerun(
         {a_id: {"genre": ["Synthwave"]}, b_id: {"genre": ["Metal"]}},
     )
 
-    def flaky_write(path: Path, managed_tags: dict[str, list[str]]) -> TagWriteResult:
+    def flaky_write(
+        path: Path,
+        managed_tags: dict[str, list[str]],
+        *,
+        droppable_frames: frozenset[str] = frozenset(),
+    ) -> TagWriteResult:
         # Fail the write for the SECOND file (B) only. A reverts durably.
         if path.name == b.name:
             message = "simulated disk failure"
             raise OSError(message)
-        return write_managed_tags(path, managed_tags)
+        return write_managed_tags(path, managed_tags, droppable_frames=droppable_frames)
 
     monkeypatch.setattr(versioning, "write_managed_tags", flaky_write)
     result = versioning.revert_commit(engine_settings, target)

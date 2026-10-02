@@ -126,6 +126,7 @@ def build_seed(settings: Settings) -> dict[str, object]:
         "fpcalc_path": settings.fpcalc_path or "",
         "acoustid_rate_per_sec": str(settings.acoustid_rate_per_sec),
         "song_stage_limit": str(settings.song_stage_limit),
+        "id3_droppable_frames": ";".join(settings.id3_droppable_frames),
         "acoustid_api_key": MASK_PLACEHOLDER if settings.acoustid_api_key is not None else "",
     }
     has_key = settings.lastfm_api_key is not None

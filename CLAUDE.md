@@ -142,6 +142,8 @@ Each entry names a subsystem, its MCP tools and its modules under `src/tagmend/e
 - The writer refuses a container the verifier has no layout for and a non-Ogg file whose audio
   payload it cannot locate. It also refuses an ID3 file whose v2.4 save would drop an unmanaged
   frame, such as `RVAD` or `NCON`. `tags.ensure_writable` makes staging refuse the same files.
+  A frame whose id the `id3_droppable_frames` setting names is dropped instead, and no revert
+  can restore it.
 - A move never overwrites a target. TagMend never deletes a library file. A commit prunes only
   the folders its moves empty.
 - A sidecar waits until every audio file under its album folder has moved. Of two folders whose

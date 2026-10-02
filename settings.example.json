@@ -8,6 +8,7 @@
   "genre_min_weight": "2",
   "genre_stage_limit": "300",
   "genre_use_album_tags": "true",
+  "id3_droppable_frames": "",
   "lastfm_api_key": "0000000000000000000000000000000a",
   "lastfm_rate_per_sec": "1.0",
   "music_path": "/path/to/your/music",

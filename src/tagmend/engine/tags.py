@@ -11,6 +11,7 @@ dropped NAS connection mid-write cannot corrupt the original (PLAN.md §7 and §
 Before the swap it verifies the temp copy, and refuses with :class:`TagWriteError` when the
 save changed anything outside the target. A container the verifier cannot check is refused
 before any copy, and :func:`ensure_writable` lets staging refuse it before a change is queued.
+An ID3 frame the caller names in ``droppable_frames`` is the one entry a save may drop.
 """
 
 from __future__ import annotations
@@ -399,11 +400,13 @@ class TagWriteResult:
     """What :func:`write_managed_tags` did to the file.
 
     ``audio_proven`` holds after a write whose verified payload hash decides the decoded audio,
-    so a fingerprint taken before the write still describes the file.
+    so a fingerprint taken before the write still describes the file. ``dropped_frames`` holds
+    the sorted ID3 frame ids the write removed under ``droppable_frames``.
     """
 
     written: bool
     audio_proven: bool
+    dropped_frames: tuple[str, ...] = ()
 
 
 def _container_of(audio: FileType) -> _Container:
@@ -597,6 +600,15 @@ def _upgrade_keeps(frame_id: str, value: str, successors: _Successors) -> bool:
     return False
 
 
+# mutagen keeps a frame it cannot parse as raw bytes, so its entry key carries only its id.
+_UNKNOWN_FRAME_PREFIX: Final = "unknown frame "
+
+
+def _frame_id(entry_key: str) -> str:
+    """Return the ID3 frame id an :func:`_id3_entries` key names."""
+    return entry_key.removeprefix(_UNKNOWN_FRAME_PREFIX)
+
+
 def _id3_entries(source: Path | BinaryIO) -> dict[str, list[str]]:
     """Return the unmanaged ID3v2 frames of *source* as ``frame key -> value digests``.
 
@@ -615,7 +627,7 @@ def _id3_entries(source: Path | BinaryIO) -> dict[str, list[str]]:
     entries: dict[str, list[str]] = {}
     id_size, header_size = (3, 6) if frames.version < (2, 3, 0) else (4, 10)
     for data in frames.unknown_frames:
-        key = f"unknown frame {bytes(data[:id_size]).decode('latin-1')}"
+        key = f"{_UNKNOWN_FRAME_PREFIX}{bytes(data[:id_size]).decode('latin-1')}"
         entries.setdefault(key, []).append(_digest(bytes(data[header_size:])))
     older = [
         (frame_id, frame)
@@ -703,12 +715,23 @@ def _snapshot(path: Path, container: _Container, kind: type[FileType]) -> _Conta
     )
 
 
-def _snapshot_violations(before: _ContainerSnapshot, after: _ContainerSnapshot) -> list[str]:
-    """Describe every way *after* differs from *before*."""
+def _dropped_keys(before: _ContainerSnapshot, after: _ContainerSnapshot) -> set[str]:
+    """Return the unmanaged entry keys *before* holds and *after* lacks."""
+    return before.entries.keys() - after.entries.keys()
+
+
+def _snapshot_violations(
+    before: _ContainerSnapshot,
+    after: _ContainerSnapshot,
+    *,
+    droppable_frames: frozenset[str] = frozenset(),
+) -> list[str]:
+    """Describe every way *after* differs from *before*, except a drop *droppable_frames* names."""
+    allowed = {key for key in _dropped_keys(before, after) if _frame_id(key) in droppable_frames}
     violations: list[str] = []
     if before.audio_digest != after.audio_digest:
         violations.append("audio payload changed")
-    for key in sorted(before.entries.keys() | after.entries.keys()):
+    for key in sorted((before.entries.keys() | after.entries.keys()) - allowed):
         if key not in after.entries:
             violations.append(f"dropped {key}")
         elif key not in before.entries:
@@ -871,11 +894,12 @@ def _require_verifiable(path: Path, audio: FileType) -> _Container:
     return container
 
 
-def _require_lossless_id3_save(path: Path) -> None:
+def _require_lossless_id3_save(path: Path, *, droppable_frames: frozenset[str]) -> None:
     """Raise :class:`TagWriteError` when saving *path*'s ID3 tag as v2.4 drops an unmanaged frame.
 
     Every ID3 write saves v2.4, which discards v2.3-only frames such as ``RVAD`` and unknown
-    frames, so the verifier refuses every write of such a file whatever its changes.
+    frames, so the verifier refuses every write of such a file whatever its changes. A frame
+    whose id *droppable_frames* names is the exception.
     """
     try:
         frames: Any = ID3(path, load_v1=False)  # type: ignore[no-untyped-call]
@@ -884,7 +908,11 @@ def _require_lossless_id3_save(path: Path) -> None:
     saved = io.BytesIO()
     frames.save(saved)
     saved.seek(0)
-    violations = _snapshot_violations(_id3_entries_snapshot(path), _id3_entries_snapshot(saved))
+    violations = _snapshot_violations(
+        _id3_entries_snapshot(path),
+        _id3_entries_snapshot(saved),
+        droppable_frames=droppable_frames,
+    )
     if violations:
         raise TagWriteError(path, violations)
 
@@ -895,21 +923,26 @@ def _id3_entries_snapshot(source: Path | BinaryIO) -> _ContainerSnapshot:
     return _ContainerSnapshot(audio_digest=None, entries=entries, has_id3v1=False, has_apev2=False)
 
 
-def ensure_writable(path: Path) -> None:
+def ensure_writable(path: Path, *, droppable_frames: frozenset[str] = frozenset()) -> None:
     """Raise when :func:`write_managed_tags` would refuse *path* before reading its changes.
 
     Staging calls this so a change on a file that can never be written is refused up front
-    rather than failing on every commit.
+    rather than failing on every commit. *droppable_frames* is the set the write is given.
     """
     audio = mutagen.File(path, easy=True)  # type: ignore[attr-defined]
     if audio is None:
         message = f"mutagen could not identify {path} for writing"
         raise ValueError(message)
     if _require_verifiable(path, audio) is _Container.ID3:
-        _require_lossless_id3_save(path)
+        _require_lossless_id3_save(path, droppable_frames=droppable_frames)
 
 
-def write_managed_tags(path: Path, managed: dict[str, list[str]]) -> TagWriteResult:
+def write_managed_tags(
+    path: Path,
+    managed: dict[str, list[str]],
+    *,
+    droppable_frames: frozenset[str] = frozenset(),
+) -> TagWriteResult:
     """Surgically write the managed-tag set on *path*, leaving all other tags intact.
 
     For each key in :data:`MANAGED_TAGS`: a non-empty value list in *managed* is written
@@ -932,6 +965,8 @@ def write_managed_tags(path: Path, managed: dict[str, list[str]]) -> TagWriteRes
     and a re-read of every managed key against *managed*. Any difference deletes the temp copy
     and raises :class:`TagWriteError` listing each one. A container the verifier has no layout
     for, or a non-Ogg file whose audio payload cannot be located, is refused before the copy.
+    On an ID3 file, an unmanaged frame whose id *droppable_frames* names may be dropped. The
+    result lists it in ``dropped_frames`` and a warning names it, since no revert restores it.
     Measured on a 10 MB MP3 on a local SSD, the verification costs about 18 ms of a 34 ms write
     (two SHA-256 passes and two tag parses).
     """
@@ -952,7 +987,10 @@ def write_managed_tags(path: Path, managed: dict[str, list[str]]) -> TagWriteRes
         return TagWriteResult(written=False, audio_proven=False)
     container = _require_verifiable(path, original)
     kind = type(original)
+    # A Vorbis field or an MP4 atom can share its name with an ID3 frame id.
+    droppable = droppable_frames if container is _Container.ID3 else frozenset()
     before = _snapshot(path, container, kind)
+    dropped_frames: tuple[str, ...] = ()
 
     # Output: apply the plan to a temp copy, verify it, then atomically swap it in.
     tmp = path.with_name(f"{path.name}.tagmend.tmp")
@@ -960,13 +998,25 @@ def write_managed_tags(path: Path, managed: dict[str, list[str]]) -> TagWriteRes
     replaced = False
     try:
         _apply_changes(tmp, container, kind, changes)
-        violations = _snapshot_violations(before, _snapshot(tmp, container, kind))
+        after = _snapshot(tmp, container, kind)
+        violations = _snapshot_violations(before, after, droppable_frames=droppable)
         violations += _readback_violations(tmp, kind, managed)
         if violations:
             raise TagWriteError(path, violations)
+        dropped_frames = tuple(sorted({_frame_id(key) for key in _dropped_keys(before, after)}))
         tmp.replace(path)
         replaced = True
     finally:
         if not replaced:
             tmp.unlink(missing_ok=True)
-    return TagWriteResult(written=True, audio_proven=container in _PAYLOAD_DECIDES_AUDIO)
+    if dropped_frames:
+        logger.warning(
+            "dropped ID3 frame(s) %s from %s, and no revert can restore them",
+            ", ".join(dropped_frames),
+            path,
+        )
+    return TagWriteResult(
+        written=True,
+        audio_proven=container in _PAYLOAD_DECIDES_AUDIO,
+        dropped_frames=dropped_frames,
+    )

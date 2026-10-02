@@ -378,13 +378,14 @@ def _observe_durably(conn: sqlite3.Connection, target: Revision, path: Path) -> 
     return drifted
 
 
-def _revert_file(
+def _revert_file(  # noqa: PLR0913 - cohesive keyword-only per-file revert inputs
     conn: sqlite3.Connection,
     file_id: int,
     target_version: int,
     *,
     note: str | None,
     commit_id: int,
+    droppable_frames: frozenset[str],
 ) -> tuple[int, bool]:
     """Restore one file to *target_version* and append the revert revision. No commit.
 
@@ -397,7 +398,7 @@ def _revert_file(
     did not change. It is an explicit, audited action and is what makes "revert a revert" work.
     Returns ``(new version, changed)``, where *changed* is ``False`` for a revert that moved
     nothing on disk (an empty diff). Callers report that as ``noop`` rather than as a
-    successful revert.
+    successful revert. The write is given *droppable_frames*.
 
     Raises :class:`ValueError` if the file is unknown, the file is flagged missing, or the
     target revision is unknown (:func:`_revert_plan`). Leaves all DB writes in the open
@@ -413,7 +414,9 @@ def _revert_file(
     before_write = path.stat()
     audio_proven = False
     if compute_diff(current, planned):
-        audio_proven = write_managed_tags(path, planned).audio_proven
+        audio_proven = write_managed_tags(
+            path, planned, droppable_frames=droppable_frames
+        ).audio_proven
 
     # Refresh the live snapshot so file_tags reflects the actual on-disk state.
     reverted_tags = read_tags(path).tags
@@ -528,6 +531,7 @@ def revert_tags(
                 version,
                 note=note,
                 commit_id=commit_id,
+                droppable_frames=frozenset(settings.id3_droppable_frames),
             )
             commits.set_commit_status(connection, commit_id, "applied")
             connection.commit()
@@ -795,6 +799,7 @@ def revert_commit(
                     revision.version - 1,
                     note=note,
                     commit_id=new_commit,
+                    droppable_frames=frozenset(settings.id3_droppable_frames),
                 )
                 connection.commit()  # disk already done inside; revision now durable
             except (OSError, ValueError, mutagen.MutagenError) as exc:  # type: ignore[attr-defined]

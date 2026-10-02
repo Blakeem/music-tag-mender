@@ -13,6 +13,7 @@ rather than the dummy byte file ``temp_library`` produces.
 
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 import sqlite3
@@ -23,6 +24,7 @@ from typing import TYPE_CHECKING
 import httpx
 import mutagen
 import pytest
+from mutagen.id3 import ID3, RVAD, TIT2  # type: ignore[attr-defined]
 
 from tagmend import config
 from tagmend.config import Settings
@@ -70,6 +72,26 @@ def make_track(
         audio.save()
 
     return dest
+
+
+def make_droppable_frames_mp3(dest: Path) -> Path:
+    """Write an ID3v2.3 MP3 titled ``Loud`` holding an ``RVAD`` frame and an unknown ``NCON``.
+
+    A v2.4 save drops both frames, so the writer refuses the file unless the caller names them.
+    """
+    track = make_track(dest)
+    frames = ID3()  # type: ignore[no-untyped-call]
+    frames.add(TIT2(encoding=3, text=["Loud"]))  # type: ignore[no-untyped-call]
+    frames.add(RVAD(adjustments=[1, 1], peaks=[1, 1]))  # type: ignore[no-untyped-call]
+    frames.save(track, v2_version=3)
+    # mutagen never writes a frame it cannot parse, so NCON is spliced in after the tag header.
+    data = track.read_bytes()
+    ncon = b"NCON" + (4).to_bytes(4, "big") + b"\x00\x00" + b"\x00\x01\x02\x03"
+    shifts = (21, 14, 7, 0)
+    size = sum(byte << shift for byte, shift in zip(data[6:10], shifts, strict=True)) + len(ncon)
+    header = data[:6] + bytes((size >> shift) & 0x7F for shift in shifts)
+    track.write_bytes(header + ncon + data[10:])
+    return track
 
 
 # The ways a user can type one folder. Upper case names the same folder only where the
@@ -148,6 +170,18 @@ def temp_library(tmp_path: Path) -> Path:
     (album / "01 Track.mp3").write_bytes(b"\x00")
     (album / "cover.jpg").write_bytes(b"\x00")  # ignored: not an audio extension
     return tmp_path
+
+
+@pytest.fixture
+def tagmend_warnings(caplog: pytest.LogCaptureFixture) -> Iterator[pytest.LogCaptureFixture]:
+    """Capture ``tagmend`` warnings, which the root ``caplog`` handler misses (propagate=False)."""
+    logger = logging.getLogger("tagmend")
+    logger.addHandler(caplog.handler)
+    try:
+        with caplog.at_level(logging.WARNING, logger="tagmend"):
+            yield caplog
+    finally:
+        logger.removeHandler(caplog.handler)
 
 
 @pytest.fixture

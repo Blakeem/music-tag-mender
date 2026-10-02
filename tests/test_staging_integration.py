@@ -9,6 +9,7 @@ resume-free model — there is no ``resume`` call).
 
 from __future__ import annotations
 
+import dataclasses
 import sys
 import wave
 from pathlib import Path
@@ -19,7 +20,7 @@ import pytest
 from mutagen.flac import FLAC
 from mutagen.id3 import ID3, RVAD, TIT2, TYER, MakeID3v1  # type: ignore[attr-defined]
 
-from conftest import make_track
+from conftest import make_droppable_frames_mp3, make_track
 from tagmend import mcp_server
 from tagmend.config import load_settings
 from tagmend.engine import axis, commits, staging, store, tags, versioning
@@ -304,11 +305,13 @@ def test_commit_continues_past_an_unwritable_file(
     locked = tracks[1]
     real_write = write_managed_tags
 
-    def write_unless_locked(path: Path, managed: dict[str, list[str]]) -> TagWriteResult:
+    def write_unless_locked(
+        path: Path, managed: dict[str, list[str]], *, droppable_frames: frozenset[str] = frozenset()
+    ) -> TagWriteResult:
         if path.name == locked.name:
             message = f"file in use by another process: {path}"
             raise OSError(message)
-        return real_write(path, managed)
+        return real_write(path, managed, droppable_frames=droppable_frames)
 
     monkeypatch.setattr(staging, "write_managed_tags", write_unless_locked)
     result = staging.commit_tags(engine_settings)
@@ -342,7 +345,9 @@ def test_commit_error_envelope_via_mcp(music_dir: Path, monkeypatch: pytest.Monk
     file_id = _file_id(load_settings(), music_dir, track.name)
     assert mcp_server.stage_tags(file_id, {"genre": ["Jazz"]}) == {"ok": True}
 
-    def always_locked(path: Path, managed: dict[str, list[str]]) -> TagWriteResult:
+    def always_locked(
+        path: Path, managed: dict[str, list[str]], *, droppable_frames: frozenset[str] = frozenset()
+    ) -> TagWriteResult:
         message = f"file in use by another process: {path} ({len(managed)} tags)"
         raise OSError(message)
 
@@ -708,6 +713,47 @@ def test_stage_refuses_a_v23_file_whose_unknown_frame_every_write_drops(
         staging.stage_tags(engine_settings, file_id=file_id, tags={"genre": ["Rock"]})
 
     assert _staged(engine_settings, file_id) is None
+
+
+def _holds_dropped_frames(track: Path) -> bool:
+    raw = ID3(track, translate=False)  # type: ignore[no-untyped-call]
+    return bool(raw.getall("RVAD")) or bool(raw.unknown_frames)  # type: ignore[no-untyped-call]
+
+
+def test_named_droppable_frames_let_a_v23_file_stage_commit_and_revert(
+    engine_settings: Settings, music_dir: Path
+) -> None:
+    track = make_droppable_frames_mp3(music_dir / "loud.mp3")
+    scan_library(engine_settings)
+    file_id = _file_id(engine_settings, music_dir, track.name)
+    only_rvad = dataclasses.replace(engine_settings, id3_droppable_frames=("RVAD",))
+    both = dataclasses.replace(engine_settings, id3_droppable_frames=("RVAD", "NCON"))
+
+    with pytest.raises(ValueError, match="dropped RVAD"):
+        staging.stage_tags(engine_settings, file_id=file_id, tags={"genre": ["Rock"]})
+    with pytest.raises(ValueError, match="dropped unknown frame NCON"):
+        staging.stage_tags(only_rvad, file_id=file_id, tags={"genre": ["Rock"]})
+    assert staging.stage_tags(both, file_id=file_id, tags={"genre": ["Rock"]}) is True
+
+    # The commit write honors the setting on its own: committed without it, the file is refused.
+    refused = staging.commit_tags(engine_settings)
+    assert refused.errors == 1
+    assert refused.outcomes[0].detail is not None
+    assert "dropped RVAD" in refused.outcomes[0].detail
+    assert _holds_dropped_frames(track)
+
+    committed = staging.commit_tags(both)
+    assert committed.committed == 1
+    assert committed.commit_id is not None
+    assert read_tags(track).tags["genre"] == ["Rock"]
+    assert read_tags(track).tags["title"] == ["Loud"]
+    assert not _holds_dropped_frames(track)
+
+    reverted = versioning.revert_commit(both, committed.commit_id)
+    assert [outcome.status for outcome in reverted.outcomes] == ["reverted"]
+    assert "genre" not in read_tags(track).tags
+    assert read_tags(track).tags["title"] == ["Loud"]
+    assert not _holds_dropped_frames(track)
 
 
 def test_stage_accepts_a_v23_file_whose_date_frames_the_upgrade_folds(

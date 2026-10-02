@@ -3,10 +3,10 @@
 Updated 2026-10-02. This file lists only the remaining work, in order. `CLAUDE.md` maps what
 shipped. `PLAN.md` holds the design.
 
-The final run on a fresh copy of `E:\Music` is done. The working copy (`music/`) holds 11,206
-files, since the owner removed 26 one-off files and one duplicate. Every audio payload matches
-`E:\Music`, and the mismatch gate is open. The file ids below name files in the fresh ledger. A
-file the owner moved by hand has a new id.
+The final run on a fresh copy of `E:\Music` is done. The working copy (`music/`) holds 11,180 files
+after the owner's cleanup removed one-off files, duplicates and a second Taylor Swift album and
+added one MAPHRA track. Every audio payload matches `E:\Music`, and the mismatch gate is open. The
+file ids below name files in the fresh ledger. A file the owner moved by hand has a new id.
 
 ## 1. Owner questions
 
@@ -20,9 +20,18 @@ The owner decides each one. TagMend never deletes a file.
   Celldweller 1637. Neon Hitch holds three single pairs (6171 and 6181, 6174 and 6179, 6175 and
   6180). The path planner holds the Pendulum, Imperative Reaction, KMFDM and Velvet Acid Christ
   albums until the owner decides.
-- Cue sheets. 86 files sit in folders whose cue sheet names the audio files, so a rename would
-  break the cue. The folders are Beck "Morning Phase", Code 64 "Departure" and "Trialogue",
-  Taylor Swift "1989" and "Best Of", and The Postal Service "2 Give Up_".
+- Cue sheets. 44 files sit in folders whose cue sheet names the audio files, so a rename would
+  break the cue. The folders are Beck "Morning Phase" and Code 64 "Departure" and "Trialogue".
+  The Postal Service "2 Give Up_" lost its cue sheet in the owner's cleanup, so its 10 files now
+  render to "(2003) The Postal Service - Give Up".
+- Covers. 17 albums show no cover after commit 373. Weezer "Raditude" holds two images that may be
+  the front. The owner kept the concert cover off "Tool\Other". No source exists for Gary Numan
+  "Replicas" and "The Fury", team sleep, Code 64 "Trialogue CD2" (its scans sit in
+  `Trialogue\Artwork`), Leaf Yard, Roberto Paci Dalò "Sparks", Solitary Experiments "The Great
+  Illusion", Sublime "Greatest Hits" and "Misc LIVE+Acoustic+Extras", Sync24 "Source", Techny-Call
+  X "Evolution", The White Stripes "BBC Radio 1 John Peel Show", Tool "Unreleased", the FiXT
+  sampler and The Faint "[Other]". `stage_covers(folder=..., image=...)` stages an image the owner
+  chooses.
 - Long paths. 29 files render to a path over 259 characters. They are The Crow "City of
   Angels", Hackers 2 and 3, and one My Chemical Romance track.
 - Folder casing. 1,126 files sit in folders whose name differs from the render only in case,

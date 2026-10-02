@@ -24,7 +24,7 @@ import re
 import shutil
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import TYPE_CHECKING, Any, BinaryIO, Final
+from typing import TYPE_CHECKING, Any, BinaryIO, Final, Protocol
 
 import mutagen
 
@@ -39,6 +39,7 @@ from mutagen.id3 import (  # type: ignore[attr-defined]
     ID3,
     ID3FileType,
     ID3NoHeaderError,
+    ID3UnsupportedVersionError,
     MakeID3v1,
     ParseID3v1,
 )
@@ -48,7 +49,7 @@ from mutagen.ogg import OggFileType
 from tagmend.log import get_logger
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Mapping
+    from collections.abc import Iterable, Mapping, Sequence
     from pathlib import Path
 
     from mutagen._file import FileType
@@ -236,7 +237,7 @@ def governed_tags(managed_set: int) -> frozenset[str]:
 # an older one and re-read them exactly once. BUMP THIS IN THE SAME COMMIT as any change to
 # what :func:`read_tags` produces (the managed set, a Vorbis spelling, a format registration), or
 # every already-scanned file keeps serving the old reader's output to every detector.
-TAG_READER_VERSION: Final = 7
+TAG_READER_VERSION: Final = 8
 
 
 @dataclass(frozen=True, slots=True)
@@ -244,6 +245,14 @@ class TrackTags:
     """A file's tags: canonical lowercase name -> ordered list of string values."""
 
     tags: dict[str, list[str]]
+
+
+class _EasyTags(Protocol):
+    """The mapping face of mutagen's easy tags and Vorbis comments, which it leaves untyped."""
+
+    def __contains__(self, key: object, /) -> bool: ...
+
+    def __getitem__(self, key: str, /) -> Sequence[object]: ...
 
 
 def _vorbis_field(key: str) -> str:
@@ -310,11 +319,46 @@ def _unconverted_tyer_date(path: Path) -> list[str]:
     mutagen converts only a bare year or ``YYYY-MM-DD`` and silently drops anything longer, such
     as ``2013-10-04T07:00:00Z``, so the date would otherwise read as absent and vanish on save.
     """
-    try:
-        frames: Any = ID3(path, translate=False, load_v1=False)  # type: ignore[no-untyped-call]
-    except ID3NoHeaderError:
+    frames: Any = _raw_id3v2(path)
+    if frames is None:
         return []
     return _first_iso_date(str(text) for frame in frames.getall("TYER") for text in frame.text)
+
+
+def _raw_id3v2(source: Path | BinaryIO) -> ID3 | None:
+    """Return the untranslated ID3v2 tag of *source*, or ``None`` when it has no readable one.
+
+    mutagen's merged loader falls back to ID3v1 on an unsupported version as on a missing header.
+    """
+    try:
+        return ID3(source, translate=False, load_v1=False)  # type: ignore[no-untyped-call]
+    except (ID3NoHeaderError, ID3UnsupportedVersionError):
+        return None
+
+
+def _id3v2_holds_frames(path: Path) -> bool:
+    """Whether the ID3v2 tag of *path* holds a frame, the test TagLib's ``isEmpty`` applies.
+
+    TagLib keeps unknown and obsolete frames in its frame list, so they count.
+    """
+    frames: Any = _raw_id3v2(path)
+    return frames is not None and (bool(frames.keys()) or bool(frames.unknown_frames))
+
+
+def _taglib_view(path: Path, tags: _EasyTags | None) -> _EasyTags:
+    """Return the part of the easy *tags* read from *path* that a TagLib reader sees.
+
+    mutagen's easy MP3 loader fills each field ID3v2 lacks from ID3v1. TagLib, which Navidrome
+    reads through, reads an ID3v2 tag that holds any frame alone and reads ID3v1 only otherwise.
+    TagLib also reads an APEv2 tag before ID3v1, which this view does not model.
+    """
+    if tags is None:
+        return {}
+    if not isinstance(tags, EasyID3) or not _id3v2_holds_frames(path):
+        return tags
+    id3v2_only = EasyID3()  # type: ignore[no-untyped-call]
+    id3v2_only.load(path, load_v1=False)
+    return id3v2_only
 
 
 def read_tags(path: Path) -> TrackTags:
@@ -324,6 +368,7 @@ def read_tags(path: Path) -> TrackTags:
     carries no tags. Lets :class:`mutagen.MutagenError` propagate so the caller can
     decide how to record a read failure. An ID3v2.3 ``TYER`` that starts with a full
     ``YYYY-MM-DD`` date mutagen cannot convert reads as that ``date`` when no other date exists.
+    An MP3 reads ID3v2 alone when it holds a frame, else ID3v1, as TagLib reads it apart from APEv2.
     """
     return _normalized_tags(path, mutagen.File(path, easy=True))  # type: ignore[attr-defined]
 
@@ -335,9 +380,7 @@ def _normalized_tags(path: Path, audio: FileType | None) -> TrackTags:
     weighs the file name when it sniffs and the temp name carries no audio extension.
     """
     # Input
-    tags: Any = None if audio is None else audio.tags
-    if tags is None:
-        return TrackTags({})
+    tags: Any = {} if audio is None else _taglib_view(path, audio.tags)
 
     # Process — a file can carry both spellings of one concept (a tagger wrote the Vorbis name,
     # an older TagMend wrote the canonical one). The Vorbis name is what every other reader
@@ -620,9 +663,8 @@ def _id3_entries(source: Path | BinaryIO) -> dict[str, list[str]]:
     saved copy, which lacks it, reads as dropping it. ID3v1 is left out: the snapshot compares
     only its presence.
     """
-    try:
-        frames: Any = ID3(source, translate=False, load_v1=False)  # type: ignore[no-untyped-call]
-    except ID3NoHeaderError:
+    frames: Any = _raw_id3v2(source)
+    if frames is None:
         return {}
     entries: dict[str, list[str]] = {}
     id_size, header_size = (3, 6) if frames.version < (2, 3, 0) else (4, 10)
@@ -765,30 +807,29 @@ def _readback_violations(
 
 def _plan_changes(
     path: Path,
-    audio: FileType,
+    container: _Container,
+    tags: _EasyTags,
     managed: dict[str, list[str]],
 ) -> list[tuple[str, list[str] | None]]:
-    """Return the ``(written key, values)`` edits that turn *audio* into *managed*.
+    """Return the ``(written key, values)`` edits that turn the easy *tags* into *managed*.
 
     ``None`` values mean delete. A key whose current values already equal the target is left
     out, because the easy layers build a fresh frame on assignment and would re-encode an
     unchanged one. Sorted because a Vorbis assignment appends the field, so set order would
     shuffle them.
     """
-    vorbis = isinstance(audio.tags, VCommentDict)
+    vorbis = isinstance(tags, VCommentDict)
     # read_tags reports the date of a v2.3 TYER the easy view lost, so a target without a date
     # must plan its deletion too, or the commit keeps a date its diff removed.
     has_tyer_date = (
-        _container_of(audio) is _Container.ID3
-        and "date" not in audio
-        and bool(_unconverted_tyer_date(path))
+        container is _Container.ID3 and "date" not in tags and bool(_unconverted_tyer_date(path))
     )
     changes: list[tuple[str, list[str] | None]] = []
     for key in sorted(MANAGED_TAGS):
         written = _vorbis_field(key) if vorbis else key
         values = managed.get(key)
-        present = written in audio or (key == "date" and has_tyer_date)
-        current = [str(value) for value in audio[written]] if written in audio else []
+        present = written in tags or (key == "date" and has_tyer_date)
+        current = [str(value) for value in tags[written]] if written in tags else []
         if values and current != list(values):
             changes.append((written, list(values)))
         elif not values and present:
@@ -798,7 +839,7 @@ def _plan_changes(
         # a second spelling to drop: on ID3 and MP4 the easy layer owns the frame/atom name,
         # and reaching a foreign one (a TXXX:ALBUMARTISTSORT some other tagger wrote) would
         # need raw container access the easy layer does not expose.
-        if vorbis and key in _VORBIS_SPELLINGS and key in audio:
+        if vorbis and key in _VORBIS_SPELLINGS and key in tags:
             changes.append((key, None))
     return changes
 
@@ -834,7 +875,7 @@ def _rewrite_id3v1(path: Path, original: Mapping[str, object], touched: frozense
 
 
 def _apply_id3(path: Path, changes: list[tuple[str, list[str] | None]]) -> None:
-    """Apply *changes* to the ID3v2 tag of *path* without promoting ID3v1-only values.
+    """Apply *changes* to the ID3v2 tag of *path*, writing only the planned keys.
 
     mutagen's easy MP3 loader merges ID3v1 into the ID3v2 frames it holds, and a save then
     writes those truncated values into ID3v2. Loading ID3v2 alone and setting keys through
@@ -950,8 +991,9 @@ def write_managed_tags(
     list) is deleted from the file, so reverting to a baseline that lacked a tag removes
     a later-added one. Keys outside :data:`MANAGED_TAGS` are never read, written, or
     removed. Passing one raises :class:`ValueError` (a caller bug). Only the keys whose
-    values differ are touched, so an unchanged frame keeps its encoding. On an MP3, a value
-    held only in ID3v1 stays there unless the target changes it.
+    values differ from what :func:`read_tags` reports are touched, so an unchanged frame keeps
+    its encoding. On an MP3, a write that creates the first ID3v2 frame writes every value of
+    *managed* into ID3v2, since TagLib then stops reading ID3v1.
 
     Returns ``written=False`` without touching the file when nothing differs. After a write it
     returns ``written=True``, and ``audio_proven`` for an ID3 or FLAC file. The write is
@@ -980,12 +1022,17 @@ def write_managed_tags(
         message = f"mutagen could not identify {path} for writing"
         raise ValueError(message)
 
-    # Process: plan against the original (the merged view a reader sees), so a no-op never
-    # copies or rewrites the file.
-    changes = _plan_changes(path, original, managed)
+    # Process: plan against what read_tags reports, so a no-op never copies or rewrites the file.
+    container = _container_of(original)
+    changes = _plan_changes(path, container, _taglib_view(path, original.tags), managed)
+    if changes and container is _Container.ID3 and not _id3v2_holds_frames(path):
+        # TagLib stops reading ID3v1 once ID3v2 holds a frame. A deletion still goes through,
+        # since rebuilding ID3v1 blanks each touched field.
+        deletions = [change for change in changes if change[1] is None]
+        changes = _plan_changes(path, container, {}, managed) + deletions
     if not changes:
         return TagWriteResult(written=False, audio_proven=False)
-    container = _require_verifiable(path, original)
+    _require_verifiable(path, original)
     kind = type(original)
     # A Vorbis field or an MP4 atom can share its name with an ID3 frame id.
     droppable = droppable_frames if container is _Container.ID3 else frozenset()
@@ -1000,7 +1047,10 @@ def write_managed_tags(
         _apply_changes(tmp, container, kind, changes)
         after = _snapshot(tmp, container, kind)
         violations = _snapshot_violations(before, after, droppable_frames=droppable)
-        violations += _readback_violations(tmp, kind, managed)
+        readback = _readback_violations(tmp, kind, managed)
+        if readback and container is _Container.ID3 and not _id3v2_holds_frames(tmp):
+            readback.append("emptying ID3v2 exposes the values only ID3v1 holds")
+        violations += readback
         if violations:
             raise TagWriteError(path, violations)
         dropped_frames = tuple(sorted({_frame_id(key) for key in _dropped_keys(before, after)}))

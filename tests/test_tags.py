@@ -13,13 +13,16 @@ from mutagen.flac import FLAC
 from mutagen.id3 import (  # type: ignore[attr-defined]
     ID3,
     IPLS,
+    TALB,
     TCON,
     TDAT,
     TDOR,
+    TDRC,
     TIME,
     TIPL,
     TIT2,
     TORY,
+    TPE1,
     TRCK,
     TRDA,
     TSO2,
@@ -602,7 +605,7 @@ def test_managed_set_version_4_registered() -> None:
     assert MANAGED_SETS[1] == ORIGINAL_MANAGED_TAGS
     assert len(MANAGED_SETS[2]) == 18
     assert MANAGED_SETS[3] == MANAGED_TAGS - {"artists"}
-    assert TAG_READER_VERSION == 7
+    assert TAG_READER_VERSION == 8
 
 
 def test_write_leaves_unchanged_frames_untouched(tmp_path: Path) -> None:
@@ -1052,15 +1055,75 @@ def test_write_keeps_id3v1_and_apev2_presence(tmp_path: Path) -> None:
     assert read_tags(with_ape).tags["genre"] == ["Jazz"]
 
 
-def test_write_does_not_promote_id3v1_only_fields(tmp_path: Path) -> None:
-    track = make_track(tmp_path / "v1only.mp3")
+def _id3v1_title_beside_genre(dest: Path) -> Path:
+    """Write an MP3 whose ID3v2 tag holds only a genre and whose ID3v1 block holds a title."""
+    track = make_track(dest)
     frames = ID3()  # type: ignore[no-untyped-call]
     frames.add(TCON(encoding=3, text=["Rock"]))  # type: ignore[no-untyped-call]
     frames.save(track, v1=0)
     title = TIT2(encoding=0, text=["Short Title"])  # type: ignore[no-untyped-call]
     with track.open("ab") as handle:
         handle.write(MakeID3v1({"TIT2": title}))  # type: ignore[no-untyped-call]
-    assert read_tags(track).tags["title"] == ["Short Title"]
+    return track
+
+
+def _id3v1_only(dest: Path) -> Path:
+    """Write an MP3 with no ID3v2 tag and an ID3v1 block holding a title, artist, album and year."""
+    track = make_track(dest)
+    ID3(track).delete()  # type: ignore[no-untyped-call]
+    block = MakeID3v1(  # type: ignore[no-untyped-call]
+        {
+            "TIT2": TIT2(encoding=0, text=["Short Title"]),  # type: ignore[no-untyped-call]
+            "TPE1": TPE1(encoding=0, text=["Band"]),  # type: ignore[no-untyped-call]
+            "TALB": TALB(encoding=0, text=["Record"]),  # type: ignore[no-untyped-call]
+            "TDRC": TDRC(encoding=0, text=["1999"]),  # type: ignore[no-untyped-call]
+        },
+    )
+    with track.open("ab") as handle:
+        handle.write(block)
+    return track
+
+
+def test_read_ignores_id3v1_beside_an_id3v2_frame(tmp_path: Path) -> None:
+    track = _id3v1_title_beside_genre(tmp_path / "beside.mp3")
+
+    assert read_tags(track).tags == {"genre": ["Rock"]}
+
+
+def test_read_falls_back_to_id3v1_without_an_id3v2_frame(tmp_path: Path) -> None:
+    track = _id3v1_only(tmp_path / "v1only.mp3")
+
+    assert read_tags(track).tags == {
+        "album": ["Record"],
+        "artist": ["Band"],
+        "date": ["1999"],
+        "title": ["Short Title"],
+    }
+
+
+def test_write_creating_id3v2_writes_every_value(tmp_path: Path) -> None:
+    track = _id3v1_only(tmp_path / "v1only.mp3")
+    target = {**_managed(track), "genre": ["Jazz"]}
+
+    assert write_managed_tags(track, target).written is True
+
+    v2 = ID3(track, load_v1=False)  # type: ignore[no-untyped-call]
+    assert sorted(v2.keys()) == ["TALB", "TCON", "TDRC", "TIT2", "TPE1"]  # type: ignore[no-untyped-call]
+    assert read_tags(track).tags == target
+    assert track.read_bytes()[-128:-125] == b"TAG"
+
+
+def test_write_of_an_id3v1_only_file_skips_a_no_op(tmp_path: Path) -> None:
+    track = _id3v1_only(tmp_path / "v1only.mp3")
+    before = track.read_bytes()
+
+    assert write_managed_tags(track, _managed(track)).written is False
+
+    assert track.read_bytes() == before
+
+
+def test_write_keeps_an_id3v1_only_field_out_of_id3v2(tmp_path: Path) -> None:
+    track = _id3v1_title_beside_genre(tmp_path / "beside.mp3")
 
     write_managed_tags(track, {**_managed(track), "genre": ["Jazz"]})
 
@@ -1070,6 +1133,72 @@ def test_write_does_not_promote_id3v1_only_fields(tmp_path: Path) -> None:
     v1 = ParseID3v1(track.read_bytes()[-128:])  # type: ignore[no-untyped-call]
     assert v1 is not None
     assert v1["TIT2"].text == ["Short Title"]
+
+
+def _syncsafe(size: int) -> bytes:
+    return bytes((size >> shift) & 0x7F for shift in (21, 14, 7, 0))
+
+
+def _raw_id3v2_beside_id3v1_title(dest: Path, major: int, frames: bytes) -> Path:
+    """Write an MP3 whose ID3v2 tag holds *frames* under a v2.*major* header and an ID3v1 title."""
+    track = make_track(dest)
+    ID3(track).delete()  # type: ignore[no-untyped-call]
+    padding = bytes(64)
+    header = b"ID3" + bytes((major, 0, 0)) + _syncsafe(len(frames) + len(padding))
+    title = TIT2(encoding=0, text=["Short Title"])  # type: ignore[no-untyped-call]
+    block = MakeID3v1({"TIT2": title})  # type: ignore[no-untyped-call]
+    track.write_bytes(header + frames + padding + track.read_bytes() + block)
+    return track
+
+
+def test_read_falls_back_to_id3v1_behind_a_frameless_id3v2_header(tmp_path: Path) -> None:
+    track = _raw_id3v2_beside_id3v1_title(tmp_path / "frameless.mp3", 4, b"")
+
+    assert read_tags(track).tags == {"title": ["Short Title"]}
+
+
+def test_read_counts_an_unknown_frame_as_an_id3v2_frame(tmp_path: Path) -> None:
+    frame = b"ZZZZ" + _syncsafe(1) + b"\x00\x00" + b"x"
+    track = _raw_id3v2_beside_id3v1_title(tmp_path / "unknown.mp3", 4, frame)
+
+    assert read_tags(track).tags == {}
+
+
+def test_read_falls_back_to_id3v1_behind_an_unsupported_id3v2_version(tmp_path: Path) -> None:
+    track = _raw_id3v2_beside_id3v1_title(tmp_path / "v25.mp3", 5, b"")
+
+    assert read_tags(track).tags == {"title": ["Short Title"]}
+
+
+def test_read_ignores_id3v1_beside_an_id3v23_frame(tmp_path: Path) -> None:
+    track = make_track(tmp_path / "v23.mp3")
+    frames = ID3()  # type: ignore[no-untyped-call]
+    frames.add(TPE1(encoding=0, text=["Band"]))  # type: ignore[no-untyped-call]
+    frames.save(track, v2_version=3, v1=0)
+    title = TIT2(encoding=0, text=["Short Title"])  # type: ignore[no-untyped-call]
+    with track.open("ab") as handle:
+        handle.write(MakeID3v1({"TIT2": title}))  # type: ignore[no-untyped-call]
+
+    assert read_tags(track).tags == {"artist": ["Band"]}
+
+
+def test_write_deletes_every_value_of_an_id3v1_only_file(tmp_path: Path) -> None:
+    track = _id3v1_only(tmp_path / "v1only.mp3")
+
+    assert write_managed_tags(track, {}).written is True
+
+    assert read_tags(track).tags == {}
+    assert track.read_bytes()[-128:-125] == b"TAG"
+
+
+def test_write_refuses_to_empty_id3v2_over_id3v1_values(tmp_path: Path) -> None:
+    track = _id3v1_title_beside_genre(tmp_path / "beside.mp3")
+    before = track.read_bytes()
+
+    with pytest.raises(TagWriteError, match="emptying ID3v2 exposes the values only ID3v1 holds"):
+        write_managed_tags(track, {})
+
+    assert track.read_bytes() == before
 
 
 @pytest.mark.parametrize("suffix", _ALL_FORMATS)

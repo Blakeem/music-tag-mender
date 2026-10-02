@@ -99,3 +99,7 @@ command mirrors its MCP name with `-` for `_`.
   `resolve_artists` writes the artist's canonical name. The value left on disk depends on which
   ran last. The fix candidate is a stamp that writes the canonical name of each credited artist
   id.
+- L20: TagLib reads an MP3's APEv2 tag before ID3v1, and `read_tags` does not model APEv2. The
+  live library holds no MP3 this affects, since all 550 MP3s with an APEv2 tag also hold ID3v2
+  frames. A write that creates the first ID3v2 frame also leaves the ID3v1 comment out of ID3v2,
+  so Navidrome stops showing it.

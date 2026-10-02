@@ -115,6 +115,10 @@ Each entry names a subsystem, its MCP tools and its modules under `src/tagmend/e
 - `tags.py` owns the canonical tag namespace, since mutagen's easy layer is incomplete. A read
   accepts every known spelling and prefers the container-native one. A write emits the native
   one and drops every alternate, so a file never carries two values for one concept.
+- An MP3 reads as TagLib, and so Navidrome, reads it. An ID3v2 tag that holds a frame is read
+  alone, and ID3v1 is read only when ID3v2 holds none. TagLib reads an APEv2 tag before ID3v1,
+  which the reader does not model. A write that creates the first ID3v2 frame writes every
+  managed value into it. A write that empties ID3v2 while ID3v1 holds other values is refused.
 - mutagen's easy layer gets three containers wrong, so `tags.py` registers its own names.
   `EasyID3` maps `albumartistsort` to a `TXXX` frame Picard never writes, so `tags.py` maps it to
   `TSO2`. `EasyMP4` freeform atom names are case-sensitive. Its `releasecountry` atom is a word

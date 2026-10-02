@@ -17,6 +17,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import pytest
+from mutagen.id3 import ID3, TIT2, TPE1, MakeID3v1  # type: ignore[attr-defined]
 
 from conftest import make_track
 from tagmend.engine import commits, staging, store, versioning
@@ -637,3 +638,35 @@ def test_single_file_revert_blocked_by_staged_change(
 
     with pytest.raises(ValueError, match="staged change"):
         versioning.revert_tags(engine_settings, file_id, 0)
+
+
+def test_revert_commit_round_trips_an_id3v1_only_mp3(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    track = make_track(music_dir / "v1only.mp3")
+    ID3(track).delete()  # type: ignore[no-untyped-call]
+    block = MakeID3v1(  # type: ignore[no-untyped-call]
+        {
+            "TIT2": TIT2(encoding=0, text=["Song"]),  # type: ignore[no-untyped-call]
+            "TPE1": TPE1(encoding=0, text=["Band"]),  # type: ignore[no-untyped-call]
+        },
+    )
+    with track.open("ab") as handle:
+        handle.write(block)
+    scan_library(engine_settings)
+    file_id = _file_id(engine_settings, music_dir, track.name)
+    baseline = {"artist": ["Band"], "title": ["Song"]}
+    assert _live_tags(engine_settings, file_id) == baseline
+
+    target = _stage_and_commit(engine_settings, {file_id: {"genre": ["Rock"]}})
+
+    v2 = ID3(track, load_v1=False)  # type: ignore[no-untyped-call]
+    assert sorted(v2.keys()) == ["TCON", "TIT2", "TPE1"]  # type: ignore[no-untyped-call]
+    assert read_tags(track).tags == {**baseline, "genre": ["Rock"]}
+
+    result = versioning.revert_commit(engine_settings, target)
+
+    assert result.reverted == 1
+    assert read_tags(track).tags == baseline
+    assert _live_tags(engine_settings, file_id) == baseline

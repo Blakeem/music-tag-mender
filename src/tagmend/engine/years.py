@@ -1,9 +1,9 @@
 """Album original-year fill: group → look up MusicBrainz → blank-fill ``originaldate``.
 
-The year-axis orchestrator, a near-clone of :mod:`tagmend.engine.genres`. It selects the
-in-scope files that derive ``pending`` on :data:`tagmend.engine.axis.YEAR_AXIS`, groups the
-blank ones by ``(albumartist-else-artist, album)`` (the SAME identity genre uses), looks up each
-group's first-release date via MusicBrainz, and **blank-fills** ``originaldate``.
+The year-axis resolver, run by :func:`tagmend.engine.axis_resolver.run` as genre is. It
+selects the in-scope files that derive ``pending`` on :data:`tagmend.engine.axis.YEAR_AXIS`,
+groups the blank ones by ``(albumartist-else-artist, album)`` (the SAME identity genre uses),
+looks up each group's first-release date via MusicBrainz, and **blank-fills** ``originaldate``.
 
 Design notes (the spec):
 
@@ -24,20 +24,21 @@ commit. The building blocks in :mod:`tagmend.engine.store` never commit.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING
 
-from tagmend.engine import axis, axis_status, clock, db, lookup_clients, schema, staging, store
+import mutagen
+
+from tagmend.engine import axis, axis_resolver, axis_status, staging, store
 from tagmend.engine.musicbrainz import MusicBrainzClient, MusicBrainzError
-from tagmend.engine.validation import check_limit
-from tagmend.log import get_logger
+from tagmend.engine.tags import read_tags
 
 if TYPE_CHECKING:
     import sqlite3
+    from collections.abc import Mapping
 
     from tagmend.config import Settings
-    from tagmend.engine.musicbrainz import MBReleaseGroupSource
-
-logger = get_logger(__name__)
+    from tagmend.engine.musicbrainz import MBReleaseGroup, MBReleaseGroupSource
 
 # The single managed field the year axis fills (shared with the status derivation).
 _YEAR_FIELD = axis.YEAR_AXIS.fields[0]
@@ -75,20 +76,6 @@ class ResolveYearsResult:
         }
 
 
-@dataclass(slots=True)
-class _Tally:
-    """Mutable accumulator for one ``resolve_years`` run, frozen into the result at end."""
-
-    settled: int = 0
-    staged_files: int = 0
-    no_match: int = 0
-    # identity -> original_date (one mapping per resolved album group).
-    mappings: dict[tuple[str | None, str | None], str] = field(default_factory=dict)
-    # One item per album group whose MusicBrainz lookup failed and per file staging refused, so
-    # an outage or an unstageable file is visible.
-    error_items: list[dict[str, str]] = field(default_factory=list)
-
-
 # --- public entry --------------------------------------------------------------------
 
 
@@ -114,209 +101,104 @@ def resolve_years(  # noqa: PLR0913 - cohesive keyword-only scope + injection pa
     the call.
 
     *dry_run* returns the proposed mappings and the would-settle and would-stage counts and
-    writes nothing. Lookups still run. A cached answer costs nothing and a cache miss makes a
-    live request. A dry run skips the empty-staging precondition. A non-dry-run raises
-    :class:`ValueError` if anything is already staged, and any run raises it for a negative
-    *limit* or an unknown file id. *client* lets callers inject an
-    :class:`tagmend.engine.musicbrainz.MBReleaseGroupSource`, such as a fake in tests. When
-    *client* is ``None`` a real :class:`MusicBrainzClient` is built. This function owns its
-    connection, and ``stage_tags`` opens its own.
+    writes nothing. A file counts as would-stage only when its ``originaldate`` is blank on
+    disk, as the real run's fill-only stage requires. Lookups still run. A cached answer costs
+    nothing and a cache miss makes a live request. A dry run skips the empty-staging
+    precondition. A non-dry-run raises :class:`ValueError` if anything is already staged, and
+    any run raises it for a negative *limit* or an unknown file id. *client* lets callers
+    inject an :class:`tagmend.engine.musicbrainz.MBReleaseGroupSource`, such as a fake in
+    tests. When *client* is ``None`` a real :class:`MusicBrainzClient` is built. This function
+    owns its connection, and ``stage_tags`` opens its own.
     """
-    check_limit(limit)
-    effective_limit = limit if limit is not None else settings.year_stage_limit
-    tally = _Tally()
-
-    connection = db.connect(settings.db_path)
-    try:
-        schema.apply_schema(connection)
-
-        if not dry_run and store.any_staged(connection):
-            message = "commit or unstage pending changes first"
-            raise ValueError(message)
-
-        scoped_ids = store.files_in_scope(
-            connection,
-            value_fields=axis.YEAR_AXIS.scope_fields,
-            value=value,
-            file_ids=file_ids,
+    resolver: axis_resolver.AxisResolver[MBReleaseGroupSource, MBReleaseGroup] = (
+        axis_resolver.AxisResolver(
+            axis_=axis.YEAR_AXIS,
+            build_client=lambda conn: MusicBrainzClient.from_settings(settings, conn),
+            lookup=_first_release,
+            transient_error=MusicBrainzError,
+            group_key=_album_key,
+            stage=lambda conn, fid, release_group, dry_run: _stage_resolved(
+                settings, conn, fid, release_group.original_date, dry_run=dry_run
+            ),
+            settles_without_lookup=_holds_year,
         )
-        pending = store.pending_file_ids(connection, axis.YEAR_AXIS, scoped_ids)
-        blanks = _settle_present(connection, pending[:effective_limit], tally, dry_run=dry_run)
-        groups = _group_by_identity(connection, blanks)
-        if groups:
-            _process_groups(settings, connection, groups, client, tally, dry_run=dry_run)
-        pending_remaining = len(store.pending_file_ids(connection, axis.YEAR_AXIS, scoped_ids))
-    finally:
-        connection.close()
+    )
 
-    return _build_result(tally, pending_remaining=pending_remaining, dry_run=dry_run)
+    outcome = axis_resolver.run(
+        settings,
+        resolver,
+        value=value,
+        file_ids=file_ids,
+        limit=limit,
+        default_limit=settings.year_stage_limit,
+        dry_run=dry_run,
+        client=client,
+    )
 
-
-# --- selection -----------------------------------------------------------------------
-
-
-def _settle_present(
-    conn: sqlite3.Connection,
-    selected: list[int],
-    tally: _Tally,
-    *,
-    dry_run: bool,
-) -> list[int]:
-    """Record ``done`` for each selected file already carrying a year. Return the blank ones.
-
-    A present value is never overwritten, so its file needs no lookup, and without a row it
-    would stay ``pending`` at the front of the file-id order forever.
-    """
-    blanks: list[int] = []
-    present: list[int] = []
-    for fid in selected:
-        values = store.get_tags(conn, fid).get(_YEAR_FIELD, [])
-        if any(value.strip() for value in values):
-            present.append(fid)
-        else:
-            blanks.append(fid)
-
-    tally.settled += len(present)
-    if dry_run or not present:
-        return blanks
-    now = clock.utc_now()
-    for fid in present:
-        store.record_outcome(conn, axis.YEAR_AXIS, file_id=fid, status="done", now=now)
-    conn.commit()
-    return blanks
+    mappings: list[dict[str, str | None]] = [
+        {
+            "artist": identity.artist,
+            "album": identity.album,
+            "original_date": release_group.original_date,
+        }
+        for identity, release_group in outcome.answers.items()
+        if release_group is not None
+    ]
+    return ResolveYearsResult(
+        settled=outcome.settled,
+        staged_files=outcome.staged_files,
+        no_match=outcome.no_match,
+        pending_remaining=outcome.pending_remaining,
+        more=outcome.more,
+        mappings=mappings,
+        summary=outcome.summary,
+        errors=outcome.errors,
+        error_items=outcome.error_items,
+    )
 
 
-def _group_by_identity(
-    conn: sqlite3.Connection,
-    file_ids: list[int],
-) -> dict[axis.LookupIdentity, list[int]]:
-    """Group file ids by their album identity, preserving first-seen group order."""
-    groups: dict[axis.LookupIdentity, list[int]] = {}
-    for fid in file_ids:
-        identity = axis.lookup_identity(store.get_tags(conn, fid))
-        groups.setdefault(identity, []).append(fid)
-    return groups
+# --- per-axis parts ------------------------------------------------------------------
 
 
-# --- processing ----------------------------------------------------------------------
+def _holds_year(tags: Mapping[str, list[str]]) -> bool:
+    """Whether *tags* hold a non-blank ``originaldate``, which the fill never overwrites."""
+    return any(value.strip() for value in tags.get(_YEAR_FIELD, []))
 
 
-def _process_groups(  # noqa: PLR0913 - cohesive orchestration inputs
-    settings: Settings,
-    conn: sqlite3.Connection,
-    groups: dict[axis.LookupIdentity, list[int]],
-    client: MBReleaseGroupSource | None,
-    tally: _Tally,
-    *,
-    dry_run: bool,
-) -> None:
-    """Resolve each group via *client* (built if None) and settle its files."""
-    with lookup_clients.injected_or_owned(
-        client,
-        lambda: MusicBrainzClient.from_settings(settings, conn),
-    ) as source:
-        for identity, fids in groups.items():
-            _process_one_group(settings, conn, identity, fids, source, tally, dry_run=dry_run)
+def _album_key(identity: axis.LookupIdentity) -> str:
+    """Key a failed group's error item by its looked-up artist and album."""
+    return f"{identity.artist} - {identity.album}"
 
 
-def _process_one_group(  # noqa: PLR0913 - cohesive per-group inputs
-    settings: Settings,
-    conn: sqlite3.Connection,
-    identity: axis.LookupIdentity,
-    file_ids: list[int],
+def _first_release(
     client: MBReleaseGroupSource,
-    tally: _Tally,
+    identity: axis.LookupIdentity,
+) -> MBReleaseGroup | None:
+    """Ask MusicBrainz for the first release of one ``(artist, album)`` group."""
+    # A pending file has a year identity, which needs an artist and an album.
+    assert identity.artist is not None  # noqa: S101 - selection invariant
+    assert identity.album is not None  # noqa: S101 - selection invariant
+    return client.album_first_release(identity.artist, identity.album)
+
+
+def _stage_resolved(
+    settings: Settings,
+    conn: sqlite3.Connection,
+    file_id: int,
+    original_date: str,
     *,
     dry_run: bool,
-) -> None:
-    """Resolve one ``(artist, album)`` group and blank-fill / mark its files accordingly.
-
-    A transient :class:`MusicBrainzError` writes nothing, records one error item, and returns
-    without aborting the wider call, so the group's files stay ``pending``. A file staging
-    refuses records its own error item and stays ``pending`` while its siblings settle.
-    """
-    failed: set[int] = set()
-
-    # A pending file has a year identity, which needs an artist and an album.
-    lookup_artist = identity.artist
-    lookup_album = identity.album
-    assert lookup_artist is not None  # noqa: S101 - selection invariant
-    assert lookup_album is not None  # noqa: S101 - selection invariant
-
-    try:
-        resolved = client.album_first_release(lookup_artist, lookup_album)
-    except MusicBrainzError as exc:
-        logger.warning(
-            "musicbrainz error for artist=%r album=%r: %s",
-            lookup_artist,
-            lookup_album,
-            exc,
-        )
-        tally.error_items.append(
-            {"key": f"{lookup_artist} - {lookup_album}", "message": str(exc)},
-        )
-        return
-
-    tally.settled += len(file_ids)
-    status = "no_match"
-    if resolved is None:
-        tally.no_match += len(file_ids)
-    else:
-        status = "done"
-        tally.mappings[(identity.artist, identity.album)] = resolved.original_date
-
-    # The lookup already happened, so a preview can and must report the outcome. Only the
-    # stage and the status rows are withheld until the real run.
-    if dry_run:
-        if resolved is not None:
-            tally.staged_files += len(file_ids)
-        return
-    # Every stage runs before any row write, because stage_tags needs the write lock this
-    # connection would otherwise hold.
-    if resolved is not None:
-        failed = _stage_group(settings, file_ids, resolved.original_date, tally)
-    now = clock.utc_now()
-    for fid in file_ids:
-        if fid not in failed:
-            store.record_outcome(conn, axis.YEAR_AXIS, file_id=fid, status=status, now=now)
-    conn.commit()
-
-
-def _stage_group(
-    settings: Settings,
-    file_ids: list[int],
-    original_date: str,
-    tally: _Tally,
-) -> set[int]:
-    """Stage *original_date* on each of *file_ids* and return the ids staging refused.
-
-    A refused file (vanished, unreadable or unwritable since the scan) is itemized and taken
-    back out of ``settled``, so it stays ``pending`` without aborting its siblings or the call.
-    """
-    failed: set[int] = set()
-    for fid in file_ids:
-        try:
-            staged = _stage_resolved(settings, fid, original_date)
-        except ValueError as exc:
-            logger.warning("resolve_years: file_id=%d not staged: %s", fid, exc)
-            tally.error_items.append({"key": f"file_id={fid}", "message": str(exc)})
-            tally.settled -= 1
-            failed.add(fid)
-            continue
-        if staged:
-            tally.staged_files += 1
-    return failed
-
-
-def _stage_resolved(settings: Settings, file_id: int, original_date: str) -> bool:
+) -> bool:
     """Stage *original_date* for *file_id*, passing ONLY ``originaldate`` (P0, no deletion).
 
     :func:`tagmend.engine.staging._stage_one` merges it onto the tags read from disk, so
     every other managed tag keeps its on-disk value through the commit's delete-on-absent
     write. ``originaldate`` is fill-only: selection read the snapshot mirror, which can lag the
-    file, so a value already on disk wins and ``False`` is returned. ``stage_tags`` owns its
-    conn.
+    file, so a value already on disk wins and ``False`` is returned. A dry run reads the same
+    disk value and stages nothing. ``stage_tags`` owns its conn.
     """
+    if dry_run:
+        return not _holds_year(_disk_tags(conn, file_id))
     return staging.stage_tags(
         settings,
         file_id=file_id,
@@ -327,52 +209,18 @@ def _stage_resolved(settings: Settings, file_id: int, original_date: str) -> boo
     )
 
 
-# --- result --------------------------------------------------------------------------
-
-
-def _build_result(
-    tally: _Tally,
-    *,
-    pending_remaining: int,
-    dry_run: bool,
-) -> ResolveYearsResult:
-    """Freeze the run's tally + counts into the public :class:`ResolveYearsResult`."""
-    mappings = [
-        {"artist": artist, "album": album, "original_date": date}
-        for (artist, album), date in tally.mappings.items()
-    ]
-    return ResolveYearsResult(
-        settled=tally.settled,
-        staged_files=tally.staged_files,
-        no_match=tally.no_match,
-        pending_remaining=pending_remaining,
-        more=not dry_run and tally.settled > 0 and pending_remaining > 0,
-        mappings=mappings,
-        summary=_summarize(tally, pending_remaining=pending_remaining, dry_run=dry_run),
-        errors=len(tally.error_items),
-        error_items=list(tally.error_items),
-    )
-
-
-def _summarize(tally: _Tally, *, pending_remaining: int, dry_run: bool) -> str:
-    """Build a short, plain human summary of what settled and what is left.
-
-    A dry run records nothing, so its remainder is not resumable and is worded accordingly.
-    """
-    parts = [
-        f"Settled {tally.settled} file(s): staged {tally.staged_files}, no_match {tally.no_match}.",
-    ]
-    if dry_run:
-        parts.append(
-            f"A dry run records nothing, so {pending_remaining} file(s) in scope stay pending "
-            f"and an identical call previews the same files.",
-        )
-    elif pending_remaining > 0:
-        parts.append(f"{pending_remaining} file(s) still pending. Call again to continue.")
-    errors = len(tally.error_items)
-    if errors > 0:
-        parts.append(f"{errors} item(s) errored and stay pending. Re-run to retry.")
-    return " ".join(parts)
+def _disk_tags(conn: sqlite3.Connection, file_id: int) -> dict[str, list[str]]:
+    """Read *file_id*'s tags from disk. A failed read raises :class:`ValueError`, as in staging."""
+    file_row = store.get_file_by_id(conn, file_id)
+    if file_row is None:
+        message = f"unknown file_id={file_id}"
+        raise ValueError(message)
+    path = Path(file_row.folder) / file_row.filename
+    try:
+        return read_tags(path).tags
+    except (mutagen.MutagenError, OSError) as exc:  # type: ignore[attr-defined]
+        message = f"cannot read tags from disk for file_id={file_id} ({path}): {exc}"
+        raise ValueError(message) from exc
 
 
 # --- status tools --------------------------------------------------------------------

@@ -359,6 +359,7 @@ src/tagmend/
     lookup_clients.py  uses an injected lookup client or builds and owns a real one
     axis.py         the parameterized Axis: one outcome-row model for genre/artist/year/song, plus the mismatch axis entry
     axis_status.py  the one set_/reset_<axis>_status implementation, parameterized by Axis
+    axis_resolver.py  the group-lookup runner behind resolve_genres and resolve_years
     classify.py     genre vocab/overlay loader + fold-key index + classify.classify_genres (pure)
     genres.py       resolve_genres + set/reset_genre_status
     artists.py      resolve_artists + set/reset_artist_status: MusicBrainz-by-MBID then getCorrection cascade-stage + file_artist_status workflow

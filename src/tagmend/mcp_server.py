@@ -1902,7 +1902,8 @@ def resolve_years(
         limit: Max files to settle this call (default ``year_stage_limit``). Call again while
             ``more`` is true.
         dry_run: Preview the album → original-date mappings and the would-settle and
-            would-stage counts without writing anything. Lookups still run. A cached answer
+            would-stage counts without writing anything. A file counts as would-stage only
+            when its ``originaldate`` is blank on disk. Lookups still run. A cached answer
             costs nothing and a cache miss makes a live request. A dry run skips the
             empty-staging precondition.
 

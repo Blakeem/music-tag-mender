@@ -525,6 +525,47 @@ def test_dry_run_returns_mappings_but_stages_nothing(
     assert len(staging.diff_tags(engine_settings)) == 0
 
 
+def test_dry_run_counts_only_the_files_the_real_run_stages(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    make_track(music_dir / "a.mp3", {"artist": ["Black Sabbath"], "album": ["Paranoid"]})
+    held = make_track(music_dir / "b.mp3", {"artist": ["Black Sabbath"], "album": ["Paranoid"]})
+    scan_library(engine_settings)
+    audio = mutagen.File(held, easy=True)  # type: ignore[attr-defined]
+    audio["originaldate"] = ["1969"]
+    audio.save()  # on disk only: no rescan, so the mirror still groups it as blank
+
+    fake = FakeMBReleaseGroupSource({("Black Sabbath", "Paranoid"): _mb("1970")})
+    preview = years.resolve_years(engine_settings, client=fake, dry_run=True)
+    real = years.resolve_years(engine_settings, client=fake)
+
+    assert preview.settled == 2
+    assert preview.staged_files == 1
+    assert real.settled == 2
+    assert real.staged_files == 1
+    assert [view.filename for view in staging.diff_tags(engine_settings)] == ["a.mp3"]
+
+
+def test_dry_run_itemizes_a_file_staging_would_refuse(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    make_track(music_dir / "kept.mp3", {"artist": ["Black Sabbath"], "album": ["Paranoid"]})
+    gone = make_track(music_dir / "gone.mp3", {"artist": ["Black Sabbath"], "album": ["Paranoid"]})
+    scan_library(engine_settings)
+    gone_id = _file_id(engine_settings, music_dir, "gone.mp3")
+    gone.unlink()  # after the scan, so the file is still selected
+
+    fake = FakeMBReleaseGroupSource({("Black Sabbath", "Paranoid"): _mb("1970")})
+    result = years.resolve_years(engine_settings, client=fake, dry_run=True)
+
+    assert result.settled == 1
+    assert result.staged_files == 1
+    assert [item["key"] for item in result.error_items] == [f"file_id={gone_id}"]
+    assert staging.diff_tags(engine_settings) == []
+
+
 def test_dry_run_ignores_empty_staging_precondition(
     engine_settings: Settings,
     music_dir: Path,

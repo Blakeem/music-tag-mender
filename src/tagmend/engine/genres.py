@@ -20,9 +20,10 @@ Design notes (the spec):
   decides, and :func:`tagmend.engine.staging._stage_one` merges it onto the tags read from
   disk, so ``write_managed_tags``'s delete-on-absent behavior can never drop
   ``artist``/``albumartist`` and a lagging snapshot mirror can never overwrite a newer value.
-* **One connection** is owned here for selection, cache, and status writes. The
-  :class:`tagmend.engine.lastfm.LastfmClient` shares it (eager cache commits), while
-  :func:`tagmend.engine.staging.stage_tags` opens and owns its own connection per call.
+* **One connection** is owned by :func:`tagmend.engine.axis_resolver.run` for selection,
+  cache, and status writes. The :class:`tagmend.engine.lastfm.LastfmClient` shares it (eager
+  cache commits), while :func:`tagmend.engine.staging.stage_tags` opens and owns its own
+  connection per call.
 
 Like the rest of the conn-owning layer, the public functions here own their connection
 and commit. The building blocks in :mod:`tagmend.engine.store` never commit.
@@ -30,23 +31,11 @@ and commit. The building blocks in :mod:`tagmend.engine.store` never commit.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from tagmend.engine import (
-    axis,
-    axis_status,
-    classify,
-    clock,
-    db,
-    lookup_clients,
-    schema,
-    staging,
-    store,
-)
+from tagmend.engine import axis, axis_resolver, axis_status, classify, staging, store
 from tagmend.engine.lastfm import LastfmClient, LastfmError
-from tagmend.engine.validation import check_limit
-from tagmend.log import get_logger
 
 if TYPE_CHECKING:
     import sqlite3
@@ -54,8 +43,6 @@ if TYPE_CHECKING:
     from tagmend.config import Settings
     from tagmend.engine.classify import Vocabulary
     from tagmend.engine.lastfm import Tag, TagSource
-
-logger = get_logger(__name__)
 
 _GENRE_FIELD = axis.GENRE_AXIS.fields[0]
 
@@ -92,17 +79,6 @@ class ResolveGenresResult:
         }
 
 
-@dataclass(slots=True)
-class _Tally:
-    """Mutable accumulator for one ``resolve_genres`` run, frozen into the result at the end."""
-
-    settled: int = 0
-    staged_files: int = 0
-    no_match: int = 0
-    error_items: list[dict[str, str]] = field(default_factory=list)
-    no_match_artists: set[str] = field(default_factory=set)
-
-
 # --- staging orchestration -----------------------------------------------------------
 
 
@@ -126,7 +102,7 @@ def resolve_genres(  # noqa: PLR0913 - cohesive keyword-only scope + injection p
     equal its current ones, ``done`` and staged (``origin='auto'``, only ``genre`` changed) when
     they differ, ``no_match`` when nothing usable came back. A transient Last.fm error leaves the
     group ``pending`` and is reported, never aborting the call. A file that cannot be staged is
-    reported in ``error_items`` and stays ``pending``.
+    reported in ``error_items`` under ``file_id=<id>`` and stays ``pending``.
 
     *dry_run* counts what would settle and stage without staging or writing any status row. It
     still reads the lookup cache and fetches on a cache miss.
@@ -138,145 +114,53 @@ def resolve_genres(  # noqa: PLR0913 - cohesive keyword-only scope + injection p
     negative *limit*, an unknown file id, *album* without *value*, or when a real client is
     needed but no API key is configured. Owns its connection, and ``stage_tags`` opens its own.
     """
-    check_limit(limit)
-    effective_limit = limit if limit is not None else settings.genre_stage_limit
     vocab = classify.load_vocabulary()
-    tally = _Tally()
+    resolver: axis_resolver.AxisResolver[TagSource, list[str]] = axis_resolver.AxisResolver(
+        axis_=axis.GENRE_AXIS,
+        build_client=lambda conn: LastfmClient.from_settings(settings, conn),
+        lookup=lambda source, identity: _resolve_group(settings, identity, vocab, source) or None,
+        transient_error=LastfmError,
+        group_key=_artist_key,
+        stage=lambda conn, fid, resolved, dry_run: _stage_resolved(
+            settings, conn, fid, resolved, dry_run=dry_run
+        ),
+    )
 
-    connection = db.connect(settings.db_path)
-    try:
-        schema.apply_schema(connection)
+    outcome = axis_resolver.run(
+        settings,
+        resolver,
+        value=value,
+        album=album,
+        file_ids=file_ids,
+        limit=limit,
+        default_limit=settings.genre_stage_limit,
+        dry_run=dry_run,
+        client=client,
+    )
 
-        # Staging replaces a file's pending row, so a genre run would silently discard a
-        # manual fix to another field that is still waiting for its commit.
-        if not dry_run and store.any_staged(connection):
-            message = "commit or unstage pending changes first"
-            raise ValueError(message)
-
-        scoped_ids = store.files_in_scope(
-            connection,
-            value_fields=axis.GENRE_AXIS.scope_fields,
-            value=value,
-            album=album,
-            file_ids=file_ids,
-        )
-        pending = store.pending_file_ids(connection, axis.GENRE_AXIS, scoped_ids)
-        selected = pending[:effective_limit]
-        if selected:
-            _process_groups(settings, connection, selected, vocab, client, tally, dry_run=dry_run)
-        pending_remaining = len(store.pending_file_ids(connection, axis.GENRE_AXIS, scoped_ids))
-    finally:
-        connection.close()
-
-    return _build_result(tally, pending_remaining=pending_remaining, dry_run=dry_run)
-
-
-def _process_groups(  # noqa: PLR0913 - cohesive orchestration inputs
-    settings: Settings,
-    conn: sqlite3.Connection,
-    selected: list[int],
-    vocab: Vocabulary,
-    client: TagSource | None,
-    tally: _Tally,
-    *,
-    dry_run: bool,
-) -> None:
-    """Group *selected* by identity and resolve each group via *client* (built if None)."""
-    groups = _group_by_identity(conn, selected)
-
-    with lookup_clients.injected_or_owned(
-        client,
-        lambda: LastfmClient.from_settings(settings, conn),
-    ) as source:
-        for identity, fids in groups.items():
-            _process_one_group(
-                settings,
-                conn,
-                identity,
-                fids,
-                vocab,
-                source,
-                tally,
-                dry_run=dry_run,
-            )
+    no_match_artists = {
+        identity.artist
+        for identity, resolved in outcome.answers.items()
+        if resolved is None and identity.artist is not None
+    }
+    return ResolveGenresResult(
+        settled=outcome.settled,
+        staged_files=outcome.staged_files,
+        no_match=outcome.no_match,
+        pending_remaining=outcome.pending_remaining,
+        more=outcome.more,
+        errors=outcome.errors,
+        error_items=outcome.error_items,
+        no_match_artists=sorted(no_match_artists),
+        summary=outcome.summary,
+    )
 
 
-def _group_by_identity(
-    conn: sqlite3.Connection,
-    file_ids: list[int],
-) -> dict[axis.LookupIdentity, list[int]]:
-    """Group file ids by their lookup identity, preserving first-seen group order."""
-    groups: dict[axis.LookupIdentity, list[int]] = {}
-    for fid in file_ids:
-        identity = axis.lookup_identity(store.get_tags(conn, fid))
-        groups.setdefault(identity, []).append(fid)
-    return groups
-
-
-def _process_one_group(  # noqa: PLR0913 - cohesive per-group inputs
-    settings: Settings,
-    conn: sqlite3.Connection,
-    identity: axis.LookupIdentity,
-    file_ids: list[int],
-    vocab: Vocabulary,
-    client: TagSource,
-    tally: _Tally,
-    *,
-    dry_run: bool,
-) -> None:
-    """Resolve one ``(artist, album)`` group and settle its files.
-
-    A transient :class:`LastfmError` writes nothing, records the error, and returns without
-    aborting the wider call, so the group's files stay ``pending``. The group's status rows
-    are committed together at the end. A dry run counts the outcome and writes nothing.
-    """
+def _artist_key(identity: axis.LookupIdentity) -> str:
+    """Key a failed group's error item by its looked-up artist."""
     # A pending file has a genre identity, which needs an artist.
-    lookup_artist = identity.artist
-    assert lookup_artist is not None  # noqa: S101 - selection invariant
-
-    try:
-        resolved = _resolve_group(settings, identity, vocab, client)
-    except LastfmError as exc:
-        logger.warning("last.fm error for artist=%r: %s", lookup_artist, exc)
-        tally.error_items.append({"key": lookup_artist, "message": str(exc)})
-        return
-
-    changed: list[int] = []
-    failed: set[int] = set()
-    status = "no_match"
-    if resolved:
-        status = "done"
-        changed = [
-            fid for fid in file_ids if store.get_tags(conn, fid).get(_GENRE_FIELD, []) != resolved
-        ]
-    else:
-        tally.no_match += len(file_ids)
-        tally.no_match_artists.add(lookup_artist)
-    tally.settled += len(file_ids)
-    tally.staged_files += len(changed)
-
-    # The lookup already happened, so a preview reports the outcome. Only the stage and the
-    # status rows are withheld until the real run.
-    if dry_run:
-        return
-    # Every stage runs before any row write, because stage_tags needs the write lock this
-    # connection would otherwise hold.
-    for fid in changed:
-        try:
-            _stage_resolved(settings, fid, resolved)
-        except ValueError as exc:
-            logger.warning("cannot stage genre for file_id=%s: %s", fid, exc)
-            tally.error_items.append({"key": str(fid), "message": str(exc)})
-            failed.add(fid)
-    # A file that could not be staged writes no row, so it stays pending for the next call.
-    tally.settled -= len(failed)
-    tally.staged_files -= len(failed)
-    now = clock.utc_now()
-    for fid in file_ids:
-        if fid in failed:
-            continue
-        store.record_outcome(conn, axis.GENRE_AXIS, file_id=fid, status=status, now=now)
-    conn.commit()
+    assert identity.artist is not None  # noqa: S101 - selection invariant
+    return identity.artist
 
 
 def _resolve_group(
@@ -306,62 +190,33 @@ def _resolve_group(
     )
 
 
-def _stage_resolved(settings: Settings, file_id: int, resolved: list[str]) -> None:
+def _stage_resolved(
+    settings: Settings,
+    conn: sqlite3.Connection,
+    file_id: int,
+    resolved: list[str],
+    *,
+    dry_run: bool,
+) -> bool:
     """Stage *resolved* genres for *file_id*, passing ONLY ``genre`` (P0, no deletion).
 
-    :func:`tagmend.engine.staging._stage_one` merges it onto the tags read from disk, so
-    every other managed tag keeps its on-disk value through the commit's delete-on-absent
-    write. ``stage_tags`` opens and owns its own connection.
+    A file already holding *resolved* stages nothing and returns ``False``, as does every file
+    on a dry run that would not stage. :func:`tagmend.engine.staging._stage_one` merges the
+    genre onto the tags read from disk, so every other managed tag keeps its on-disk value
+    through the commit's delete-on-absent write. ``stage_tags`` opens and owns its own
+    connection.
     """
-    staging.stage_tags(
+    if store.get_tags(conn, file_id).get(_GENRE_FIELD, []) == resolved:
+        return False
+    if dry_run:
+        return True
+    return staging.stage_tags(
         settings,
         file_id=file_id,
-        tags={"genre": resolved},
+        tags={_GENRE_FIELD: resolved},
         origin="auto",
         note=f"lastfm: {', '.join(resolved)}",
     )
-
-
-def _build_result(
-    tally: _Tally,
-    *,
-    pending_remaining: int,
-    dry_run: bool,
-) -> ResolveGenresResult:
-    """Freeze the run's tally + counts into the public :class:`ResolveGenresResult`."""
-    more = not dry_run and tally.settled > 0 and pending_remaining > 0
-    return ResolveGenresResult(
-        settled=tally.settled,
-        staged_files=tally.staged_files,
-        no_match=tally.no_match,
-        pending_remaining=pending_remaining,
-        more=more,
-        errors=len(tally.error_items),
-        error_items=list(tally.error_items),
-        no_match_artists=sorted(tally.no_match_artists),
-        summary=_summarize(tally, pending_remaining=pending_remaining, dry_run=dry_run),
-    )
-
-
-def _summarize(tally: _Tally, *, pending_remaining: int, dry_run: bool) -> str:
-    """Build a short, plain human summary of what settled and what is left.
-
-    A dry run records nothing, so its remainder is not resumable and is worded accordingly.
-    """
-    errors = len(tally.error_items)
-    parts = [
-        f"Settled {tally.settled} file(s): staged {tally.staged_files}, no_match {tally.no_match}.",
-    ]
-    if dry_run:
-        parts.append(
-            f"A dry run records nothing, so {pending_remaining} file(s) in scope stay pending "
-            f"and an identical call previews the same files.",
-        )
-    elif pending_remaining > 0:
-        parts.append(f"{pending_remaining} file(s) still pending. Call again to continue.")
-    if errors > 0:
-        parts.append(f"{errors} item(s) errored and their files stay pending. Re-run to retry.")
-    return " ".join(parts)
 
 
 # --- status tools --------------------------------------------------------------------

@@ -35,6 +35,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from tagmend.engine import axis, axis_resolver, classify, staging, store
+from tagmend.engine.detector_core import FieldDict
 from tagmend.engine.lastfm import LastfmClient, LastfmError
 
 if TYPE_CHECKING:
@@ -51,7 +52,7 @@ _GENRE_FIELD = axis.GENRE_AXIS.fields[0]
 
 
 @dataclass(frozen=True, slots=True)
-class ResolveGenresResult:
+class ResolveGenresResult(FieldDict):
     """Immutable summary of one :func:`resolve_genres` call, JSON-ready for the MCP tool."""
 
     settled: int
@@ -63,20 +64,6 @@ class ResolveGenresResult:
     error_items: list[dict[str, str]]
     no_match_artists: list[str]
     summary: str
-
-    def to_dict(self) -> dict[str, object]:
-        """JSON-serializable form for the MCP tool."""
-        return {
-            "settled": self.settled,
-            "staged_files": self.staged_files,
-            "no_match": self.no_match,
-            "pending_remaining": self.pending_remaining,
-            "more": self.more,
-            "errors": self.errors,
-            "error_items": [dict(item) for item in self.error_items],
-            "no_match_artists": list(self.no_match_artists),
-            "summary": self.summary,
-        }
 
 
 # --- staging orchestration -----------------------------------------------------------

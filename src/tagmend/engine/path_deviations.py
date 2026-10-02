@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
 from tagmend.engine import db, mismatch, naming, path_keys, paths, schema, store
-from tagmend.engine.detector_core import parse_position
+from tagmend.engine.detector_core import FieldDict, parse_position
 from tagmend.engine.path_text import clean_value
 from tagmend.engine.text_keys import alnum_ascii_key, artist_name_key
 from tagmend.engine.validation import check_limit
@@ -56,7 +56,7 @@ _KIND_ORDER: Final = (paths.KIND_MOVE, paths.KIND_RENAME, paths.KIND_CASE)
 
 
 @dataclass(frozen=True, slots=True)
-class LevelFit:
+class LevelFit(FieldDict):
     """How one pattern component fits the current path: same text, same key, or different."""
 
     component: str
@@ -64,18 +64,9 @@ class LevelFit:
     case: int
     differs: int
 
-    def to_dict(self) -> dict[str, object]:
-        """JSON-serializable form for the MCP tool."""
-        return {
-            "component": self.component,
-            "exact": self.exact,
-            "case": self.case,
-            "differs": self.differs,
-        }
-
 
 @dataclass(frozen=True, slots=True)
-class ContainerCandidate:
+class ContainerCandidate(FieldDict):
     """A top folder most of whose files name another album artist.
 
     It is either a container (``Soundtracks``) or a tag spelling ``detect_mismatches`` owns.
@@ -88,19 +79,9 @@ class ContainerCandidate:
     top_album_artist: str | None
     listed: bool
 
-    def to_dict(self) -> dict[str, object]:
-        """JSON-serializable form for the MCP tool."""
-        return {
-            "folder": self.folder,
-            "files": self.files,
-            "album_artists": self.album_artists,
-            "top_album_artist": self.top_album_artist,
-            "listed": self.listed,
-        }
-
 
 @dataclass(frozen=True, slots=True)
-class DeviationGroup:
+class DeviationGroup(FieldDict):
     """One source folder holding a file that deviates. Paths are relative to ``music_path``.
 
     ``kind`` is the largest change among its files: ``move``, then ``rename``, then ``case``.
@@ -114,20 +95,9 @@ class DeviationGroup:
     held: dict[str, int]
     example: dict[str, str | None] | None
 
-    def to_dict(self) -> dict[str, object]:
-        """JSON-serializable form for the MCP tool."""
-        return {
-            "folder": self.folder,
-            "files": self.files,
-            "destinations": list(self.destinations),
-            "kind": self.kind,
-            "held": self.held,
-            "example": self.example,
-        }
-
 
 @dataclass(frozen=True, slots=True)
-class DeviationsReport:
+class DeviationsReport(FieldDict):
     """The entire ``detect_path_deviations`` answer. Counts always describe the entire library."""
 
     pattern: str
@@ -145,26 +115,6 @@ class DeviationsReport:
     group_count: int
     groups: tuple[DeviationGroup, ...]
     rows: tuple[paths.FilePlan, ...]
-
-    def to_dict(self) -> dict[str, object]:
-        """JSON-serializable form for the MCP tool."""
-        return {
-            "pattern": self.pattern,
-            "persisted": self.persisted,
-            "default_pattern": self.default_pattern,
-            "container_folders": list(self.container_folders),
-            "total_files": self.total_files,
-            "counts": self.counts,
-            "held": self.held,
-            "fit": [level.to_dict() for level in self.fit],
-            "shapes": self.shapes,
-            "container_candidates": [c.to_dict() for c in self.container_candidates],
-            "gate": self.gate.to_dict(),
-            "volume_refusal": self.volume_refusal,
-            "group_count": self.group_count,
-            "groups": [group.to_dict() for group in self.groups],
-            "rows": [row.to_dict() for row in self.rows],
-        }
 
 
 # --- the header ----------------------------------------------------------------------

@@ -39,7 +39,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
 from tagmend.engine import axis, classify, db, lookup_clients, parsing, path_keys, schema, store
-from tagmend.engine.detector_core import group_by_folder
+from tagmend.engine.detector_core import FieldDict, group_by_folder
 from tagmend.engine.musicbrainz import MusicBrainzClient, MusicBrainzError
 from tagmend.engine.tags import VERIFIABLE_SUFFIXES
 from tagmend.engine.text_keys import alnum_key
@@ -123,7 +123,7 @@ class _FileInput:
 
 
 @dataclass(frozen=True, slots=True)
-class AlbumGapProposal:
+class AlbumGapProposal(FieldDict):
     """One blank file's proposed ``album`` fill with its confidence + provenance note."""
 
     file_id: int
@@ -133,20 +133,9 @@ class AlbumGapProposal:
     reason: str | None  # None when green, else the confirm or review reason
     note: str  # pre-formatted for stage_tags_batch (e.g. "sibling: unanimous n=11")
 
-    def to_dict(self) -> dict[str, object]:
-        """JSON-serializable form for the MCP tool."""
-        return {
-            "file_id": self.file_id,
-            "filename": self.filename,
-            "proposed": self.proposed,
-            "confidence": self.confidence,
-            "reason": self.reason,
-            "note": self.note,
-        }
-
 
 @dataclass(frozen=True, slots=True)
-class AlbumGapGroup:
+class AlbumGapGroup(FieldDict):
     """One folder's blank-album files collapsed into a sourced group with its proposals."""
 
     folder: str
@@ -159,23 +148,9 @@ class AlbumGapGroup:
     errors: int = 0  # recording lookups in this folder that failed
     unwritable: int = 0  # blank files whose format the writer refuses, never proposed
 
-    def to_dict(self) -> dict[str, object]:
-        """JSON-serializable form for the MCP tool."""
-        return {
-            "folder": self.folder,
-            "blank_count": self.blank_count,
-            "file_count": self.file_count,
-            "file_ids": self.file_ids,
-            "sibling_histogram": self.sibling_histogram,
-            "source": self.source,
-            "proposals": [p.to_dict() for p in self.proposals],
-            "errors": self.errors,
-            "unwritable": self.unwritable,
-        }
-
 
 @dataclass(frozen=True, slots=True)
-class AlbumGapsReport:
+class AlbumGapsReport(FieldDict):
     """Immutable summary of one :func:`detect_album_gaps` run, JSON-ready for the MCP tool.
 
     ``groups`` is the (folder-sorted, optionally narrowed) worklist. ``total_files`` and the
@@ -195,26 +170,11 @@ class AlbumGapsReport:
     confirm: int
     review: int
     stays_blank: int
-    summary: str
     errors: int = 0
     error_items: list[dict[str, str]] = field(default_factory=list)
     unwritable: int = 0
-
-    def to_dict(self) -> dict[str, object]:
-        """JSON-serializable form for the MCP tool."""
-        return {
-            "groups": [g.to_dict() for g in self.groups],
-            "total_files": self.total_files,
-            "total_blank": self.total_blank,
-            "green": self.green,
-            "confirm": self.confirm,
-            "review": self.review,
-            "stays_blank": self.stays_blank,
-            "errors": self.errors,
-            "error_items": [dict(e) for e in self.error_items],
-            "unwritable": self.unwritable,
-            "summary": self.summary,
-        }
+    # Last, so the payload ends with it. Keyword-only keeps it required after the defaults.
+    summary: str = field(kw_only=True)
 
 
 # --- pure classifier -----------------------------------------------------------------

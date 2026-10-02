@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING
 import mutagen
 
 from tagmend.engine import axis, axis_resolver, staging, store
+from tagmend.engine.detector_core import FieldDict
 from tagmend.engine.musicbrainz import MusicBrainzClient, MusicBrainzError
 from tagmend.engine.tags import read_tags
 
@@ -48,7 +49,7 @@ _YEAR_FIELD = axis.YEAR_AXIS.fields[0]
 
 
 @dataclass(frozen=True, slots=True)
-class ResolveYearsResult:
+class ResolveYearsResult(FieldDict):
     """Immutable summary of one :func:`resolve_years` call, JSON-ready for the MCP tool."""
 
     settled: int
@@ -57,23 +58,10 @@ class ResolveYearsResult:
     pending_remaining: int
     more: bool
     mappings: list[dict[str, str | None]]
-    summary: str
     errors: int = 0
     error_items: list[dict[str, str]] = field(default_factory=list)
-
-    def to_dict(self) -> dict[str, object]:
-        """JSON-serializable form for the MCP tool."""
-        return {
-            "settled": self.settled,
-            "staged_files": self.staged_files,
-            "no_match": self.no_match,
-            "pending_remaining": self.pending_remaining,
-            "more": self.more,
-            "mappings": [dict(m) for m in self.mappings],
-            "errors": self.errors,
-            "error_items": [dict(e) for e in self.error_items],
-            "summary": self.summary,
-        }
+    # Last, so the payload ends with it. Keyword-only keeps it required after the defaults.
+    summary: str = field(kw_only=True)
 
 
 # --- public entry --------------------------------------------------------------------

@@ -72,6 +72,7 @@ from tagmend.engine import (
     staging,
     store,
 )
+from tagmend.engine.detector_core import FieldDict
 from tagmend.engine.lastfm import LastfmClient, LastfmError
 from tagmend.engine.musicbrainz import MusicBrainzClient, MusicBrainzError
 from tagmend.engine.text_keys import artist_name_key
@@ -200,7 +201,7 @@ def _shrinks_credit(value: str, canonical: str) -> bool:
 
 
 @dataclass(frozen=True, slots=True)
-class ResolveArtistsResult:
+class ResolveArtistsResult(FieldDict):
     """Immutable summary of one :func:`resolve_artists` call, JSON-ready for the MCP tool."""
 
     settled: int
@@ -225,33 +226,6 @@ class ResolveArtistsResult:
     name_id_disagreement_values: list[dict[str, str]]
     error_items: list[dict[str, str]]
     summary: str
-
-    def to_dict(self) -> dict[str, object]:
-        """JSON-serializable form for the MCP tool."""
-        return {
-            "settled": self.settled,
-            "staged_files": self.staged_files,
-            "corrected_values": self.corrected_values,
-            "skipped_multi_artist": self.skipped_multi_artist,
-            "skipped_sentinel": self.skipped_sentinel,
-            "no_correction": self.no_correction,
-            "already_canonical": self.already_canonical,
-            "shrinks_credit": self.shrinks_credit,
-            "needs_review": self.needs_review,
-            "name_id_disagreement": self.name_id_disagreement,
-            "errors": self.errors,
-            "pending_remaining": self.pending_remaining,
-            "more": self.more,
-            "mappings": [dict(m) for m in self.mappings],
-            "multi_artist_files": list(self.multi_artist_files),
-            "no_correction_values": list(self.no_correction_values),
-            "already_canonical_values": list(self.already_canonical_values),
-            "shrinks_credit_values": [dict(h) for h in self.shrinks_credit_values],
-            "needs_review_values": [dict(h) for h in self.needs_review_values],
-            "name_id_disagreement_values": [dict(d) for d in self.name_id_disagreement_values],
-            "error_items": [dict(e) for e in self.error_items],
-            "summary": self.summary,
-        }
 
 
 @dataclass(frozen=True, slots=True)

@@ -29,6 +29,7 @@ from tagmend.engine import axis, axis_status, clock, db, path_keys, schema, stor
 from tagmend.engine.detector_core import (
     NON_ALBUM_FOLDERS,
     TIER_RANK,
+    FieldDict,
     Tier,
     group_by_folder,
     parse_position,
@@ -579,20 +580,16 @@ class MismatchRow:
 
 
 @dataclass(frozen=True, slots=True)
-class ComparisonSummary:
+class ComparisonSummary(FieldDict):
     """One comparison inside a group: how many files carry it, with one example pair."""
 
     files: int
     tag: str
     path: str
 
-    def to_dict(self) -> dict[str, object]:
-        """JSON-serializable form for the MCP tool."""
-        return {"files": self.files, "tag": self.tag, "path": self.path}
-
 
 @dataclass(frozen=True, slots=True)
-class MismatchGroup:
+class MismatchGroup(FieldDict):
     """One release folder's flagged and exception files (the ``group=True`` view).
 
     The keys of ``comparisons`` plus ``exception`` are the names a decision covers. ``file_ids``
@@ -611,21 +608,6 @@ class MismatchGroup:
     suppressed: dict[str, int]
     file_ids: list[int]
     unflagged_ids: list[int]
-
-    def to_dict(self) -> dict[str, object]:
-        """JSON-serializable form for the MCP tool."""
-        return {
-            "folder": self.folder,
-            "file_count": self.file_count,
-            "flagged": self.flagged,
-            "tier": self.tier,
-            "comparisons": {name: s.to_dict() for name, s in self.comparisons.items()},
-            "mb_stamped": self.mb_stamped,
-            "exception": self.exception,
-            "suppressed": self.suppressed,
-            "file_ids": self.file_ids,
-            "unflagged_ids": self.unflagged_ids,
-        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -1638,20 +1620,12 @@ def status_counts(conn: sqlite3.Connection, settings: Settings) -> dict[str, int
 
 
 @dataclass(frozen=True, slots=True)
-class GateState:
+class GateState(FieldDict):
     """The library-wide stage gate, open when no file flags and no exception is undecided."""
 
     open: bool
     flagged: int
     exceptions_undecided: int
-
-    def to_dict(self) -> dict[str, object]:
-        """JSON-serializable form for a tool envelope."""
-        return {
-            "open": self.open,
-            "flagged": self.flagged,
-            "exceptions_undecided": self.exceptions_undecided,
-        }
 
 
 def gate_state(settings: Settings) -> GateState:
@@ -1704,16 +1678,12 @@ def planner_keep(conn: sqlite3.Connection, file_id: int) -> bool:
 
 
 @dataclass(frozen=True, slots=True)
-class DecidedFile:
+class DecidedFile(FieldDict):
     """What the path planner does with one decided file's folder and filename."""
 
     file_id: int
     folder: str
     filename: str
-
-    def to_dict(self) -> dict[str, object]:
-        """JSON-serializable form for the MCP tool."""
-        return {"file_id": self.file_id, "folder": self.folder, "filename": self.filename}
 
 
 @dataclass(frozen=True, slots=True)

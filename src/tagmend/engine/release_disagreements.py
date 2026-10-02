@@ -44,6 +44,7 @@ from typing import TYPE_CHECKING, Final
 
 from tagmend.engine import db, lookup_clients, path_keys, release_match, schema, store
 from tagmend.engine.detector_core import (
+    FieldDict,
     Tier,
     group_by_folder,
     narrow,
@@ -128,7 +129,7 @@ class _FileInput:
 
 
 @dataclass(frozen=True, slots=True)
-class ReleaseDisagreementRow:
+class ReleaseDisagreementRow(FieldDict):
     """One field on one file that contradicts the release the file names."""
 
     file_id: int
@@ -147,24 +148,9 @@ class ReleaseDisagreementRow:
         """Return whether this row fills a blank rather than contradicting a value."""
         return not self.have
 
-    def to_dict(self) -> dict[str, object]:
-        """JSON-serializable form for the MCP tool."""
-        return {
-            "file_id": self.file_id,
-            "folder": self.folder,
-            "filename": self.filename,
-            "release_mbid": self.release_mbid,
-            "release_title": self.release_title,
-            "field": self.field,
-            "have": self.have,
-            "want": self.want,
-            "tier": self.tier,
-            "reason": self.reason,
-        }
-
 
 @dataclass(frozen=True, slots=True)
-class ReleaseDisagreementGroup:
+class ReleaseDisagreementGroup(FieldDict):
     """One folder's disagreements, compact enough to scan a whole library at a glance.
 
     ``flagged`` counts files, matching the headline count, so the groups sum to it. One file
@@ -183,21 +169,6 @@ class ReleaseDisagreementGroup:
     fills: int
     fields: dict[str, int]
     releases: list[dict[str, object]]
-
-    def to_dict(self) -> dict[str, object]:
-        """JSON-serializable form for the MCP tool."""
-        return {
-            "folder": self.folder,
-            "file_count": self.file_count,
-            "flagged": self.flagged,
-            "folder_context": self.folder_context,
-            "tiers": self.tiers,
-            "file_ids": self.file_ids,
-            "flagged_fields": self.flagged_fields,
-            "fills": self.fills,
-            "fields": self.fields,
-            "releases": [dict(r) for r in self.releases],
-        }
 
 
 @dataclass(frozen=True, slots=True)

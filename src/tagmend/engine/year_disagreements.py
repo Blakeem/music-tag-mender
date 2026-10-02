@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING, Final
 
 from tagmend.engine import axis, db, lookup_clients, path_keys, schema, store
 from tagmend.engine.detector_core import (
+    FieldDict,
     Tier,
     group_by_key,
     is_non_album_folder,
@@ -101,7 +102,7 @@ class _Lookups:
 
 
 @dataclass(frozen=True, slots=True)
-class YearDisagreementRow:
+class YearDisagreementRow(FieldDict):
     """One year field on one file that contradicts its release group's first release."""
 
     file_id: int
@@ -122,26 +123,9 @@ class YearDisagreementRow:
         """Return the grouped-view line this row belongs to."""
         return (self.folder, self.artist, self.album)
 
-    def to_dict(self) -> dict[str, object]:
-        """JSON-serializable form for the MCP tool."""
-        return {
-            "file_id": self.file_id,
-            "folder": self.folder,
-            "filename": self.filename,
-            "artist": self.artist,
-            "album": self.album,
-            "field": self.field,
-            "have": self.have,
-            "first_release_year": self.first_release_year,
-            "release_group_mbid": self.release_group_mbid,
-            "release_group_title": self.release_group_title,
-            "tier": self.tier,
-            "reason": self.reason,
-        }
-
 
 @dataclass(frozen=True, slots=True)
-class YearDisagreementGroup:
+class YearDisagreementGroup(FieldDict):
     """One album identity's disagreements inside one folder.
 
     A folder holding several albums gets one group per album, because each resolves to its own
@@ -167,23 +151,6 @@ class YearDisagreementGroup:
     def group_key(self) -> _GroupKey:
         """Return the key the rows of this group carry."""
         return (self.folder, self.artist, self.album)
-
-    def to_dict(self) -> dict[str, object]:
-        """JSON-serializable form for the MCP tool."""
-        return {
-            "folder": self.folder,
-            "artist": self.artist,
-            "album": self.album,
-            "first_release_year": self.first_release_year,
-            "release_group_mbid": self.release_group_mbid,
-            "release_group_title": self.release_group_title,
-            "file_count": self.file_count,
-            "flagged": self.flagged,
-            "folder_context": self.folder_context,
-            "tiers": self.tiers,
-            "file_ids": self.file_ids,
-            "fields": self.fields,
-        }
 
 
 @dataclass(frozen=True, slots=True)

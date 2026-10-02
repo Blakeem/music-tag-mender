@@ -40,6 +40,7 @@ from typing import TYPE_CHECKING, Final
 import mutagen
 
 from tagmend.engine import acoustid, clock, commits, db, paths, schema, store
+from tagmend.engine.detector_core import FieldDict
 from tagmend.engine.tags import (
     MANAGED_SET_VERSION,
     MANAGED_TAGS,
@@ -446,7 +447,7 @@ def _revert_file(
 
 
 @dataclass(frozen=True, slots=True)
-class RevertResult:
+class RevertResult(FieldDict):
     """Summary of a single-file revert: the new revision and the commit recording it.
 
     A dry run records nothing, so its ``new_version`` and ``commit_id`` are ``None``.
@@ -458,17 +459,6 @@ class RevertResult:
     commit_id: int | None
     status: str  # 'reverted' (tags moved) | 'noop' (already at the target state)
     dry_run: bool
-
-    def to_dict(self) -> dict[str, object]:
-        """JSON-serializable form for the MCP tool."""
-        return {
-            "file_id": self.file_id,
-            "target_version": self.target_version,
-            "new_version": self.new_version,
-            "commit_id": self.commit_id,
-            "status": self.status,
-            "dry_run": self.dry_run,
-        }
 
 
 def revert_tags(

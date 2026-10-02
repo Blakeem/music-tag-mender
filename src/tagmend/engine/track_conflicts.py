@@ -40,6 +40,7 @@ from typing import TYPE_CHECKING, Final
 from tagmend.engine import db, path_keys, schema, store
 from tagmend.engine.detector_core import (
     TIER_RANK,
+    FieldDict,
     Tier,
     group_by_folder,
     is_non_album_folder,
@@ -103,7 +104,7 @@ class _FileInput:
 
 
 @dataclass(frozen=True, slots=True)
-class TrackConflictRow:
+class TrackConflictRow(FieldDict):
     """One flagged file: the slot it shares, who it shares it with, and why that is wrong."""
 
     file_id: int
@@ -116,23 +117,9 @@ class TrackConflictRow:
     reason: str
     peers: list[int]
 
-    def to_dict(self) -> dict[str, object]:
-        """JSON-serializable form for the MCP tool."""
-        return {
-            "file_id": self.file_id,
-            "folder": self.folder,
-            "filename": self.filename,
-            "disc": self.disc,
-            "track": self.track,
-            "title": self.title,
-            "tier": self.tier,
-            "reason": self.reason,
-            "peers": self.peers,
-        }
-
 
 @dataclass(frozen=True, slots=True)
-class TrackConflictGroup:
+class TrackConflictGroup(FieldDict):
     """One folder's conflicts, compact enough to scan a whole library at a glance."""
 
     folder: str
@@ -143,21 +130,9 @@ class TrackConflictGroup:
     tiers: dict[str, int]
     file_ids: list[int]
 
-    def to_dict(self) -> dict[str, object]:
-        """JSON-serializable form for the MCP tool."""
-        return {
-            "folder": self.folder,
-            "file_count": self.file_count,
-            "flagged": self.flagged,
-            "folder_context": self.folder_context,
-            "slots": self.slots,
-            "tiers": self.tiers,
-            "file_ids": self.file_ids,
-        }
-
 
 @dataclass(frozen=True, slots=True)
-class TrackConflictsReport:
+class TrackConflictsReport(FieldDict):
     """Immutable summary of one :func:`detect_track_conflicts` run, JSON-ready for the tool.
 
     The ``high``/``medium``/``low``/``flagged`` counts describe the whole library and are
@@ -172,25 +147,11 @@ class TrackConflictsReport:
     high: int
     medium: int
     low: int
-    summary: str
     folder_context: int = 0
     folder_context_rows: list[TrackConflictRow] = field(default_factory=list)
     groups: list[TrackConflictGroup] = field(default_factory=list)
-
-    def to_dict(self) -> dict[str, object]:
-        """JSON-serializable form for the MCP tool."""
-        return {
-            "rows": [r.to_dict() for r in self.rows],
-            "total_files": self.total_files,
-            "flagged": self.flagged,
-            "high": self.high,
-            "medium": self.medium,
-            "low": self.low,
-            "folder_context": self.folder_context,
-            "folder_context_rows": [r.to_dict() for r in self.folder_context_rows],
-            "groups": [g.to_dict() for g in self.groups],
-            "summary": self.summary,
-        }
+    # Last, so the payload ends with it. Keyword-only keeps it required after the defaults.
+    summary: str = field(kw_only=True)
 
 
 # --- pure classifier -----------------------------------------------------------------

@@ -101,7 +101,7 @@ from tagmend.engine import (
     schema,
     store,
 )
-from tagmend.engine.detector_core import parse_position
+from tagmend.engine.detector_core import FieldDict, parse_position
 from tagmend.engine.path_text import part_problems
 from tagmend.log import get_logger
 
@@ -651,20 +651,16 @@ _SIDECAR_ERRORS: Final = (OSError, sqlite3.IntegrityError)
 
 
 @dataclass(frozen=True, slots=True)
-class SidecarHold:
+class SidecarHold(FieldDict):
     """A sidecar a stage leaves in its folder, because its target is taken or too long."""
 
     from_path: str
     to_path: str
     detail: str
 
-    def to_dict(self) -> dict[str, object]:
-        """JSON-serializable form for the MCP tools."""
-        return {"from_path": self.from_path, "to_path": self.to_path, "detail": self.detail}
-
 
 @dataclass(frozen=True, slots=True)
-class SidecarOutcome:
+class SidecarOutcome(FieldDict):
     """What one commit or revert did with one sidecar. Paths are relative to ``music_path``.
 
     ``status`` is ``moved`` (``reverted`` in a revert), ``waiting`` (its album's audio has not
@@ -677,15 +673,6 @@ class SidecarOutcome:
     to_path: str
     status: str
     detail: str | None = None
-
-    def to_dict(self) -> dict[str, object]:
-        """JSON-serializable form for the MCP tools."""
-        return {
-            "from_path": self.from_path,
-            "to_path": self.to_path,
-            "status": self.status,
-            "detail": self.detail,
-        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -2172,7 +2159,7 @@ def render_targets(
 
 
 @dataclass(frozen=True, slots=True)
-class StagePathsResult:
+class StagePathsResult(FieldDict):
     """What one :func:`stage_paths` call staged, or would stage on a dry run.
 
     ``matched`` counts the present files in scope. ``unstaged`` counts the ``auto`` rows in
@@ -2199,27 +2186,6 @@ class StagePathsResult:
     staged_targets_under_path: int | None
     sidecars_staged: int
     sidecars_held: tuple[SidecarHold, ...]
-
-    def to_dict(self) -> dict[str, object]:
-        """JSON-serializable form for the MCP tool."""
-        return {
-            "dry_run": self.dry_run,
-            "pattern": self.pattern,
-            "matched": self.matched,
-            "staged": self.staged,
-            "folders": self.folders,
-            "kinds": self.kinds,
-            "at_target": self.at_target,
-            "case_only": self.case_only,
-            "kept_staged": self.kept_staged,
-            "unstaged": self.unstaged,
-            "held_count": self.held_count,
-            "held": self.held,
-            "held_files": [plan.to_dict() for plan in self.held_files],
-            "staged_targets_under_path": self.staged_targets_under_path,
-            "sidecars_staged": self.sidecars_staged,
-            "sidecars_held": [hold.to_dict() for hold in self.sidecars_held],
-        }
 
 
 def held_counts(plans: Sequence[FilePlan]) -> dict[str, int]:
@@ -2402,22 +2368,13 @@ def stage_paths(
 
 
 @dataclass(frozen=True, slots=True)
-class NamingSettings:
+class NamingSettings(FieldDict):
     """The naming settings :func:`set_naming_pattern` saved."""
 
     pattern: str
     default_pattern: str
     container_folders: tuple[str, ...]
     settings_path: str
-
-    def to_dict(self) -> dict[str, object]:
-        """JSON-serializable form for the MCP tool."""
-        return {
-            "pattern": self.pattern,
-            "default_pattern": self.default_pattern,
-            "container_folders": list(self.container_folders),
-            "settings_path": self.settings_path,
-        }
 
 
 def set_naming_pattern(
@@ -2483,15 +2440,11 @@ def _staged_in_scope(
 
 
 @dataclass(frozen=True, slots=True)
-class UnstagePathsResult:
+class UnstagePathsResult(FieldDict):
     """What one :func:`unstage_paths` call dropped: audio moves and sidecar moves."""
 
     removed: int
     sidecars_removed: int
-
-    def to_dict(self) -> dict[str, object]:
-        """JSON-serializable form for the MCP tool."""
-        return {"removed": self.removed, "sidecars_removed": self.sidecars_removed}
 
 
 def _refuse_landed(
@@ -2578,7 +2531,7 @@ def unstage_paths(
 
 
 @dataclass(frozen=True, slots=True)
-class PathDiffView:
+class PathDiffView(FieldDict):
     """One staged move as ``diff_paths`` shows it. Both paths are relative to ``music_path``.
 
     ``state`` is the row's disk state, one of the module docstring's six. ``stale`` marks an
@@ -2593,19 +2546,6 @@ class PathDiffView:
     staged_at: str
     state: str
     stale: bool
-
-    def to_dict(self) -> dict[str, object]:
-        """JSON-serializable form for the MCP tool."""
-        return {
-            "file_id": self.file_id,
-            "from_path": self.from_path,
-            "to_path": self.to_path,
-            "origin": self.origin,
-            "note": self.note,
-            "staged_at": self.staged_at,
-            "state": self.state,
-            "stale": self.stale,
-        }
 
 
 def diff_paths(
@@ -2650,7 +2590,7 @@ def diff_paths(
 
 
 @dataclass(frozen=True, slots=True)
-class SidecarDiffView:
+class SidecarDiffView(FieldDict):
     """One staged sidecar move as ``diff_paths`` shows it. Paths are relative to ``music_path``.
 
     ``state`` is the row's disk state, one of the module docstring's six.
@@ -2662,17 +2602,6 @@ class SidecarDiffView:
     note: str | None
     staged_at: str
     state: str
-
-    def to_dict(self) -> dict[str, object]:
-        """JSON-serializable form for the MCP tool."""
-        return {
-            "from_path": self.from_path,
-            "to_path": self.to_path,
-            "origin": self.origin,
-            "note": self.note,
-            "staged_at": self.staged_at,
-            "state": self.state,
-        }
 
 
 def diff_sidecars(
@@ -2713,7 +2642,7 @@ def diff_sidecars(
 
 
 @dataclass(frozen=True, slots=True)
-class PathProblem:
+class PathProblem(FieldDict):
     """One staged move a commit left unfinished, with what to do about it."""
 
     file_id: int
@@ -2721,18 +2650,9 @@ class PathProblem:
     to_path: str
     detail: str
 
-    def to_dict(self) -> dict[str, object]:
-        """JSON-serializable form for the MCP tool."""
-        return {
-            "file_id": self.file_id,
-            "status": self.status,
-            "to_path": self.to_path,
-            "detail": self.detail,
-        }
-
 
 @dataclass(frozen=True, slots=True)
-class PathCommitResult:
+class PathCommitResult(FieldDict):
     """The summary of one :func:`commit_paths` call. ``problems`` lists every unfinished move.
 
     ``sidecars_moved`` counts the sidecars moved and logged, ``sidecars_waiting`` those whose
@@ -2755,23 +2675,6 @@ class PathCommitResult:
     sidecars_held: tuple[str, ...] = ()
     folders_pruned: int = 0
     sidecar_problems: tuple[SidecarOutcome, ...] = ()
-
-    def to_dict(self) -> dict[str, object]:
-        """JSON-serializable form for the MCP tool."""
-        return {
-            "commit_id": self.commit_id,
-            "committed": self.committed,
-            "noop": self.noop,
-            "missing": self.missing,
-            "changed_since_stage": self.changed_since_stage,
-            "errors": self.errors,
-            "problems": [problem.to_dict() for problem in self.problems],
-            "sidecars_moved": self.sidecars_moved,
-            "sidecars_waiting": self.sidecars_waiting,
-            "sidecars_held": list(self.sidecars_held),
-            "folders_pruned": self.folders_pruned,
-            "sidecar_problems": [outcome.to_dict() for outcome in self.sidecar_problems],
-        }
 
 
 _PROBLEM_DETAILS: Final = {
@@ -3039,7 +2942,7 @@ def _stage_revert_row(  # noqa: PLR0913 - cohesive keyword-only revert-row paylo
 
 
 @dataclass(frozen=True, slots=True)
-class PathRevertResult:
+class PathRevertResult(FieldDict):
     """One :func:`revert_paths` call. ``status`` is ``reverted`` or why the move did not finish."""
 
     file_id: int
@@ -3050,19 +2953,6 @@ class PathRevertResult:
     status: str
     detail: str | None
     dry_run: bool
-
-    def to_dict(self) -> dict[str, object]:
-        """JSON-serializable form for the MCP tool."""
-        return {
-            "file_id": self.file_id,
-            "target_version": self.target_version,
-            "new_version": self.new_version,
-            "commit_id": self.commit_id,
-            "to_path": self.to_path,
-            "status": self.status,
-            "detail": self.detail,
-            "dry_run": self.dry_run,
-        }
 
 
 def _require_revert_source(

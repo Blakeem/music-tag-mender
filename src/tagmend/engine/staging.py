@@ -37,6 +37,7 @@ from typing import TYPE_CHECKING, Final, cast
 import mutagen
 
 from tagmend.engine import axis, clock, commits, db, path_keys, schema, store, versioning
+from tagmend.engine.detector_core import FieldDict
 from tagmend.engine.tags import (
     MANAGED_SET_VERSION,
     MANAGED_TAGS,
@@ -127,7 +128,7 @@ def _drop_filled(
 
 
 @dataclass(frozen=True, slots=True)
-class TagDiffView:
+class TagDiffView(FieldDict):
     """A staged tag change enriched with the current→target diff (``git diff --staged``)."""
 
     file_id: int
@@ -141,22 +142,6 @@ class TagDiffView:
     target: dict[str, list[str]]
     diff: dict[str, dict[str, list[str]]]
     stale_identity: list[dict[str, object]] = field(default_factory=list)
-
-    def to_dict(self) -> dict[str, object]:
-        """JSON-serializable form for the MCP tool."""
-        return {
-            "file_id": self.file_id,
-            "folder": self.folder,
-            "filename": self.filename,
-            "is_missing": self.is_missing,
-            "origin": self.origin,
-            "note": self.note,
-            "staged_at": self.staged_at,
-            "current": self.current,
-            "target": self.target,
-            "diff": self.diff,
-            "stale_identity": self.stale_identity,
-        }
 
 
 @dataclass(frozen=True, slots=True)

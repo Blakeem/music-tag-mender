@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Final
 import mutagen
 
 from tagmend.engine import axis, clock, db, mismatch, path_keys, scan, schema, store, versioning
+from tagmend.engine.detector_core import FieldDict
 from tagmend.engine.tags import TAG_READER_VERSION, read_tags
 from tagmend.engine.validation import check_limit, require_choice
 from tagmend.log import get_logger
@@ -42,7 +43,7 @@ _YEAR_FIELD: Final = axis.YEAR_AXIS.fields[0]
 
 
 @dataclass(frozen=True, slots=True)
-class FileView:
+class FileView(FieldDict):
     """One tracked file plus its current managed tags, for the discovery tools."""
 
     file_id: int
@@ -65,31 +66,6 @@ class FileView:
     song_source_release_track_mbid: str | None = None
     mismatch_status: str = "pending"
     mismatch_source_value: dict[str, object] | None = None  # the decision's snapshot
-
-    def to_dict(self) -> dict[str, object]:
-        """JSON-serializable form for the MCP tool."""
-        return {
-            "file_id": self.file_id,
-            "folder": self.folder,
-            "filename": self.filename,
-            "ext": self.ext,
-            "is_missing": self.is_missing,
-            "managed_tags": self.managed_tags,
-            "genre_status": self.genre_status,
-            "genre_source_artist": self.genre_source_artist,
-            "genre_source_album": self.genre_source_album,
-            "artist_status": self.artist_status,
-            "artist_source_artist": self.artist_source_artist,
-            "artist_source_albumartist": self.artist_source_albumartist,
-            "year_status": self.year_status,
-            "year_source_artist": self.year_source_artist,
-            "year_source_album": self.year_source_album,
-            "song_status": self.song_status,
-            "song_source_album_mbid": self.song_source_album_mbid,
-            "song_source_release_track_mbid": self.song_source_release_track_mbid,
-            "mismatch_status": self.mismatch_status,
-            "mismatch_source_value": self.mismatch_source_value,
-        }
 
 
 def _axis_view(
@@ -319,15 +295,11 @@ def get_file(settings: Settings, file_id: int) -> FileView | None:
 
 
 @dataclass(frozen=True, slots=True)
-class ArtistRow:
+class ArtistRow(FieldDict):
     """One distinct ``artist`` tag value with its file count, for ``list_artists``."""
 
     artist: str
     file_count: int
-
-    def to_dict(self) -> dict[str, object]:
-        """JSON-serializable form for the MCP tool."""
-        return {"artist": self.artist, "file_count": self.file_count}
 
 
 def list_artists(settings: Settings, *, limit: int | None = None) -> list[ArtistRow]:
@@ -351,7 +323,7 @@ def list_artists(settings: Settings, *, limit: int | None = None) -> list[Artist
 
 
 @dataclass(frozen=True, slots=True)
-class AlbumRow:
+class AlbumRow(FieldDict):
     """One distinct ``(albumartist-else-artist, album)`` group with its status, for listing."""
 
     artist: str | None
@@ -359,16 +331,6 @@ class AlbumRow:
     file_count: int
     year_status: str
     blank_originaldate: int
-
-    def to_dict(self) -> dict[str, object]:
-        """JSON-serializable form for the MCP tool."""
-        return {
-            "artist": self.artist,
-            "album": self.album,
-            "file_count": self.file_count,
-            "year_status": self.year_status,
-            "blank_originaldate": self.blank_originaldate,
-        }
 
 
 def list_albums(
@@ -440,7 +402,7 @@ class ScanMode(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
-class ScanResult:
+class ScanResult(FieldDict):
     """Immutable summary of one scan run."""
 
     total_seen: int
@@ -453,21 +415,6 @@ class ScanResult:
     errors: int
     respelled: int
     pending_commit: int
-
-    def to_dict(self) -> dict[str, object]:
-        """JSON-serializable form for the MCP tool."""
-        return {
-            "total_seen": self.total_seen,
-            "added": self.added,
-            "updated": self.updated,
-            "unchanged": self.unchanged,
-            "tags_read": self.tags_read,
-            "missing_flagged": self.missing_flagged,
-            "restored": self.restored,
-            "errors": self.errors,
-            "respelled": self.respelled,
-            "pending_commit": self.pending_commit,
-        }
 
 
 @dataclass(slots=True)

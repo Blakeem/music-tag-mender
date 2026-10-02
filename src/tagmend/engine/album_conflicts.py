@@ -50,6 +50,7 @@ from typing import TYPE_CHECKING, Final
 from tagmend.engine import db, path_keys, schema, store
 from tagmend.engine.detector_core import (
     TIER_RANK,
+    FieldDict,
     Tier,
     group_by_folder,
     is_non_album_folder,
@@ -172,7 +173,7 @@ class _FileInput:
 
 
 @dataclass(frozen=True, slots=True)
-class AlbumConflictRow:
+class AlbumConflictRow(FieldDict):
     """One flagged file: the identity it carries, the one its folder shares, and why."""
 
     file_id: int
@@ -187,25 +188,9 @@ class AlbumConflictRow:
     tier: str  # Tier value
     reason: str
 
-    def to_dict(self) -> dict[str, object]:
-        """JSON-serializable form for the MCP tool."""
-        return {
-            "file_id": self.file_id,
-            "folder": self.folder,
-            "filename": self.filename,
-            "album": self.album,
-            "albumartist": self.albumartist,
-            "release_mbid": self.release_mbid,
-            "date": self.date,
-            "identity": self.identity,
-            "majority_identity": self.majority_identity,
-            "tier": self.tier,
-            "reason": self.reason,
-        }
-
 
 @dataclass(frozen=True, slots=True)
-class AlbumConflictGroup:
+class AlbumConflictGroup(FieldDict):
     """One folder's split, compact enough to scan a whole library at a glance.
 
     ``file_count`` counts every present file in the folder, blank album included. ``file_ids``
@@ -222,23 +207,9 @@ class AlbumConflictGroup:
     tiers: dict[str, int]
     file_ids: list[int]
 
-    def to_dict(self) -> dict[str, object]:
-        """JSON-serializable form for the MCP tool."""
-        return {
-            "folder": self.folder,
-            "file_count": self.file_count,
-            "flagged": self.flagged,
-            "folder_context": self.folder_context,
-            "identities": self.identities,
-            "majority_identity": self.majority_identity,
-            "majority_files": self.majority_files,
-            "tiers": self.tiers,
-            "file_ids": self.file_ids,
-        }
-
 
 @dataclass(frozen=True, slots=True)
-class AlbumConflictsReport:
+class AlbumConflictsReport(FieldDict):
     """Immutable summary of one :func:`detect_album_conflicts` run, JSON-ready for the tool.
 
     The ``high``/``medium``/``low``/``flagged`` counts describe the whole library and are
@@ -253,25 +224,11 @@ class AlbumConflictsReport:
     high: int
     medium: int
     low: int
-    summary: str
     folder_context: int = 0
     folder_context_rows: list[AlbumConflictRow] = field(default_factory=list)
     groups: list[AlbumConflictGroup] = field(default_factory=list)
-
-    def to_dict(self) -> dict[str, object]:
-        """JSON-serializable form for the MCP tool."""
-        return {
-            "rows": [r.to_dict() for r in self.rows],
-            "total_files": self.total_files,
-            "flagged": self.flagged,
-            "high": self.high,
-            "medium": self.medium,
-            "low": self.low,
-            "folder_context": self.folder_context,
-            "folder_context_rows": [r.to_dict() for r in self.folder_context_rows],
-            "groups": [g.to_dict() for g in self.groups],
-            "summary": self.summary,
-        }
+    # Last, so the payload ends with it. Keyword-only keeps it required after the defaults.
+    summary: str = field(kw_only=True)
 
 
 # --- pure classifier -----------------------------------------------------------------

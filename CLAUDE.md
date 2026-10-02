@@ -361,10 +361,10 @@ src/tagmend/
     axis_status.py  the one set_/reset_<axis>_status implementation, parameterized by Axis
     axis_resolver.py  the group-lookup runner behind resolve_genres and resolve_years
     classify.py     genre vocab/overlay loader + fold-key index + classify.classify_genres (pure)
-    genres.py       resolve_genres + set/reset_genre_status
-    artists.py      resolve_artists + set/reset_artist_status: MusicBrainz-by-MBID then getCorrection cascade-stage + file_artist_status workflow
-    songs.py        resolve_songs + set/reset_song_status: AcoustID folder consensus, anchored check, rebind report, manual release path
-    years.py        resolve_years + set/reset_year_status: MusicBrainz originaldate blank-fill + file_year_status workflow
+    genres.py       resolve_genres
+    artists.py      resolve_artists: MusicBrainz-by-MBID then getCorrection cascade-stage + file_artist_status workflow
+    songs.py        resolve_songs: AcoustID folder consensus, anchored check, rebind report, manual release path
+    years.py        resolve_years: MusicBrainz originaldate blank-fill + file_year_status workflow
     mismatch.py     detect_mismatches + set/reset_mismatch_status + layout_of + the path gate: tags vs every path level, tiered
     path_text.py    clean_value and the part rules: what a tag value and a path part may hold
     detector_core.py  the shared core of the detect_* family: tiers, folder buckets and positions

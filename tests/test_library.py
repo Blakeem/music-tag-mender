@@ -15,15 +15,14 @@ import pytest
 from conftest import make_track
 from tagmend.config import Settings
 from tagmend.engine import (
-    artists,
     axis,
+    axis_status,
     library,
     mismatch,
     path_keys,
     staging,
     store,
     versioning,
-    years,
 )
 from tagmend.engine.db import connect
 from tagmend.engine.library import (
@@ -657,7 +656,9 @@ def test_list_files_filters_to_artist_manual_with_genre_status_none(
 
     # Exclude exactly the middle track on the artist axis.
     target = _file_row(engine_settings, music_dir, tracks[1].name)
-    artists.set_artist_status(engine_settings, file_ids=[target.id], status="manual")
+    axis_status.set_manual_status(
+        engine_settings, axis.ARTIST_AXIS, file_ids=[target.id], value=None, status="manual"
+    )
 
     # genre_status defaults to None; only the artist filter applies.
     views = list_files(engine_settings, artist_status="manual")
@@ -689,7 +690,9 @@ def test_list_files_composes_both_status_filters(
     row0 = _file_row(engine_settings, music_dir, tracks[0].name)
     row1 = _file_row(engine_settings, music_dir, tracks[1].name)
     row2 = _file_row(engine_settings, music_dir, tracks[2].name)
-    artists.set_artist_status(engine_settings, file_ids=[row0.id, row2.id], status="manual")
+    axis_status.set_manual_status(
+        engine_settings, axis.ARTIST_AXIS, file_ids=[row0.id, row2.id], value=None, status="manual"
+    )
     _set_no_match(engine_settings, row1.id)
     _set_no_match(engine_settings, row2.id)
 
@@ -705,7 +708,9 @@ def test_get_library_stats_includes_artist_block(
     tracks = _populate(music_dir, _N)
     scan_library(engine_settings)
     row = _file_row(engine_settings, music_dir, tracks[0].name)
-    artists.set_artist_status(engine_settings, file_ids=[row.id], status="manual")
+    axis_status.set_manual_status(
+        engine_settings, axis.ARTIST_AXIS, file_ids=[row.id], value=None, status="manual"
+    )
 
     stats = get_library_stats(engine_settings)
 
@@ -765,7 +770,9 @@ def test_list_files_composes_year_with_other_filters(
     row2 = _file_row(engine_settings, music_dir, tracks[2].name)
     _set_year_no_match(engine_settings, row0.id)
     _set_year_no_match(engine_settings, row2.id)
-    artists.set_artist_status(engine_settings, file_ids=[row2.id], status="manual")
+    axis_status.set_manual_status(
+        engine_settings, axis.ARTIST_AXIS, file_ids=[row2.id], value=None, status="manual"
+    )
 
     # Both filters set → only track 2 satisfies BOTH.
     views = list_files(engine_settings, year_status="no_match", artist_status="manual")
@@ -929,7 +936,9 @@ def test_list_files_composes_mismatch_with_other_filters(
         status="legit_ignore",
         covers=[],
     )
-    artists.set_artist_status(engine_settings, file_ids=[rows[2].id], status="manual")
+    axis_status.set_manual_status(
+        engine_settings, axis.ARTIST_AXIS, file_ids=[rows[2].id], value=None, status="manual"
+    )
 
     # Both filters set -> only track 2 satisfies BOTH.
     views = list_files(engine_settings, mismatch_status="legit_ignore", artist_status="manual")
@@ -1066,7 +1075,9 @@ def test_list_albums_year_status_filter(
     scan_library(engine_settings)
 
     file_id = _file_row(engine_settings, music_dir, track.name).id
-    years.set_year_status(engine_settings, file_ids=[file_id], status="manual")
+    axis_status.set_manual_status(
+        engine_settings, axis.YEAR_AXIS, file_ids=[file_id], value=None, status="manual"
+    )
 
     manual = list_albums(engine_settings, year_status="manual")
     assert [row.album for row in manual] == ["A1"]
@@ -1083,7 +1094,9 @@ def test_list_albums_ignores_a_missing_file(
     kept = make_track(music_dir / "b.mp3", {"artist": ["Alpha"], "album": ["A1"]})
     scan_library(engine_settings)
     kept_id = _file_row(engine_settings, music_dir, kept.name).id
-    years.set_year_status(engine_settings, file_ids=[kept_id], status="manual")
+    axis_status.set_manual_status(
+        engine_settings, axis.YEAR_AXIS, file_ids=[kept_id], value=None, status="manual"
+    )
     gone.unlink()
     scan_library(engine_settings)
 
@@ -1125,7 +1138,9 @@ def test_list_albums_actionable_composes_with_year_status_and_precedes_limit(
     scan_library(engine_settings)
 
     manual_id = _file_row(engine_settings, music_dir, manual_track.name).id
-    years.set_year_status(engine_settings, file_ids=[manual_id], status="manual")
+    axis_status.set_manual_status(
+        engine_settings, axis.YEAR_AXIS, file_ids=[manual_id], value=None, status="manual"
+    )
 
     both = list_albums(engine_settings, year_status="pending", actionable=True)
     assert [row.album for row in both] == ["C1", "D1"]

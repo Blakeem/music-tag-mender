@@ -48,7 +48,6 @@ from typing import TYPE_CHECKING, Final
 
 from tagmend.engine import (
     axis,
-    axis_status,
     clock,
     db,
     path_keys,
@@ -2024,43 +2023,3 @@ def _summarize(
         parts.append(f"{tally.cold_folders_remaining} cold folder(s) left. Call again to continue.")
     parts.append(f"{pending_remaining} file(s) in scope still pending.")
     return " ".join(parts)
-
-
-# --- status tools --------------------------------------------------------------------
-
-
-def set_song_status(
-    settings: Settings,
-    *,
-    file_ids: list[int] | None = None,
-    value: str | None = None,
-    status: str,
-) -> int:
-    """Record ``manual`` on the song axis for every file in scope.
-
-    Scope is *file_ids* when given, else every file whose ``album`` tag equals *value*: this axis
-    has no lookup name field, and a whole album is the natural unit to exclude by hand. With
-    neither the call changes nothing and returns 0. A ``manual`` file still votes for its folder.
-    The row is sticky until :func:`reset_song_status`. Raises :class:`ValueError` for any
-    *status* other than ``manual`` or an unknown file id.
-    """
-    return axis_status.set_manual_status(
-        settings,
-        axis.SONG_AXIS,
-        file_ids=file_ids,
-        value=value,
-        status=status,
-    )
-
-
-def reset_song_status(
-    settings: Settings,
-    *,
-    file_ids: list[int] | None = None,
-    value: str | None = None,
-) -> int:
-    """Delete the song status row of every file in scope, the one hand-back of ``manual``.
-
-    Same scoping as :func:`set_song_status`. Returns the number of files affected.
-    """
-    return axis_status.reset_status(settings, axis.SONG_AXIS, file_ids=file_ids, value=value)

@@ -22,7 +22,7 @@ import mutagen
 import pytest
 
 from conftest import make_track
-from tagmend.engine import artists, axis, staging, store, versioning
+from tagmend.engine import artists, axis, axis_status, staging, store, versioning
 from tagmend.engine.db import connect
 from tagmend.engine.lastfm import ArtistCorrection, LastfmError
 from tagmend.engine.library import list_files as library_list
@@ -750,10 +750,8 @@ def test_manual_excluded_file_is_skipped_and_reported(
     excluded_id = _file_id(engine_settings, music_dir, excluded.name)
     kept_id = _file_id(engine_settings, music_dir, kept.name)
 
-    affected = artists.set_artist_status(
-        engine_settings,
-        file_ids=[excluded_id],
-        status="manual",
+    affected = axis_status.set_manual_status(
+        engine_settings, axis.ARTIST_AXIS, file_ids=[excluded_id], value=None, status="manual"
     )
     assert affected == 1
 
@@ -781,10 +779,8 @@ def test_set_artist_status_by_value_matches_albumartist(
     scan_library(engine_settings)
     file_id = _file_id(engine_settings, music_dir, track.name)
 
-    affected = artists.set_artist_status(
-        engine_settings,
-        value="Miami Nights 84",
-        status="manual",
+    affected = axis_status.set_manual_status(
+        engine_settings, axis.ARTIST_AXIS, file_ids=None, value="Miami Nights 84", status="manual"
     )
     assert affected == 1
 
@@ -800,7 +796,9 @@ def test_manual_is_sticky_across_rerun(
     track = make_track(music_dir / "t.mp3", {"artist": ["Miami Nights '84"]})
     scan_library(engine_settings)
     file_id = _file_id(engine_settings, music_dir, track.name)
-    artists.set_artist_status(engine_settings, file_ids=[file_id], status="manual")
+    axis_status.set_manual_status(
+        engine_settings, axis.ARTIST_AXIS, file_ids=[file_id], value=None, status="manual"
+    )
 
     fake = FakeCorrectionSource(
         {"Miami Nights '84": ArtistCorrection("Miami Nights 1984", "mbid-1")},
@@ -820,9 +818,14 @@ def test_reset_artist_status_requeues(
     track = make_track(music_dir / "t.mp3", {"artist": ["Miami Nights '84"]})
     scan_library(engine_settings)
     file_id = _file_id(engine_settings, music_dir, track.name)
-    artists.set_artist_status(engine_settings, file_ids=[file_id], status="manual")
+    axis_status.set_manual_status(
+        engine_settings, axis.ARTIST_AXIS, file_ids=[file_id], value=None, status="manual"
+    )
 
-    assert artists.reset_artist_status(engine_settings, file_ids=[file_id]) == 1
+    assert (
+        axis_status.reset_status(engine_settings, axis.ARTIST_AXIS, file_ids=[file_id], value=None)
+        == 1
+    )
 
     fake = FakeCorrectionSource(
         {"Miami Nights '84": ArtistCorrection("Miami Nights 1984", "mbid-1")},
@@ -842,9 +845,16 @@ def test_reset_artist_status_by_value_matches_albumartist(
     )
     scan_library(engine_settings)
     file_id = _file_id(engine_settings, music_dir, track.name)
-    artists.set_artist_status(engine_settings, value="Miami Nights 84", status="manual")
+    axis_status.set_manual_status(
+        engine_settings, axis.ARTIST_AXIS, file_ids=None, value="Miami Nights 84", status="manual"
+    )
 
-    assert artists.reset_artist_status(engine_settings, value="Miami Nights 84") == 1
+    assert (
+        axis_status.reset_status(
+            engine_settings, axis.ARTIST_AXIS, file_ids=None, value="Miami Nights 84"
+        )
+        == 1
+    )
     view = next(v for v in library_list(engine_settings) if v.file_id == file_id)
     assert view.artist_status == "pending"
 
@@ -852,7 +862,9 @@ def test_reset_artist_status_by_value_matches_albumartist(
 @pytest.mark.parametrize("status", ["no_match", "pending"])
 def test_set_artist_status_accepts_manual_only(engine_settings: Settings, status: str) -> None:
     with pytest.raises(ValueError, match="unknown status"):
-        artists.set_artist_status(engine_settings, file_ids=[1], status=status)
+        axis_status.set_manual_status(
+            engine_settings, axis.ARTIST_AXIS, file_ids=[1], value=None, status=status
+        )
 
 
 @pytest.mark.parametrize("suffix", _FORMATS)
@@ -1262,7 +1274,9 @@ def test_mb_tier_skips_a_manual_file_like_every_other_tier(
     make_track(music_dir / "a.mp3", {"artist": ["SOLAR FIELDS"], "musicbrainz_artistid": ["m1"]})
     scan_library(engine_settings)
     file_id = _file_id(engine_settings, music_dir, "a.mp3")
-    artists.set_artist_status(engine_settings, status="manual", file_ids=[file_id])
+    axis_status.set_manual_status(
+        engine_settings, axis.ARTIST_AXIS, file_ids=[file_id], value=None, status="manual"
+    )
 
     mb = FakeArtistSource({"m1": _mb("Solar Fields", mbid="m1")})
     result = artists.resolve_artists(

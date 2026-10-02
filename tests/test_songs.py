@@ -23,7 +23,7 @@ import httpx
 import pytest
 
 from conftest import make_track
-from tagmend.engine import axis, library, songs, staging, store, versioning
+from tagmend.engine import axis, axis_status, library, songs, staging, store, versioning
 from tagmend.engine.acoustid import (
     AcoustidClient,
     AcoustidKeyError,
@@ -437,7 +437,9 @@ def test_a_manual_file_off_its_release_leaves_its_siblings_on_the_anchored_route
     _anchored_lp_folder(music_dir)
     library.scan_library(engine_settings)
     ids = _ids(engine_settings)
-    songs.set_song_status(engine_settings, file_ids=[ids[_NAMES[0]]], status="manual")
+    axis_status.set_manual_status(
+        engine_settings, axis.SONG_AXIS, file_ids=[ids[_NAMES[0]]], value=None, status="manual"
+    )
 
     result = _resolve(engine_settings, _off_release_kit(0))
 
@@ -459,7 +461,9 @@ def test_a_pending_file_off_its_release_routes_rebind_and_alone_is_flagged(
     _anchored_lp_folder(music_dir)
     library.scan_library(engine_settings)
     ids = _ids(engine_settings)
-    songs.set_song_status(engine_settings, file_ids=[ids[_NAMES[0]]], status="manual")
+    axis_status.set_manual_status(
+        engine_settings, axis.SONG_AXIS, file_ids=[ids[_NAMES[0]]], value=None, status="manual"
+    )
 
     result = _resolve(engine_settings, _off_release_kit(0, 1))
 
@@ -1834,7 +1838,9 @@ def test_a_manual_file_is_skipped_but_still_votes(
     _make_folder(music_dir / "LP", [{}] * 4)
     library.scan_library(engine_settings)
     ids = _ids(engine_settings)
-    songs.set_song_status(engine_settings, file_ids=[ids[_NAMES[0]]], status="manual")
+    axis_status.set_manual_status(
+        engine_settings, axis.SONG_AXIS, file_ids=[ids[_NAMES[0]]], value=None, status="manual"
+    )
     # The fourth file finds nothing, so without the manual file's vote 2 of 3 voters fall
     # below the floor.
     kit = _converging_kit()

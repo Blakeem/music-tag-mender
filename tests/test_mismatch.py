@@ -23,7 +23,15 @@ from conftest import FOLDER_SPELLINGS, make_track, spell_folder
 from tagmend import config, mcp_server
 from tagmend.cli import app
 from tagmend.config import Settings
-from tagmend.engine import artists, axis, mismatch, path_keys, staging, store, versioning
+from tagmend.engine import (
+    axis,
+    axis_status,
+    mismatch,
+    path_keys,
+    staging,
+    store,
+    versioning,
+)
 from tagmend.engine.db import connect
 from tagmend.engine.detector_core import Tier, parse_position
 from tagmend.engine.library import scan_library
@@ -1530,7 +1538,9 @@ def test_mismatch_fix_flow_end_to_end(
         )
     _record_genre_done(engine_settings, [jem1, jem2])
     staging.commit_tags(engine_settings)
-    artists.set_artist_status(engine_settings, file_ids=[jem1, jem2], status="manual")
+    axis_status.set_manual_status(
+        engine_settings, axis.ARTIST_AXIS, file_ids=[jem1, jem2], value=None, status="manual"
+    )
     assert _derived(engine_settings, jem1) == ("done", "no_identity", "manual")
 
     # 1. detect flags the two Jem files (high) and the curated single.

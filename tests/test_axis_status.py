@@ -17,9 +17,9 @@ from conftest import make_track
 from tagmend.engine import (
     artists,
     axis,
+    axis_status,
     genres,
     library,
-    songs,
     staging,
     store,
     versioning,
@@ -198,15 +198,16 @@ def test_set_status_manual_records_manual(
     make_track(music_dir / "t.flac", {"artist": ["Daft Punk"], "album": ["Discovery"]})
     library.scan_library(engine_settings)
     file_id = _ids(engine_settings)["t.flac"]
-    setters = {
-        "genre": genres.set_genre_status,
-        "artist": artists.set_artist_status,
-        "year": years.set_year_status,
-        "song": songs.set_song_status,
-    }
 
-    assert setters[tag_axis.name](engine_settings, file_ids=[file_id], status="manual") == 1
+    affected = axis_status.set_manual_status(
+        engine_settings,
+        tag_axis,
+        file_ids=[file_id],
+        value=None,
+        status="manual",
+    )
 
+    assert affected == 1
     assert _status(engine_settings, file_id, tag_axis) == "manual"
 
 
@@ -217,7 +218,9 @@ def test_external_edit_over_a_human_value_stays_manual(
     track = make_track(music_dir / "t.flac", {"artist": ["Daft Punk"], "genre": ["Old"]})
     library.scan_library(engine_settings)
     file_id = _ids(engine_settings)["t.flac"]
-    genres.set_genre_status(engine_settings, file_ids=[file_id], status="manual")
+    axis_status.set_manual_status(
+        engine_settings, axis.GENRE_AXIS, file_ids=[file_id], value=None, status="manual"
+    )
 
     _edit_on_disk(track, genre=["Overwritten Elsewhere"], artist=["Renamed"])
     library.scan_library(engine_settings)

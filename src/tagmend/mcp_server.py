@@ -23,6 +23,8 @@ from tagmend.engine import (
     album_conflicts,
     album_gaps,
     artists,
+    axis,
+    axis_status,
     commits,
     genres,
     health,
@@ -1667,8 +1669,9 @@ def set_genre_status(
     Returns:
         ``{"ok": True, "affected": <count>}``, or ``{"ok": False, "error": ...}``.
     """
-    affected = genres.set_genre_status(
+    affected = axis_status.set_manual_status(
         load_settings(),
+        axis.GENRE_AXIS,
         file_ids=file_ids,
         value=value,
         status=status,
@@ -1697,8 +1700,9 @@ def reset_genre_status(
         ``{"ok": True, "affected": <count>}``, or ``{"ok": False, "error": ...}`` if a file id
         is unknown.
     """
-    affected = genres.reset_genre_status(
+    affected = axis_status.reset_status(
         load_settings(),
+        axis.GENRE_AXIS,
         file_ids=file_ids,
         value=value,
     )
@@ -1729,8 +1733,9 @@ def set_artist_status(
     Returns:
         ``{"ok": True, "affected": <count>}``, or ``{"ok": False, "error": ...}``.
     """
-    affected = artists.set_artist_status(
+    affected = axis_status.set_manual_status(
         load_settings(),
+        axis.ARTIST_AXIS,
         file_ids=file_ids,
         value=value,
         status=status,
@@ -1759,8 +1764,9 @@ def reset_artist_status(
         ``{"ok": True, "affected": <count>}``, or ``{"ok": False, "error": ...}`` if a file id
         is unknown.
     """
-    affected = artists.reset_artist_status(
+    affected = axis_status.reset_status(
         load_settings(),
+        axis.ARTIST_AXIS,
         file_ids=file_ids,
         value=value,
     )
@@ -1986,8 +1992,9 @@ def set_year_status(
     Returns:
         ``{"ok": True, "affected": <count>}``, or ``{"ok": False, "error": ...}``.
     """
-    affected = years.set_year_status(
+    affected = axis_status.set_manual_status(
         load_settings(),
+        axis.YEAR_AXIS,
         file_ids=file_ids,
         value=value,
         status=status,
@@ -2016,8 +2023,9 @@ def reset_year_status(
         ``{"ok": True, "affected": <count>}``, or ``{"ok": False, "error": ...}`` if a file id
         is unknown.
     """
-    affected = years.reset_year_status(
+    affected = axis_status.reset_status(
         load_settings(),
+        axis.YEAR_AXIS,
         file_ids=file_ids,
         value=value,
     )
@@ -2163,8 +2171,9 @@ def set_song_status(
     Returns:
         ``{"ok": True, "affected": <count>}``, or ``{"ok": False, "error": ...}``.
     """
-    affected = songs.set_song_status(
+    affected = axis_status.set_manual_status(
         load_settings(),
+        axis.SONG_AXIS,
         file_ids=file_ids,
         value=value,
         status=status,
@@ -2193,8 +2202,9 @@ def reset_song_status(
         ``{"ok": True, "affected": <count>}``, or ``{"ok": False, "error": ...}`` if a file id
         is unknown.
     """
-    affected = songs.reset_song_status(
+    affected = axis_status.reset_status(
         load_settings(),
+        axis.SONG_AXIS,
         file_ids=file_ids,
         value=value,
     )

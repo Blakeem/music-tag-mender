@@ -21,7 +21,7 @@ import mutagen
 import pytest
 
 from conftest import make_track
-from tagmend.engine import axis, staging, store, versioning, years
+from tagmend.engine import axis, axis_status, staging, store, versioning, years
 from tagmend.engine.db import connect
 from tagmend.engine.library import list_files as library_list
 from tagmend.engine.library import scan_library
@@ -458,7 +458,12 @@ def test_manual_excluded_file_is_skipped(
     excluded_id = _file_id(engine_settings, music_dir, "ex.mp3")
     kept_id = _file_id(engine_settings, music_dir, "keep.flac")
 
-    assert years.set_year_status(engine_settings, file_ids=[excluded_id], status="manual") == 1
+    assert (
+        axis_status.set_manual_status(
+            engine_settings, axis.YEAR_AXIS, file_ids=[excluded_id], value=None, status="manual"
+        )
+        == 1
+    )
 
     fake = FakeMBReleaseGroupSource({("Black Sabbath", "Paranoid"): _mb("1970")})
     result = years.resolve_years(engine_settings, client=fake)
@@ -477,7 +482,12 @@ def test_set_year_status_by_value_scopes_on_album(
     scan_library(engine_settings)
     file_id = _file_id(engine_settings, music_dir, "a.mp3")
 
-    assert years.set_year_status(engine_settings, value="Paranoid", status="manual") == 1
+    assert (
+        axis_status.set_manual_status(
+            engine_settings, axis.YEAR_AXIS, file_ids=None, value="Paranoid", status="manual"
+        )
+        == 1
+    )
     view = next(v for v in library_list(engine_settings) if v.file_id == file_id)
     assert view.year_status == "manual"
 
@@ -489,9 +499,14 @@ def test_reset_year_status_requeues(
     make_track(music_dir / "a.mp3", {"artist": ["Black Sabbath"], "album": ["Paranoid"]})
     scan_library(engine_settings)
     file_id = _file_id(engine_settings, music_dir, "a.mp3")
-    years.set_year_status(engine_settings, file_ids=[file_id], status="manual")
+    axis_status.set_manual_status(
+        engine_settings, axis.YEAR_AXIS, file_ids=[file_id], value=None, status="manual"
+    )
 
-    assert years.reset_year_status(engine_settings, file_ids=[file_id]) == 1
+    assert (
+        axis_status.reset_status(engine_settings, axis.YEAR_AXIS, file_ids=[file_id], value=None)
+        == 1
+    )
     fake = FakeMBReleaseGroupSource({("Black Sabbath", "Paranoid"): _mb("1970")})
     result = years.resolve_years(engine_settings, client=fake)
     assert result.settled == 1
@@ -501,7 +516,9 @@ def test_reset_year_status_requeues(
 @pytest.mark.parametrize("status", ["no_match", "pending"])
 def test_set_year_status_accepts_manual_only(engine_settings: Settings, status: str) -> None:
     with pytest.raises(ValueError, match="unknown status"):
-        years.set_year_status(engine_settings, file_ids=[1], status=status)
+        axis_status.set_manual_status(
+            engine_settings, axis.YEAR_AXIS, file_ids=[1], value=None, status=status
+        )
 
 
 # --- dry-run + precondition ----------------------------------------------------------

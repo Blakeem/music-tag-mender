@@ -34,7 +34,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from tagmend.engine import axis, axis_resolver, axis_status, classify, staging, store
+from tagmend.engine import axis, axis_resolver, classify, staging, store
 from tagmend.engine.lastfm import LastfmClient, LastfmError
 
 if TYPE_CHECKING:
@@ -216,48 +216,4 @@ def _stage_resolved(
         tags={_GENRE_FIELD: resolved},
         origin="auto",
         note=f"lastfm: {', '.join(resolved)}",
-    )
-
-
-# --- status tools --------------------------------------------------------------------
-
-
-def set_genre_status(
-    settings: Settings,
-    *,
-    file_ids: list[int] | None = None,
-    value: str | None = None,
-    status: str,
-) -> int:
-    """Record ``manual`` on the genre axis for every file in scope.
-
-    Scope is *file_ids* when given, else every file carrying *value* as ``artist`` or
-    ``albumartist``. With neither the call changes nothing and returns 0. A ``manual`` row is
-    sticky until :func:`reset_genre_status`. Returns the number of files affected. Raises
-    :class:`ValueError` for any *status* other than ``manual`` or an unknown file id.
-    """
-    return axis_status.set_manual_status(
-        settings,
-        axis.GENRE_AXIS,
-        file_ids=file_ids,
-        value=value,
-        status=status,
-    )
-
-
-def reset_genre_status(
-    settings: Settings,
-    *,
-    file_ids: list[int] | None = None,
-    value: str | None = None,
-) -> int:
-    """Delete the genre status row of every file in scope, the one hand-back of ``manual``.
-
-    Same scoping as :func:`set_genre_status`. Returns the number of files affected.
-    """
-    return axis_status.reset_status(
-        settings,
-        axis.GENRE_AXIS,
-        file_ids=file_ids,
-        value=value,
     )

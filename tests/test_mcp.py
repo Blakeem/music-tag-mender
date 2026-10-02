@@ -425,6 +425,44 @@ def test_set_year_status_rejects_unknown_status(music_dir: Path) -> None:
     assert "error" in payload
 
 
+_STATUS_TOOLS = {
+    "genre": (mcp_server.set_genre_status, mcp_server.reset_genre_status),
+    "artist": (mcp_server.set_artist_status, mcp_server.reset_artist_status),
+    "year": (mcp_server.set_year_status, mcp_server.reset_year_status),
+    "song": (mcp_server.set_song_status, mcp_server.reset_song_status),
+}
+
+
+def _manual_axes(file_id: int) -> list[str]:
+    conn = connect(load_settings().db_path)
+    try:
+        return [
+            tag_axis.name
+            for tag_axis in axis.TAG_AXES
+            if store.derived_status(conn, tag_axis, file_id) == "manual"
+        ]
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("tag_axis", axis.TAG_AXES, ids=lambda a: a.name)
+def test_axis_status_tools_set_and_reset_only_their_own_axis(
+    music_dir: Path,
+    tag_axis: axis.Axis,
+) -> None:
+    file_id = _scanned_track_id(music_dir)
+    set_tool, reset_tool = _STATUS_TOOLS[tag_axis.name]
+
+    set_payload = set_tool("manual", file_ids=[file_id])
+    manual_after_set = _manual_axes(file_id)
+    reset_payload = reset_tool(file_ids=[file_id])
+
+    assert set_payload == {"ok": True, "affected": 1}
+    assert manual_after_set == [tag_axis.name]
+    assert reset_payload == {"ok": True, "affected": 1}
+    assert _manual_axes(file_id) == []
+
+
 def test_get_library_stats_includes_year_block(music_dir: Path) -> None:
     _scanned_track_id(music_dir)
     stats = mcp_server.get_library_stats()

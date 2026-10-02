@@ -21,7 +21,7 @@ import mutagen
 import pytest
 
 from conftest import make_track
-from tagmend.engine import axis, classify, genres, staging, store, versioning
+from tagmend.engine import axis, axis_status, classify, genres, staging, store, versioning
 from tagmend.engine.db import connect
 from tagmend.engine.lastfm import LastfmError, Tag
 from tagmend.engine.library import ScanMode, list_files, scan_library
@@ -444,7 +444,9 @@ def test_manual_status_skips_then_reset_requeues(
     scan_library(engine_settings)
     file_id = _file_id(engine_settings, music_dir, track.name)
 
-    affected = genres.set_genre_status(engine_settings, file_ids=[file_id], status="manual")
+    affected = axis_status.set_manual_status(
+        engine_settings, axis.GENRE_AXIS, file_ids=[file_id], value=None, status="manual"
+    )
     assert affected == 1
 
     fake = FakeTagSource({"Daft Punk": _DAFT_PUNK_TAGS})
@@ -454,7 +456,10 @@ def test_manual_status_skips_then_reset_requeues(
     assert fake.artist_lookups == []  # sticky: never even looked up
 
     # reset re-queues it.
-    assert genres.reset_genre_status(engine_settings, file_ids=[file_id]) == 1
+    assert (
+        axis_status.reset_status(engine_settings, axis.GENRE_AXIS, file_ids=[file_id], value=None)
+        == 1
+    )
     second = genres.resolve_genres(engine_settings, client=fake)
     assert second.settled == 1
     assert second.staged_files == 1
@@ -464,7 +469,9 @@ def test_manual_status_skips_then_reset_requeues(
 def test_set_genre_status_accepts_manual_only(engine_settings: Settings, status: str) -> None:
     # A resolver alone decides done/no_match, and reset is the only hand-back of manual.
     with pytest.raises(ValueError, match="unknown status"):
-        genres.set_genre_status(engine_settings, file_ids=[1], status=status)
+        axis_status.set_manual_status(
+            engine_settings, axis.GENRE_AXIS, file_ids=[1], value=None, status=status
+        )
 
 
 def _genre_status_rows(settings: Settings) -> list[tuple[int, str]]:
@@ -485,7 +492,12 @@ def test_set_genre_status_without_scope_changes_nothing(
     make_track(music_dir / "b.mp3", {"artist": ["Justice"]})
     scan_library(engine_settings)
 
-    assert genres.set_genre_status(engine_settings, status="manual") == 0
+    assert (
+        axis_status.set_manual_status(
+            engine_settings, axis.GENRE_AXIS, file_ids=None, value=None, status="manual"
+        )
+        == 0
+    )
     assert _genre_status_rows(engine_settings) == []
 
 
@@ -496,9 +508,13 @@ def test_reset_genre_status_without_scope_keeps_manual_rows(
     track = make_track(music_dir / "a.mp3", {"artist": ["Daft Punk"]})
     scan_library(engine_settings)
     file_id = _file_id(engine_settings, music_dir, track.name)
-    genres.set_genre_status(engine_settings, file_ids=[file_id], status="manual")
+    axis_status.set_manual_status(
+        engine_settings, axis.GENRE_AXIS, file_ids=[file_id], value=None, status="manual"
+    )
 
-    assert genres.reset_genre_status(engine_settings) == 0
+    assert (
+        axis_status.reset_status(engine_settings, axis.GENRE_AXIS, file_ids=None, value=None) == 0
+    )
     assert _genre_status_rows(engine_settings) == [(file_id, "manual")]
 
 

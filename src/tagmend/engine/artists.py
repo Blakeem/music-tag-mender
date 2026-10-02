@@ -65,7 +65,6 @@ from typing import TYPE_CHECKING, Final
 
 from tagmend.engine import (
     axis,
-    axis_status,
     clock,
     db,
     lookup_clients,
@@ -919,48 +918,3 @@ def _summarize(tally: _Tally, *, pending_remaining: int, dry_run: bool) -> str:
             f"Re-run to retry.",
         )
     return " ".join(parts)
-
-
-# --- status tools --------------------------------------------------------------------
-
-
-def set_artist_status(
-    settings: Settings,
-    *,
-    file_ids: list[int] | None = None,
-    value: str | None = None,
-    status: str,
-) -> int:
-    """Record ``manual`` on the artist axis for every file in scope.
-
-    Scope is *file_ids* when given, else every file carrying *value* as ``artist`` or
-    ``albumartist``. With neither the call changes nothing and returns 0. A ``manual`` file is
-    never selected and no cascade stages on it until :func:`reset_artist_status`. Returns the
-    number of files affected. Raises :class:`ValueError` for any *status* other than
-    ``manual`` or an unknown file id.
-    """
-    return axis_status.set_manual_status(
-        settings,
-        axis.ARTIST_AXIS,
-        file_ids=file_ids,
-        value=value,
-        status=status,
-    )
-
-
-def reset_artist_status(
-    settings: Settings,
-    *,
-    file_ids: list[int] | None = None,
-    value: str | None = None,
-) -> int:
-    """Delete the artist status row of every file in scope, the one hand-back of ``manual``.
-
-    Same scoping as :func:`set_artist_status`. Returns the number of files affected.
-    """
-    return axis_status.reset_status(
-        settings,
-        axis.ARTIST_AXIS,
-        file_ids=file_ids,
-        value=value,
-    )

@@ -29,7 +29,7 @@ from typing import TYPE_CHECKING
 
 import mutagen
 
-from tagmend.engine import axis, axis_resolver, axis_status, staging, store
+from tagmend.engine import axis, axis_resolver, staging, store
 from tagmend.engine.musicbrainz import MusicBrainzClient, MusicBrainzError
 from tagmend.engine.tags import read_tags
 
@@ -221,47 +221,3 @@ def _disk_tags(conn: sqlite3.Connection, file_id: int) -> dict[str, list[str]]:
     except (mutagen.MutagenError, OSError) as exc:  # type: ignore[attr-defined]
         message = f"cannot read tags from disk for file_id={file_id} ({path}): {exc}"
         raise ValueError(message) from exc
-
-
-# --- status tools --------------------------------------------------------------------
-
-
-def set_year_status(
-    settings: Settings,
-    *,
-    file_ids: list[int] | None = None,
-    value: str | None = None,
-    status: str,
-) -> int:
-    """Record ``manual`` on the year axis for every file in scope.
-
-    Scope is *file_ids* when given, else every file carrying *value* as its ``album`` tag.
-    With neither the call changes nothing and returns 0. A ``manual`` row is sticky until
-    :func:`reset_year_status`. Returns the number of files affected. Raises
-    :class:`ValueError` for any *status* other than ``manual`` or an unknown file id.
-    """
-    return axis_status.set_manual_status(
-        settings,
-        axis.YEAR_AXIS,
-        file_ids=file_ids,
-        value=value,
-        status=status,
-    )
-
-
-def reset_year_status(
-    settings: Settings,
-    *,
-    file_ids: list[int] | None = None,
-    value: str | None = None,
-) -> int:
-    """Delete the year status row of every file in scope, the one hand-back of ``manual``.
-
-    Same scoping as :func:`set_year_status`. Returns the number of files affected.
-    """
-    return axis_status.reset_status(
-        settings,
-        axis.YEAR_AXIS,
-        file_ids=file_ids,
-        value=value,
-    )

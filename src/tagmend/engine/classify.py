@@ -3,13 +3,15 @@
 This module turns raw Last.fm community tags into a clean, ordered list of canonical
 genre names spelled against the bundled **MusicBrainz** vocabulary. It owns two pieces:
 
-* :func:`load_vocabulary` — load ``data/genre_vocabulary.yml`` (generated, collision-free
+* :func:`load_vocabulary`: load ``data/genre_vocabulary.yml`` (generated, collision-free
   by construction) and merge the user-editable ``data/genre_overlay.yml`` over it per
   ``docs/genre-tagging-spec.md`` §4.5, producing a frozen :class:`Vocabulary` whose
-  ``fold-key → canonical name`` index is single-valued.
-* :func:`classify_genres` — the pure pipeline of spec §6: fold-match each tag to a
-  canonical name, drop sub-threshold weights, merge artist + album by *max* weight, order
-  by weight desc then name asc, and optionally cap at ``genre_max_count``.
+  ``fold-key → canonical name`` index is single-valued and which carries the overlay's
+  ``deny:`` rules.
+* :func:`classify_genres`: the pure pipeline of spec §6. It fold-matches each tag to a
+  canonical name, drops sub-threshold weights, merges artist + album by *max* weight, drops
+  the genres the overlay denies for the lookup artist, orders by weight desc then name asc,
+  and optionally caps at ``genre_max_count``.
 
 The **fold-key** (:func:`tagmend.engine.text_keys.alnum_key`) is a match/dedup key only. The
 **canonical spelling** (the vocabulary ``name``) is what gets written to files. Conflating
@@ -43,17 +45,27 @@ _OVERLAY_RESOURCE: Final = "genre_overlay.yml"
 
 @dataclass(frozen=True, slots=True)
 class Vocabulary:
-    """An immutable ``fold-key → canonical name`` genre index.
+    """An immutable ``fold-key → canonical name`` genre index plus the overlay's deny rules.
 
     Built by :func:`load_vocabulary`. ``match`` folds an incoming Last.fm tag name and
     returns the canonical spelling to write, or ``None`` when the tag is not a known genre.
+    ``denied_everywhere`` holds the canonical genres denied for every artist.
+    ``denied_for_artists`` maps a canonical genre to the artist fold-keys it is denied for.
     """
 
     index: Mapping[str, str]
+    denied_everywhere: frozenset[str]
+    denied_for_artists: Mapping[str, frozenset[str]]
 
     def match(self, tag_name: str) -> str | None:
         """Return the canonical genre name for *tag_name*, or ``None`` if not in vocab."""
         return self.index.get(alnum_key(tag_name))
+
+    def denies(self, genre: str, artist: str) -> bool:
+        """Return whether the overlay denies canonical *genre* for lookup *artist*."""
+        if genre in self.denied_everywhere:
+            return True
+        return alnum_key(artist) in self.denied_for_artists.get(genre, frozenset())
 
     def __len__(self) -> int:
         """Return the number of distinct fold-keys (matchable spellings) in the index."""
@@ -76,18 +88,28 @@ def load_vocabulary(
     The generated vocabulary is collision-free by construction, so a duplicate fold-key
     there is a real build bug and raises :class:`ValueError`. The overlay is user-editable,
     so its collisions are tolerated: an alias/name folding to a *different* existing genre
-    is logged and skipped rather than crashing (spec §4.5).
+    is logged and skipped rather than crashing (spec §4.5). The overlay's ``deny:`` entries
+    resolve against the merged index, so a deny can name an overlay genre.
     """
-    # Input: parse both YAML layers into {name, aliases} entry lists.
-    vocab_entries = _load_entries(vocabulary_path, _VOCABULARY_RESOURCE)
-    overlay_entries = _load_entries(overlay_path, _OVERLAY_RESOURCE)
+    # Input: parse both YAML layers into {name, aliases} and {genre, artists} entry lists.
+    vocab_document = _load_document(vocabulary_path, _VOCABULARY_RESOURCE)
+    overlay_document = _load_document(overlay_path, _OVERLAY_RESOURCE)
+    vocab_entries = _document_entries(vocab_document, "genres")
+    overlay_entries = _document_entries(overlay_document, "genres")
+    deny_entries = _deny_entries(overlay_document)
 
-    # Process: build the base index (single-valued by construction), then merge overlay.
+    # Process: build the base index (single-valued by construction), merge the overlay, then
+    # resolve the deny rules against the merged index.
     index = _build_base_index(vocab_entries)
     _merge_overlay(index, overlay_entries)
+    denied_everywhere, denied_for_artists = _build_deny_rules(index, deny_entries)
 
-    # Output: an immutable view over the assembled index.
-    return Vocabulary(index=dict(index))
+    # Output: an immutable view over the assembled index and deny rules.
+    return Vocabulary(
+        index=dict(index),
+        denied_everywhere=denied_everywhere,
+        denied_for_artists=denied_for_artists,
+    )
 
 
 def _build_base_index(entries: Iterable[Mapping[str, object]]) -> dict[str, str]:
@@ -185,19 +207,116 @@ def _merge_overlay_alias(
         )
 
 
-def _load_entries(
-    path: Path | None,
-    resource: str,
-) -> list[Mapping[str, object]]:
-    """Read a genre YAML file's ``genres:`` list from *path* or the bundled *resource*."""
-    text = _read_text(path, resource)
-    document = yaml.safe_load(text)
+def _build_deny_rules(
+    index: Mapping[str, str],
+    entries: Iterable[Mapping[str, object]],
+) -> tuple[frozenset[str], dict[str, frozenset[str]]]:
+    """Resolve the overlay's ``deny:`` entries against the merged index (spec §4.5).
+
+    Returns the genres denied everywhere and, per genre, the artist fold-keys it is denied
+    for. An entry naming no vocabulary genre, or with an unusable ``artists`` value, is logged
+    and skipped like an overlay collision. An absent ``artists`` key denies the genre everywhere.
+    """
+    everywhere: set[str] = set()
+    for_artists: dict[str, set[str]] = {}
+    for entry in entries:
+        genre = _deny_genre(index, entry)
+        if genre is None:
+            continue
+        if "artists" not in entry:
+            everywhere.add(genre)
+            continue
+        artist_keys = _deny_artist_keys(entry.get("artists"), genre)
+        for_artists.setdefault(genre, set()).update(artist_keys)
+    denied_for_artists = {genre: frozenset(keys) for genre, keys in for_artists.items() if keys}
+    return frozenset(everywhere), denied_for_artists
+
+
+def _deny_genre(index: Mapping[str, str], entry: Mapping[str, object]) -> str | None:
+    """Return the canonical genre a deny entry names, or ``None`` after logging why not."""
+    raw = entry.get("genre")
+    if not isinstance(raw, str) or not raw.strip():
+        logger.warning("overlay deny entry %r names no genre, skipping entry", entry)
+        return None
+    key = alnum_key(raw)
+    canonical = index.get(key)
+    if canonical is None:
+        logger.warning(
+            "overlay deny genre %r (fold %r) is not in the vocabulary, skipping entry",
+            raw,
+            key,
+        )
+    return canonical
+
+
+def _deny_artist_keys(raw: object, genre: str) -> set[str]:
+    """Return the artist fold-keys of one deny entry, logging every name it cannot use.
+
+    YAML reads an unquoted name such as ``Yes`` or ``311`` as a boolean or a number, so a
+    non-string name is skipped rather than guessed at. A name folding to an empty key is
+    skipped, since every name without an ASCII letter or digit folds to that same key and the
+    deny would reach unrelated artists.
+    """
+    keys: set[str] = set()
+    if not isinstance(raw, list):
+        logger.warning("overlay deny for %r has a non-list artists value, skipping entry", genre)
+        return keys
+    for name in raw:
+        if not isinstance(name, str):
+            logger.warning(
+                "overlay deny artist %r for %r is not a string (quote it in YAML), skipping artist",
+                name,
+                genre,
+            )
+            continue
+        key = alnum_key(name)
+        if not key:
+            logger.warning(
+                "overlay deny artist %r for %r folds to an empty key, skipping artist",
+                name,
+                genre,
+            )
+            continue
+        keys.add(key)
+    if not keys:
+        logger.warning("overlay deny for %r names no usable artist, skipping entry", genre)
+    return keys
+
+
+def _load_document(path: Path | None, resource: str) -> Mapping[str, object]:
+    """Parse a genre YAML file from *path* or the bundled *resource* into its top mapping."""
+    document = yaml.safe_load(_read_text(path, resource))
     if not isinstance(document, dict):
+        return {}
+    return document
+
+
+def _document_entries(document: Mapping[str, object], key: str) -> list[Mapping[str, object]]:
+    """Return the mapping entries of the *key* list in a parsed genre YAML document."""
+    entries = document.get(key)
+    if not isinstance(entries, list):
         return []
-    genres = document.get("genres")
-    if not isinstance(genres, list):
-        return []
-    return [entry for entry in genres if isinstance(entry, dict)]
+    return [entry for entry in entries if isinstance(entry, dict)]
+
+
+def _deny_entries(document: Mapping[str, object]) -> list[Mapping[str, object]]:
+    """Return the mapping entries of the overlay's ``deny:`` list, logging every other item."""
+    raw = document.get("deny")
+    entries: list[Mapping[str, object]] = []
+    if raw is None:
+        return entries
+    if not isinstance(raw, list):
+        logger.warning("overlay deny value %r is not a list, skipping every deny", raw)
+        return entries
+    for item in raw:
+        if not isinstance(item, dict):
+            logger.warning(
+                "overlay deny entry %r is not a {genre, artists} mapping, skipping entry",
+                item,
+            )
+            continue
+        entries.append(item)
+    return entries
 
 
 def _read_text(path: Path | None, resource: str) -> str:
@@ -233,15 +352,18 @@ def classify_genres(
     album_tags: list[Tag] | None,
     vocab: Vocabulary,
     settings: Settings,
+    *,
+    lookup_artist: str,
 ) -> list[str]:
     """Resolve Last.fm tags to an ordered list of canonical genre names (spec §6).
 
     Pure. For each present source (artist, and album when not ``None``): fold-match each
     tag to a canonical name via *vocab* (dropping non-matches), and drop tags weighing
     less than ``settings.genre_min_weight``. The sources are unioned with the merged weight
-    per genre taken as the **max** across the sources it appeared in. The result is ordered
-    by merged weight descending then canonical name ascending, and capped at
-    ``settings.genre_max_count`` when that is set.
+    per genre taken as the **max** across the sources it appeared in. A genre the overlay
+    denies for *lookup_artist* is dropped before ordering, so it never takes a capped slot.
+    The result is ordered by merged weight descending then canonical name ascending, and
+    capped at ``settings.genre_max_count`` when that is set.
     """
     # Input: per-source survivors → canonical name with its (filtered) source weight.
     artist_survivors = _survivors(artist_tags, vocab, settings.genre_min_weight)
@@ -249,9 +371,12 @@ def classify_genres(
         _survivors(album_tags, vocab, settings.genre_min_weight) if album_tags is not None else {}
     )
 
-    # Process: merge by max weight, then order by weight desc, name asc.
+    # Process: merge by max weight, drop denied genres, then order by weight desc, name asc.
     merged = _merge_max(artist_survivors, album_survivors)
-    ordered = sorted(merged.items(), key=lambda item: (-item[1], item[0]))
+    allowed = {
+        name: weight for name, weight in merged.items() if not vocab.denies(name, lookup_artist)
+    }
+    ordered = sorted(allowed.items(), key=lambda item: (-item[1], item[0]))
     names = [name for name, _weight in ordered]
 
     # Output: optionally cap to the top N.

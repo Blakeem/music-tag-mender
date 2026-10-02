@@ -21,7 +21,7 @@ import mutagen
 import pytest
 
 from conftest import make_track
-from tagmend.engine import axis, genres, staging, store, versioning
+from tagmend.engine import axis, classify, genres, staging, store, versioning
 from tagmend.engine.db import connect
 from tagmend.engine.lastfm import LastfmError, Tag
 from tagmend.engine.library import ScanMode, list_files, scan_library
@@ -151,6 +151,33 @@ def test_albumartist_is_preferred_lookup_identity(
 
     assert result.staged_files == 1
     assert fake.artist_lookups == ["Daft Punk"]  # albumartist beat artist
+
+
+def test_overlay_deny_drops_genre_for_the_lookup_artist_only(
+    engine_settings: Settings,
+    music_dir: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    overlay = tmp_path / "overlay.yml"
+    overlay.write_text(
+        "version: 1\ndeny:\n- genre: house\n  artists: [Daft Punk]\n", encoding="utf-8"
+    )
+    denying_vocab = classify.load_vocabulary(overlay_path=overlay)
+    monkeypatch.setattr(classify, "load_vocabulary", lambda: denying_vocab)
+    # The deny names the lookup artist, which here is the albumartist.
+    make_track(music_dir / "daft.mp3", {"artist": ["Various"], "albumartist": ["Daft Punk"]})
+    make_track(music_dir / "justice.mp3", {"artist": ["Justice"]})
+    scan_library(engine_settings)
+
+    fake = FakeTagSource({"Daft Punk": _DAFT_PUNK_TAGS, "Justice": _DAFT_PUNK_TAGS})
+    genres.resolve_genres(engine_settings, client=fake)
+
+    staged = {view.filename: view.target["genre"] for view in staging.diff_tags(engine_settings)}
+    assert staged == {
+        "daft.mp3": ["electronic", "dance", "techno"],
+        "justice.mp3": _EXPECTED_DAFT_PUNK,
+    }
 
 
 # --- P0: no accidental deletion ------------------------------------------------------

@@ -229,8 +229,22 @@ separate so a refresh can't clobber user data). Two uses:
 Same fold-key + collision rules as §4.2/§4.4. An overlay entry whose `name` folds to an
 existing genre **adds its aliases**; otherwise it becomes a **new genre** (no MBID).
 Overlay/vocabulary collisions are reported, never silent. This file is what the **LLM
-grows** from Last.fm tags that match nothing (§5.1) — the primary place the alias/genre
+grows** from Last.fm tags that match nothing (§5.1), the primary place the alias/genre
 vocabulary improves over time.
+
+**Deny rules.** The overlay's optional top-level `deny:` list stops a genre Last.fm
+misapplies. Last.fm tags the indie band Cannons with `oi`, a punk style the vocabulary
+holds. Each entry is `{genre: <name>, artists: [<name>, ...]}`, and both names compare by
+fold-key. The genre is dropped for each named lookup artist (`albumartist`, else `artist`).
+An entry without `artists` drops the genre for every artist. An entry whose `artists` value
+names no usable artist is reported and skipped, so it never widens into a global deny. An
+artist name with no ASCII letter or digit folds to the empty key and is skipped the same way.
+An artist name YAML reads as a non-string (an unquoted `Yes` or `311`) is reported and skipped,
+as is a `deny:` item that is not a mapping.
+A deny naming a genre the merged vocabulary lacks is reported and skipped, like a collision.
+Classification drops a denied genre before ordering and the cap (§6 step 5), so it never
+takes a kept genre's slot. A deny reaches only later classifications. A file already settled
+`done` keeps its genres until `reset_genre_status` re-opens it.
 
 ---
 
@@ -282,11 +296,13 @@ Per file (artist + album come from the file's existing tags):
 4. Merge    union artist ∪ album
             merged_weight[name] = max(weight across the sources it appeared in)
 
-5. Order    sort by merged_weight desc, then name asc (stable)
+5. Deny     drop each genre the overlay denies for the lookup artist (§4.5)
 
-6. Cap      if genre_max_count is set, keep the top N
+6. Order    sort by merged_weight desc, then name asc (stable)
 
-7. Write    genre = [name, name, ...]  ── multi-value tag, via the staging/commit engine
+7. Cap      if genre_max_count is set, keep the top N
+
+8. Write    genre = [name, name, ...]  ── multi-value tag, via the staging/commit engine
 ```
 
 Notes:

@@ -301,7 +301,9 @@ def _resolve_group(
     if settings.genre_use_album_tags and identity.album is not None:
         album_tags = client.album_top_tags(lookup_artist, identity.album)
 
-    return classify.classify_genres(artist_tags, album_tags, vocab, settings)
+    return classify.classify_genres(
+        artist_tags, album_tags, vocab, settings, lookup_artist=lookup_artist
+    )
 
 
 def _stage_resolved(settings: Settings, file_id: int, resolved: list[str]) -> None:

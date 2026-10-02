@@ -1476,8 +1476,10 @@ def resolve_genres(
     controlled genre vocabulary, and settles the file. Resolved genres equal to the current
     ones record ``done``. Differing ones are staged as an ``auto`` change replacing ONLY
     ``genre`` (other managed tags are preserved) and record ``done``. No usable genre records
-    ``no_match``. Review with ``diff_tags`` and apply with ``commit_tags``. ``revert_commit``
-    undoes the whole commit and ``revert_tags`` undoes one file.
+    ``no_match``. A genre the overlay's ``deny:`` list denies for the lookup artist, or for every
+    artist, is dropped before the ``genre_max_count`` cap. Review with ``diff_tags`` and apply
+    with ``commit_tags``. ``revert_commit`` undoes the whole commit and ``revert_tags`` undoes
+    one file.
 
     Each file's status on this axis is ``pending``, ``staged``, ``done``, ``no_match``,
     ``manual`` or ``no_identity``. A ``done`` or ``no_match`` counts only while the identity and

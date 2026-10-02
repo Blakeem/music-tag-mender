@@ -84,6 +84,7 @@ from __future__ import annotations
 import os
 import re
 import sqlite3
+from bisect import bisect_left
 from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
@@ -692,7 +693,8 @@ class _Unit:
     """An album folder whose every tracked audio file is staged to one other folder.
 
     Keys and paths are relative to ``music_path``. Of two units claiming one sidecar target,
-    the one with the lower ``lowest_id`` keeps it.
+    the one with the lower ``lowest_id`` keeps it. ``discs`` holds the keys of every disc folder
+    directly under a release folder unit, and is empty for a folder holding its audio directly.
     """
 
     key: str
@@ -700,6 +702,20 @@ class _Unit:
     destination: str
     origin: str
     lowest_id: int
+    discs: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class _AudioFolders:
+    """The tracked audio present on disk by folder key, and every folder audio once sat in.
+
+    ``keys`` is ``members`` sorted. ``sat_in`` holds the key of each folder a logged path
+    revision's file sat in directly, so an album folder whose audio left stays an album folder.
+    """
+
+    members: dict[str, list[store.FileRow]]
+    keys: tuple[str, ...]
+    sat_in: frozenset[str]
 
 
 @dataclass(frozen=True, slots=True)
@@ -796,6 +812,16 @@ def _members_by_folder(conn: sqlite3.Connection) -> dict[str, list[store.FileRow
     return members
 
 
+def _audio_folders(conn: sqlite3.Connection, music_path: Path) -> _AudioFolders:
+    """Return the present audio by folder, and the folders the path log saw audio sit in."""
+    members = _members_by_folder(conn)
+    sat_in = frozenset(
+        path_keys.path_key(music_path / Path(source).parent)
+        for source in store.path_revision_sources(conn)
+    )
+    return _AudioFolders(members=members, keys=tuple(sorted(members)), sat_in=sat_in)
+
+
 def _staged_targets(conn: sqlite3.Connection) -> dict[int, tuple[str, str]]:
     """Return each staged audio file's ``(to_path, origin)``."""
     return {row.file_id: (row.to_path, row.origin) for row in store.list_staged_paths(conn)}
@@ -832,6 +858,86 @@ def _moving_unit(
     )
 
 
+def _disc_members(
+    settings: Settings,
+    key: str,
+    audio: _AudioFolders,
+) -> list[list[store.FileRow]]:
+    """Return the members of each disc folder of the release folder keyed *key*, else none.
+
+    A release folder holds no audio directly and never did, and every folder under it holding
+    audio is a disc folder (:func:`tagmend.engine.mismatch.layout_of`) directly below it.
+    """
+    music_path = _require_music_path(settings)
+    root_key = path_keys.path_key(music_path / key)
+    low, high = path_keys.subtree_bounds(root_key)
+    discs: list[list[store.FileRow]] = []
+    folder: Path | None = None
+    if key == path_keys.path_key(".") or root_key in audio.members or root_key in audio.sat_in:
+        return discs
+    for folder_key in audio.keys[bisect_left(audio.keys, low) : bisect_left(audio.keys, high)]:
+        folder = Path(audio.members[folder_key][0].folder)
+        if path_keys.path_key(folder.parent) != root_key:
+            return []
+        if mismatch.layout_of(settings, str(folder), "").disc_folder is None:
+            return []
+        discs.append(audio.members[folder_key])
+    return discs
+
+
+def _disc_folder_keys(settings: Settings, folder: str) -> set[str]:
+    """Return the keys of the disc folders directly under the release folder *folder*.
+
+    A disc folder whose audio already left still counts, so a file it held back stays in it.
+    """
+    music_path = _require_music_path(settings)
+    keys: set[str] = set()
+    try:
+        with os.scandir(music_path / folder) as listing:
+            entries = list(listing)
+    except OSError:
+        # The release folder's own walk cannot list it either, so it carries nothing.
+        return keys
+    for entry in entries:
+        if _is_link(entry) or not entry.is_dir(follow_symlinks=False):
+            continue
+        if mismatch.layout_of(settings, entry.path, "").disc_folder is not None:
+            keys.add(path_keys.path_key(_relative(music_path, Path(entry.path))))
+    return keys
+
+
+def _release_unit(
+    settings: Settings,
+    key: str,
+    discs: list[list[store.FileRow]],
+    targets: dict[int, tuple[str, str]],
+) -> _Unit | None:
+    """Return the unit of the release folder keyed *key* when its discs all move to one folder.
+
+    Its destination, origin and lowest file id come from its disc units, so it ties with the
+    disc unit holding that file.
+    """
+    music_path = _require_music_path(settings)
+    units = [_moving_unit(music_path, members, targets) for members in discs]
+    moving = [unit for unit in units if unit is not None]
+    destinations = {path_keys.path_key(unit.destination) for unit in moving}
+    if len(moving) != len(units):
+        return None
+    if len(destinations) != 1 or key in destinations:
+        return None
+    first = min(moving, key=lambda unit: unit.lowest_id)
+    folder = str(Path(first.folder).parent)
+    disc_keys = {unit.key for unit in moving} | _disc_folder_keys(settings, folder)
+    return _Unit(
+        key=key,
+        folder=folder,
+        destination=first.destination,
+        origin=_AUTO if all(unit.origin == _AUTO for unit in moving) else "manual",
+        lowest_id=first.lowest_id,
+        discs=tuple(sorted(disc_keys)),
+    )
+
+
 def _sidecar_hold(
     music_path: Path,
     from_key: str,
@@ -856,35 +962,45 @@ def _sidecar_hold(
 
 
 def _units_to_recompute(
-    music_path: Path,
+    settings: Settings,
     unit_keys: set[str],
     targets: dict[int, tuple[str, str]],
-    members: dict[str, list[store.FileRow]],
+    audio: _AudioFolders,
     existing: list[store.StagedSidecar],
 ) -> dict[str, _Unit | None]:
     """Return every unit to recompute, keyed by folder key, with its plan when it moves.
 
     A unit with no present audio keeps its rows, since its audio already moved. A unit whose
     rows share a destination with a recomputed unit is recomputed too, so the lower file id
-    wins a shared target whatever order the calls came in.
+    wins a shared target whatever order the calls came in. The release folder above each
+    recomputed folder is recomputed too, so its rows drop once its discs part ways.
     """
+    music_path = _require_music_path(settings)
+    units: dict[str, _Unit | None] = {}
 
-    def members_of(key: str) -> list[store.FileRow]:
-        return members.get(path_keys.path_key(music_path / key), [])
+    def add(key: str) -> None:
+        own = audio.members.get(path_keys.path_key(music_path / key), [])
+        discs = [] if own else _disc_members(settings, key, audio)
+        if own:
+            units[key] = _moving_unit(music_path, own, targets)
+        elif discs:
+            units[key] = _release_unit(settings, key, discs, targets)
 
-    units = {
-        key: _moving_unit(music_path, members_of(key), targets)
-        for key in unit_keys
-        if members_of(key)
-    }
+    for key in unit_keys:
+        add(key)
     destinations = {path_keys.path_key(u.destination) for u in units.values() if u is not None}
     destinations |= {
         _destination_key(row) for row in existing if row.origin != _REVERT and row.unit_key in units
     }
     for row in existing:
         joins = row.origin != _REVERT and _destination_key(row) in destinations
-        if joins and row.unit_key not in units and members_of(row.unit_key):
-            units[row.unit_key] = _moving_unit(music_path, members_of(row.unit_key), targets)
+        if joins and row.unit_key not in units:
+            add(row.unit_key)
+    for key in list(units):
+        release = path_keys.path_key(Path(key).parent)
+        discs = [] if release in units else _disc_members(settings, release, audio)
+        if discs:
+            units[release] = _release_unit(settings, release, discs, targets)
     return units
 
 
@@ -911,9 +1027,11 @@ def _carry(  # noqa: PLR0913 - cohesive keyword-only claim state and row payload
     for source in found:
         from_path = _relative(music_path, source)
         from_key = path_keys.path_key(from_path)
-        # A source with a staged row is already moving, and a file inside the destination
-        # already sits with the album.
+        # A source with a staged row is already moving, a file inside the destination already
+        # sits with the album, and a disc folder's files follow that disc's own unit.
         if from_key in sources or path_keys.is_within(from_key, destination_key):
+            continue
+        if any(path_keys.is_within(from_key, disc) for disc in unit.discs):
             continue
         to_path = speller.respell(
             str(Path(unit.destination) / Path(from_path).relative_to(unit.folder))
@@ -945,7 +1063,7 @@ def _carry(  # noqa: PLR0913 - cohesive keyword-only claim state and row payload
 
 def _plan_sidecars(
     conn: sqlite3.Connection,
-    music_path: Path,
+    settings: Settings,
     unit_keys: set[str],
     targets: dict[int, tuple[str, str]],
     *,
@@ -960,8 +1078,10 @@ def _plan_sidecars(
     a commit may log that move, and one that changed there is confirmed at its signature now.
     A revert row is never dropped, but it is confirmed like any other, or nothing would clear it.
     """
+    music_path = _require_music_path(settings)
     existing = store.list_staged_sidecars(conn)
-    units = _units_to_recompute(music_path, unit_keys, targets, _members_by_folder(conn), existing)
+    audio = _audio_folders(conn, music_path)
+    units = _units_to_recompute(settings, unit_keys, targets, audio, existing)
     touched = unit_keys | set(units)
 
     drops: list[str] = []
@@ -983,7 +1103,10 @@ def _plan_sidecars(
     held: list[SidecarHold] = []
     now = clock.utc_now()
     speller = _Speller(music_path)
-    moving = sorted((u for u in units.values() if u is not None), key=lambda u: u.lowest_id)
+    # A release unit ties with the disc unit holding its lowest file id, and claims first.
+    moving = sorted(
+        (u for u in units.values() if u is not None), key=lambda u: (u.lowest_id, not u.discs)
+    )
     for unit in moving:
         unit_inserts, unit_held = _carry(
             music_path,
@@ -1118,8 +1241,9 @@ def _sidecar_step(
 ) -> _SidecarStep:
     """Move every staged sidecar in scope whose album audio has left its folder, then prune.
 
-    Runs after the commit loop. A sidecar waits while any staged audio file still sits in its
-    album folder. Once the last sidecar row of an album folder leaves, the folder is pruned.
+    Runs after the commit loop. A sidecar waits while any staged audio file still sits at or
+    under its album folder, so a release folder's sidecars wait for every disc folder below it.
+    Once the last sidecar row of an album folder leaves, the folder is pruned.
     """
     rows = [
         row
@@ -1127,8 +1251,9 @@ def _sidecar_step(
         if _in_scope(music_path, row.from_path, root_key)
     ]
     occupied = {
-        path_keys.path_key(_source_of(conn, staged.file_id).parent)
+        path_keys.path_key(folder)
         for staged in store.list_staged_paths(conn)
+        for folder in _source_of(conn, staged.file_id).parents
     }
     outcomes: list[SidecarOutcome] = []
     vacated: dict[str, Path] = {}
@@ -1179,8 +1304,9 @@ def _left_behind(conn: sqlite3.Connection, music_path: Path, folders: set[Path])
 def _emptied_release_folders(settings: Settings, folders: set[Path]) -> set[Path]:
     """Return the release folder above each disc folder of *folders* once no audio sits under it.
 
-    Only a folder holding audio is a sidecar unit, so a release folder's own cover and scans
-    above its disc folders follow no move. They are reported rather than left behind silently.
+    A release folder's own cover and scans follow no move when its discs went to different
+    folders, when audio once sat in it directly, or when its unit's target was taken. They are
+    reported rather than left silently.
     """
     releases: set[Path] = set()
     for folder in folders:
@@ -1554,7 +1680,7 @@ def stage_paths_batch(
                 ),
             )
         sidecars = _plan_sidecars(
-            connection, music_path, touched, _staged_targets(connection), note=note
+            connection, settings, touched, _staged_targets(connection), note=note
         )
         _apply_sidecar_plan(connection, sidecars)
         connection.commit()
@@ -2233,7 +2359,7 @@ def stage_paths(
         touched = {path_keys.path_key(plan.source_folder) for plan in (*moving, *replaced)}
         sidecars = _plan_sidecars(
             connection,
-            music_path,
+            settings,
             touched | _sidecar_units_under(connection, music_path, root_key),
             _targets_after(connection, moving, replaced),
             note=note,
@@ -2442,7 +2568,7 @@ def unstage_paths(
         for sidecar in sidecars:
             store.delete_staged_sidecar(connection, sidecar.from_key)
         units = _plan_sidecars(
-            connection, music_path, touched, _staged_targets(connection), note=None
+            connection, settings, touched, _staged_targets(connection), note=None
         )
         _apply_sidecar_plan(connection, units)
         connection.commit()
@@ -2613,7 +2739,7 @@ class PathCommitResult:
     album audio still sits in their folder, and ``sidecar_problems`` every other sidecar row.
     ``sidecars_held`` lists the sidecars left with no staged move in a folder the commit's
     audio all left: their target was taken, the folder's files went to different folders, or
-    they sit in the release folder above disc folders the commit emptied of audio.
+    they sit in a release folder whose disc folders the commit sent to different folders.
     ``folders_pruned`` counts the emptied folders removed.
     """
 
@@ -3135,26 +3261,39 @@ _AUDIO_STAYS: Final = frozenset({"skipped_later_changes", "error"})
 
 def _audio_staying(
     conn: sqlite3.Connection,
+    settings: Settings,
     planned: Sequence[tuple[store.PathRevision, str, str | None, Path | None]],
 ) -> dict[tuple[str, str], list[tuple[str, int]]]:
     """Map ``(unit key, folder key)`` to the ``(kind, file_id)`` of audio the revert leaves.
 
     The unit key is the folder the file left, which names its sidecars' unit, so a unit merged
-    into a shared destination never holds another unit's sidecars. The folder key is where the
-    file sits now, since a later commit may have moved it away from those sidecars. A file gone
-    from disk leaves no audio for a sidecar to stay with.
+    into a shared destination never holds another unit's sidecars. Audio that left a disc
+    folder also counts for the release folder above it, unless audio left that release folder
+    itself, which makes it a unit of its own. The folder key is where the file sits now, since
+    a later commit may have moved it away from those sidecars. A file gone from disk leaves no
+    audio for a sidecar to stay with.
     """
+    music_path = _require_music_path(settings)
+    left = {path_keys.path_key(Path(revision.from_path).parent) for revision, *_ in planned}
     staying: dict[tuple[str, str], list[tuple[str, int]]] = {}
     row: store.FileRow | None = None
-    unit_key = ""
+    unit_keys: list[str] = []
+    source_folder = Path()
+    release_key = ""
     for revision, kind, _, _ in planned:
         row = store.get_file_by_id(conn, revision.file_id) if kind in _AUDIO_STAYS else None
         if row is None or row.is_missing or not _present(Path(row.folder) / row.filename):
             continue
-        unit_key = path_keys.path_key(Path(revision.from_path).parent)
-        staying.setdefault((unit_key, path_keys.path_key(row.folder)), []).append(
-            (kind, revision.file_id)
-        )
+        source_folder = Path(revision.from_path).parent
+        release_key = path_keys.path_key(source_folder.parent)
+        unit_keys = [path_keys.path_key(source_folder)]
+        disc = mismatch.layout_of(settings, str(music_path / source_folder), "").disc_folder
+        if disc is not None and release_key not in left:
+            unit_keys.append(release_key)
+        for unit_key in unit_keys:
+            staying.setdefault((unit_key, path_keys.path_key(row.folder)), []).append(
+                (kind, revision.file_id)
+            )
     return staying
 
 
@@ -3169,7 +3308,8 @@ def _classify_sidecar_revert(
     The kind is ``revertable``, ``skipped_later_changes`` (a later move left or reached its
     target), ``missing`` (it is not at its target) or ``error`` (its source is taken now). A
     sidecar whose own unit's audio in *staying* still sits in its album folder takes that
-    audio's kind, so the cover stays with its album.
+    audio's kind, so the cover stays with its album. A release folder's unit counts the audio
+    of its disc folders (:func:`_audio_staying`).
     """
     album_key: str | None = None
     if store.sidecar_moved_later(conn, move.id, move.to_key):
@@ -3270,7 +3410,7 @@ def revert_commit_moves(  # noqa: PLR0913 - the revert_commit surface plus its o
         if root_key is None
         or path_keys.is_within(path_keys.path_key(_source_of(conn, revision.file_id)), root_key)
     ]
-    staying = _audio_staying(conn, planned)
+    staying = _audio_staying(conn, settings, planned)
     sidecars = [
         (move, *_classify_sidecar_revert(conn, music_path, move, staying))
         for move in store.sidecar_moves_for_commit(conn, commit_id)

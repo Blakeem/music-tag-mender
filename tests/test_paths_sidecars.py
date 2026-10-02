@@ -328,27 +328,203 @@ def test_a_held_sidecar_under_two_vacated_folders_is_listed_once(
     assert result.sidecars_held == (str(_CD2 / "Folder.jpg"),)
 
 
-def test_the_release_folders_own_sidecars_above_emptied_disc_folders_are_reported(
-    engine_settings: Settings, music_dir: Path
-) -> None:
+_RELEASE_SIDECARS = (Path("Folder.jpg"), Path("Scans") / "Back.jpg")
+
+
+@pytest.fixture
+def release(engine_settings: Settings, music_dir: Path) -> _Album:
+    """A release folder holding a cover and scans above two disc folders of one track each."""
     _library(engine_settings, music_dir, _CD1 / "01.mp3", _CD2 / "01.mp3")
     (music_dir / _ALBUM / "Folder.jpg").write_bytes(b"cover")
     (music_dir / _ALBUM / "Scans").mkdir()
     (music_dir / _ALBUM / "Scans" / "Back.jpg").write_bytes(b"back")
-    moves = [
-        (_id_at(engine_settings, music_dir / _CD1 / "01.mp3"), _MERGED / "101.mp3"),
-        (_id_at(engine_settings, music_dir / _CD2 / "01.mp3"), _MERGED / "201.mp3"),
-    ]
-    _stage(engine_settings, *moves)
+    return _Album(
+        settings=engine_settings,
+        music=music_dir,
+        x=_id_at(engine_settings, music_dir / _CD1 / "01.mp3"),
+        y=_id_at(engine_settings, music_dir / _CD2 / "01.mp3"),
+    )
 
-    result = paths.commit_paths(engine_settings)
+
+def _stage_release(release: _Album) -> None:
+    _stage(release.settings, (release.x, _MERGED / "101.mp3"), (release.y, _MERGED / "201.mp3"))
+
+
+def test_a_release_folder_carries_its_own_sidecars_when_its_discs_join(release: _Album) -> None:
+    _stage_release(release)
+    staged = {(Path(row.from_path), row.unit_key) for row in _staged_sidecars(release.settings)}
+    assert staged == {(_ALBUM / r, path_keys.path_key(_ALBUM)) for r in _RELEASE_SIDECARS}
+
+    result = paths.commit_paths(release.settings)
+
+    assert (result.committed, result.sidecars_moved, result.sidecars_held) == (2, 2, ())
+    assert (release.music / _MERGED / "Folder.jpg").read_bytes() == b"cover"
+    assert (release.music / _MERGED / "Scans" / "Back.jpg").read_bytes() == b"back"
+    assert not (release.music / _ALBUM).exists()
+    assert result.commit_id is not None
+    logged = {
+        (Path(m.from_path), Path(m.to_path)) for m in _logged(release.settings, result.commit_id)
+    }
+    assert logged == {(_ALBUM / r, _MERGED / r) for r in _RELEASE_SIDECARS}
+
+
+def test_a_release_folders_sidecar_waits_for_the_audio_of_its_disc_folders(
+    release: _Album,
+) -> None:
+    _stage_release(release)
+
+    first = paths.commit_paths(release.settings, path=str(_ALBUM / "Folder.jpg"))
+
+    assert (first.committed, first.sidecars_moved, first.sidecars_waiting) == (0, 0, 1)
+    assert (release.music / _ALBUM / "Folder.jpg").read_bytes() == b"cover"
+
+    second = paths.commit_paths(release.settings)
+
+    assert (second.committed, second.sidecars_moved, second.sidecars_waiting) == (2, 2, 0)
+    assert (release.music / _MERGED / "Folder.jpg").read_bytes() == b"cover"
+
+
+@pytest.mark.parametrize("order", ["lower_first", "higher_first"])
+def test_a_release_cover_colliding_with_a_disc_cover_keeps_one_and_holds_the_other(
+    release: _Album, order: str
+) -> None:
+    (release.music / _CD1 / "Folder.jpg").write_bytes(b"disc")
+    assert release.x < release.y
+    moves = [(release.x, _MERGED / "101.mp3"), (release.y, _MERGED / "201.mp3")]
+    held = [
+        hold
+        for file_id, target in (moves if order == "lower_first" else moves[::-1])
+        for hold in paths.stage_paths_batch(
+            release.settings, entries=[(file_id, str(target))]
+        ).sidecars_held
+    ]
+    assert [(Path(h.from_path), Path(h.to_path)) for h in held] == [
+        (_CD1 / "Folder.jpg", _MERGED / "Folder.jpg")
+    ]
+
+    result = paths.commit_paths(release.settings)
+
+    assert (result.committed, result.sidecars_moved) == (2, 2)
+    assert result.sidecars_held == (str(_CD1 / "Folder.jpg"),)
+    assert (release.music / _MERGED / "Folder.jpg").read_bytes() == b"cover"
+    assert (release.music / _MERGED / "Scans" / "Back.jpg").read_bytes() == b"back"
+    assert (release.music / _CD1 / "Folder.jpg").read_bytes() == b"disc"
+
+
+def test_a_release_folder_never_carries_the_files_of_a_disc_whose_audio_landed(
+    release: _Album, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (release.music / _CD1 / "Disc1.log").write_bytes(b"one")
+    _stage_release(release)
+    real = paths.move_no_clobber
+
+    def move_then_crash(source: Path, target: Path) -> None:
+        real(source, target)
+        if source.parent.name == "CD1" and source.suffix == ".mp3":
+            raise _CrashError
+
+    with monkeypatch.context() as patch:
+        patch.setattr(paths, "move_no_clobber", move_then_crash)
+        with pytest.raises(_CrashError):
+            paths.commit_paths(release.settings)
+    # CD1 holds no audio on disk now, so the release folder's walk reaches its log.
+    _stage(release.settings, (release.y, _MERGED / "201.mp3"))
+
+    targets = {Path(row.from_path): Path(row.to_path) for row in _staged_sidecars(release.settings)}
+    assert targets[_CD1 / "Disc1.log"] == _MERGED / "Disc1.log"
+    result = paths.commit_paths(release.settings)
+    assert (result.committed, result.sidecar_problems) == (2, ())
+    assert (release.music / _MERGED / "Disc1.log").read_bytes() == b"one"
+    assert (release.music / _MERGED / "Folder.jpg").read_bytes() == b"cover"
+
+
+def test_a_release_folder_never_carries_a_held_file_of_a_disc_whose_audio_landed(
+    release: _Album,
+) -> None:
+    (release.music / _CD1 / "Folder.jpg").write_bytes(b"disc")
+    _stage_release(release)
+    first = paths.commit_paths(release.settings, path=str(_CD1))
+    assert (first.committed, first.sidecars_held) == (1, (str(_CD1 / "Folder.jpg"),))
+
+    _stage(release.settings, (release.y, _MERGED / "201.mp3"))
+
+    assert _CD1 / "Folder.jpg" not in {
+        Path(row.from_path) for row in _staged_sidecars(release.settings)
+    }
+    second = paths.commit_paths(release.settings)
+    assert (second.committed, second.sidecar_problems) == (1, ())
+    assert (release.music / _CD1 / "Folder.jpg").read_bytes() == b"disc"
+    assert not (release.music / _MERGED / "CD1").exists()
+    assert (release.music / _MERGED / "Folder.jpg").read_bytes() == b"cover"
+
+
+def test_discs_staged_to_two_folders_leave_the_release_cover_and_report_it(
+    release: _Album,
+) -> None:
+    _stage_release(release)
+    assert len(_staged_sidecars(release.settings)) == len(_RELEASE_SIDECARS)
+    _stage(release.settings, (release.y, Path("Artist") / "Elsewhere" / "201.mp3"))
+    assert _staged_sidecars(release.settings) == []
+
+    result = paths.commit_paths(release.settings)
 
     assert (result.committed, result.sidecars_moved) == (2, 0)
-    assert result.sidecars_held == (
-        str(_ALBUM / "Folder.jpg"),
-        str(_ALBUM / "Scans" / "Back.jpg"),
+    assert result.sidecars_held == tuple(str(_ALBUM / r) for r in _RELEASE_SIDECARS)
+    assert (release.music / _ALBUM / "Folder.jpg").read_bytes() == b"cover"
+    assert (release.music / _ALBUM / "Scans" / "Back.jpg").read_bytes() == b"back"
+
+
+_MAIN = Path("Artist") / "Main"
+_BONUS = Path("Artist") / "Bonus"
+
+
+@pytest.fixture
+def bonus(engine_settings: Settings, music_dir: Path) -> _Album:
+    """An album folder holding a track and a cover, plus a disc-named folder of one track."""
+    _library(engine_settings, music_dir, _ALBUM / "01.mp3", _CD2 / "01.mp3")
+    (music_dir / _ALBUM / "Folder.jpg").write_bytes(b"cover")
+    return _Album(
+        settings=engine_settings,
+        music=music_dir,
+        x=_id_at(engine_settings, music_dir / _ALBUM / "01.mp3"),
+        y=_id_at(engine_settings, music_dir / _CD2 / "01.mp3"),
     )
-    assert (music_dir / _ALBUM / "Folder.jpg").read_bytes() == b"cover"
+
+
+def test_a_waiting_cover_keeps_its_album_target_once_its_album_audio_left(bonus: _Album) -> None:
+    _stage(bonus.settings, (bonus.x, _MAIN / "01.mp3"), (bonus.y, _BONUS / "01.mp3"))
+    blocker = bonus.music / _BONUS / "01.mp3"
+    blocker.parent.mkdir(parents=True)
+    blocker.write_bytes(b"blocker")
+    first = paths.commit_paths(bonus.settings)
+    assert (first.committed, first.errors, first.sidecars_waiting) == (1, 1, 1)
+    blocker.unlink()
+
+    _stage(bonus.settings, (bonus.y, _BONUS / "01.mp3"))
+
+    targets = {Path(row.from_path): Path(row.to_path) for row in _staged_sidecars(bonus.settings)}
+    assert targets == {_ALBUM / "Folder.jpg": _MAIN / "Folder.jpg"}
+    second = paths.commit_paths(bonus.settings)
+    assert (second.committed, second.sidecars_moved) == (1, 1)
+    assert (bonus.music / _MAIN / "Folder.jpg").read_bytes() == b"cover"
+    assert not (bonus.music / _BONUS / "Folder.jpg").exists()
+
+
+def test_a_held_cover_stays_held_once_its_album_audio_left(bonus: _Album) -> None:
+    (bonus.music / _MAIN).mkdir(parents=True)
+    (bonus.music / _MAIN / "Folder.jpg").write_bytes(b"taken")
+    _stage(bonus.settings, (bonus.x, _MAIN / "01.mp3"))
+    first = paths.commit_paths(bonus.settings)
+    assert first.sidecars_held == (str(_ALBUM / "Folder.jpg"),)
+
+    _stage(bonus.settings, (bonus.y, _BONUS / "01.mp3"))
+
+    assert _staged_sidecars(bonus.settings) == []
+    second = paths.commit_paths(bonus.settings)
+    assert (second.committed, second.sidecars_moved) == (1, 0)
+    assert second.sidecars_held == (str(_ALBUM / "Folder.jpg"),)
+    assert (bonus.music / _ALBUM / "Folder.jpg").read_bytes() == b"cover"
+    assert not (bonus.music / _BONUS / "Folder.jpg").exists()
 
 
 def test_a_batch_into_a_folder_whose_cover_is_taken_reports_the_held_sidecar(
@@ -723,6 +899,46 @@ def test_revert_commit_holds_only_the_sidecars_of_the_disc_whose_audio_stays(
     assert _at(engine_settings, disc2) == music_dir / _MERGED / "201b.mp3"
     assert (music_dir / _MERGED / "Disc2.log").read_bytes() == b"two"
     assert not (music_dir / _MERGED / "Disc1.log").exists()
+
+
+def test_revert_commit_puts_a_release_folders_sidecars_back(release: _Album) -> None:
+    _stage_release(release)
+    forward = paths.commit_paths(release.settings)
+    assert forward.commit_id is not None
+
+    back = versioning.revert_commit(release.settings, forward.commit_id)
+
+    assert isinstance(back, paths.PathRevertCommitResult)
+    assert (back.reverted, back.errors) == (2, 0)
+    assert [o.status for o in back.sidecars] == ["reverted"] * len(_RELEASE_SIDECARS)
+    assert _at(release.settings, release.x) == release.music / _CD1 / "01.mp3"
+    assert _at(release.settings, release.y) == release.music / _CD2 / "01.mp3"
+    assert (release.music / _ALBUM / "Folder.jpg").read_bytes() == b"cover"
+    assert (release.music / _ALBUM / "Scans" / "Back.jpg").read_bytes() == b"back"
+    assert not (release.music / _MERGED).exists()
+
+
+def test_revert_commit_keeps_the_release_cover_with_disc_audio_that_stays(
+    release: _Album,
+) -> None:
+    _stage_release(release)
+    forward = paths.commit_paths(release.settings)
+    assert forward.commit_id is not None
+    _stage(release.settings, (release.y, _MERGED / "201b.mp3"))
+    assert paths.commit_paths(release.settings).committed == 1
+
+    back = versioning.revert_commit(release.settings, forward.commit_id)
+
+    assert isinstance(back, paths.PathRevertCommitResult)
+    assert back.reverted == 1
+    assert {Path(o.from_path).name: o.status for o in back.sidecars} == {
+        "Folder.jpg": "skipped_later_changes",
+        "Back.jpg": "skipped_later_changes",
+    }
+    assert all(f"[{release.y}]" in str(o.detail) for o in back.sidecars)
+    assert _at(release.settings, release.x) == release.music / _CD1 / "01.mp3"
+    assert (release.music / _MERGED / "Folder.jpg").read_bytes() == b"cover"
+    assert not (release.music / _ALBUM / "Folder.jpg").exists()
 
 
 def test_revert_commit_refuses_a_path_scope_on_a_tag_commit(album: _Album) -> None:

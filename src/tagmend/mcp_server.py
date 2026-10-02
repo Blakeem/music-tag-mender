@@ -1239,8 +1239,11 @@ def stage_paths(
 
     A folder whose every file moves to one other folder takes its sidecars along: every
     non-audio file under it (cover art, hidden thumbnails, cue sheets, rip logs, a ``Scans``
-    folder), with names and relative structure unchanged. A sidecar whose target is taken
-    stays in place, and of two folders claiming one target the one with the lower file id wins.
+    folder), with names and relative structure unchanged. A release folder above disc folders
+    (``CD1``, ``CD2``) that audio never sat in directly takes its own non-audio files along when
+    all its disc folders move to one folder. A sidecar whose target is taken stays in place, and
+    of two folders claiming one target the one with the lower file id wins, a release folder
+    ahead of its own disc folders. ``sidecars_held`` lists each sidecar left in place this way.
 
     A ``legit_ignore`` decision keeps the file's folder, and only its filename renders. No
     decision keeps a filename, so a filename rename you reverted is rendered again while the
@@ -1403,9 +1406,10 @@ def commit_paths(path: str | None = None, message: str | None = None) -> dict[st
         "sidecar_problems": [{from_path, to_path, status, detail}, ...]}``. ``commit_id`` is
         ``null`` when nothing was staged. ``sidecars_held`` lists the non-audio files left in
         a folder whose audio all moved, because their target was taken, the folder's files
-        went to different folders, or they sit in the release folder above disc folders the
-        commit emptied of audio, which no move carries. Each problem keeps its row, except a
-        ``missing`` one, and its ``detail`` names the next step.
+        went to different folders, or they sit in a release folder no move carries, since its
+        disc folders went to different folders or audio once sat in it directly. A release
+        folder whose disc folders all went to one folder carries its own files there. Each
+        problem keeps its row, except a ``missing`` one, and its ``detail`` names the next step.
     """
     result = paths.commit_paths(load_settings(), path=path, message=message)
     return {"ok": True, **result.to_dict()}

@@ -1418,6 +1418,12 @@ def path_versions(conn: sqlite3.Connection) -> dict[int, int]:
     return {db.as_int(row[0]): db.as_int(row[1]) for row in cursor.fetchall()}
 
 
+def path_revision_sources(conn: sqlite3.Connection) -> list[str]:
+    """Return every distinct ``from_path`` the ``path_revisions`` log holds."""
+    cursor = conn.execute("SELECT DISTINCT from_path FROM path_revisions")
+    return [str(row[0]) for row in cursor.fetchall()]
+
+
 def relocate_file(
     conn: sqlite3.Connection,
     file_id: int,

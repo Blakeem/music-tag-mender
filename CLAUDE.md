@@ -150,8 +150,13 @@ unsaved. `stage_paths` stages entire folders as `auto` rows. Both read one plann
 render moved. A rendered path never flags in `detect_mismatches`, which a round-trip test checks.
 When every audio file of a folder moves to one new folder, its non-audio files (cover art, `.cue`,
 `.log`, `Scans/`) move with it under their own names, logged in `sidecar_moves` and reverted by
-`revert_commit`. A sidecar waits until its album's audio has moved, a same-name collision keeps the
-lower file id's copy and reports the other in `sidecars_held`, and nothing is ever deleted.
+`revert_commit`. A release folder above disc folders (`mismatch.layout_of`) that audio never sat in
+directly is a unit of its own when all its discs move to one folder: its own non-audio files and
+audio-free subfolders follow them, and the disc folders' files follow their own units. A sidecar
+waits until every audio file under its album folder has moved, a same-name collision keeps the lower
+file id's copy (a release folder ahead of its own discs) and reports the other in `sidecars_held`,
+and nothing is ever deleted. `commit_paths` also lists in `sidecars_held` the files of a release
+folder no move carries, since its discs went to different folders or audio once sat in it directly.
 
 **The canonical tag namespace is TagMend's, not mutagen's.** mutagen's "easy" layer is an
 incomplete normalizer, so `tags.py` owns the mapping wherever it is wrong: `EasyID3` points

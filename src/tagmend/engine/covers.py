@@ -3,9 +3,9 @@
 Navidrome takes an album's cover from an image in the album's folders whose lowercased name
 matches ``cover.*``, ``folder.*`` or ``front.*`` (its default ``CoverArtPriority``), and then
 from a picture embedded in a track. :func:`plan_album_covers` groups the present files into
-albums by :func:`tagmend.engine.detector_core.album_identity`, the identity
-``detect_album_conflicts`` compares, and gives each album one status.
-:func:`detect_cover_gaps` reports the albums that show no cover. Both write nothing.
+albums by :func:`tagmend.engine.detector_core.album_identity` with the release date Navidrome
+keys on, and gives each album one status. :func:`detect_cover_gaps` reports the albums that
+show no cover. Both write nothing.
 
 :func:`stage_covers` stages one cover image per ``gap`` album in ``cover_writes_staged``, bytes
 included. :func:`unstage_covers` drops staged rows and :func:`diff_covers` shows them with their
@@ -37,7 +37,6 @@ from tagmend.engine.detector_core import (
     album_identity,
     display_album_artist,
     group_by_key,
-    release_date,
 )
 from tagmend.engine.lookup_clients import injected_or_owned
 from tagmend.engine.serialize import FieldDict
@@ -109,8 +108,19 @@ _FIELDS: Final = (
     "musicbrainz_albumid",
     "musicbrainz_releasegroupid",
     "date",
+    "releasedate",
     "year",
 )
+
+# The tags Navidrome reads as an album's releasedate, first value first, by file suffix. An MP3's
+# date (TDRC) and a FLAC's or Ogg's DATE feed its recordingdate instead, not its album key.
+_VORBIS_RELEASE_DATE: Final = ("releasedate", "year")
+_RELEASE_DATE_FIELDS: Final[dict[str, tuple[str, ...]]] = {
+    ".m4a": ("date",),
+    ".flac": _VORBIS_RELEASE_DATE,
+    ".ogg": _VORBIS_RELEASE_DATE,
+    ".opus": _VORBIS_RELEASE_DATE,
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -186,8 +196,10 @@ def _load_tracks(conn: sqlite3.Connection) -> list[_Track]:
         artist = display_album_artist(
             values.get("albumartist"), values.get("compilation"), values.get("artist")
         )
+        release_fields = _RELEASE_DATE_FIELDS.get(Path(row.filename).suffix.lower(), ())
+        release_date = next((values[f] for f in release_fields if values.get(f, "").strip()), None)
         identity = album_identity(
-            values.get("musicbrainz_albumid"), artist, values.get("album"), release_date(values)
+            values.get("musicbrainz_albumid"), artist, values.get("album"), release_date
         )
         tracks.append(
             _Track(

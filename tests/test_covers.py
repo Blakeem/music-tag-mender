@@ -57,16 +57,20 @@ def _image(path: Path) -> None:
     path.write_bytes(_IMAGE)
 
 
-def _plan(settings: Settings) -> dict[str | None, covers.AlbumCover]:
-    """Scan the library and return each album's cover plan keyed by album title."""
+def _plans(settings: Settings) -> list[covers.AlbumCover]:
+    """Scan the library and return every album's cover plan."""
     scan_library(settings)
     connection = db.connect(settings.db_path)
     try:
         schema.apply_schema(connection)
-        albums = covers.plan_album_covers(connection, settings)
+        return covers.plan_album_covers(connection, settings)
     finally:
         connection.close()
-    return {album.album: album for album in albums}
+
+
+def _plan(settings: Settings) -> dict[str | None, covers.AlbumCover]:
+    """Scan the library and return each album's cover plan keyed by album title."""
+    return {album.album: album for album in _plans(settings)}
 
 
 # --- the embedded-picture probe -----------------------------------------------------
@@ -119,6 +123,79 @@ def test_an_embedded_picture_in_the_second_track_covers_the_album(
     plan = _plan(engine_settings)
 
     assert plan["Green"].status == covers.STATUS_COVERED_BY_PICTURE
+
+
+def _albums_in(settings: Settings, name: str) -> list[covers.AlbumCover]:
+    """Scan the library and return every album plan titled *name*."""
+    return [album for album in _plans(settings) if album.album == name]
+
+
+def _dated_tracks(folder: Path) -> list[Path]:
+    """Write three tracks of one album whose dates differ, one of them blank."""
+    base = {"artist": ["Band"], "album": ["[Other]"]}
+    return [
+        make_track(folder / "a.mp3", {**base, "date": ["2001"]}),
+        make_track(folder / "b.mp3", {**base, "date": ["2004"]}),
+        make_track(folder / "c.mp3", base),
+    ]
+
+
+def test_mp3_tracks_differing_only_in_date_are_one_album(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    _dated_tracks(music_dir / "Band" / "Other")
+
+    [album] = _albums_in(engine_settings, "[Other]")
+
+    assert album.status == covers.STATUS_GAP
+    assert len(album.file_ids) == 3
+
+
+@pytest.mark.parametrize(
+    ("suffix", "field"),
+    [(".flac", "year"), (".flac", "releasedate"), (".ogg", "year"), (".m4a", "date")],
+)
+def test_a_release_date_navidrome_keys_on_splits_the_album(
+    engine_settings: Settings,
+    music_dir: Path,
+    suffix: str,
+    field: str,
+) -> None:
+    folder = music_dir / "Band" / "Other"
+    base = {"artist": ["Band"], "album": ["[Other]"]}
+    make_track(folder / f"a{suffix}", {**base, field: ["2001"]})
+    make_track(folder / f"b{suffix}", {**base, field: ["2004"]})
+
+    albums = _albums_in(engine_settings, "[Other]")
+
+    assert [album.status for album in albums] == [covers.STATUS_SHARED_FOLDER] * 2
+
+
+def test_a_vorbis_releasedate_outranks_its_year(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    folder = music_dir / "Band" / "Other"
+    base = {"artist": ["Band"], "album": ["[Other]"], "releasedate": ["2001"]}
+    make_track(folder / "a.flac", {**base, "year": ["2001"]})
+    make_track(folder / "b.flac", {**base, "year": ["2004"]})
+
+    [album] = _albums_in(engine_settings, "[Other]")
+
+    assert album.status == covers.STATUS_GAP
+
+
+def test_a_picture_on_one_dated_track_covers_the_whole_album(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    tracks = _dated_tracks(music_dir / "Band" / "Other")
+    _embed_picture(tracks[1])
+
+    [album] = _albums_in(engine_settings, "[Other]")
+
+    assert album.status == covers.STATUS_COVERED_BY_PICTURE
 
 
 def test_an_image_no_pattern_matches_leaves_a_gap_and_is_listed(

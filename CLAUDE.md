@@ -38,17 +38,18 @@ Each entry names a subsystem, its MCP tools and its modules under `src/tagmend/e
   `DEFAULT_PATTERN`. The settings keys are `naming_pattern` (empty for the default) and
   `container_folders`. `paths.plan_library` is the one planner. It applies every hold.
   `diff_paths` flags an `auto` row `stale` when its render moved.
-- Cover art: `detect_cover_gaps`, `stage_covers`, `unstage_covers`, `diff_covers`,
-  `commit_covers`. Module `covers.py`. An album is grouped by `detector_core.album_identity`,
-  the identity `detect_album_conflicts` uses. It is covered when an image in its folders matches
-  Navidrome's `cover.*`, `folder.*` or `front.*`, or a track holds an embedded picture. A gap
-  album's cover goes in its one folder, or in the release folder above its disc folders. A
-  folder shared by two albums and an album scattered over unrelated folders get none.
-  `stage_covers` takes the owner's `image`, else one front image under the album folder
-  (copied), else the Cover Art Archive front of the release, then of the release group. A staged
-  row holds the image bytes, and `commit_covers` writes them with no overwrite. `cover_writes`
-  logs each write with its bytes. `revert_commit` sends a written cover to the OS trash through
-  `trash.py`, and a revert of that revert writes it again.
+- Cover art: `detect_cover_gaps`, `stage_covers`, `unstage_covers`, `diff_covers`, `commit_covers`.
+  Module `covers.py`. An album is grouped by `detector_core.album_identity` with the date Navidrome
+  keys an album on. That date is an M4A's `date`, or a FLAC's or Ogg's raw `releasedate`, else its
+  `year`. An MP3 has none, since its `date` feeds Navidrome's `recordingdate`. An album is covered
+  when an image in its folders matches Navidrome's `cover.*`, `folder.*` or `front.*`, or a track
+  holds an embedded picture. A gap album's cover goes in its one folder, or in the release folder
+  above its disc folders. A folder shared by two albums and an album scattered over unrelated
+  folders get none. `stage_covers` takes the owner's `image`, else one front image under the album
+  folder (copied), else the Cover Art Archive front of the release, then of the release group. A
+  staged row holds the image bytes, and `commit_covers` writes them with no overwrite.
+  `cover_writes` logs each write with its bytes. `revert_commit` sends a written cover to the OS
+  trash through `trash.py`, and a revert of that revert writes it again.
 - Tag axes (genre, artist, year, song): `resolve_<axis>s`, `set_<axis>_status` and
   `reset_<axis>_status`, 12 tools. `axis.py` defines each `Axis`, `MISMATCH_AXIS` included.
   `axis_status.py` is the one set and reset implementation. `axis_resolver.py` runs the group

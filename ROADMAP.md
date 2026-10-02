@@ -99,6 +99,11 @@ command mirrors its MCP name with `-` for `_`.
 - L21: no decision keeps a file name. The owner keeps the names of the two Alice in Chains covers
   in "Tool\Other" (files 11251 and 11252), so a library-wide `stage_paths` stages a rename the
   owner must unstage. The fix candidate is a keep that also holds the file names.
+- L22: Navidrome keys an album on an MP3's `TDRL` release date, and the reader does not read
+  `TDRL`. So `detect_cover_gaps` keeps MP3 tracks with different `TDRL` dates in one album where
+  Navidrome splits them. The live library holds 29 such MP3s in 3 folders. Only Neon Hitch
+  "Unreleased" mixes dates, and it shows a cover. The fix candidate is a raw `releasedate` read of
+  `TDRL`, with a reader version bump.
 - L20: TagLib reads an MP3's APEv2 tag before ID3v1, and `read_tags` does not model APEv2. The
   live library holds no MP3 this affects, since all 550 MP3s with an APEv2 tag also hold ID3v2
   frames. A write that creates the first ID3v2 frame also leaves the ID3v1 comment out of ID3v2,

@@ -1,16 +1,21 @@
-"""The shared core of the ``detect_*`` family: tiers, folder buckets and positions."""
+"""The shared core of the ``detect_*`` family: tiers, folder buckets, views and positions."""
 
 from __future__ import annotations
 
+from collections import Counter
+from dataclasses import replace
 from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, Protocol
 
+from tagmend.engine import path_keys
 from tagmend.engine.text_keys import alnum_ascii_key
 from tagmend.engine.validation import require_choice
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable
+    from collections.abc import Callable, Hashable, Iterable
+
+    from _typeshed import DataclassInstance
 
 
 class Tier(StrEnum):
@@ -49,6 +54,23 @@ class _HasTier(Protocol):
     def tier(self) -> str: ...
 
 
+class _TieredRow(_HasFolder, _HasTier, Protocol):
+    """A detector row that sits in one folder and carries a tier."""
+
+
+class _FieldRow(_TieredRow, Protocol):
+    """A detector row that reports one field of one file."""
+
+    @property
+    def file_id(self) -> int: ...
+
+    @property
+    def filename(self) -> str: ...
+
+    @property
+    def field(self) -> str: ...
+
+
 def validate_tier(tier: str | None) -> None:
     """Raise :class:`ValueError` for a *tier* outside :data:`TIERS`. ``None`` passes."""
     require_choice("tier", tier, TIERS)
@@ -63,12 +85,38 @@ def is_non_album_folder(folder: str) -> bool:
     return alnum_ascii_key(Path(folder).name) in _NON_ALBUM_KEYS
 
 
+def group_by_key[T, K](items: Iterable[T], key: Callable[[T], K]) -> dict[K, list[T]]:
+    """Bucket *items* by *key*, preserving first-seen order within each bucket."""
+    grouped: dict[K, list[T]] = {}
+    for item in items:
+        grouped.setdefault(key(item), []).append(item)
+    return grouped
+
+
+def _folder_of(item: _HasFolder) -> str:
+    """Return the folder *item* sits in."""
+    return item.folder
+
+
 def group_by_folder[T: _HasFolder](items: Iterable[T]) -> dict[str, list[T]]:
     """Bucket *items* by their folder, preserving first-seen order within each folder."""
-    grouped: dict[str, list[T]] = {}
-    for item in items:
-        grouped.setdefault(item.folder, []).append(item)
-    return grouped
+    return group_by_key(items, _folder_of)
+
+
+def ordered[R: _FieldRow](rows: list[R]) -> list[R]:
+    """Return *rows* most-severe first, then stably by location and field."""
+    return sorted(rows, key=lambda r: (TIER_RANK[Tier(r.tier)], r.folder, r.filename, r.field))
+
+
+def tiers_by_file(rows: Iterable[_FieldRow]) -> Counter[str]:
+    """Count files by their most severe row, so the counts sum to the file count."""
+    worst: dict[int, Tier] = {}
+    for row in rows:
+        tier = Tier(row.tier)
+        current = worst.get(row.file_id)
+        if current is None or TIER_RANK[tier] < TIER_RANK[current]:
+            worst[row.file_id] = tier
+    return Counter(tier.value for tier in worst.values())
 
 
 def rows_in_tier[T: _HasTier](rows: list[T], tier: str | None) -> list[T]:
@@ -86,14 +134,68 @@ def regroup[G: _HasFolder, R: _HasFolder](
     groups: list[G],
     rows: list[R],
     refold: Callable[[G, list[R]], G],
+    *,
+    key: Callable[[G | R], Hashable] = _folder_of,
 ) -> list[G]:
-    """Refold each of *groups* over its own folder's *rows*, dropping a group with none."""
-    rows_by_folder = group_by_folder(rows)
-    return [
-        refold(group, rows_by_folder[group.folder])
-        for group in groups
-        if group.folder in rows_by_folder
-    ]
+    """Refold each of *groups* over the *rows* sharing its *key*, dropping a group with none."""
+    rows_by_key = group_by_key(rows, key)
+    return [refold(group, rows_by_key[key(group)]) for group in groups if key(group) in rows_by_key]
+
+
+def narrow[D: DataclassInstance, R: _TieredRow, G: _HasFolder](  # noqa: PLR0913 - one keyword per view knob and per detector difference
+    report: D,
+    *,
+    rows: list[R],
+    groups: list[G],
+    secondary_field: str,
+    secondary_rows: list[R],
+    secondary_in_tier: bool,
+    refold: Callable[[G, list[R]], G],
+    key: Callable[[G | R], Hashable] = _folder_of,
+    tier: str | None,
+    folder_key: str | None,
+    limit: int | None,
+    group: bool,
+) -> D:
+    """Return *report* with its rows and groups narrowed for display. The run counts never change.
+
+    *secondary_field* names the report's second row list, which every filter narrows alongside
+    *rows*, so a caller expanding one folder does not also receive every other folder's rows. A
+    *tier* keeps the secondary rows of that tier when *secondary_in_tier* is set, and otherwise
+    drops them, since context rows sit outside every tier count. Groups ride only on the grouped
+    view. A *folder_key* wins over *group*: that call returns the folder's flat rows and no
+    groups. A *tier* filters the rows first, and *refold* rebuilds each group, matched by *key*,
+    over the rows the filter kept.
+    """
+    # Input: the tier filter, which also decides which groups survive.
+    view_rows = rows_in_tier(rows, tier)
+    if secondary_in_tier:
+        view_secondary = rows_in_tier(secondary_rows, tier)
+    else:
+        view_secondary = secondary_rows if tier is None else []
+    tier_groups = (
+        groups if tier is None else regroup(groups, view_rows + view_secondary, refold, key=key)
+    )
+
+    # Process: the folder and the limit, then the flat or the grouped shape.
+    if folder_key is not None:
+        view_rows = [r for r in view_rows if path_keys.path_key(r.folder) == folder_key]
+        view_secondary = [r for r in view_secondary if path_keys.path_key(r.folder) == folder_key]
+    if limit is not None:
+        view_rows = view_rows[:limit]
+        view_secondary = view_secondary[:limit]
+    flat = not group or folder_key is not None
+    view_groups = [] if flat else tier_groups
+    if limit is not None:
+        view_groups = view_groups[:limit]
+
+    # Output: every other report field describes the whole run, which no view changes.
+    return replace(
+        report,
+        rows=view_rows if flat else [],
+        groups=view_groups,
+        **{secondary_field: view_secondary if flat else []},
+    )
 
 
 def parse_position(value: str | None) -> int | None:

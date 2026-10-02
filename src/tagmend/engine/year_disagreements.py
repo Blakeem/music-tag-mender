@@ -27,10 +27,12 @@ from typing import TYPE_CHECKING, Final
 
 from tagmend.engine import axis, db, lookup_clients, path_keys, schema, store
 from tagmend.engine.detector_core import (
-    TIER_RANK,
     Tier,
+    group_by_key,
     is_non_album_folder,
-    rows_in_tier,
+    narrow,
+    ordered,
+    tiers_by_file,
     validate_tier,
 )
 from tagmend.engine.musicbrainz import MusicBrainzClient, MusicBrainzError
@@ -370,10 +372,10 @@ def _classify(
                 rows.extend(found)
 
     # Output: the whole-library counts, which no later narrowing changes.
-    tiers = _tiers_by_file(rows)
+    tiers = tiers_by_file(rows)
     context_files = len({r.file_id for r in context_rows})
     return YearDisagreementsReport(
-        rows=_ordered(rows),
+        rows=ordered(rows),
         total_files=len(files),
         flagged=sum(tiers.values()),
         flagged_fields=len(rows),
@@ -393,26 +395,15 @@ def _classify(
             lookups=lookups,
         ),
         folder_context=context_files,
-        folder_context_rows=_ordered(context_rows),
+        folder_context_rows=ordered(context_rows),
         error_items=lookups.error_items,
         groups=_build_groups(rows, context_rows, lookups, identity_sizes),
     )
 
 
-def _ordered(rows: list[YearDisagreementRow]) -> list[YearDisagreementRow]:
-    """Return *rows* most-severe first, then stably by location and field."""
-    return sorted(rows, key=lambda r: (TIER_RANK[Tier(r.tier)], r.folder, r.filename, r.field))
-
-
-def _tiers_by_file(rows: list[YearDisagreementRow]) -> Counter[str]:
-    """Count files by their most severe row, so the counts sum to the file count."""
-    worst: dict[int, Tier] = {}
-    for row in rows:
-        tier = Tier(row.tier)
-        current = worst.get(row.file_id)
-        if current is None or TIER_RANK[tier] < TIER_RANK[current]:
-            worst[row.file_id] = tier
-    return Counter(tier.value for tier in worst.values())
+def _group_key(item: YearDisagreementRow | YearDisagreementGroup) -> _GroupKey:
+    """Return the grouped-view line *item* belongs to."""
+    return item.group_key
 
 
 def _build_groups(
@@ -422,8 +413,8 @@ def _build_groups(
     identity_sizes: Counter[_GroupKey],
 ) -> list[YearDisagreementGroup]:
     """Fold the rows into one line per album identity per folder, sorted by that key."""
-    flagged_by_key = _rows_by_key(rows)
-    context_by_key = _rows_by_key(context_rows)
+    flagged_by_key = group_by_key(rows, _group_key)
+    context_by_key = group_by_key(context_rows, _group_key)
     groups: list[YearDisagreementGroup] = []
     for key in sorted(flagged_by_key.keys() | context_by_key.keys()):
         folder, artist, album = key
@@ -446,20 +437,12 @@ def _build_groups(
     return groups
 
 
-def _rows_by_key(rows: list[YearDisagreementRow]) -> dict[_GroupKey, list[YearDisagreementRow]]:
-    """Bucket *rows* by their grouped-view key."""
-    grouped: dict[_GroupKey, list[YearDisagreementRow]] = defaultdict(list)
-    for row in rows:
-        grouped[row.group_key].append(row)
-    return grouped
-
-
 def _refold_group(
     group: YearDisagreementGroup,
     rows: list[YearDisagreementRow],
 ) -> YearDisagreementGroup:
     """Return *group* with its flagged counts describing exactly *rows*, its flagged rows."""
-    tiers = _tiers_by_file(rows)
+    tiers = tiers_by_file(rows)
     return replace(
         group,
         flagged=sum(tiers.values()),
@@ -502,58 +485,6 @@ def _summarize(
     if lookups.error_items:
         head += f" {len(lookups.error_items)} lookup(s) errored. Re-run to retry."
     return head
-
-
-# --- view narrowing ------------------------------------------------------------------
-
-
-def _regroup(
-    groups: list[YearDisagreementGroup],
-    rows: list[YearDisagreementRow],
-) -> list[YearDisagreementGroup]:
-    """Refold each of *groups* over its own key's *rows*, dropping a group with none."""
-    rows_by_key = _rows_by_key(rows)
-    return [
-        _refold_group(group, rows_by_key[group.group_key])
-        for group in groups
-        if group.group_key in rows_by_key
-    ]
-
-
-def _narrow(
-    report: YearDisagreementsReport,
-    *,
-    tier: str | None,
-    folder_key: str | None,
-    limit: int | None,
-    group: bool,
-) -> YearDisagreementsReport:
-    """Return *report* with its rows filtered for display. The run counts never change.
-
-    Groups ride only on the grouped view. A *folder_key* wins over *group*: that call returns
-    the folder's flat rows and no groups, like every sibling detector. A *tier* filters the rows
-    first, and the grouped view is refolded over the filtered rows.
-    """
-    rows = rows_in_tier(report.rows, tier)
-    context_rows = report.folder_context_rows if tier is None else []
-    tier_groups = report.groups if tier is None else _regroup(report.groups, rows)
-    if folder_key is not None:
-        rows = [r for r in rows if path_keys.path_key(r.folder) == folder_key]
-        context_rows = [r for r in context_rows if path_keys.path_key(r.folder) == folder_key]
-    if limit is not None:
-        rows = rows[:limit]
-        context_rows = context_rows[:limit]
-
-    flat = not group or folder_key is not None
-    groups = [] if flat else tier_groups
-    if limit is not None:
-        groups = groups[:limit]
-    return replace(
-        report,
-        rows=rows if flat else [],
-        folder_context_rows=context_rows if flat else [],
-        groups=groups,
-    )
 
 
 # --- public entry --------------------------------------------------------------------
@@ -634,4 +565,17 @@ def detect_year_disagreements(  # noqa: PLR0913 - cohesive keyword-only view + i
         report.release_groups_checked,
         report.total_files,
     )
-    return _narrow(report, tier=tier, folder_key=folder_key, limit=limit, group=group)
+    return narrow(
+        report,
+        rows=report.rows,
+        groups=report.groups,
+        secondary_field="folder_context_rows",
+        secondary_rows=report.folder_context_rows,
+        secondary_in_tier=False,
+        refold=_refold_group,
+        key=_group_key,
+        tier=tier,
+        folder_key=folder_key,
+        limit=limit,
+        group=group,
+    )

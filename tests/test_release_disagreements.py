@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 from conftest import FOLDER_SPELLINGS, make_track, spell_folder
-from tagmend.engine import musicbrainz, release_disagreements
+from tagmend.engine import detector_core, musicbrainz, release_disagreements
 from tagmend.engine.detector_core import Tier
 from tagmend.engine.library import scan_library
 from tagmend.engine.musicbrainz import MBMedium, MBRelease, MBTrack, MusicBrainzError
@@ -121,6 +121,29 @@ def _run(
 ) -> release_disagreements.ReleaseDisagreementsReport:
     source = FakeReleaseSource({_RELEASE_ID: release or _release(_track("1", "Song One"))})
     return _classify(files, source, release_limit=None)
+
+
+def _view(
+    report: release_disagreements.ReleaseDisagreementsReport,
+    *,
+    tier: str | None,
+    folder_key: str | None,
+    limit: int | None,
+    group: bool,
+) -> release_disagreements.ReleaseDisagreementsReport:
+    return detector_core.narrow(
+        report,
+        rows=report.rows,
+        groups=report.groups,
+        secondary_field="fill_rows",
+        secondary_rows=report.fill_rows,
+        secondary_in_tier=True,
+        refold=release_disagreements._refold_group,
+        tier=tier,
+        folder_key=folder_key,
+        limit=limit,
+        group=group,
+    )
 
 
 # --- an agreeing file is silent ------------------------------------------------------
@@ -451,12 +474,8 @@ def test_group_file_ids_exclude_fill_only_files() -> None:
 def test_groups_ship_only_in_the_grouped_view() -> None:
     report = _run([_f(1, album="Wrong Album")])
 
-    flat = release_disagreements._narrow(
-        report, tier=None, folder_key=None, limit=None, group=False
-    )
-    grouped = release_disagreements._narrow(
-        report, tier=None, folder_key=None, limit=None, group=True
-    )
+    flat = _view(report, tier=None, folder_key=None, limit=None, group=False)
+    grouped = _view(report, tier=None, folder_key=None, limit=None, group=True)
 
     assert flat.groups == []
     assert len(grouped.groups) == 1
@@ -471,9 +490,7 @@ def test_grouped_view_respects_tier() -> None:
         ],
     )
 
-    view = release_disagreements._narrow(
-        report, tier="high", folder_key=None, limit=None, group=True
-    )
+    view = _view(report, tier="high", folder_key=None, limit=None, group=True)
 
     assert [g.folder for g in view.groups] == [r"C:\m\Band\High"]
     assert view.groups[0].flagged == 1
@@ -1013,7 +1030,7 @@ def test_a_limit_caps_both_row_lists() -> None:
             _f(2, album="Wrong Too", releasecountry="XX", date=None),
         ]
     )
-    view = release_disagreements._narrow(report, tier=None, folder_key=None, limit=1, group=False)
+    view = _view(report, tier=None, folder_key=None, limit=1, group=False)
 
     assert len(view.rows) == 1
     assert len(view.fill_rows) == 1

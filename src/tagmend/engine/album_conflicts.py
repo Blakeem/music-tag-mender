@@ -53,8 +53,7 @@ from tagmend.engine.detector_core import (
     Tier,
     group_by_folder,
     is_non_album_folder,
-    regroup,
-    rows_in_tier,
+    narrow,
     validate_tier,
 )
 from tagmend.engine.text_keys import display_key
@@ -512,55 +511,6 @@ def _summarize(
     return head
 
 
-# --- view narrowing ------------------------------------------------------------------
-
-
-def _narrow(
-    report: AlbumConflictsReport,
-    *,
-    tier: str | None,
-    folder_key: str | None,
-    limit: int | None,
-    group: bool = False,
-) -> AlbumConflictsReport:
-    """Return *report* with its rows filtered for display; the library counts never change.
-
-    Every filter applies to the context rows as well as the flagged ones. Without that, a
-    caller expanding one folder also received every ``Singles``/``Remixes`` context row in the
-    library. Groups ride only on the grouped view, which is what ``detect_track_conflicts``
-    does, so a flat call does not also ship a line per folder. A *folder_key* wins over
-    *group*: that call returns the folder's flat rows and no groups, like every sibling. A
-    *tier* filters the rows first, and the grouped view is refolded over the filtered rows.
-    """
-    rows = rows_in_tier(report.rows, tier)
-    context_rows = report.folder_context_rows if tier is None else []
-    tier_groups = report.groups if tier is None else regroup(report.groups, rows, _refold_group)
-    if folder_key is not None:
-        rows = [r for r in rows if path_keys.path_key(r.folder) == folder_key]
-        context_rows = [r for r in context_rows if path_keys.path_key(r.folder) == folder_key]
-    if limit is not None:
-        rows = rows[:limit]
-        context_rows = context_rows[:limit]
-
-    flat = not group or folder_key is not None
-    groups = [] if flat else tier_groups
-    if limit is not None:
-        groups = groups[:limit]
-
-    return AlbumConflictsReport(
-        rows=rows if flat else [],
-        total_files=report.total_files,
-        flagged=report.flagged,
-        high=report.high,
-        medium=report.medium,
-        low=report.low,
-        summary=report.summary,
-        folder_context=report.folder_context,
-        folder_context_rows=context_rows if flat else [],
-        groups=groups,
-    )
-
-
 # --- public entry --------------------------------------------------------------------
 
 
@@ -621,4 +571,16 @@ def detect_album_conflicts(
         report.folder_context,
         report.total_files,
     )
-    return _narrow(report, tier=tier, folder_key=folder_key, limit=limit, group=group)
+    return narrow(
+        report,
+        rows=report.rows,
+        groups=report.groups,
+        secondary_field="folder_context_rows",
+        secondary_rows=report.folder_context_rows,
+        secondary_in_tier=False,
+        refold=_refold_group,
+        tier=tier,
+        folder_key=folder_key,
+        limit=limit,
+        group=group,
+    )

@@ -12,11 +12,11 @@ from typing import TYPE_CHECKING, Final
 import pytest
 
 from conftest import make_track
-from tagmend.engine import year_disagreements
+from tagmend.engine import detector_core, year_disagreements
 from tagmend.engine.detector_core import Tier
 from tagmend.engine.library import scan_library
 from tagmend.engine.musicbrainz import MBReleaseGroup, MusicBrainzError
-from tagmend.engine.year_disagreements import _REASON_NON_ALBUM, _classify, _FileInput, _narrow
+from tagmend.engine.year_disagreements import _REASON_NON_ALBUM, _classify, _FileInput
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -80,6 +80,30 @@ def _run(
 ) -> year_disagreements.YearDisagreementsReport:
     source = FakeReleaseGroupSource(table if table is not None else {_SABBATH: _rg("1970")})
     return _classify(files, source, release_limit=200)
+
+
+def _view(
+    report: year_disagreements.YearDisagreementsReport,
+    *,
+    tier: str | None,
+    folder_key: str | None,
+    limit: int | None,
+    group: bool,
+) -> year_disagreements.YearDisagreementsReport:
+    return detector_core.narrow(
+        report,
+        rows=report.rows,
+        groups=report.groups,
+        secondary_field="folder_context_rows",
+        secondary_rows=report.folder_context_rows,
+        secondary_in_tier=False,
+        refold=year_disagreements._refold_group,
+        key=year_disagreements._group_key,
+        tier=tier,
+        folder_key=folder_key,
+        limit=limit,
+        group=group,
+    )
 
 
 # --- tiers ---------------------------------------------------------------------------
@@ -219,7 +243,7 @@ def test_a_folder_holding_two_albums_is_grouped_once_per_album() -> None:
         ("Black Sabbath", "Master of Reality"): _rg("1971", "Master of Reality", "rg-2"),
     }
 
-    view = _narrow(_run(files, table), tier=None, folder_key=None, limit=None, group=True)
+    view = _view(_run(files, table), tier=None, folder_key=None, limit=None, group=True)
 
     assert [(g.album, g.first_release_year, g.file_ids) for g in view.groups] == [
         ("Master of Reality", "1971", [2]),
@@ -236,7 +260,7 @@ def test_a_tier_filter_refolds_each_group_over_its_rows() -> None:
     ]
     report = _run(files)
 
-    view = _narrow(report, tier="medium", folder_key=None, limit=None, group=True)
+    view = _view(report, tier="medium", folder_key=None, limit=None, group=True)
 
     assert [(g.flagged, g.file_ids, g.tiers) for g in view.groups] == [
         (1, [2], {Tier.MEDIUM.value: 1}),
@@ -248,8 +272,8 @@ def test_limit_caps_rows_and_groups_without_changing_counts() -> None:
     files = [_f(1, originaldate="1999"), _f(2, originaldate="1998", folder="/m/Other")]
     report = _run(files)
 
-    flat = _narrow(report, tier=None, folder_key=None, limit=1, group=False)
-    grouped = _narrow(report, tier=None, folder_key=None, limit=1, group=True)
+    flat = _view(report, tier=None, folder_key=None, limit=1, group=False)
+    grouped = _view(report, tier=None, folder_key=None, limit=1, group=True)
 
     assert len(flat.rows) == 1
     assert len(grouped.groups) == 1

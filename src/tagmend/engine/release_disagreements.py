@@ -44,11 +44,11 @@ from typing import TYPE_CHECKING, Final
 
 from tagmend.engine import db, lookup_clients, path_keys, release_match, schema, store
 from tagmend.engine.detector_core import (
-    TIER_RANK,
     Tier,
     group_by_folder,
-    regroup,
-    rows_in_tier,
+    narrow,
+    ordered,
+    tiers_by_file,
     validate_tier,
 )
 from tagmend.engine.musicbrainz import MusicBrainzClient, MusicBrainzError
@@ -488,9 +488,9 @@ def _classify(
     # Output: the contradictions and the blank fills are separate populations.
     contradictions = [r for r in rows if not r.is_fill]
     fills = [r for r in rows if r.is_fill]
-    tiers = _tiers_by_file(contradictions)
+    tiers = tiers_by_file(contradictions)
     return ReleaseDisagreementsReport(
-        rows=_ordered(contradictions),
+        rows=ordered(contradictions),
         total_files=len(files),
         flagged=sum(tiers.values()),
         flagged_fields=len(contradictions),
@@ -516,26 +516,10 @@ def _classify(
             unmatched=unmatched,
             errors=len(errors),
         ),
-        fill_rows=_ordered(fills),
+        fill_rows=ordered(fills),
         error_items=errors,
         groups=_build_groups(rows, files, titles),
     )
-
-
-def _ordered(rows: list[ReleaseDisagreementRow]) -> list[ReleaseDisagreementRow]:
-    """Return *rows* most-severe first, then stably by location and field."""
-    return sorted(rows, key=lambda r: (TIER_RANK[Tier(r.tier)], r.folder, r.filename, r.field))
-
-
-def _tiers_by_file(contradictions: list[ReleaseDisagreementRow]) -> Counter[str]:
-    """Count files by their most severe contradiction, so the counts sum to the file count."""
-    worst: dict[int, Tier] = {}
-    for row in contradictions:
-        tier = Tier(row.tier)
-        current = worst.get(row.file_id)
-        if current is None or TIER_RANK[tier] < TIER_RANK[current]:
-            worst[row.file_id] = tier
-    return Counter(tier.value for tier in worst.values())
 
 
 def _releases_in(folder_files: list[_FileInput], titles: dict[str, str]) -> list[dict[str, object]]:
@@ -584,7 +568,7 @@ def _refold_group(
 ) -> ReleaseDisagreementGroup:
     """Return *group* with its counts describing exactly *rows*, contradictions and fills."""
     contradictions = [r for r in rows if not r.is_fill]
-    tiers = _tiers_by_file(contradictions)
+    tiers = tiers_by_file(contradictions)
     return replace(
         group,
         flagged=sum(tiers.values()),
@@ -628,47 +612,6 @@ def _summarize(  # noqa: PLR0913 - one keyword per reported count, cohesive by d
     if errors:
         head += f" {errors} release lookup(s) errored and stay pending. Re-run to retry."
     return head
-
-
-# --- view narrowing ------------------------------------------------------------------
-
-
-def _narrow(
-    report: ReleaseDisagreementsReport,
-    *,
-    tier: str | None,
-    folder_key: str | None,
-    limit: int | None,
-    group: bool,
-) -> ReleaseDisagreementsReport:
-    """Return *report* with its rows filtered for display. The run counts never change.
-
-    Groups ride only on the grouped view. A *folder_key* wins over *group*: that call returns
-    the folder's flat rows and no groups, like every sibling detector. A *tier* filters the rows
-    first, and the grouped view is refolded over the filtered rows.
-    """
-    rows = rows_in_tier(report.rows, tier)
-    fill_rows = rows_in_tier(report.fill_rows, tier)
-    tier_groups = (
-        report.groups if tier is None else regroup(report.groups, rows + fill_rows, _refold_group)
-    )
-    if folder_key is not None:
-        rows = [r for r in rows if path_keys.path_key(r.folder) == folder_key]
-        fill_rows = [r for r in fill_rows if path_keys.path_key(r.folder) == folder_key]
-    if limit is not None:
-        rows = rows[:limit]
-        fill_rows = fill_rows[:limit]
-
-    flat = not group or folder_key is not None
-    groups = [] if flat else tier_groups
-    if limit is not None:
-        groups = groups[:limit]
-    return replace(
-        report,
-        rows=rows if flat else [],
-        fill_rows=fill_rows if flat else [],
-        groups=groups,
-    )
 
 
 # --- public entry --------------------------------------------------------------------
@@ -783,4 +726,16 @@ def detect_release_disagreements(  # noqa: PLR0913 - cohesive keyword-only scope
         report.releases_checked,
         report.total_files,
     )
-    return _narrow(report, tier=tier, folder_key=folder_key, limit=limit, group=group)
+    return narrow(
+        report,
+        rows=report.rows,
+        groups=report.groups,
+        secondary_field="fill_rows",
+        secondary_rows=report.fill_rows,
+        secondary_in_tier=True,
+        refold=_refold_group,
+        tier=tier,
+        folder_key=folder_key,
+        limit=limit,
+        group=group,
+    )

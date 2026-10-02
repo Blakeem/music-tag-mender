@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 from conftest import FOLDER_SPELLINGS, make_track, spell_folder
-from tagmend.engine import album_conflicts, path_keys
+from tagmend.engine import album_conflicts, detector_core, path_keys
 from tagmend.engine.album_conflicts import _REASON_NO_ALBUMARTIST, _classify, _FileInput
 from tagmend.engine.library import scan_library
 
@@ -45,6 +45,29 @@ def _f(  # noqa: PLR0913 - one keyword per detected field, cohesive by design
         release_mbid=release_mbid,
         date=date,
         compilation=compilation,
+    )
+
+
+def _view(
+    report: album_conflicts.AlbumConflictsReport,
+    *,
+    tier: str | None,
+    folder_key: str | None,
+    limit: int | None,
+    group: bool = False,
+) -> album_conflicts.AlbumConflictsReport:
+    return detector_core.narrow(
+        report,
+        rows=report.rows,
+        groups=report.groups,
+        secondary_field="folder_context_rows",
+        secondary_rows=report.folder_context_rows,
+        secondary_in_tier=False,
+        refold=album_conflicts._refold_group,
+        tier=tier,
+        folder_key=folder_key,
+        limit=limit,
+        group=group,
     )
 
 
@@ -371,7 +394,7 @@ def test_a_context_folder_never_appears_under_a_tier_filter() -> None:
         _f(1, folder=r"C:\m\B\Singles", album="One"),
         _f(2, folder=r"C:\m\B\Singles", filename="b.mp3", album="Two"),
     ]
-    report = album_conflicts._narrow(_classify(files), tier="medium", folder_key=None, limit=None)
+    report = _view(_classify(files), tier="medium", folder_key=None, limit=None)
 
     assert report.rows == []
 
@@ -649,7 +672,7 @@ def _three_folder_report() -> album_conflicts.AlbumConflictsReport:
 
 
 def test_a_folder_narrowing_also_narrows_the_context_rows() -> None:
-    view = album_conflicts._narrow(
+    view = _view(
         _three_folder_report(),
         tier=None,
         folder_key=path_keys.path_key(r"C:\m\A\Album"),
@@ -661,7 +684,7 @@ def test_a_folder_narrowing_also_narrows_the_context_rows() -> None:
 
 
 def test_a_limit_caps_the_context_rows_too() -> None:
-    view = album_conflicts._narrow(_three_folder_report(), tier=None, folder_key=None, limit=1)
+    view = _view(_three_folder_report(), tier=None, folder_key=None, limit=1)
 
     assert len(view.rows) == 1
     assert len(view.folder_context_rows) == 1
@@ -669,15 +692,15 @@ def test_a_limit_caps_the_context_rows_too() -> None:
 
 def test_groups_are_returned_only_for_the_grouped_view() -> None:
     report = _three_folder_report()
-    flat = album_conflicts._narrow(report, tier=None, folder_key=None, limit=None)
-    grouped = album_conflicts._narrow(report, tier=None, folder_key=None, limit=None, group=True)
+    flat = _view(report, tier=None, folder_key=None, limit=None)
+    grouped = _view(report, tier=None, folder_key=None, limit=None, group=True)
 
     assert flat.groups == []
     assert len(grouped.groups) == 3
 
 
 def test_folder_wins_over_group() -> None:
-    view = album_conflicts._narrow(
+    view = _view(
         _three_folder_report(),
         tier=None,
         folder_key=path_keys.path_key(r"C:\m\A\Album"),
@@ -701,7 +724,7 @@ def test_grouped_view_respects_tier() -> None:
         ],
     )
 
-    view = album_conflicts._narrow(report, tier="high", folder_key=None, limit=None, group=True)
+    view = _view(report, tier="high", folder_key=None, limit=None, group=True)
 
     assert [g.folder for g in view.groups] == [r"C:\m\A\Album"]
     assert view.groups[0].flagged == 1
@@ -711,7 +734,7 @@ def test_grouped_view_respects_tier() -> None:
 
 
 def test_a_limit_caps_the_groups_in_the_grouped_view() -> None:
-    view = album_conflicts._narrow(
+    view = _view(
         _three_folder_report(),
         tier=None,
         folder_key=None,

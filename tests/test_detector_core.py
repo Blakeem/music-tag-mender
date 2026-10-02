@@ -15,6 +15,15 @@ class _Item:
     name: str
 
 
+@dataclass(frozen=True, slots=True)
+class _Row:
+    file_id: int
+    folder: str
+    tier: str
+    filename: str = "a.mp3"
+    field: str = "date"
+
+
 @pytest.mark.parametrize(
     ("value", "expected"),
     [
@@ -60,3 +69,21 @@ def test_group_by_folder_preserves_first_seen_order() -> None:
     assert list(grouped) == ["b", "a"]
     assert [i.name for i in grouped["b"]] == ["1", "3"]
     assert [i.name for i in grouped["a"]] == ["2", "4"]
+
+
+def test_tiers_by_file_counts_each_file_once_at_its_worst_tier() -> None:
+    rows = [_Row(1, "a", "low"), _Row(1, "a", "high"), _Row(2, "a", "medium")]
+
+    assert detector_core.tiers_by_file(rows) == {"high": 1, "medium": 1}
+
+
+def test_regroup_matches_rows_to_groups_by_the_given_key() -> None:
+    groups = [_Item("a", "x"), _Item("a", "y"), _Item("b", "x")]
+    rows = [_Item("a", "y"), _Item("b", "x"), _Item("b", "x")]
+
+    def refold(group: _Item, group_rows: list[_Item]) -> _Item:
+        return _Item(group.folder, f"{group.name}{len(group_rows)}")
+
+    regrouped = detector_core.regroup(groups, rows, refold, key=lambda i: (i.folder, i.name))
+
+    assert regrouped == [_Item("a", "y1"), _Item("b", "x2")]

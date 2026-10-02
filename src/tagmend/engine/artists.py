@@ -72,9 +72,9 @@ from tagmend.engine import (
     staging,
     store,
 )
-from tagmend.engine.detector_core import FieldDict
 from tagmend.engine.lastfm import LastfmClient, LastfmError
 from tagmend.engine.musicbrainz import MusicBrainzClient, MusicBrainzError
+from tagmend.engine.serialize import FieldDict
 from tagmend.engine.text_keys import artist_name_key
 from tagmend.engine.validation import check_limit
 from tagmend.log import get_logger

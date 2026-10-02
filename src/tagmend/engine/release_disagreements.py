@@ -44,7 +44,6 @@ from typing import TYPE_CHECKING, Final
 
 from tagmend.engine import db, lookup_clients, path_keys, release_match, schema, store
 from tagmend.engine.detector_core import (
-    FieldDict,
     Tier,
     group_by_folder,
     narrow,
@@ -53,6 +52,7 @@ from tagmend.engine.detector_core import (
     validate_tier,
 )
 from tagmend.engine.musicbrainz import MusicBrainzClient, MusicBrainzError
+from tagmend.engine.serialize import FieldDict
 from tagmend.engine.validation import check_limit
 from tagmend.log import get_logger
 

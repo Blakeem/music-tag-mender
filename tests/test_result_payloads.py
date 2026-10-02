@@ -14,13 +14,13 @@ from tagmend.engine import (
     album_conflicts,
     album_gaps,
     artists,
-    detector_core,
     genres,
     library,
     mismatch,
     path_deviations,
     paths,
     release_disagreements,
+    serialize,
     staging,
     track_conflicts,
     versioning,
@@ -1002,7 +1002,7 @@ class _Plain:
 
 
 @dataclass(frozen=True, slots=True)
-class _Walked(detector_core.FieldDict):
+class _Walked(serialize.FieldDict):
     plain: _Plain
     by_key: dict[str, _Plain]
     pairs: list[tuple[int, int]]

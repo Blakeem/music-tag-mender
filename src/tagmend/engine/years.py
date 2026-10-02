@@ -30,8 +30,8 @@ from typing import TYPE_CHECKING
 import mutagen
 
 from tagmend.engine import axis, axis_resolver, staging, store
-from tagmend.engine.detector_core import FieldDict
 from tagmend.engine.musicbrainz import MusicBrainzClient, MusicBrainzError
+from tagmend.engine.serialize import FieldDict
 from tagmend.engine.tags import read_tags
 
 if TYPE_CHECKING:

@@ -23,8 +23,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
 from tagmend.engine import db, mismatch, naming, path_keys, paths, schema, store
-from tagmend.engine.detector_core import FieldDict, parse_position
+from tagmend.engine.detector_core import parse_position
 from tagmend.engine.path_text import clean_value
+from tagmend.engine.serialize import FieldDict
 from tagmend.engine.text_keys import alnum_ascii_key, artist_name_key
 from tagmend.engine.validation import check_limit
 from tagmend.log import get_logger

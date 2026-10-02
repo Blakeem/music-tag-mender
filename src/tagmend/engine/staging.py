@@ -37,7 +37,7 @@ from typing import TYPE_CHECKING, Final, cast
 import mutagen
 
 from tagmend.engine import axis, clock, commits, db, path_keys, schema, store, versioning
-from tagmend.engine.detector_core import FieldDict
+from tagmend.engine.serialize import FieldDict
 from tagmend.engine.tags import (
     MANAGED_SET_VERSION,
     MANAGED_TAGS,

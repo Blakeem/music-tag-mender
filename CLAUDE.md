@@ -344,6 +344,7 @@ src/tagmend/
     text_keys.py    the shared text fold keys (alnum, display, artist name, loose, title)
     clock.py        the engine's one source of the current time
     validation.py   argument checks shared by the engine entry points
+    serialize.py    FieldDict: the to_dict the result dataclasses derive from their fields
     scan.py         filesystem discovery + signatures
     health.py       check_health / readiness + interrupted-commit report
     store.py        pure data access: files/file_tags + tag_revisions[_staged] + tag-axis derived status + mismatch status

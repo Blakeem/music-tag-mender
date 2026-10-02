@@ -101,8 +101,9 @@ from tagmend.engine import (
     schema,
     store,
 )
-from tagmend.engine.detector_core import FieldDict, parse_position
+from tagmend.engine.detector_core import parse_position
 from tagmend.engine.path_text import part_problems
+from tagmend.engine.serialize import FieldDict
 from tagmend.log import get_logger
 
 if TYPE_CHECKING:

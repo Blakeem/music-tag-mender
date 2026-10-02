@@ -40,7 +40,7 @@ from typing import TYPE_CHECKING, Final
 import mutagen
 
 from tagmend.engine import acoustid, clock, commits, db, paths, schema, store
-from tagmend.engine.detector_core import FieldDict
+from tagmend.engine.serialize import FieldDict
 from tagmend.engine.tags import (
     MANAGED_SET_VERSION,
     MANAGED_TAGS,

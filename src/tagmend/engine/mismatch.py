@@ -29,7 +29,6 @@ from tagmend.engine import axis, axis_status, clock, db, path_keys, schema, stor
 from tagmend.engine.detector_core import (
     NON_ALBUM_FOLDERS,
     TIER_RANK,
-    FieldDict,
     Tier,
     group_by_folder,
     parse_position,
@@ -37,6 +36,7 @@ from tagmend.engine.detector_core import (
 )
 from tagmend.engine.parsing import parse_filename_track
 from tagmend.engine.path_text import clean_value
+from tagmend.engine.serialize import FieldDict
 from tagmend.engine.text_keys import alnum_ascii_key, loose_key
 from tagmend.engine.validation import check_limit, require_choice
 from tagmend.log import get_logger

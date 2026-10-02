@@ -35,8 +35,8 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from tagmend.engine import axis, axis_resolver, classify, staging, store
-from tagmend.engine.detector_core import FieldDict
 from tagmend.engine.lastfm import LastfmClient, LastfmError
+from tagmend.engine.serialize import FieldDict
 
 if TYPE_CHECKING:
     import sqlite3

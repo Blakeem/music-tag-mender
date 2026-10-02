@@ -50,13 +50,13 @@ from typing import TYPE_CHECKING, Final
 from tagmend.engine import db, path_keys, schema, store
 from tagmend.engine.detector_core import (
     TIER_RANK,
-    FieldDict,
     Tier,
     group_by_folder,
     is_non_album_folder,
     narrow,
     validate_tier,
 )
+from tagmend.engine.serialize import FieldDict
 from tagmend.engine.text_keys import display_key
 from tagmend.engine.validation import check_limit
 from tagmend.log import get_logger

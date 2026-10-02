@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING, Final
 import mutagen
 
 from tagmend.engine import axis, clock, db, mismatch, path_keys, scan, schema, store, versioning
-from tagmend.engine.detector_core import FieldDict
+from tagmend.engine.serialize import FieldDict
 from tagmend.engine.tags import TAG_READER_VERSION, read_tags
 from tagmend.engine.validation import check_limit, require_choice
 from tagmend.log import get_logger

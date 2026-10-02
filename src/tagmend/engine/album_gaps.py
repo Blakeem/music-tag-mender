@@ -39,8 +39,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
 from tagmend.engine import axis, classify, db, lookup_clients, parsing, path_keys, schema, store
-from tagmend.engine.detector_core import FieldDict, group_by_folder
+from tagmend.engine.detector_core import group_by_folder
 from tagmend.engine.musicbrainz import MusicBrainzClient, MusicBrainzError
+from tagmend.engine.serialize import FieldDict
 from tagmend.engine.tags import VERIFIABLE_SUFFIXES
 from tagmend.engine.text_keys import alnum_key
 from tagmend.engine.validation import check_limit

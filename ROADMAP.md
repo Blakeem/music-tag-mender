@@ -15,10 +15,11 @@ The owner decides each one. TagMend never deletes a file.
 - Duplicates. Pendulum "(2010) - Immersion" holds every track twice (files 6882 to 6896 and
   6897 to 6911). The remaining copy then takes a stamp onto release a8515645. Imperative
   Reaction "(1999)" and "(2006) Eulogy For The Sick Child" are the same 14 files. KMFDM 4732 is
-  a second "Love Is Like". Velvet Acid Christ 10526 holds the audio of Apoptygma Berzerk 437. Killswitch Engage 4674 holds the audio of 4687. Blue
-  Stahli 1268 holds the audio of Celldweller 1637. Neon Hitch holds three single pairs (6171
-  and 6181, 6174 and 6179, 6175 and 6180). The path planner holds the Pendulum, Imperative
-  Reaction, KMFDM and Velvet Acid Christ albums until the owner decides.
+  a second "Love Is Like". Velvet Acid Christ 10526 holds the audio of Apoptygma Berzerk 437.
+  Killswitch Engage 4674 holds the audio of 4687. Blue Stahli 1268 holds the audio of
+  Celldweller 1637. Neon Hitch holds three single pairs (6171 and 6181, 6174 and 6179, 6175 and
+  6180). The path planner holds the Pendulum, Imperative Reaction, KMFDM and Velvet Acid Christ
+  albums until the owner decides.
 - Cue sheets. 86 files sit in folders whose cue sheet names the audio files, so a rename would
   break the cue. The folders are Beck "Morning Phase", Code 64 "Departure" and "Trialogue",
   Taylor Swift "1989" and "Best Of", and The Postal Service "2 Give Up_".

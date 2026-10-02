@@ -135,7 +135,8 @@ class Settings:
     """Resolved, typed settings with file + env overrides already applied."""
 
     music_path: Path | None
-    lastfm_api_key: str | None
+    # Both API keys stay out of the repr so a logged Settings never leaks them.
+    lastfm_api_key: str | None = field(repr=False)
     db_path: Path
     # M2 genre/Last.fm settings carry defaults so direct construction (tests, fixtures)
     # needn't restate them; ``load_settings`` always passes the coerced values.
@@ -154,7 +155,7 @@ class Settings:
     container_folders: tuple[str, ...] = ()
     # The path naming pattern. Empty means the built-in default the naming module defines.
     naming_pattern: str = ""
-    # Song-axis settings. The key stays out of the repr so a logged Settings never leaks it.
+    # Song-axis settings.
     acoustid_api_key: str | None = field(default=None, repr=False)
     fpcalc_path: str | None = None
     acoustid_rate_per_sec: float = _ACOUSTID_RATE_PER_SEC_DEFAULT

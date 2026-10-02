@@ -325,8 +325,9 @@ def test_song_stage_limit_is_coerced_like_the_other_limits(raw: str, expected: i
     assert config.load_settings().song_stage_limit == expected
 
 
-def test_the_acoustid_key_is_redacted_from_the_settings_repr() -> None:
-    config.set_setting("acoustid_api_key", "secret-acoustid-key")
+@pytest.mark.parametrize("key", sorted(config.SECRET_KEYS))
+def test_every_api_key_is_redacted_from_the_settings_repr(key: str) -> None:
+    config.set_setting(key, "secret-api-key")
     settings = config.load_settings()
-    assert settings.acoustid_api_key == "secret-acoustid-key"
-    assert "secret-acoustid-key" not in repr(settings)
+    assert getattr(settings, key) == "secret-api-key"
+    assert "secret-api-key" not in repr(settings)

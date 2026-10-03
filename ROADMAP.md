@@ -3,7 +3,7 @@
 Updated 2026-10-02. This file lists only the remaining work, in order. `CLAUDE.md` maps what
 shipped. `PLAN.md` holds the design.
 
-The final run on a fresh copy of `E:\Music` is done. The working copy (`music/`) holds 11,148 files
+The final run on a fresh copy of `E:\Music` is done. The working copy (`music/`) holds 11,119 files
 after the owner's cleanup removed one-off files, duplicates, albums the owner does not play, a
 second Taylor Swift album and a second rip of The Postal Service "Give Up". The owner added one
 MAPHRA track, Carpenter Brut "Leather Terror" and Assemblage 23 "Endure". Every audio payload
@@ -14,14 +14,14 @@ name files in the fresh ledger. A file the owner moved by hand has a new id.
 
 The owner decides each one. TagMend never deletes a file.
 
-- Duplicates. Pendulum "(2010) - Immersion" holds every track twice (files 6882 to 6896 and
-  6897 to 6911). The remaining copy then takes a stamp onto release a8515645. Imperative
-  Reaction "(1999)" and "(2006) Eulogy For The Sick Child" are the same 14 files. KMFDM 4732 is
-  a second "Love Is Like". Velvet Acid Christ 10526 holds the audio of Apoptygma Berzerk 437.
-  Killswitch Engage 4674 holds the audio of 4687. Blue Stahli 1268 holds the audio of
-  Celldweller 1637. Neon Hitch holds three single pairs (6171 and 6181, 6174 and 6179, 6175 and
-  6180). The path planner holds the Pendulum, Imperative Reaction, KMFDM and Velvet Acid Christ
-  albums until the owner decides.
+- Duplicates. KMFDM "Skold vs KMFDM" holds 23 files for 22 tracks. File 4732, named "05 -
+  Bloodsport", is a second "Love Is Like" (245 s against 248 s), and each later filename names
+  the track before the one it holds. Velvet Acid Christ "Calling ov the Dead" file 10526, named
+  "05 - The Dead", holds Apoptygma Berzerk "Untitled 3" (file 437). The file named "04 - The
+  Calling" holds track 5, and track 4 is missing. The path planner holds both albums until the
+  owner removes 4732 and 10526. Killswitch Engage 4674 holds the audio of 4687. Blue Stahli 1268
+  holds the audio of Celldweller 1637. Neon Hitch holds three single pairs (6171 and 6181, 6174
+  and 6179, 6175 and 6180).
 - Covers. 13 albums show no cover after commit 380. Weezer "Raditude" holds two images that may be
   the front. The owner kept the concert cover off "Tool\Other". No source exists for Gary Numan
   "Replicas" and "The Fury", team sleep, Leaf Yard, Roberto Paci Dalò "Sparks", Solitary
@@ -60,10 +60,10 @@ The owner decides each one. TagMend never deletes a file.
   Navidrome shows no album year when the tracks disagree.
 - Wrong credits. Tool "Unreleased" file 10322 is Joe Satriani's "Drum Solo". File 10320 may be
   Pink Floyd's "Comfortably Numb" demo.
-- Extras off their release. Rank 1 file 7454 is an unidentified second "Cosmomatic". Skrillex "My
-  Name Is Skrillex" holds 6 extras that carry the EP id but sit on no release. Neon Hitch file 6134
-  carries the "301 to Paradise" release id, which does not list it. VNV Nation file 10668 is the
-  single's "Darkangel (Gabriel)" in the album's track 9 slot.
+- Extras off their release. Skrillex "My Name Is Skrillex" holds 6 extras that carry the EP id
+  but sit on no release. Neon Hitch file 6134 carries the "301 to Paradise" release id, which
+  does not list it. VNV Nation file 10668 is the single's "Darkangel (Gabriel)" in the album's
+  track 9 slot.
 - White Stripes file 10138 "Rayed X" is probably "Rated X".
 - Held names. "Miley Cyrus" (16 files, plus the `artists` list of file 2873) is held as `manual`,
   since MusicBrainz now credits "MILEY". File 4279 is held as `manual` with `artist` "J.Views"

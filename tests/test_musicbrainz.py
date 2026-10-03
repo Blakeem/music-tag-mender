@@ -38,7 +38,7 @@ if TYPE_CHECKING:
 def _group(**overrides: object) -> dict[str, object]:
     """Build one release-group entry as the MB JSON search response shapes it.
 
-    Defaults describe a clean Album hit (*Paranoid*, 1970, score 100, one release);
+    Defaults describe a clean Album hit (*Paranoid*, 1970, score 100, one Official release);
     pass keyword overrides (e.g. ``primary_type="Single"``, ``secondary_types=["Live"]``,
     ``releases=None``) to vary it.
     """
@@ -48,7 +48,7 @@ def _group(**overrides: object) -> dict[str, object]:
         "primary-type": "Album",
         "first-release-date": "1970-09-18",
         "score": 100,
-        "releases": [{"id": "rel-1"}],
+        "releases": [{"id": "rel-1", "status": "Official"}],
     }
     # Normalize Python-friendly override keys to the MB JSON spellings.
     rename = {
@@ -156,6 +156,73 @@ def test_picks_highest_scoring_album(db_conn: sqlite3.Connection) -> None:
     assert album is not None
     assert album.original_date == "1970"
     assert album.release_group_mbid == "rg-hi"
+
+
+def test_score_tie_prefers_the_group_holding_an_official_release(
+    db_conn: sqlite3.Connection,
+) -> None:
+    # MusicBrainz lists Team Sleep's 2003 promo CD-R group ahead of the 2005 album at the same
+    # score.
+    body = _body(
+        _group(
+            title="Team Sleep",
+            first_release_date="2003",
+            rgid="rg-promo",
+            releases=[{"id": "rel-promo", "status": "Promotion"}],
+        ),
+        _group(
+            title="Team Sleep",
+            first_release_date="2005-05-09",
+            rgid="rg-album",
+            releases=[{"id": "rel-gb", "status": "Official"}],
+        ),
+    )
+    client, _ = _client(db_conn, [_json_response(body)])
+    with client:
+        album = client.album_first_release("Team Sleep", "Team Sleep")
+    assert album is not None
+    assert album.original_date == "2005-05-09"
+    assert album.release_group_mbid == "rg-album"
+
+
+def test_higher_score_wins_over_an_official_release(db_conn: sqlite3.Connection) -> None:
+    body = _body(
+        _group(first_release_date="1999", score=90, releases=[{"id": "r1", "status": "Official"}]),
+        _group(
+            first_release_date="1970",
+            score=100,
+            rgid="rg-hi",
+            releases=[{"id": "r2", "status": "Promotion"}],
+        ),
+    )
+    client, _ = _client(db_conn, [_json_response(body)])
+    with client:
+        album = client.album_first_release("Artist", "Paranoid")
+    assert album is not None
+    assert album.release_group_mbid == "rg-hi"
+
+
+def test_full_tie_sharing_a_year_keeps_the_first(db_conn: sqlite3.Connection) -> None:
+    body = _body(
+        _group(first_release_date="1970-09-18", rgid="rg-first"),
+        _group(first_release_date="1970", rgid="rg-second"),
+    )
+    client, _ = _client(db_conn, [_json_response(body)])
+    with client:
+        album = client.album_first_release("Artist", "Paranoid")
+    assert album is not None
+    assert album.release_group_mbid == "rg-first"
+
+
+def test_full_tie_across_years_is_no_match(db_conn: sqlite3.Connection) -> None:
+    # Weezer names several self-titled albums, each Official and scoring 100.
+    body = _body(
+        _group(title="Weezer", first_release_date="1994-05-10", rgid="rg-blue"),
+        _group(title="Weezer", first_release_date="2001-05-15", rgid="rg-green"),
+    )
+    client, _ = _client(db_conn, [_json_response(body)])
+    with client:
+        assert client.album_first_release("Weezer", "Weezer") is None
 
 
 def test_skips_non_album_primary_type(db_conn: sqlite3.Connection) -> None:
@@ -443,7 +510,13 @@ def _recording(group: dict[str, object] | None = None, **overrides: object) -> d
         "id": "rec-1",
         "title": "War Pigs",
         "score": 100,
-        "releases": [{"id": "rel-1", "release-group": _rec_group() if group is None else group}],
+        "releases": [
+            {
+                "id": "rel-1",
+                "status": "Official",
+                "release-group": _rec_group() if group is None else group,
+            }
+        ],
     }
     rename = {"rec_id": "id"}
     for key, value in overrides.items():
@@ -484,6 +557,87 @@ def test_recording_search_picks_highest_scoring(db_conn: sqlite3.Connection) -> 
     assert recording.album_title == "High"
     assert recording.release_group_mbid == "rg-hi"
     assert recording.recording_mbid == "rec-hi"
+
+
+def test_recording_search_tie_prefers_the_recording_on_an_official_album(
+    db_conn: sqlite3.Connection,
+) -> None:
+    bootleg = _recording(
+        rec_id="rec-demo",
+        releases=[
+            {
+                "id": "rel-demo",
+                "status": "Bootleg",
+                "release-group": _rec_group(title="Unmastered Demos", rgid="rg-demo"),
+            }
+        ],
+    )
+    body = _recording_body(
+        bootleg,
+        _recording(_rec_group(title="Team Sleep", rgid="rg-album"), rec_id="rec-album"),
+    )
+    client, _ = _client(db_conn, [_json_response(body)])
+    with client:
+        recording = client.recording_search("Team Sleep", "Ever (Foreign Flag)")
+    assert recording is not None
+    assert recording.album_title == "Team Sleep"
+    assert recording.recording_mbid == "rec-album"
+
+
+def test_recording_search_takes_the_official_release_of_one_recording(
+    db_conn: sqlite3.Connection,
+) -> None:
+    entry = _recording(
+        releases=[
+            {
+                "id": "rel-demo",
+                "status": "Bootleg",
+                "release-group": _rec_group(title="Unmastered Demos", rgid="rg-demo"),
+            },
+            {
+                "id": "rel-album",
+                "status": "Official",
+                "release-group": _rec_group(title="Team Sleep", rgid="rg-album"),
+            },
+        ],
+    )
+    client, _ = _client(db_conn, [_json_response(_recording_body(entry))])
+    with client:
+        recording = client.recording_search("Team Sleep", "Ever (Foreign Flag)")
+    assert recording is not None
+    assert recording.album_title == "Team Sleep"
+    assert recording.release_group_mbid == "rg-album"
+
+
+def test_recording_search_falls_back_to_a_release_that_is_not_official(
+    db_conn: sqlite3.Connection,
+) -> None:
+    entry = _recording(
+        releases=[
+            {
+                "id": "rel-demo",
+                "status": "Bootleg",
+                "release-group": _rec_group(title="Unmastered Demos", rgid="rg-demo"),
+            }
+        ],
+    )
+    client, _ = _client(db_conn, [_json_response(_recording_body(entry))])
+    with client:
+        recording = client.recording_search("Team Sleep", "Ever (Foreign Flag)")
+    assert recording is not None
+    assert recording.album_title == "Unmastered Demos"
+
+
+def test_recording_search_full_tie_keeps_the_first(db_conn: sqlite3.Connection) -> None:
+    body = _recording_body(
+        _recording(_rec_group(title="First", rgid="rg-first"), rec_id="rec-first"),
+        _recording(_rec_group(title="Second", rgid="rg-second"), rec_id="rec-second"),
+    )
+    client, _ = _client(db_conn, [_json_response(body)])
+    with client:
+        recording = client.recording_search("Artist", "Title")
+    assert recording is not None
+    assert recording.recording_mbid == "rec-first"
 
 
 def test_recording_search_skips_non_album_release_group(db_conn: sqlite3.Connection) -> None:

@@ -8,12 +8,12 @@ are used:
 * ``/ws/2/release-group/`` (Lucene query ``artist:"…" AND releasegroup:"…"``): ranked
   candidate release groups, feeding ``resolve_years`` and ``detect_year_disagreements``. A
   candidate is kept only when it has ``primary-type == "Album"``, no non-studio secondary type,
-  a title matching the album asked for and a non-empty ``first-release-date``. The
-  highest-scoring one is picked.
+  a title matching the album asked for and a non-empty ``first-release-date``.
+  :func:`_select_album` picks one.
 * ``/ws/2/recording/`` (Lucene query ``artist:"…" AND recording:"…"``): a review-only
   ``(artist, title)`` → album lookup feeding ``detect_album_gaps``' recording tier. Only a
   recording with a release whose release group is a usable Album (same ``primary-type`` and
-  secondary-type gate) is kept. The highest-scoring one is picked. The lookup returns its
+  secondary-type gate) is kept. :func:`_select_recording` picks one. The lookup returns its
   release group's title, its recording MBID and its release-group MBID.
 * ``/ws/2/artist/<mbid>?inc=aliases``: a direct lookup by the MBID a file carries, feeding
   ``resolve_artists``' MusicBrainz tier.
@@ -44,6 +44,7 @@ import json
 import re
 import time
 from dataclasses import dataclass
+from operator import itemgetter
 from typing import TYPE_CHECKING, Final, Literal, Protocol, Self, cast, overload
 
 from tagmend.engine import clock
@@ -58,7 +59,7 @@ from tagmend.engine.store import (
     put_cached_mb_release,
     put_cached_mb_release_group,
 )
-from tagmend.engine.text_keys import title_key
+from tagmend.engine.text_keys import title_key, year_key
 from tagmend.log import get_logger
 
 if TYPE_CHECKING:
@@ -101,7 +102,7 @@ _EXCLUDED_SECONDARY_TYPES: Final = frozenset(
 # Folded into both cache keys so changing the selection or parse rules re-fetches every lookup
 # resolved under the old ones, instead of replaying its stale cached pick forever. The album
 # and recording paths share the excluded-secondary-type set, so one bump must invalidate both.
-_SELECTION_VERSION: Final = "3"
+_SELECTION_VERSION: Final = "4"
 
 # The artist lookup runs its own version token: it has no selection rules to tighten, so a
 # release-group rule change must not re-fetch every artist. Bump only when the fields
@@ -114,6 +115,11 @@ _RELEASE_VERSION: Final = "5"
 # One trailing parenthetical or bracketed segment: the edition suffix a tag carries and a release
 # group does not (``Fiction (Deluxe Edition)``, ``The Red Album [Deluxe Edition]``).
 _EDITION_SUFFIX: Final = re.compile(r"\s*[(\[][^()\[\]]*[)\]]\s*$")
+
+_OFFICIAL: Final = "Official"
+
+# A search candidate's rank: its score, then whether it holds an Official release.
+type _Rank = tuple[int, bool]
 
 # A 404 from the artist endpoint is a real answer (no such artist), not a transient failure.
 _HTTP_NOT_FOUND: Final = 404
@@ -1058,24 +1064,35 @@ def _select_album(body: dict[str, object], requested_album: str) -> MBReleaseGro
 
     Keeps only ``primary-type == "Album"`` groups with no excluded secondary type, a title
     matching *requested_album* (see :func:`_title_matches`) and a non-empty
-    ``first-release-date``. Returns the highest-scoring one (``None`` when nothing usable).
-    The date is kept exactly as MusicBrainz gives it, which is Picard's ``originaldate`` form.
+    ``first-release-date``. Ranks them by score, then by holding an Official release, since a
+    promo or bootleg group can share the album's title and score and be listed first. Of the
+    groups sharing the top rank, returns the first when they share a first-release year, else
+    ``None``, since the year is then ambiguous (``Weezer`` names several albums). The date is
+    kept exactly as MusicBrainz gives it, which is Picard's ``originaldate`` form.
     """
     raw_groups = body.get("release-groups")
     if not isinstance(raw_groups, list):
         return None
 
-    best: MBReleaseGroup | None = None
-    best_score = -1
-    for entry in raw_groups:
-        candidate = _candidate(entry, requested_album)
-        if candidate is None:
-            continue
-        score = candidate[0]
-        if score > best_score:
-            best_score = score
-            best = candidate[1]
-    return best
+    candidates = [
+        candidate
+        for entry in raw_groups
+        if (candidate := _candidate(entry, requested_album)) is not None
+    ]
+    if not candidates:
+        return None
+
+    top_rank = max(rank for rank, _ in candidates)
+    leaders = [release_group for rank, release_group in candidates if rank == top_rank]
+    leader_years = {year_key(release_group.original_date) for release_group in leaders}
+    if len(leader_years) > 1:
+        logger.info(
+            "musicbrainz album %r is ambiguous: tied release groups span years %s",
+            requested_album,
+            sorted(str(year) for year in leader_years),
+        )
+        return None
+    return leaders[0]
 
 
 def _title_matches(requested_album: str, candidate_title: str) -> bool:
@@ -1095,8 +1112,8 @@ def _title_matches(requested_album: str, candidate_title: str) -> bool:
     return title_key(_EDITION_SUFFIX.sub("", requested_album)) == candidate_key
 
 
-def _candidate(entry: object, requested_album: str) -> tuple[int, MBReleaseGroup] | None:
-    """Return ``(score, MBReleaseGroup)`` for a usable Album release group matching the request."""
+def _candidate(entry: object, requested_album: str) -> tuple[_Rank, MBReleaseGroup] | None:
+    """Return ``((score, holds Official), MBReleaseGroup)`` for a usable matching Album group."""
     if not isinstance(entry, dict):
         return None
     if entry.get("primary-type") != "Album":
@@ -1120,7 +1137,7 @@ def _candidate(entry: object, requested_album: str) -> tuple[int, MBReleaseGroup
     rgid = entry.get("id")
     release_group_mbid = rgid if isinstance(rgid, str) else ""
     return (
-        score,
+        (score, _holds_official_release(entry)),
         MBReleaseGroup(
             album_title=title,
             original_date=original_date,
@@ -1147,35 +1164,34 @@ def _select_recording(body: dict[str, object]) -> MBRecording | None:
     """Pick the best recording whose release group is a usable Album from a search response.
 
     Keeps only recordings that have a release whose release group is ``primary-type ==
-    "Album"`` with no excluded secondary type. Returns the highest-scoring one's
-    release-group title (+ ids), or ``None`` when nothing usable exists.
+    "Album"`` with no excluded secondary type. Ranks them as :func:`_select_album` does, by
+    score and then by an Official release, and returns the release-group title and ids of the
+    first top-ranked recording, or ``None`` when nothing usable exists. A tie stays answered,
+    since a human reviews every album this lookup proposes.
     """
     raw_recordings = body.get("recordings")
     if not isinstance(raw_recordings, list):
         return None
 
-    best: MBRecording | None = None
-    best_score = -1
-    for entry in raw_recordings:
-        candidate = _recording_candidate(entry)
-        if candidate is None:
-            continue
-        score = candidate[0]
-        if score > best_score:
-            best_score = score
-            best = candidate[1]
-    return best
+    candidates = [
+        candidate
+        for entry in raw_recordings
+        if (candidate := _recording_candidate(entry)) is not None
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=itemgetter(0))[1]
 
 
-def _recording_candidate(entry: object) -> tuple[int, MBRecording] | None:
-    """Return ``(score, MBRecording)`` for a recording with a usable Album release, or ``None``."""
+def _recording_candidate(entry: object) -> tuple[_Rank, MBRecording] | None:
+    """Return ``((score, holds Official), MBRecording)`` for a recording with a usable Album."""
     if not isinstance(entry, dict):
         return None
 
     release_group = _usable_release_group(entry)
     if release_group is None:
         return None
-    title, release_group_mbid = release_group
+    title, release_group_mbid, official = release_group
 
     raw_score = entry.get("score")
     score = raw_score if isinstance(raw_score, int) else 0
@@ -1183,7 +1199,7 @@ def _recording_candidate(entry: object) -> tuple[int, MBRecording] | None:
     rec_id = entry.get("id")
     recording_mbid = rec_id if isinstance(rec_id, str) and rec_id else None
     return (
-        score,
+        (score, official),
         MBRecording(
             album_title=title,
             release_group_mbid=release_group_mbid,
@@ -1192,16 +1208,20 @@ def _recording_candidate(entry: object) -> tuple[int, MBRecording] | None:
     )
 
 
-def _usable_release_group(entry: dict[str, object]) -> tuple[str, str] | None:
-    """Return ``(title, release_group_mbid)`` for the first usable Album release, or ``None``.
+def _usable_release_group(entry: dict[str, object]) -> tuple[str, str, bool] | None:
+    """Return ``(title, release_group_mbid, official)`` for the recording's best Album release.
 
     Scans the recording's ``releases``. A release's ``release-group`` qualifies when its
     ``primary-type == "Album"``, it carries no excluded secondary type, and it has a non-empty
-    title. This is :func:`_candidate`'s Album gate with no requested title to match.
+    title. This is :func:`_candidate`'s Album gate with no requested title to match. The first
+    qualifying Official release wins, else the first qualifying release, since a bootleg of
+    the song can be listed ahead of its album.
     """
     releases = entry.get("releases")
     if not isinstance(releases, list):
         return None
+
+    usable: list[tuple[str, str, bool]] = []
     for release in releases:
         if not isinstance(release, dict):
             continue
@@ -1218,8 +1238,21 @@ def _usable_release_group(entry: dict[str, object]) -> tuple[str, str] | None:
             continue
         rgid = group.get("id")
         release_group_mbid = rgid if isinstance(rgid, str) else ""
-        return (title, release_group_mbid)
-    return None
+        usable.append((title, release_group_mbid, release.get("status") == _OFFICIAL))
+
+    if not usable:
+        return None
+    return next((group for group in usable if group[2]), usable[0])
+
+
+def _holds_official_release(entry: dict[str, object]) -> bool:
+    """Return whether any release in a release group's ``releases`` list has status Official."""
+    releases = entry.get("releases")
+    if not isinstance(releases, list):
+        return False
+    return any(
+        isinstance(release, dict) and release.get("status") == _OFFICIAL for release in releases
+    )
 
 
 def _first_release_mbid(entry: dict[str, object]) -> str | None:

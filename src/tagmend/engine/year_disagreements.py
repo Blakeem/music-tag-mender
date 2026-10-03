@@ -37,6 +37,7 @@ from tagmend.engine.detector_core import (
 )
 from tagmend.engine.musicbrainz import MusicBrainzClient, MusicBrainzError
 from tagmend.engine.serialize import FieldDict
+from tagmend.engine.text_keys import year_key
 from tagmend.engine.validation import check_limit
 from tagmend.log import get_logger
 
@@ -54,8 +55,6 @@ _DATE: Final = "date"
 # How many uncached release groups one call looks up when the caller names no limit. At the one
 # request per second MusicBrainz asks for, this is about three minutes of wall clock.
 _DEFAULT_RELEASE_LIMIT: Final = 200
-
-_YEAR_LEN: Final = 4
 
 _REASON_NON_ALBUM: Final = (
     "non-album folder (singles/remixes), where a single's year legitimately differs from the "
@@ -209,17 +208,6 @@ class YearDisagreementsReport:
 # --- comparison ----------------------------------------------------------------------
 
 
-def _year(value: str | None) -> str | None:
-    """Return the four-digit year leading *value*, or ``None`` when it carries none.
-
-    ASCII digits only, so two years of equal length compare correctly as strings.
-    """
-    head = (value or "").strip()[:_YEAR_LEN]
-    if len(head) == _YEAR_LEN and head.isascii() and head.isdigit():
-        return head
-    return None
-
-
 def _compare_one(
     file: _FileInput,
     artist: str,
@@ -248,14 +236,14 @@ def _compare_one(
             ),
         )
 
-    if file.originaldate and _year(file.originaldate) != first_year:
+    if file.originaldate and year_key(file.originaldate) != first_year:
         add(
             _ORIGINALDATE,
             file.originaldate,
             Tier.HIGH,
             f"the release group was first released in {first_year}",
         )
-    date_year = _year(file.date)
+    date_year = year_key(file.date)
     if file.date and date_year is not None and date_year < first_year:
         add(
             _DATE,
@@ -296,7 +284,7 @@ def _look_up(
             lookups.error_items.append({"key": f"{artist} - {album}", "message": str(exc)})
             continue
         lookups.checked += 1
-        first_year = None if release_group is None else _year(release_group.original_date)
+        first_year = None if release_group is None else year_key(release_group.original_date)
         if release_group is None or first_year is None:
             lookups.unknown += 1
             continue

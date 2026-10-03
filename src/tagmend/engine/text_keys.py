@@ -7,6 +7,7 @@
 * :func:`artist_name_key` also treats a dash written for a word break as cosmetic.
 * :func:`loose_key` treats Unicode compatibility forms, casing and whitespace as cosmetic.
 * :func:`title_key` is :func:`alnum_key`, or :func:`loose_key` for a title it empties.
+* :func:`year_key` treats everything after a date's leading four-digit year as cosmetic.
 
 A key decides whether two spellings are the same. It is never written to disk.
 """
@@ -23,6 +24,7 @@ if TYPE_CHECKING:
 _NON_ALNUM: Final = re.compile(r"[^a-z0-9]+")
 _ASCII_ALNUM: Final = re.compile(r"[a-z0-9]+")
 _SCRIPT_CATEGORIES: Final = frozenset({"L", "M", "N"})
+_YEAR_LEN: Final = 4
 
 # Ligature/eszett map applied after casefold (which already folds ``ß`` → ``ss`` and
 # ``Æ`` → ``æ`` etc.), covering the compatibility cases NFKD does not decompose.
@@ -142,3 +144,14 @@ def loose_key(value: str) -> str:
 def title_key(title: str) -> str:
     """Return *title*'s comparison key: its :func:`alnum_key`, or :func:`loose_key` when empty."""
     return alnum_key(title) or loose_key(title)
+
+
+def year_key(value: str | None) -> str | None:
+    """Return the four-digit year leading *value*, or ``None`` when it carries none.
+
+    ASCII digits only, so two years of equal length compare correctly as strings.
+    """
+    head = (value or "").strip()[:_YEAR_LEN]
+    if len(head) == _YEAR_LEN and head.isascii() and head.isdigit():
+        return head
+    return None

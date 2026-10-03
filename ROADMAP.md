@@ -21,9 +21,6 @@ The owner decides each one. TagMend never deletes a file.
   Celldweller 1637. Neon Hitch holds three single pairs (6171 and 6181, 6174 and 6179, 6175 and
   6180). The path planner holds the Pendulum, Imperative Reaction, KMFDM and Velvet Acid Christ
   albums until the owner decides.
-- Cue sheets. 15 renames wait on a cue sheet that names the audio files, since a rename would
-  break the cue. They are the 13 tracks of Beck "Morning Phase" and two case-only renames in
-  Code 64 "Departure".
 - Covers. 16 albums show no cover after commit 376. Weezer "Raditude" holds two images that may be
   the front. The owner kept the concert cover off "Tool\Other". No source exists for Gary Numan
   "Replicas" and "The Fury", team sleep, Leaf Yard, Roberto Paci Dalò "Sparks", Solitary

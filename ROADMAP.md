@@ -3,11 +3,12 @@
 Updated 2026-10-02. This file lists only the remaining work, in order. `CLAUDE.md` maps what
 shipped. `PLAN.md` holds the design.
 
-The final run on a fresh copy of `E:\Music` is done. The working copy (`music/`) holds 11,170 files
-after the owner's cleanup removed one-off files, duplicates, a second Taylor Swift album and a
-second rip of The Postal Service "Give Up", and added one MAPHRA track. Every audio payload matches
-`E:\Music`, and the mismatch gate is open. The file ids below name files in the fresh ledger. A file
-the owner moved by hand has a new id.
+The final run on a fresh copy of `E:\Music` is done. The working copy (`music/`) holds 11,129 files
+after the owner's cleanup removed one-off files, duplicates, albums the owner does not play, a
+second Taylor Swift album and a second rip of The Postal Service "Give Up". The owner added one
+MAPHRA track and Carpenter Brut "Leather Terror". Every audio payload that came from `E:\Music`
+still matches it, and the mismatch gate is open. The file ids below name files in the fresh
+ledger. A file the owner moved by hand has a new id.
 
 ## 1. Owner questions
 
@@ -21,29 +22,28 @@ The owner decides each one. TagMend never deletes a file.
   Celldweller 1637. Neon Hitch holds three single pairs (6171 and 6181, 6174 and 6179, 6175 and
   6180). The path planner holds the Pendulum, Imperative Reaction, KMFDM and Velvet Acid Christ
   albums until the owner decides.
-- Covers. 16 albums show no cover after commit 376. Weezer "Raditude" holds two images that may be
+- Covers. 13 albums show no cover after commit 380. Weezer "Raditude" holds two images that may be
   the front. The owner kept the concert cover off "Tool\Other". No source exists for Gary Numan
   "Replicas" and "The Fury", team sleep, Leaf Yard, Roberto Paci Dalò "Sparks", Solitary
-  Experiments "The Great Illusion", Sublime "Greatest Hits" and "Misc LIVE+Acoustic+Extras", Sync24
-  "Source", Techny-Call X "Evolution", The White Stripes "BBC Radio 1 John Peel Show", Tool
-  "Unreleased", the FiXT sampler and The Faint "[Other]". `stage_covers(folder=..., image=...)`
-  stages an image the owner chooses.
+  Experiments "The Great Illusion", The White Stripes "BBC Radio 1 John Peel Show", Tool
+  "Unreleased" and the FiXT sampler. `stage_covers(folder=..., image=...)` stages an image the
+  owner chooses. Blue Stahli "Blue Stahli Corner Competition" and Sybreed "Doomsday Party" share
+  "The Luna Sequence\Other" with other albums, so a folder image there would cover every album in
+  it.
 - Long paths. 29 files render to a path over 259 characters. They are The Crow "City of
   Angels", Hackers 2 and 3, and one My Chemical Romance track.
 - Folder casing. 1,126 files sit in folders whose name differs from the render only in case,
   such as "ASURA" for the tag "Asura". TagMend keeps an existing folder's casing. A fix would
   rename through a temporary name, tracked like any move.
-- Leftover folders. The disc joins left 26 folders that hold only non-audio files. Most hold the
-  disc 2 cover art of a joined disc set. They stay until the owner removes them.
+- Leftover folders. 27 folders hold only non-audio files. 12 are album or disc folders that a
+  move emptied, and most of them hold cover art. 14 are scan or artwork folders inside an album
+  folder. The `Sync24` folder is empty. They stay until the owner removes them.
 - Damaged audio. fpcalc cannot decode files 436 and 451 (Apoptygma Berzerk "Kathy's Song"),
   6466 (Nine Inch Nails "28 Ghosts IV") and 9616 (The Faint "Worked Up So Sexual").
 - Korn file 4852 "When Will This End" is off its tagged release, likely the hidden-track
   version.
 - White Stripes file 10119 (Roskilde) is off its tagged release. It is a bootleg with no
   candidate release.
-- The Faint file 11246 sits in "Danse Macabre Remixes" as 11/11 "Let the Poison Spill
-  (Remix)", with low confidence. Its 252 s audio matches no MusicBrainz recording. It needs a
-  listening check.
 - Calyx file 1430 "Follow the Leader" is 282 s against the release's 385 s. It may be an edit or
   a truncated rip.
 - LCD Soundsystem "45_33 Remixes": 7 of 8 lengths disagree with the tagged tracks. It needs a

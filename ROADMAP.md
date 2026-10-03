@@ -1,6 +1,6 @@
 # TagMend Roadmap
 
-Updated 2026-10-02. This file lists only the remaining work, in order. `CLAUDE.md` maps what
+Updated 2026-10-03. This file lists only the remaining work, in order. `CLAUDE.md` maps what
 shipped. `PLAN.md` holds the design.
 
 The final run on a fresh copy of `E:\Music` is done. The working copy (`music/`) holds 11,118 files
@@ -17,14 +17,11 @@ The owner decides each one. TagMend never deletes a file.
 - Duplicates. Killswitch Engage 4674 holds the audio of 4687. Blue Stahli 1268 holds the audio
   of Celldweller 1637. Neon Hitch holds three single pairs (6171 and 6181, 6174 and 6179, 6175
   and 6180).
-- Covers. 13 albums show no cover after commit 380. Weezer "Raditude" holds two images that may be
-  the front. The owner kept the concert cover off "Tool\Other". No source exists for Gary Numan
-  "Replicas" and "The Fury", team sleep, Leaf Yard, Roberto Paci Dalò "Sparks", Solitary
-  Experiments "The Great Illusion", The White Stripes "BBC Radio 1 John Peel Show", Tool
-  "Unreleased" and the FiXT sampler. `stage_covers(folder=..., image=...)` stages an image the
-  owner chooses. Blue Stahli "Blue Stahli Corner Competition" and Sybreed "Doomsday Party" share
-  "The Luna Sequence\Other" with other albums, so a folder image there would cover every album in
-  it.
+- Covers. 6 albums show no cover after commit 394. Tool "Unreleased" is a bootleg with no official
+  cover. The White Stripes "BBC Radio 1 John Peel Show" holds two session tracks. Leaf Yard,
+  Roberto Paci Dalò "Sparks" and the FiXT sampler hold one track each. The owner kept the concert
+  cover off "Tool\Other". `stage_covers(folder=..., image=...)` stages an image the owner chooses.
+  The Solitary Experiments "The Great Illusion" cover is 600 by 600, the largest copy found.
 - Long path. One My Chemical Romance track in "I Brought You My Bullets, You Brought Me Your
   Love" renders to 263 characters, over the limit of 259. Under `E:\Music` it renders to 246.
 - Folder casing. 1,126 files sit in folders whose name differs from the render only in case,
@@ -108,3 +105,7 @@ command mirrors its MCP name with `-` for `_`.
   live library holds no MP3 this affects, since all 550 MP3s with an APEv2 tag also hold ID3v2
   frames. A write that creates the first ID3v2 frame also leaves the ID3v1 comment out of ID3v2,
   so Navidrome stops showing it.
+- L23: `resolve_years` keeps the first release group of a score tie. The two "Team Sleep" groups
+  both score 100, and the first is a 2003 promo CD-R with other songs. So the 2005 album carries
+  `originaldate` 2003 and renders "(2003)". The fix candidate prefers a group holding an Official
+  release on a tie.

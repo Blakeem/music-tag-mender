@@ -3,7 +3,7 @@
 Updated 2026-10-02. This file lists only the remaining work, in order. `CLAUDE.md` maps what
 shipped. `PLAN.md` holds the design.
 
-The final run on a fresh copy of `E:\Music` is done. The working copy (`music/`) holds 11,119 files
+The final run on a fresh copy of `E:\Music` is done. The working copy (`music/`) holds 11,118 files
 after the owner's cleanup removed one-off files, duplicates, albums the owner does not play, a
 second Taylor Swift album and a second rip of The Postal Service "Give Up". The owner added one
 MAPHRA track, Carpenter Brut "Leather Terror" and Assemblage 23 "Endure". Every audio payload
@@ -14,14 +14,9 @@ name files in the fresh ledger. A file the owner moved by hand has a new id.
 
 The owner decides each one. TagMend never deletes a file.
 
-- Duplicates. KMFDM "Skold vs KMFDM" holds 23 files for 22 tracks. File 4732, named "05 -
-  Bloodsport", is a second "Love Is Like" (245 s against 248 s), and each later filename names
-  the track before the one it holds. Velvet Acid Christ "Calling ov the Dead" file 10526, named
-  "05 - The Dead", holds Apoptygma Berzerk "Untitled 3" (file 437). The file named "04 - The
-  Calling" holds track 5, and track 4 is missing. The path planner holds both albums until the
-  owner removes 4732 and 10526. Killswitch Engage 4674 holds the audio of 4687. Blue Stahli 1268
-  holds the audio of Celldweller 1637. Neon Hitch holds three single pairs (6171 and 6181, 6174
-  and 6179, 6175 and 6180).
+- Duplicates. Killswitch Engage 4674 holds the audio of 4687. Blue Stahli 1268 holds the audio
+  of Celldweller 1637. Neon Hitch holds three single pairs (6171 and 6181, 6174 and 6179, 6175
+  and 6180).
 - Covers. 13 albums show no cover after commit 380. Weezer "Raditude" holds two images that may be
   the front. The owner kept the concert cover off "Tool\Other". No source exists for Gary Numan
   "Replicas" and "The Fury", team sleep, Leaf Yard, Roberto Paci Dalò "Sparks", Solitary

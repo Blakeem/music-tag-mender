@@ -21,16 +21,16 @@ The owner decides each one. TagMend never deletes a file.
   Celldweller 1637. Neon Hitch holds three single pairs (6171 and 6181, 6174 and 6179, 6175 and
   6180). The path planner holds the Pendulum, Imperative Reaction, KMFDM and Velvet Acid Christ
   albums until the owner decides.
-- Cue sheets. 44 files sit in folders whose cue sheet names the audio files, so a rename would
-  break the cue. The folders are Beck "Morning Phase" and Code 64 "Departure" and "Trialogue".
-- Covers. 17 albums show no cover after commit 373. Weezer "Raditude" holds two images that may be
+- Cue sheets. 15 renames wait on a cue sheet that names the audio files, since a rename would
+  break the cue. They are the 13 tracks of Beck "Morning Phase" and two case-only renames in
+  Code 64 "Departure".
+- Covers. 16 albums show no cover after commit 376. Weezer "Raditude" holds two images that may be
   the front. The owner kept the concert cover off "Tool\Other". No source exists for Gary Numan
-  "Replicas" and "The Fury", team sleep, Code 64 "Trialogue CD2" (its scans sit in
-  `Trialogue\Artwork`), Leaf Yard, Roberto Paci Dalò "Sparks", Solitary Experiments "The Great
-  Illusion", Sublime "Greatest Hits" and "Misc LIVE+Acoustic+Extras", Sync24 "Source", Techny-Call
-  X "Evolution", The White Stripes "BBC Radio 1 John Peel Show", Tool "Unreleased", the FiXT
-  sampler and The Faint "[Other]". `stage_covers(folder=..., image=...)` stages an image the owner
-  chooses.
+  "Replicas" and "The Fury", team sleep, Leaf Yard, Roberto Paci Dalò "Sparks", Solitary
+  Experiments "The Great Illusion", Sublime "Greatest Hits" and "Misc LIVE+Acoustic+Extras", Sync24
+  "Source", Techny-Call X "Evolution", The White Stripes "BBC Radio 1 John Peel Show", Tool
+  "Unreleased", the FiXT sampler and The Faint "[Other]". `stage_covers(folder=..., image=...)`
+  stages an image the owner chooses.
 - Long paths. 29 files render to a path over 259 characters. They are The Crow "City of
   Angels", Hackers 2 and 3, and one My Chemical Romance track.
 - Folder casing. 1,126 files sit in folders whose name differs from the render only in case,

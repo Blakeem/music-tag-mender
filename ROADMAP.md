@@ -3,12 +3,13 @@
 Updated 2026-10-03. This file lists only the remaining work, in order. `CLAUDE.md` maps what
 shipped. `PLAN.md` holds the design.
 
-The final run on a fresh copy of `E:\Music` is done. The working copy (`music/`) holds 11,118 files
+The final run on a fresh copy of `E:\Music` is done. The working copy (`music/`) holds 11,162 files
 after the owner's cleanup removed one-off files, duplicates, albums the owner does not play, a
 second Taylor Swift album and a second rip of The Postal Service "Give Up". The owner added one
-MAPHRA track, Carpenter Brut "Leather Terror" and Assemblage 23 "Endure". Every audio payload
-that came from `E:\Music` still matches it, and the mismatch gate is open. The file ids below
-name files in the fresh ledger. A file the owner moved by hand has a new id.
+MAPHRA track, Carpenter Brut "Leather Terror" and "Blood Machines", Assemblage 23 "Endure",
+Digitalism "Optimism" and Sync24 "Omnious" and "Source". Every audio payload that came from
+`E:\Music` still matches it, and the mismatch gate is open. The file ids below name files in the
+fresh ledger. A file the owner moved by hand has a new id.
 
 ## 1. Owner questions
 
@@ -105,7 +106,9 @@ command mirrors its MCP name with `-` for `_`.
   live library holds no MP3 this affects, since all 550 MP3s with an APEv2 tag also hold ID3v2
   frames. A write that creates the first ID3v2 frame also leaves the ID3v1 comment out of ID3v2,
   so Navidrome stops showing it.
-- L23: `resolve_years` keeps the first release group of a score tie. The two "Team Sleep" groups
-  both score 100, and the first is a 2003 promo CD-R with other songs. So the 2005 album carries
-  `originaldate` 2003 and renders "(2003)". The fix candidate prefers a group holding an Official
-  release on a tie.
+- L24: a release stamp clears a file's ISRC that MusicBrainz does not list for its track, unless
+  the file already carries the stamped recording's id. So a file with no MusicBrainz ids loses its
+  label ISRC. Stamps in commits 3 to 168 cleared 125 well-formed ISRCs. Some of those files moved
+  to a different recording, where the clear is right. Commit 401 restored the 11 that commit 399
+  cleared from Digitalism "Optimism". The fix candidate keeps a well-formed ISRC on a file that
+  carried no recording id and was placed by audio.

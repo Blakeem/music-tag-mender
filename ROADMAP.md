@@ -30,8 +30,8 @@ The owner decides each one. TagMend never deletes a file.
   owner chooses. Blue Stahli "Blue Stahli Corner Competition" and Sybreed "Doomsday Party" share
   "The Luna Sequence\Other" with other albums, so a folder image there would cover every album in
   it.
-- Long paths. 29 files render to a path over 259 characters. They are The Crow "City of
-  Angels", Hackers 2 and 3, and one My Chemical Romance track.
+- Long path. One My Chemical Romance track in "I Brought You My Bullets, You Brought Me Your
+  Love" renders to 263 characters, over the limit of 259. Under `E:\Music` it renders to 246.
 - Folder casing. 1,126 files sit in folders whose name differs from the render only in case,
   such as "ASURA" for the tag "Asura". TagMend keeps an existing folder's casing. A fix would
   rename through a temporary name, tracked like any move.

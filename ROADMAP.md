@@ -3,10 +3,10 @@
 Updated 2026-10-02. This file lists only the remaining work, in order. `CLAUDE.md` maps what
 shipped. `PLAN.md` holds the design.
 
-The final run on a fresh copy of `E:\Music` is done. The working copy (`music/`) holds 11,129 files
+The final run on a fresh copy of `E:\Music` is done. The working copy (`music/`) holds 11,148 files
 after the owner's cleanup removed one-off files, duplicates, albums the owner does not play, a
 second Taylor Swift album and a second rip of The Postal Service "Give Up". The owner added one
-MAPHRA track and Carpenter Brut "Leather Terror". Every audio payload that came from `E:\Music`
+MAPHRA track, Carpenter Brut "Leather Terror" and Assemblage 23 "Endure". Every audio payload that came from `E:\Music`
 still matches it, and the mismatch gate is open. The file ids below name files in the fresh
 ledger. A file the owner moved by hand has a new id.
 
@@ -35,9 +35,9 @@ The owner decides each one. TagMend never deletes a file.
 - Folder casing. 1,126 files sit in folders whose name differs from the render only in case,
   such as "ASURA" for the tag "Asura". TagMend keeps an existing folder's casing. A fix would
   rename through a temporary name, tracked like any move.
-- Leftover folders. 27 folders hold only non-audio files. 12 are album or disc folders that a
-  move emptied, and most of them hold cover art. 14 are scan or artwork folders inside an album
-  folder. The `Sync24` folder is empty. They stay until the owner removes them.
+- Leftover folders. 26 folders hold no audio. 8 hold only hidden Windows Media Player images. 5
+  hold only rip leftovers such as `.nfo` and `.sfv` files. 13 are scan or booklet folders inside
+  an album folder. They stay until the owner removes them.
 - Damaged audio. fpcalc cannot decode files 436 and 451 (Apoptygma Berzerk "Kathy's Song"),
   6466 (Nine Inch Nails "28 Ghosts IV") and 9616 (The Faint "Worked Up So Sexual").
 - Korn file 4852 "When Will This End" is off its tagged release, likely the hidden-track

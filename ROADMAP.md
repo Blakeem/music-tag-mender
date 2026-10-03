@@ -6,9 +6,9 @@ shipped. `PLAN.md` holds the design.
 The final run on a fresh copy of `E:\Music` is done. The working copy (`music/`) holds 11,148 files
 after the owner's cleanup removed one-off files, duplicates, albums the owner does not play, a
 second Taylor Swift album and a second rip of The Postal Service "Give Up". The owner added one
-MAPHRA track, Carpenter Brut "Leather Terror" and Assemblage 23 "Endure". Every audio payload that came from `E:\Music`
-still matches it, and the mismatch gate is open. The file ids below name files in the fresh
-ledger. A file the owner moved by hand has a new id.
+MAPHRA track, Carpenter Brut "Leather Terror" and Assemblage 23 "Endure". Every audio payload
+that came from `E:\Music` still matches it, and the mismatch gate is open. The file ids below
+name files in the fresh ledger. A file the owner moved by hand has a new id.
 
 ## 1. Owner questions
 

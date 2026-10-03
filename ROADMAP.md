@@ -3,10 +3,11 @@
 Updated 2026-10-02. This file lists only the remaining work, in order. `CLAUDE.md` maps what
 shipped. `PLAN.md` holds the design.
 
-The final run on a fresh copy of `E:\Music` is done. The working copy (`music/`) holds 11,180 files
-after the owner's cleanup removed one-off files, duplicates and a second Taylor Swift album and
-added one MAPHRA track. Every audio payload matches `E:\Music`, and the mismatch gate is open. The
-file ids below name files in the fresh ledger. A file the owner moved by hand has a new id.
+The final run on a fresh copy of `E:\Music` is done. The working copy (`music/`) holds 11,170 files
+after the owner's cleanup removed one-off files, duplicates, a second Taylor Swift album and a
+second rip of The Postal Service "Give Up", and added one MAPHRA track. Every audio payload matches
+`E:\Music`, and the mismatch gate is open. The file ids below name files in the fresh ledger. A file
+the owner moved by hand has a new id.
 
 ## 1. Owner questions
 
@@ -22,8 +23,6 @@ The owner decides each one. TagMend never deletes a file.
   albums until the owner decides.
 - Cue sheets. 44 files sit in folders whose cue sheet names the audio files, so a rename would
   break the cue. The folders are Beck "Morning Phase" and Code 64 "Departure" and "Trialogue".
-  The Postal Service "2 Give Up_" lost its cue sheet in the owner's cleanup, so its 10 files now
-  render to "(2003) The Postal Service - Give Up".
 - Covers. 17 albums show no cover after commit 373. Weezer "Raditude" holds two images that may be
   the front. The owner kept the concert cover off "Tool\Other". No source exists for Gary Numan
   "Replicas" and "The Fury", team sleep, Code 64 "Trialogue CD2" (its scans sit in

@@ -70,7 +70,9 @@ Each entry names a subsystem, its MCP tools and its modules under `src/tagmend/e
   - Song: `songs.py` and `release_match.py`. Every file of a folder holding a `pending` file
     votes by AcoustID fingerprint. A folder whose files all carry `musicbrainz_albumid` is
     checked against those releases. A folder without ids converges on the one Official release
-    most of its files share and fills blank `title`, `tracknumber` and `discnumber` as `auto`.
+    its files share whose disc and track totals match the totals its files agree on, and fills
+    blank `title`, `tracknumber` and `discnumber` as `auto`. A folder of fewer than three files
+    whose tags carry no total is held `unconverged` (`needs_release_mbid`).
     A folder holding a pending file whose audio is off its tagged release is reported in
     `rebind_folders` with ranked candidates. The first five candidates are placed as the manual
     release path would place the folder. A settled file (`done`, `manual` or staged) off its
@@ -141,7 +143,7 @@ Each entry names a subsystem, its MCP tools and its modules under `src/tagmend/e
 - Two tag names are collapsed only after measuring that they never disagree in the wild.
   `organization` and `label` stay unmapped and unmanaged, since 245 real FLACs hold a different
   label in each.
-- `MANAGED_TAGS` holds 26 fields (managed set 4). `MANAGED_SETS` keeps every older set frozen,
+- `MANAGED_TAGS` holds 28 fields (managed set 5). `MANAGED_SETS` keeps every older set frozen,
   since stored revisions point at them. A widening adds a new entry and bumps
   `MANAGED_SET_VERSION`. Staging and revert first append a `scan` re-baseline
   (`versioning.observe_widened_fields`) to a file whose latest revision predates the current set.
@@ -151,6 +153,12 @@ Each entry names a subsystem, its MCP tools and its modules under `src/tagmend/e
   re-baseline. Otherwise it keeps the current value.
 - `artists` is the Picard ARTISTS list Navidrome links artists from. It is `TXXX:ARTISTS` on
   ID3, the `ARTISTS` freeform atom on MP4 and `ARTISTS` on Vorbis.
+- `album artist` and `album_artist` are managed keys of their own, since Navidrome shows the
+  union of every album artist spelling. A stage that sets `albumartist` clears each of them the
+  file holds unless the stage sets it too.
+- Every mutating engine entry point and `scan_library` hold the ledger mutation lock
+  (`ledger_lock.py`), an OS lock on `<db_path>.lock`. A second mutating call on the same ledger
+  raises `LedgerBusyError`. A dry run and a read-only tool take no lock.
 - Any change to what `read_tags` produces bumps `TAG_READER_VERSION` in the same commit, so that
   the next incremental scan re-reads each stale row once.
 - Every write verifies its temp copy before the atomic swap and raises `TagWriteError` on any
@@ -197,11 +205,11 @@ Each entry names a subsystem, its MCP tools and its modules under `src/tagmend/e
   `tagmend/engine/*`, then gets a thin CLI subcommand and/or MCP tool.
 - **Settings live on disk, not in env.** The MCP server can't see the CLI's shell.
   Read config via `tagmend.config.load_settings()`. Never read env/JSON directly.
-- **`music/` is the live-testing sandbox.** It is a full **copy** of Blake's real 135 GB,
-  11,233-file library. The original is `E:\Music`, which stays untouched and can be re-copied
-  anytime. Live scans, resolver runs, fix runs and problem discovery run against this copy, so
-  that everything is proven before the mended copy replaces the real library (ROADMAP B3). The
-  folder is gitignored and copyrighted.
+- **`music/` is the live-testing sandbox.** It is a full **copy** of Blake's real library, and
+  ROADMAP.md holds the current file count. Live scans, resolver runs, fix runs and problem
+  discovery run against this copy, so that everything is proven before it replaces the real
+  library at `E:\Music` (ROADMAP B3). It now holds the mended library, so it is never re-copied
+  without the owner's go-ahead. The folder is gitignored and copyrighted.
 
 ## Tool naming
 
@@ -319,9 +327,14 @@ npx -y @modelcontextprotocol/inspector $tag mcp
 
 ## End-user install
 
+The three PyPI commands work once TagMend is published to PyPI (ROADMAP.md section 4).
+
 - CLI: `uv tool install tagmend` → `tagmend …`
 - MCP (in a client config): run `uvx tagmend mcp` (or the installed `tagmend mcp`)
 - Fallback: `pipx install tagmend`
+
+Until then, install from a repo checkout with `pip install -e .` and point an MCP client at the
+installed `tagmend mcp`.
 
 ## Layout
 
@@ -335,13 +348,14 @@ src/tagmend/
   data/             genre_vocabulary.yml, genre_overlay.yml, web/ (the config UI page)
   engine/
     db.py           SQLite connection (WAL)
-    schema.py       all DDL + PRAGMA user_version (v29)
+    schema.py       all DDL + PRAGMA user_version (v30)
+    ledger_lock.py  the ledger mutation lock every mutating entry point holds
     path_keys.py    path identity keys, subtree key ranges, the folder-argument normalizer
     text_keys.py    the shared text fold keys (alnum, display, artist name, loose, title)
     clock.py        the engine's one source of the current time
     validation.py   argument checks shared by the engine entry points
     serialize.py
-    scan.py         filesystem discovery + signatures
+    scan.py         the audio extension set and the library walk
     health.py       check_health / readiness + interrupted-commit report
     store.py        pure data access: files/file_tags + tag_revisions[_staged] + tag-axis derived status + mismatch status
     library.py      scan orchestration (3 modes) + stats + list_files/get_file

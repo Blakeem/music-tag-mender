@@ -1,6 +1,6 @@
 # TagMend Roadmap
 
-Updated 2026-10-03. This file lists only the remaining work, in order. `CLAUDE.md` maps what
+Updated 2026-10-04. This file lists only the remaining work, in order. `CLAUDE.md` maps what
 shipped. `PLAN.md` holds the design.
 
 The final run on a fresh copy of `E:\Music` is done. The working copy (`music/`) holds 11,162 files
@@ -21,7 +21,7 @@ The owner decides each one. TagMend never deletes a file.
 - Covers. 6 albums show no cover after commit 394. Tool "Unreleased" is a bootleg with no official
   cover. The White Stripes "BBC Radio 1 John Peel Show" holds two session tracks. Leaf Yard,
   Roberto Paci Dalò "Sparks" and the FiXT sampler hold one track each. The owner kept the concert
-  cover off "Tool\Other". `stage_covers(folder=..., image=...)` stages an image the owner chooses.
+  cover off "Tool\Other". `stage_covers(path=..., image=...)` stages an image the owner chooses.
   The Solitary Experiments "The Great Illusion" cover is 600 by 600, the largest copy found.
 - Long path. One My Chemical Romance track in "I Brought You My Bullets, You Brought Me Your
   Love" renders to 263 characters, over the limit of 259. Under `E:\Music` it renders to 246.
@@ -63,6 +63,18 @@ The owner decides each one. TagMend never deletes a file.
   and `artists` "J.Viewz".
 - Kept credits. ATOI, Fats, Penny, A. Hartung, Beatniks, Wumpscut and 8 collaboration credits stay
   as tagged. The owner may override any of them.
+- Wrong embedded art. 80 files in 7 albums carry another album's embedded front picture, from an
+  old art fetcher that matched on the album title. Six "Greatest Hits" albums carry the Linkin
+  Park front, and Ozzy Osbourne "Down To Earth" carries the Jem front. The picture feature
+  (`detect_picture_duplicates` and a tracked picture removal) is planned. Once it lands, the owner
+  reviews the duplicates it reports.
+- Artist page. `resolve_artists` stops at `artist_stage_limit` (300) files a call and does not
+  read past files staging refuses, as the other resolvers do. A page full of refused files repeats
+  on every call. The owner's `id3_droppable_frames` keeps this rare. The fix candidate ports the
+  refill.
+- Rebind candidates. A rebind folder's candidates rank without the disc and track totals the
+  convergence route now narrows by. So a one-file folder lists only 1-track singles, and a disc 1
+  folder lists the standard edition.
 
 ## 2. Copy promotion (B3)
 
@@ -106,6 +118,8 @@ command mirrors its MCP name with `-` for `_`.
   live library holds no MP3 this affects, since all 550 MP3s with an APEv2 tag also hold ID3v2
   frames. A write that creates the first ID3v2 frame also leaves the ID3v1 comment out of ID3v2,
   so Navidrome stops showing it.
+- L25: the reader does not read Vorbis `TRACKTOTAL` or `DISCTOTAL`, so the song convergence
+  route sees a FLAC's totals only when `tracknumber` itself holds `n/N`.
 - L24: a release stamp clears a file's ISRC that MusicBrainz does not list for its track, unless
   the file already carries the stamped recording's id. So a file with no MusicBrainz ids loses its
   label ISRC. Stamps in commits 3 to 168 cleared 125 well-formed ISRCs. Some of those files moved

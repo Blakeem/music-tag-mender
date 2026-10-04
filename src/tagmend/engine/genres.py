@@ -1,32 +1,10 @@
-"""Genre-tagging orchestration: select → look up Last.fm → classify → stage (M2 phase 1).
+"""Genre resolver: Last.fm top tags matched to the genre vocabulary and staged as ``genre``.
 
-This is the LLM-facing entry point that ties the read path, the cached Last.fm client,
-the classifier, and the revertible staging engine together. The lookups, the classification,
-and the disk writes are delegated to the modules built in chunks 1-3.
-
-Design notes (the spec):
-
-* **Selection is the classifier's ``pending`` set.** :func:`tagmend.engine.store.derived_status`
-  on :data:`tagmend.engine.axis.GENRE_AXIS` decides it, over present files in scope, in file id
-  order, capped at ``limit`` files. Every selected file leaves ``pending`` unless its lookup
-  errors, so repeated capped calls terminate.
-* **The outcome stage writes one row per selected file.** A resolved genre equal to the
-  current one records ``done``. A differing one is staged and records ``done`` snapshotting the
-  staged target. A lookup with nothing usable records ``no_match``. A transient Last.fm error
-  writes nothing and the file stays ``pending``.
-* **Lookup identity** is ``albumartist`` when present (better for compilations), else
-  ``artist``. ``album`` is used only when ``genre_use_album_tags`` is on.
-* **No accidental deletion (P0):** the resolver stages only ``genre``, the one field it
-  decides, and :func:`tagmend.engine.staging._stage_one` merges it onto the tags read from
-  disk, so ``write_managed_tags``'s delete-on-absent behavior can never drop
-  ``artist``/``albumartist`` and a lagging snapshot mirror can never overwrite a newer value.
-* **One connection** is owned by :func:`tagmend.engine.axis_resolver.run` for selection,
-  cache, and status writes. The :class:`tagmend.engine.lastfm.LastfmClient` shares it (eager
-  cache commits), while :func:`tagmend.engine.staging.stage_tags` opens and owns its own
-  connection per call.
-
-Like the rest of the conn-owning layer, the public functions here own their connection
-and commit. The building blocks in :mod:`tagmend.engine.store` never commit.
+:func:`resolve_genres` supplies the Last.fm lookup and the genre stage to
+:func:`tagmend.engine.axis_resolver.run`, which owns the selection, the grouping, the outcome
+rows, refused files and the connection. Files group by their ``(artist, album)`` lookup
+identity whatever ``genre_use_album_tags`` holds. That setting only adds the album's top tags
+to the artist's.
 """
 
 from __future__ import annotations
@@ -35,7 +13,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from tagmend.engine import axis, axis_resolver, classify, staging, store
-from tagmend.engine.lastfm import LastfmClient, LastfmError
+from tagmend.engine.lastfm import LastfmClient, LastfmError, LastfmKeyError
 from tagmend.engine.serialize import FieldDict
 
 if TYPE_CHECKING:
@@ -87,9 +65,10 @@ def resolve_genres(  # noqa: PLR0913 - cohesive keyword-only scope + injection p
     ``pending``. They are grouped by ``(artist, album)``, and per group Last.fm top tags are
     looked up and classified. Each selected file then settles: ``done`` when the resolved genres
     equal its current ones, ``done`` and staged (``origin='auto'``, only ``genre`` changed) when
-    they differ, ``no_match`` when nothing usable came back. A transient Last.fm error leaves the
-    group ``pending`` and is reported, never aborting the call. A file that cannot be staged is
-    reported in ``error_items`` under ``file_id=<id>`` and stays ``pending``.
+    they differ, ``no_match`` when nothing usable came back. A Last.fm lookup error leaves the
+    group ``pending`` and is reported, never aborting the call. A rejected key raises
+    :class:`LastfmKeyError` and stops the call. A file that cannot be staged is reported in
+    ``error_items`` under ``file_id=<id>`` and stays ``pending``.
 
     *dry_run* counts what would settle and stage without staging or writing any status row. It
     still reads the lookup cache and fetches on a cache miss.
@@ -111,6 +90,7 @@ def resolve_genres(  # noqa: PLR0913 - cohesive keyword-only scope + injection p
         stage=lambda conn, fid, resolved, dry_run: _stage_resolved(
             settings, conn, fid, resolved, dry_run=dry_run
         ),
+        fatal_error=(LastfmKeyError,),
     )
 
     outcome = axis_resolver.run(
@@ -196,7 +176,7 @@ def _stage_resolved(
     if store.get_tags(conn, file_id).get(_GENRE_FIELD, []) == resolved:
         return False
     if dry_run:
-        return True
+        return staging.would_stage(settings, conn, file_id=file_id, tags={_GENRE_FIELD: resolved})
     return staging.stage_tags(
         settings,
         file_id=file_id,

@@ -4,8 +4,8 @@ Free API key only; ``ws.audioscrobbler.com/2.0/``. This module sources the *genr
 the classifier later filters against the controlled vocabulary (see
 ``docs/genre-tagging-spec.md`` §2). Three endpoints are used:
 
-* ``artist.getTopTags`` — ranked community tags for an artist (by name **or** MBID).
-* ``album.getTopTags``  — ranked community tags for one album (by artist + album).
+* ``artist.getTopTags``: ranked community tags for an artist (by name).
+* ``album.getTopTags``: ranked community tags for one album (by artist + album).
 * ``artist.getCorrection``: the canonical artist name plus MBID, feeding ``resolve_artists``'
   Last.fm tier.
 
@@ -13,8 +13,8 @@ Each response's parsed ``(name, weight)`` list is cached persistently in ``lastf
 so every unique entity is queried at most once ever and re-runs are free. Each
 ``artist.getCorrection`` answer is cached the same way in ``lastfm_correction_cache``. The
 negative result (genuinely absent, Last.fm ``error 6``) is cached too, distinct from a found
-result that simply has no tags. Transient/auth failures (HTTP non-2xx, any other error
-code) raise :class:`LastfmError` and are **never** cached, so a re-run retries them.
+result that simply has no tags. Every other failure (an HTTP non-2xx, any other error code,
+a malformed body) raises :class:`LastfmError` and is **never** cached, so a re-run asks again.
 A transport error, an HTTP 429 or 5xx, or a temporary Last.fm error code (11, 16, 29) is
 retried first, with a doubling backoff, up to ``max_attempts`` times.
 
@@ -30,10 +30,16 @@ from __future__ import annotations
 import hashlib
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Final, Protocol, Self, cast
+from typing import TYPE_CHECKING, Final, Protocol, Self
 
 from tagmend.engine import clock
-from tagmend.engine.lookup_clients import RETRY_ATTEMPTS, PacedHttp, Retry, decode_object
+from tagmend.engine.lookup_clients import (
+    RETRY_ATTEMPTS,
+    PacedHttp,
+    Retry,
+    decode_object,
+    retry_throttle_or_server_error,
+)
 from tagmend.engine.store import (
     get_cached_correction,
     get_cached_tags,
@@ -55,16 +61,16 @@ logger = get_logger(__name__)
 
 _API_URL: Final = "https://ws.audioscrobbler.com/2.0/"
 
-# Last.fm's "not found" error code. The body is ``{"error": 6, "message": ...}``; this is
-# the one error we negative-cache (the entity genuinely is not on Last.fm). Every other
-# code (e.g. ``10`` invalid key) is transient/auth and must stay retryable.
+# Last.fm's "not found" error code, the one error negative-cached, since the entity is not on
+# Last.fm. Every other code stays uncached, so a re-run after its cause is fixed retries it.
 _ERROR_NOT_FOUND: Final = 6
+
+# Last.fm's key error codes: 10 invalid key, 26 suspended key.
+_KEY_ERROR_CODES: Final = frozenset({10, 26})
 
 # Last.fm documents these codes as temporary: 11 service offline, 16 temporary error, 29 rate
 # limit exceeded. Each is retried like a dropped connection rather than failing the lookup.
 _TEMPORARY_ERROR_CODES: Final = frozenset({11, 16, 29})
-_HTTP_TOO_MANY_REQUESTS: Final = 429
-_HTTP_SERVER_ERROR: Final = 500
 
 # A cache hit never re-parses, so bump a method's entry when its parse changes and its cached
 # rows are re-fetched instead of replayed. Version 1 keeps the original key bytes.
@@ -92,10 +98,16 @@ class ArtistCorrection:
 
 
 class LastfmError(RuntimeError):
-    """A Last.fm lookup failed transiently (HTTP non-2xx, or a non-"not found" error).
+    """A Last.fm lookup failed and nothing was cached, so a re-run asks again.
 
-    These are deliberately **not** cached so a re-run retries them.
+    Raised for a failure that outlasted the retries, an HTTP non-2xx other than 429 or 5xx, an
+    error code other than not found, and a malformed body. A rejected key raises the subclass
+    :class:`LastfmKeyError`.
     """
+
+
+class LastfmKeyError(LastfmError):
+    """Last.fm rejected the API key, which fails every lookup alike and stops the call."""
 
 
 class TagSource(Protocol):
@@ -105,12 +117,7 @@ class TagSource(Protocol):
     with no tags) and ``None`` when the entity is genuinely not on Last.fm.
     """
 
-    def artist_top_tags(
-        self,
-        name: str | None = None,
-        *,
-        mbid: str | None = None,
-    ) -> list[Tag] | None:
+    def artist_top_tags(self, name: str) -> list[Tag] | None:
         """Return the artist's top tags, or ``None`` if the artist is not found."""
 
     def album_top_tags(self, artist: str, album: str) -> list[Tag] | None:
@@ -194,29 +201,19 @@ class LastfmClient:
 
     # --- public API ------------------------------------------------------------------
 
-    def artist_top_tags(
-        self,
-        name: str | None = None,
-        *,
-        mbid: str | None = None,
-    ) -> list[Tag] | None:
-        """Return an artist's top tags by *name* **or** *mbid* (exactly one required).
+    def artist_top_tags(self, name: str) -> list[Tag] | None:
+        """Return an artist's top tags by *name*.
 
         Returns ``list[Tag]`` when found (possibly empty), ``None`` when the artist is
-        genuinely not on Last.fm. Raises :class:`ValueError` if neither or both of
-        *name*/*mbid* are given, and :class:`LastfmError` on a transient failure.
+        genuinely not on Last.fm. Raises :class:`LastfmError` when the lookup fails.
         """
-        if (name is None) == (mbid is None):
-            message = "artist_top_tags requires exactly one of name or mbid"
-            raise ValueError(message)
-        identity = {"mbid": mbid} if mbid is not None else {"artist": cast("str", name)}
-        return self._top_tags("artist.gettoptags", identity)
+        return self._top_tags("artist.gettoptags", {"artist": name})
 
     def album_top_tags(self, artist: str, album: str) -> list[Tag] | None:
         """Return an album's top tags by *artist* + *album*.
 
         Returns ``list[Tag]`` when found (possibly empty), ``None`` when the album is
-        genuinely not on Last.fm. Raises :class:`LastfmError` on a transient failure.
+        genuinely not on Last.fm. Raises :class:`LastfmError` when the lookup fails.
         """
         return self._top_tags("album.gettoptags", {"artist": artist, "album": album})
 
@@ -269,14 +266,10 @@ class LastfmClient:
         # Input: one paced network request.
         body = self._request(method, identity)
 
-        # Process: distinguish "not found" (cacheable) from transient errors (not).
-        error = body.get("error")
-        if error is not None:
-            if error == _ERROR_NOT_FOUND:
-                self._store(request_key, found=False, tags=[])
-                return None
-            message = f"Last.fm error {error}: {body.get('message', 'unknown')}"
-            raise LastfmError(message)
+        # Process: distinguish "not found" (cacheable) from every other error (not).
+        if _is_not_found(body):
+            self._store(request_key, found=False, tags=[])
+            return None
 
         try:
             tags = _parse_top_tags(body)
@@ -302,14 +295,10 @@ class LastfmClient:
         # Input: one paced network request.
         body = self._request("artist.getcorrection", {"artist": name})
 
-        # Process: distinguish "no correction" (cacheable) from transient errors (not).
-        error = body.get("error")
-        if error is not None:
-            if error == _ERROR_NOT_FOUND:
-                self._store_correction(request_key, None)
-                return None
-            message = f"Last.fm error {error}: {body.get('message', 'unknown')}"
-            raise LastfmError(message)
+        # Process: distinguish "no correction" (cacheable) from every other error (not).
+        if _is_not_found(body):
+            self._store_correction(request_key, None)
+            return None
 
         correction = _parse_correction(body)
 
@@ -368,8 +357,7 @@ def _request_key(method: str, identity: dict[str, str]) -> str:
     """Return a stable ``sha1`` over *method* + the entity-identifying params + parse version.
 
     ``api_key``/``format`` are excluded (they do not identify the entity), and the
-    identity params are sorted so insertion order never changes the key. A name-based and
-    an mbid-based artist query therefore get distinct keys. A method missing from
+    identity params are sorted so insertion order never changes the key. A method missing from
     :data:`_PARSE_VERSIONS` raises :class:`KeyError`.
     """
     parse_version = _PARSE_VERSIONS[method]
@@ -384,21 +372,47 @@ def _request_key(method: str, identity: dict[str, str]) -> str:
 def _classify_response(response: httpx.Response, method: str) -> dict[str, object] | Retry:
     """Return the decoded body of a final answer, or a :class:`Retry` for a temporary one.
 
-    Raises :class:`LastfmError` for a permanent failure: an HTTP non-2xx other than 429 or 5xx,
-    or a body that is not a JSON object.
+    Raises :class:`LastfmKeyError` for a key error code under any HTTP status. Raises
+    :class:`LastfmError` for an HTTP non-2xx other than 429 or 5xx, naming the body's error
+    code and message when it carries one, and for a 2xx body that is not a JSON object. A
+    non-2xx body is never returned, so its error 6 (a missing parameter) is never cached.
     """
-    status = response.status_code
-    if status == _HTTP_TOO_MANY_REQUESTS or status >= _HTTP_SERVER_ERROR:
-        return Retry(f"HTTP {status}")
-    if response.is_error:
-        message = f"Last.fm HTTP {status} for {method}"
-        raise LastfmError(message)
+    retry = retry_throttle_or_server_error(response)
+    if isinstance(retry, Retry):
+        return retry
 
-    body = decode_object(response, LastfmError, source="Last.fm", what=method)
+    try:
+        body = decode_object(response, LastfmError, source="Last.fm", what=method)
+    except LastfmError:
+        if not response.is_error:
+            raise
+        body = {}
     error = body.get("error")
+    if error in _KEY_ERROR_CODES:
+        message = f"Last.fm rejected the API key (error {error}). Check the lastfm_api_key setting."
+        raise LastfmKeyError(message)
+    if response.is_error:
+        message = f"Last.fm HTTP {response.status_code} for {method}"
+        if error is not None:
+            message = f"{message}: error {error}: {body.get('message', 'unknown')}"
+        raise LastfmError(message)
     if error in _TEMPORARY_ERROR_CODES:
         return Retry(f"error {error}")
     return body
+
+
+def _is_not_found(body: dict[str, object]) -> bool:
+    """Return whether *body* is Last.fm's not-found answer, the one error that is cached.
+
+    Raises :class:`LastfmError` for any other error code, so nothing is cached for it.
+    """
+    error = body.get("error")
+    if error is None:
+        return False
+    if error == _ERROR_NOT_FOUND:
+        return True
+    message = f"Last.fm error {error}: {body.get('message', 'unknown')}"
+    raise LastfmError(message)
 
 
 def _parse_top_tags(body: dict[str, object]) -> list[Tag]:

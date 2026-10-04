@@ -60,6 +60,9 @@ class AxisResolver[C, R]:
     settles_without_lookup: Callable[[Mapping[str, list[str]]], bool] | None = None
     """Picks the selected files that settle ``done`` from their own tags with no lookup."""
 
+    fatal_error: tuple[type[Exception], ...] = ()
+    """A failure that fails every lookup alike, such as a rejected key, which stops the call."""
+
 
 @dataclass(frozen=True, slots=True)
 class ResolverRun[R]:
@@ -224,6 +227,8 @@ def _process_one_group[C, R](  # noqa: PLR0913 - cohesive per-group inputs
 
     try:
         answer = resolver.lookup(source, identity)
+    except resolver.fatal_error:
+        raise
     except resolver.transient_error as exc:
         logger.warning("%s lookup failed for %r: %s", resolver.axis_.name, key, exc)
         tally.error_items.append({"key": key, "message": str(exc)})

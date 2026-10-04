@@ -265,6 +265,27 @@ def test_unstaging_one_file_drops_its_folders_sidecar_rows(album: _Album) -> Non
     assert _staged_sidecars(album.settings) == []
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="directory junctions are a Windows feature")
+def test_the_sidecar_walk_never_enters_a_junction(album: _Album) -> None:
+    import _winapi  # noqa: PLC0415 - Windows only
+
+    outside = album.music.parent / "outside"
+    (outside / "Empty").mkdir(parents=True)
+    (outside / "foreign.jpg").write_bytes(b"foreign")
+    _winapi.CreateJunction(str(outside), str(album.music / _ALBUM / "Linked"))
+
+    _stage_album(album)
+
+    staged = [Path(row.from_path) for row in _staged_sidecars(album.settings)]
+    assert staged
+    assert not [path for path in staged if path.is_relative_to(_ALBUM / "Linked")]
+    paths.commit_paths(album.settings)
+    assert (outside / "foreign.jpg").exists()
+    assert (outside / "Empty").is_dir()
+    assert not (album.music / _NEW / "Linked").exists()
+    assert (album.music / _ALBUM / "Linked").is_junction()
+
+
 def test_unstaging_the_path_of_one_sidecar_drops_that_row_alone(album: _Album) -> None:
     _stage_album(album)
 
@@ -472,6 +493,50 @@ def test_discs_staged_to_two_folders_leave_the_release_cover_and_report_it(
     assert result.sidecars_held == tuple(str(_ALBUM / r) for r in _RELEASE_SIDECARS)
     assert (release.music / _ALBUM / "Folder.jpg").read_bytes() == b"cover"
     assert (release.music / _ALBUM / "Scans" / "Back.jpg").read_bytes() == b"back"
+
+
+def test_unstaging_one_disc_counts_only_the_sidecar_rows_it_drops(
+    engine_settings: Settings, music_dir: Path
+) -> None:
+    # The other disc's row is dropped and staged again, so it counts as neither.
+    _library(engine_settings, music_dir, _CD1 / "01.mp3", _CD2 / "01.mp3")
+    (music_dir / _CD1 / "cd1.jpg").write_bytes(b"one")
+    (music_dir / _CD2 / "cd2.jpg").write_bytes(b"two")
+    (music_dir / _ALBUM / "folder.jpg").write_bytes(b"cover")
+    disc1 = _id_at(engine_settings, music_dir / _CD1 / "01.mp3")
+    disc2 = _id_at(engine_settings, music_dir / _CD2 / "01.mp3")
+    _stage(engine_settings, (disc1, _MERGED / "101.mp3"), (disc2, _MERGED / "201.mp3"))
+    assert len(_staged_sidecars(engine_settings)) == 3
+
+    result = paths.unstage_paths(engine_settings, file_id=disc2)
+
+    assert (result.removed, result.sidecars_removed, result.sidecars_staged) == (1, 2, 0)
+    assert [Path(row.from_path) for row in _staged_sidecars(engine_settings)] == [
+        _CD1 / "cd1.jpg",
+    ]
+
+
+def test_unstaging_the_winning_disc_stages_the_cover_it_held(
+    engine_settings: Settings, music_dir: Path
+) -> None:
+    _library(engine_settings, music_dir, _CD1 / "01.mp3", _CD2 / "01.mp3")
+    for disc in (_CD1, _CD2):
+        (music_dir / disc / "Folder.jpg").write_bytes(disc.name.encode())
+        (music_dir / disc / f"{disc.name}.log").write_bytes(b"log")
+    disc1 = _id_at(engine_settings, music_dir / _CD1 / "01.mp3")
+    disc2 = _id_at(engine_settings, music_dir / _CD2 / "01.mp3")
+    _stage(engine_settings, (disc1, _MERGED / "101.mp3"), (disc2, _MERGED / "201.mp3"))
+    assert _CD2 / "Folder.jpg" not in {
+        Path(row.from_path) for row in _staged_sidecars(engine_settings)
+    }
+
+    result = paths.unstage_paths(engine_settings, file_id=disc1)
+
+    assert (result.removed, result.sidecars_removed, result.sidecars_staged) == (1, 2, 1)
+    assert {Path(row.from_path) for row in _staged_sidecars(engine_settings)} == {
+        _CD2 / "CD2.log",
+        _CD2 / "Folder.jpg",
+    }
 
 
 _MAIN = Path("Artist") / "Main"

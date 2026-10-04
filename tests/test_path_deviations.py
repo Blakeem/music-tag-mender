@@ -450,7 +450,7 @@ def test_a_preview_renders_a_candidate_without_saving_it(
     assert config.load_settings().container_folders == ()
     persisted = _report(engine_settings)
     assert persisted.persisted
-    assert persisted.groups[0].example == {"from": str(_X), "to": str(_X_TARGET)}
+    assert persisted.groups[0].example == {"from_path": str(_X), "to_path": str(_X_TARGET)}
 
 
 def test_the_header_reads_the_library(engine_settings: Settings, music_dir: Path) -> None:
@@ -474,6 +474,9 @@ def test_the_header_reads_the_library(engine_settings: Settings, music_dir: Path
     candidates = [c.folder for c in report.container_candidates]
     assert candidates == ["Soundtracks"]
     assert report.container_candidates[0].top_album_artist == "Composer"
+    assert report.container_candidates[0].listed is False
+    listed = _report(engine_settings, container_folders=["Soundtracks"]).container_candidates
+    assert [(c.folder, c.listed) for c in listed] == [("Soundtracks", True)]
     assert report.gate.open is False
     assert report.volume_refusal is None
     assert [level.component for level in report.fit] == list(
@@ -482,6 +485,43 @@ def test_the_header_reads_the_library(engine_settings: Settings, music_dir: Path
     assert [(level.exact, level.case, level.differs) for level in report.fit] == [(1, 0, 1)] * 3
     assert report.groups[0].folder == str(Path("Soundtracks") / "Film")
     assert report.groups[0].kind == paths.KIND_MOVE
+
+
+def test_a_top_folder_naming_its_artist_on_the_ladder_is_no_container_candidate(
+    engine_settings: Settings, music_dir: Path
+) -> None:
+    release = Path("Beatles") / "(1969) The Beatles - Abbey Road"
+    files = {
+        release / "01 Come Together.flac": _tags(
+            albumartist="The Beatles",
+            artist="The Beatles",
+            album="Abbey Road",
+            date="1969",
+            title="Come Together",
+        ),
+    }
+    _build(engine_settings, music_dir, files)
+
+    report = _report(engine_settings)
+
+    assert report.container_candidates == ()
+
+
+def test_every_view_reports_the_library_wide_group_count(
+    engine_settings: Settings, music_dir: Path
+) -> None:
+    files = {
+        _DOMINANT / "Artist - Album - 01 - Song.flac": _tags(),
+        _X: _tags(album="Other", tracknumber="2", title="Two"),
+    }
+    _build(engine_settings, music_dir, files)
+
+    grouped = _report(engine_settings)
+    rows = _report(engine_settings, group=False)
+    folder = _report(engine_settings, folder=str(_DOMINANT))
+
+    assert grouped.group_count == len(grouped.groups) == 1
+    assert (rows.group_count, folder.group_count) == (1, 1)
 
 
 def test_folder_expands_one_folder_to_every_file(

@@ -20,7 +20,7 @@ import httpx
 import mutagen
 import pytest
 
-from conftest import make_track
+from conftest import make_rvad_mp3, make_track
 from tagmend.engine import axis, axis_status, staging, store, versioning, years
 from tagmend.engine.db import connect
 from tagmend.engine.library import list_files as library_list
@@ -581,6 +581,25 @@ def test_dry_run_itemizes_a_file_staging_would_refuse(
     assert result.staged_files == 1
     assert [item["key"] for item in result.error_items] == [f"file_id={gone_id}"]
     assert staging.diff_tags(engine_settings) == []
+
+
+def test_dry_run_itemizes_a_file_the_writer_refuses(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    make_track(music_dir / "plain.mp3", {"artist": ["Black Sabbath"], "album": ["Paranoid"]})
+    make_rvad_mp3(music_dir / "loud.mp3", {"artist": ["Black Sabbath"], "album": ["Paranoid"]})
+    scan_library(engine_settings)
+    loud_id = _file_id(engine_settings, music_dir, "loud.mp3")
+    fake = FakeMBReleaseGroupSource({("Black Sabbath", "Paranoid"): _mb("1970")})
+
+    preview = years.resolve_years(engine_settings, client=fake, dry_run=True)
+    real = years.resolve_years(engine_settings, client=fake)
+
+    assert preview.staged_files == real.staged_files == 1
+    assert [item["key"] for item in preview.error_items] == [f"file_id={loud_id}"]
+    assert "RVAD" in preview.error_items[0]["message"]
+    assert preview.error_items == real.error_items
 
 
 def test_dry_run_ignores_empty_staging_precondition(

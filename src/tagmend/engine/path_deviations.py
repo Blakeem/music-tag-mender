@@ -26,8 +26,7 @@ from tagmend.engine import db, mismatch, naming, path_keys, paths, schema, store
 from tagmend.engine.detector_core import parse_position
 from tagmend.engine.path_text import clean_value
 from tagmend.engine.serialize import FieldDict
-from tagmend.engine.text_keys import alnum_ascii_key, artist_name_key
-from tagmend.engine.validation import check_limit
+from tagmend.engine.validation import check_limit, require_music_path
 from tagmend.log import get_logger
 
 if TYPE_CHECKING:
@@ -213,29 +212,32 @@ def _candidates(
     tag_values: Mapping[int, Mapping[str, str]],
 ) -> tuple[ContainerCandidate, ...]:
     """Return the top folders whose name matches under half of their files' album artists."""
-    listed = {alnum_ascii_key(name) for name in settings.container_folders}
-    by_top: dict[str, list[str]] = {}
+    by_top: dict[str, list[tuple[str | None, bool]]] = {}
+    container_of: dict[str, bool] = {}
     for row in rows:
-        top = mismatch.layout_of(settings, row.folder, row.filename).top_folder
+        layout = mismatch.layout_of(settings, row.folder, row.filename)
+        top = layout.top_folder
         if top is None:
             continue
         values = tag_values.get(row.id, {})
-        album_artist = clean_value(values.get("albumartist") or values.get("artist") or "")
-        by_top.setdefault(top, []).append(album_artist)
+        albumartist = clean_value(values.get("albumartist", "")) or None
+        artist = clean_value(values.get("artist", "")) or None
+        container_of[top] = layout.container
+        names_top = mismatch.top_folder_names_artist(top, albumartist, artist)
+        by_top.setdefault(top, []).append((albumartist or artist, names_top))
     candidates: list[ContainerCandidate] = []
-    for top, album_artists in by_top.items():
-        top_key = artist_name_key(top)
-        matching = sum(1 for name in album_artists if name and artist_name_key(name) == top_key)
-        if matching * 2 >= len(album_artists):
+    for top, files in by_top.items():
+        matching = sum(1 for _, names_top in files if names_top)
+        if matching * 2 >= len(files):
             continue
-        named = Counter(name for name in album_artists if name)
+        named = Counter(name for name, _ in files if name is not None)
         candidates.append(
             ContainerCandidate(
                 folder=top,
-                files=len(album_artists),
+                files=len(files),
                 album_artists=len(named),
                 top_album_artist=named.most_common(1)[0][0] if named else None,
-                listed=alnum_ascii_key(top) in listed,
+                listed=container_of[top],
             ),
         )
     candidates.sort(key=lambda candidate: (-candidate.files, candidate.folder))
@@ -246,7 +248,10 @@ def _candidates(
 
 
 def _deviates(plan: paths.FilePlan) -> bool:
-    """Whether the file sits anywhere but its render."""
+    """Whether the plan is anything but ``at_target``.
+
+    A move, a case difference, a hold or a kept staged move each count.
+    """
     return plan.status != paths.STATUS_AT_TARGET
 
 
@@ -262,7 +267,11 @@ def _group(folder: str, members: list[paths.FilePlan]) -> DeviationGroup:
         ),
         kind=next((kind for kind in _KIND_ORDER if kind in kinds), None),
         held=paths.held_counts(members),
-        example=None if example is None else {"from": example.from_path, "to": example.to_path},
+        example=(
+            None
+            if example is None
+            else {"from_path": example.from_path, "to_path": example.to_path}
+        ),
     )
 
 
@@ -275,12 +284,13 @@ def _body(
 ) -> tuple[int, tuple[DeviationGroup, ...], tuple[paths.FilePlan, ...]]:
     """Return the group count, the groups and the rows the view asks for."""
     ordered = sorted(plans, key=lambda plan: plan.from_path)
+    group_count = len({plan.source_folder for plan in plans if _deviates(plan)})
     if folder_key is not None:
         rows = [plan for plan in ordered if plan.folder_key == folder_key]
-        return 0, (), tuple(rows[:limit])
+        return group_count, (), tuple(rows[:limit])
     if not group:
         rows = [plan for plan in ordered if _deviates(plan)]
-        return 0, (), tuple(rows[:limit])
+        return group_count, (), tuple(rows[:limit])
     by_folder: dict[str, list[paths.FilePlan]] = {}
     for plan in ordered:
         by_folder.setdefault(plan.source_folder, []).append(plan)
@@ -289,7 +299,7 @@ def _body(
         for folder, members in by_folder.items()
         if any(_deviates(plan) for plan in members)
     ]
-    return len(groups), tuple(groups[:limit]), ()
+    return group_count, tuple(groups[:limit]), ()
 
 
 def _effective_settings(
@@ -333,7 +343,7 @@ def detect_path_deviations(  # noqa: PLR0913 - cohesive keyword-only view parame
     group: bool = True,
     limit: int | None = 50,
 ) -> DeviationsReport:
-    """Report every file whose path differs from the path its tags render. Read-only.
+    """Report every file whose plan is not ``at_target`` under the path its tags render. Read-only.
 
     The persisted naming settings render each present file, unless *pattern* or
     *container_folders* preview a candidate, which is never saved. Save the winner with
@@ -350,10 +360,7 @@ def detect_path_deviations(  # noqa: PLR0913 - cohesive keyword-only view parame
     ``music_path`` and a missing ``music_path``.
     """
     check_limit(limit)
-    if settings.music_path is None:
-        message = "music_path not configured. Run `tagmend config-set music_path <dir>`"
-        raise ValueError(message)
-    music_path = settings.music_path
+    music_path = require_music_path(settings)
     previewed, parsed = _effective_settings(settings, pattern, container_folders)
     folder_key = None if folder is None else path_keys.folder_arg_key(settings, folder)
 

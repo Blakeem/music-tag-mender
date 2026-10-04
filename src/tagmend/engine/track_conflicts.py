@@ -2,39 +2,39 @@
 
 The intra-folder half of tag coherence: a folder that holds one album should describe ONE
 tracklist, so no two files in it may claim the same ``(discnumber, tracknumber)`` slot. When
-two do, one of them is wrong — a bulk tagger stamped a whole folder with one track's numbers,
+two do, one of them is wrong. A bulk tagger stamped a whole folder with one track's numbers,
 a duplicate file was never renumbered, or two takes were matched to the same MusicBrainz
-recording. Measured on the 11,196-file library: 54 folders, 294 files.
+recording.
 
-Pure read over the snapshot mirror — writes nothing, stages nothing, no network. The
+Pure read over the snapshot mirror. It writes nothing, stages nothing and calls no network. The
 comparison is a file's track fields against its **folder siblings'** (the ``conflict`` finding
 noun), which is what distinguishes this from ``detect_mismatches`` (tags against the folder
 PATH) and ``detect_album_gaps`` (a tag against absence).
 
 Three tiers, matching the shapes the library actually contains:
 
-* ``high`` — the colliding files carry DIFFERENT titles. Two distinct songs cannot both be
-  track 7; the numbering is wrong.
-* ``medium`` — same title, same container. A genuine duplicate stamp: the folder holds the
+* ``high``: the colliding files carry DIFFERENT titles. Two distinct songs cannot both be
+  track 7, so the numbering is wrong.
+* ``medium``: same title, same container. A genuine duplicate stamp: the folder holds the
   same track twice under one number.
-* ``low`` — same title, different container (an ``.mp3`` and a ``.flac`` of one song). Usually
+* ``low``: same title, different container (an ``.mp3`` and a ``.flac`` of one song). Usually
   a deliberate duplicate encode rather than a tagging defect, so it is reported last.
 
 A folder holding more than one album, or named as a non-album folder (``Singles``,
-``Remixes``…), legitimately repeats track numbers — every single is track 1. Those rows go to
+``Remixes``…), legitimately repeats track numbers, since every single is track 1. Those rows go to
 ``folder_context`` instead: visible for review, outside ``flagged`` and outside the tier
 counts, so the headline number keeps meaning "files that are wrong". The guard is derived from
 the folder's own ``album`` values rather than configured, so it needs no setup.
 
 Track TOTALS are deliberately not reported here. A folder of 10 files whose tags say ``/12``
 is either missing two tracks or carrying a wrong total, and nothing in the snapshot can tell
-which — that needs the MusicBrainz release tracklist.
+which. That needs the MusicBrainz release tracklist.
 """
 
 from __future__ import annotations
 
 from collections import defaultdict
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Final
 
 from tagmend.engine import db, path_keys, schema, store
@@ -43,11 +43,12 @@ from tagmend.engine.detector_core import (
     Tier,
     group_by_folder,
     is_non_album_folder,
+    narrow,
     parse_position,
     validate_tier,
 )
 from tagmend.engine.serialize import FieldDict
-from tagmend.engine.text_keys import alnum_script_key, loose_key
+from tagmend.engine.text_keys import alnum_script_key, display_key, loose_key
 from tagmend.engine.validation import check_limit
 from tagmend.log import get_logger
 
@@ -67,7 +68,7 @@ _DEFAULT_DISC: Final = "1"
 
 
 # Per-tier reason strings (named so they stay stable across the row + tests).
-_REASON_HIGH: Final = "different titles share this track slot; the numbering is wrong"
+_REASON_HIGH: Final = "different titles share this track slot, so the numbering is wrong"
 _REASON_MEDIUM: Final = "duplicate track stamp: same title and container share this track slot"
 _REASON_LOW: Final = "same title in another container shares this track slot (duplicate encode)"
 _REASON_MULTI_ALBUM: Final = (
@@ -137,7 +138,7 @@ class TrackConflictsReport(FieldDict):
 
     The ``high``/``medium``/``low``/``flagged`` counts describe the whole library and are
     unaffected by a ``tier``/``limit``/``folder`` narrowing, so a filtered view still shows the
-    full picture of what remains actionable. The tier counts always sum to ``flagged``;
+    full picture of what remains actionable. The tier counts always sum to ``flagged``, and
     ``folder_context`` is outside both.
     """
 
@@ -170,10 +171,10 @@ def _is_context_folder(files: list[_FileInput]) -> str | None:
     """Return the reason this folder legitimately repeats track slots, or ``None``.
 
     A compilation/singles folder holds several releases, so two files sharing track 1 says
-    nothing. The album-value test is intrinsic (no configuration); the leaf-name test catches
+    nothing. The album-value test is intrinsic (no configuration). The leaf-name test catches
     the same folders when their files carry no album tag at all.
     """
-    albums = {f.album for f in files if f.album}
+    albums = {display_key(f.album) for f in files if f.album and f.album.strip()}
     if len(albums) > 1:
         return _REASON_MULTI_ALBUM
     if is_non_album_folder(files[0].folder):
@@ -215,6 +216,37 @@ def _rows_for_slot(
     ]
 
 
+def _fold_group(
+    folder: str,
+    file_count: int,
+    flagged_rows: list[TrackConflictRow],
+    context_rows: list[TrackConflictRow],
+) -> TrackConflictGroup:
+    """Fold one folder's rows into one compact line, flagged and context counted apart."""
+    slots: dict[str, int] = {}
+    tiers: dict[str, int] = {}
+    # Only FLAGGED rows feed the histograms and file_ids, so a fix flow driven off a group
+    # can never pick up a review-context file.
+    for row in flagged_rows:
+        key = f"{row.disc}-{row.track}"
+        slots[key] = slots.get(key, 0) + 1
+        tiers[row.tier] = tiers.get(row.tier, 0) + 1
+    return TrackConflictGroup(
+        folder=folder,
+        file_count=file_count,
+        flagged=len(flagged_rows),
+        folder_context=len(context_rows),
+        slots=slots,
+        tiers=tiers,
+        file_ids=sorted(row.file_id for row in flagged_rows),
+    )
+
+
+def _refold_group(group: TrackConflictGroup, rows: list[TrackConflictRow]) -> TrackConflictGroup:
+    """Return *group* describing exactly *rows*, the flagged rows a tier view kept."""
+    return _fold_group(group.folder, group.file_count, rows, [])
+
+
 def _classify(files: list[_FileInput]) -> TrackConflictsReport:
     """Classify every folder's colliding track slots into flagged rows + context rows."""
     # Input: bucket files by folder, preserving discovery order within each.
@@ -234,15 +266,27 @@ def _classify(files: list[_FileInput]) -> TrackConflictsReport:
             continue
         context_reason = _is_context_folder(folder_files)
         for peers in collisions.values():
-            if context_reason is not None:
-                context.extend(_rows_for_slot(peers, Tier.LOW, context_reason))
-                continue
             tier, reason = _tier_for(peers)
-            flagged.extend(_rows_for_slot(peers, tier, reason))
+            if context_reason is not None:
+                context.extend(_rows_for_slot(peers, tier, context_reason))
+            else:
+                flagged.extend(_rows_for_slot(peers, tier, reason))
 
-    # Output: deterministic order (tier rank, then file id) and the library-wide counts.
+    # Output: deterministic order (tier rank, then file id), one group per folder holding a
+    # row, and the library-wide counts.
     flagged.sort(key=lambda r: (TIER_RANK[Tier(r.tier)], r.file_id))
     context.sort(key=lambda r: r.file_id)
+    flagged_by_folder = group_by_folder(flagged)
+    context_by_folder = group_by_folder(context)
+    groups = [
+        _fold_group(
+            folder,
+            len(by_folder[folder]),
+            flagged_by_folder.get(folder, []),
+            context_by_folder.get(folder, []),
+        )
+        for folder in sorted(flagged_by_folder.keys() | context_by_folder.keys())
+    ]
     tiers = {t: sum(1 for r in flagged if r.tier == t.value) for t in Tier}
     return TrackConflictsReport(
         rows=flagged,
@@ -253,6 +297,7 @@ def _classify(files: list[_FileInput]) -> TrackConflictsReport:
         low=tiers[Tier.LOW],
         folder_context=len(context),
         folder_context_rows=context,
+        groups=groups,
         summary=_summarize(
             total_files=len(files),
             flagged=len(flagged),
@@ -286,42 +331,8 @@ def _summarize(  # noqa: PLR0913 - one keyword per reported count, cohesive by d
 # --- narrowing -----------------------------------------------------------------------
 
 
-def _build_groups(
-    rows: list[TrackConflictRow],
-    context_rows: list[TrackConflictRow],
-    file_counts: dict[str, int],
-) -> list[TrackConflictGroup]:
-    """Fold rows into one compact line per folder, flagged and context counted apart."""
-    by_folder = group_by_folder(rows)
-    context_by_folder = group_by_folder(context_rows)
-    groups: list[TrackConflictGroup] = []
-    for folder in sorted(by_folder.keys() | context_by_folder.keys()):
-        folder_rows = by_folder.get(folder, [])
-        slots: dict[str, int] = {}
-        tiers: dict[str, int] = {}
-        # Only FLAGGED rows feed the histograms and file_ids, so a fix flow driven off a group
-        # can never pick up a review-context file.
-        for row in folder_rows:
-            key = f"{row.disc}-{row.track}"
-            slots[key] = slots.get(key, 0) + 1
-            tiers[row.tier] = tiers.get(row.tier, 0) + 1
-        groups.append(
-            TrackConflictGroup(
-                folder=folder,
-                file_count=file_counts.get(folder, 0),
-                flagged=len(folder_rows),
-                folder_context=len(context_by_folder.get(folder, [])),
-                slots=slots,
-                tiers=tiers,
-                file_ids=sorted(row.file_id for row in folder_rows),
-            ),
-        )
-    return groups
-
-
-def _narrow(  # noqa: PLR0913 - the view knobs the public entry forwards, one each
+def _narrow(
     report: TrackConflictsReport,
-    file_counts: dict[str, int],
     *,
     tier: str | None,
     limit: int | None,
@@ -329,31 +340,18 @@ def _narrow(  # noqa: PLR0913 - the view knobs the public entry forwards, one ea
     folder_key: str | None,
 ) -> TrackConflictsReport:
     """Apply the tier/folder/limit view without touching the library-wide counts."""
-    rows = report.rows if tier is None else [r for r in report.rows if r.tier == tier]
-    context_rows = report.folder_context_rows if tier is None else []
-    if folder_key is not None:
-        # Key equality, never a prefix: a sibling or a subfolder must not be swept in.
-        rows = [r for r in rows if path_keys.path_key(r.folder) == folder_key]
-        context_rows = [r for r in context_rows if path_keys.path_key(r.folder) == folder_key]
-        return replace(
-            report,
-            rows=rows[:limit] if limit is not None else rows,
-            folder_context_rows=context_rows[:limit] if limit is not None else context_rows,
-            groups=[],
-        )
-    if group:
-        groups = _build_groups(rows, context_rows, file_counts)
-        return replace(
-            report,
-            rows=[],
-            folder_context_rows=[],
-            groups=groups[:limit] if limit is not None else groups,
-        )
-    return replace(
+    return narrow(
         report,
-        rows=rows[:limit] if limit is not None else rows,
-        folder_context_rows=context_rows[:limit] if limit is not None else context_rows,
-        groups=[],
+        rows=report.rows,
+        groups=report.groups,
+        secondary_field="folder_context_rows",
+        secondary_rows=report.folder_context_rows,
+        secondary_in_tier=False,
+        refold=_refold_group,
+        tier=tier,
+        folder_key=folder_key,
+        limit=limit,
+        group=group,
     )
 
 
@@ -409,20 +407,10 @@ def detect_track_conflicts(
         connection.close()
 
     report = _classify(files)
-    file_counts: dict[str, int] = defaultdict(int)
-    for f in files:
-        file_counts[f.folder] += 1
     logger.info(
         "track conflicts: flagged=%s context=%s of %s file(s)",
         report.flagged,
         report.folder_context,
         report.total_files,
     )
-    return _narrow(
-        report,
-        dict(file_counts),
-        tier=tier,
-        limit=limit,
-        group=group,
-        folder_key=folder_key,
-    )
+    return _narrow(report, tier=tier, limit=limit, group=group, folder_key=folder_key)

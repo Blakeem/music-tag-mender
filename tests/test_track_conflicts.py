@@ -188,6 +188,22 @@ def test_multi_album_folder_is_review_context_not_flagged() -> None:
     assert report.flagged == 0
     assert report.folder_context == 2
     assert report.folder_context_rows[0].reason == track_conflicts._REASON_MULTI_ALBUM
+    # A context row keeps its computed tier, so two different titles still read high.
+    assert {r.tier for r in report.folder_context_rows} == {"high"}
+
+
+@pytest.mark.parametrize("second_album", ["The wall", " "])
+def test_albums_differing_only_in_case_or_blank_are_one_album(second_album: str) -> None:
+    folder = _MUSIC / "Pink Floyd" / "The Wall"
+    files = [
+        _mk(1, folder, "a.mp3", tracknumber="1", title="X", album="The Wall"),
+        _mk(2, folder, "b.mp3", tracknumber="1", title="Y", album=second_album),
+    ]
+
+    report = track_conflicts._classify(files)
+
+    assert [r.file_id for r in report.rows] == [1, 2]
+    assert report.folder_context_rows == []
 
 
 def test_non_album_folder_without_album_tags_is_review_context() -> None:
@@ -336,7 +352,7 @@ def test_narrowing_preserves_library_wide_counts() -> None:
     ]
     report = track_conflicts._classify(files)
 
-    narrowed = track_conflicts._narrow(report, {}, tier=None, limit=1, group=False, folder_key=None)
+    narrowed = track_conflicts._narrow(report, tier=None, limit=1, group=False, folder_key=None)
 
     assert len(narrowed.rows) == 1
     assert narrowed.flagged == 2  # unchanged by the view
@@ -352,10 +368,13 @@ def test_tier_filter_returns_no_context_rows() -> None:
     report = track_conflicts._classify(files)
 
     narrowed = track_conflicts._narrow(
-        report, {}, tier="low", limit=None, group=False, folder_key=None
+        report, tier="high", limit=None, group=False, folder_key=None
     )
+    grouped = track_conflicts._narrow(report, tier="high", limit=None, group=True, folder_key=None)
 
+    assert [row.tier for row in report.folder_context_rows] == ["high", "high"]
     assert narrowed.folder_context_rows == []
+    assert grouped.groups == []
 
 
 def test_group_view_counts_flagged_and_context_separately() -> None:
@@ -368,11 +387,8 @@ def test_group_view_counts_flagged_and_context_separately() -> None:
         _mk(4, singles, "d.mp3", tracknumber="1", title="Q", album="Q"),
     ]
     report = track_conflicts._classify(files)
-    counts = {str(album): 2, str(singles): 2}
 
-    grouped = track_conflicts._narrow(
-        report, counts, tier=None, limit=None, group=True, folder_key=None
-    )
+    grouped = track_conflicts._narrow(report, tier=None, limit=None, group=True, folder_key=None)
 
     by_folder = {g.folder: g for g in grouped.groups}
     assert by_folder[str(album)].flagged == 2
@@ -395,7 +411,7 @@ def test_folder_expansion_is_exact_not_a_prefix() -> None:
     report = track_conflicts._classify(files)
 
     narrowed = track_conflicts._narrow(
-        report, {}, tier=None, limit=None, group=False, folder_key=path_keys.path_key(outer)
+        report, tier=None, limit=None, group=False, folder_key=path_keys.path_key(outer)
     )
 
     assert {r.file_id for r in narrowed.rows} == {1, 2}
@@ -407,7 +423,7 @@ def test_folder_expansion_caps_context_rows_too() -> None:
     report = track_conflicts._classify(files)
 
     narrowed = track_conflicts._narrow(
-        report, {}, tier=None, limit=1, group=False, folder_key=path_keys.path_key(singles)
+        report, tier=None, limit=1, group=False, folder_key=path_keys.path_key(singles)
     )
 
     assert len(narrowed.folder_context_rows) == 1

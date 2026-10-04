@@ -7,11 +7,12 @@ A pattern is a ``/``-separated list of components, the last one the filename::
     field     = "{" name ("|" name)* (":" width)? "}"
     group     = "[" (literal | field)+ "]"
 
-A field renders its first non-empty name, and ``:02`` zero-pads a position such as ``3/12``. A
-group renders only when every field inside it is non-empty. A field outside every group is
-required: when it renders empty the file is held ``missing_<name>``, naming its last name. A
-component built only from groups is dropped when it renders empty. The file's own extension is
-appended to the filename and is never written in the pattern.
+A field renders its first non-empty name. ``tracknumber`` and ``discnumber`` always drop their
+``/total``, and ``:02`` zero-pads a position. A group renders only when every field inside it is
+non-empty. A field outside every group is required: when it renders empty the file is held
+``missing_<name>``, naming its last name. A component built only from groups is dropped when it
+renders empty. The file's own extension is appended to the filename and is never written in the
+pattern.
 
 A name is a managed tag or one of three computed names. ``year`` is the first four digits of
 ``originaldate``, else of ``date``, with ``0000`` empty. ``disc`` is the file's disc number when
@@ -30,8 +31,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
+from tagmend.config import FOLDER_LIST_DELIMITER
 from tagmend.engine import path_keys, text_keys
-from tagmend.engine.detector_core import parse_position
+from tagmend.engine.detector_core import parse_position, parse_total, position_head
 from tagmend.engine.path_text import clean_value, is_reserved, part_problems
 from tagmend.engine.tags import MANAGED_TAGS
 
@@ -57,10 +59,8 @@ BASE_TAGS: Final = ("album", "date", "originaldate", "discnumber", "tracknumber"
 _SEPARATOR: Final = "/"
 _SPECIAL: Final = frozenset("{}[]/")
 _WIDTH: Final = re.compile(r"[0-9]+")
-_POSITION: Final = re.compile(r"\s*([0-9]+)\s*(?:/.*)?", re.DOTALL)
-_YEAR_PREFIX: Final = re.compile(r"\s*([0-9]{4})")
+_POSITION_NAMES: Final = frozenset({"tracknumber", "discnumber"})
 _EMPTY_YEAR: Final = "0000"
-_FOLDER_LIST_DELIMITER: Final = ";"
 
 
 # --- the grammar ---------------------------------------------------------------------
@@ -269,8 +269,10 @@ def validate_container_folders(names: Sequence[str]) -> tuple[str, ...]:
         if not name:
             problems.append("an empty folder name")
             continue
-        if any(char in name for char in (_SEPARATOR, "\\", _FOLDER_LIST_DELIMITER)):
-            problems.append(f"{name!r} must be one folder name with no '/', '\\' or ';'")
+        if any(char in name for char in (_SEPARATOR, "\\", FOLDER_LIST_DELIMITER)):
+            problems.append(
+                f"{name!r} must be one folder name with no '/', '\\' or '{FOLDER_LIST_DELIMITER}'"
+            )
             continue
         problems.extend(part_problems(name))
     if problems:
@@ -281,7 +283,7 @@ def validate_container_folders(names: Sequence[str]) -> tuple[str, ...]:
 
 def folder_list_setting(names: Sequence[str]) -> str:
     """Return *names* in the stored ``container_folders`` form."""
-    return _FOLDER_LIST_DELIMITER.join(names)
+    return FOLDER_LIST_DELIMITER.join(names)
 
 
 # --- the renderer --------------------------------------------------------------------
@@ -337,31 +339,26 @@ class _Missing:
 def year_of(values: Mapping[str, str]) -> str:
     """Return the ``year`` computed name: four digits of ``originaldate``, else of ``date``."""
     for name in ("originaldate", "date"):
-        match = _YEAR_PREFIX.match(values.get(name, ""))
-        if match is not None and match[1] != _EMPTY_YEAR:
-            return match[1]
+        year = text_keys.year_key(values.get(name))
+        if year is not None and year != _EMPTY_YEAR:
+            return year
     return ""
-
-
-def _disc_total(value: str) -> int | None:
-    """Return the ``M`` of an ``N/M`` disc number, or ``None``."""
-    _, slash, total = value.partition("/")
-    stripped = total.strip()
-    return int(stripped) if slash and stripped.isdecimal() else None
 
 
 def _pad(raw: str, width: int) -> str:
     """Zero-pad a position value, dropping its ``/total``. Any other value stays as written."""
-    match = _POSITION.fullmatch(raw)
-    if match is None:
+    position = parse_position(raw)
+    if position is None:
         return raw
-    return str(int(match[1])).zfill(width)
+    return str(position).zfill(width)
 
 
 def _field_text(field: Field, values: Mapping[str, str]) -> str:
     """Return the first of *field*'s names that renders non-empty, or ``""``."""
     for name in field.names:
         raw = values.get(name, "").strip()
+        if name in _POSITION_NAMES:
+            raw = position_head(raw)
         if field.width is not None:
             raw = _pad(raw, field.width)
         text = clean_value(raw)
@@ -506,7 +503,7 @@ def album_title_key(values: Mapping[str, str]) -> str:
 def _multi_disc(members: list[RenderInput]) -> bool:
     """Whether an album's files carry more than one disc number, or any total above 1."""
     discs = {parse_position(member.values.get("discnumber")) for member in members}
-    totals = (_disc_total(member.values.get("discnumber", "")) for member in members)
+    totals = (parse_total(member.values.get("discnumber")) for member in members)
     return len(discs - {None}) > 1 or any(total is not None and total > 1 for total in totals)
 
 

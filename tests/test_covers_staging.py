@@ -4,11 +4,12 @@ fake Cover Art Archive source."""
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import shutil
 import sqlite3
 import zlib
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 import pytest
 
@@ -484,6 +485,29 @@ def test_a_staged_cover_blocks_the_resolvers_and_revert_commit(
         versioning.revert_commit(engine_settings, 1)
 
 
+def test_a_present_file_outside_music_path_is_neither_counted_nor_staged(
+    engine_settings: Settings,
+    music_dir: Path,
+    tmp_path: Path,
+) -> None:
+    old_root = tmp_path / "old"
+    _album(old_root / "Band" / "Old", "Old")
+    (old_root / "Band" / "Old" / "Old front.jpg").write_bytes(_jpeg())
+    scan_library(dataclasses.replace(engine_settings, music_path=old_root))
+    _album(music_dir / "Band" / "New", "New")
+    (music_dir / "Band" / "New" / "New front.jpg").write_bytes(_jpeg())
+    scan_library(engine_settings)
+
+    report = covers.detect_cover_gaps(engine_settings)
+    result = covers.stage_covers(engine_settings, client=_FakeCoverArt())
+
+    assert (report.albums, [row.album for row in report.rows]) == (1, ["New"])
+    assert [row.target_path for row in result.staged] == [
+        _target(music_dir, music_dir / "Band" / "New")
+    ]
+    assert result.skipped == []
+
+
 # --- diff_covers and unstage_covers ----------------------------------------------------
 
 
@@ -557,6 +581,33 @@ def test_diff_covers_keeps_disc_folders_below_the_target(
 
     assert result.staged[0].target_path == str(release.relative_to(music_dir) / "cover.jpg")
     assert view.state == covers.STATE_READY
+
+
+def test_diff_covers_reports_a_cover_that_landed_before_a_crash(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    folder = _stage_one(engine_settings, music_dir, "One")
+    (folder / "cover.jpg").write_bytes(_jpeg())
+
+    [view] = covers.diff_covers(engine_settings)
+
+    assert view.state == covers.STATE_LANDED
+
+
+def test_unstage_covers_refuses_a_landed_cover_and_drops_nothing(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    one = _stage_one(engine_settings, music_dir, "One")
+    _stage_one(engine_settings, music_dir, "Two")
+    (one / "cover.jpg").write_bytes(_jpeg())
+
+    with pytest.raises(ValueError, match="Run commit_covers") as excinfo:
+        covers.unstage_covers(engine_settings)
+
+    assert _target(music_dir, one) in str(excinfo.value)
+    assert len(_staged(engine_settings)) == 2
 
 
 def test_diff_and_unstage_scope_by_folder_and_unstage_clears_the_rows(
@@ -671,6 +722,31 @@ def test_commit_covers_writes_two_staged_covers_as_one_commit(
     assert (commit.origin, commit.status) == ("auto", "applied")
 
 
+def test_a_stage_covers_note_reaches_diff_covers_and_the_cover_write(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    folder = music_dir / "Band" / "One"
+    _album(folder, "One")
+    (folder / "One front.jpg").write_bytes(_jpeg())
+    scan_library(engine_settings)
+    covers.stage_covers(
+        engine_settings, folder="Band/One", note="front from the booklet", client=_FakeCoverArt()
+    )
+
+    diffed = covers.diff_covers(engine_settings)
+    result = covers.commit_covers(engine_settings)
+
+    assert [row.note for row in diffed] == ["front from the booklet"]
+    assert result.commit_id is not None
+    connection = db.connect(engine_settings.db_path)
+    try:
+        notes = connection.execute("SELECT note FROM cover_writes").fetchall()
+    finally:
+        connection.close()
+    assert [row[0] for row in notes] == ["front from the booklet"]
+
+
 def test_an_owner_image_among_auto_covers_makes_the_commit_manual(
     engine_settings: Settings,
     music_dir: Path,
@@ -746,6 +822,25 @@ def test_a_target_already_holding_the_staged_bytes_is_logged_as_landed(
     assert result.errors == []
     assert [row.target_path for row in result.written] == [_target(music_dir, folder)]
     assert (folder / "cover.jpg").stat().st_mtime_ns == landed_at
+    assert [row[1] for row in _cover_writes(engine_settings)] == ["create"]
+    assert _staged(engine_settings) == []
+
+
+def test_a_landed_cover_whose_album_moved_is_still_logged(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    folder = _stage_one(engine_settings, music_dir, "One")
+    (folder / "cover.jpg").write_bytes(_jpeg())
+    elsewhere = music_dir / "Band" / "Elsewhere"
+    elsewhere.mkdir()
+    shutil.move(folder / "02.mp3", elsewhere / "02.mp3")
+    scan_library(engine_settings)
+
+    result = covers.commit_covers(engine_settings)
+
+    assert result.errors == []
+    assert [row.target_path for row in result.written] == [_target(music_dir, folder)]
     assert [row[1] for row in _cover_writes(engine_settings)] == ["create"]
     assert _staged(engine_settings) == []
 
@@ -960,6 +1055,26 @@ def test_reverting_two_covers_trashes_both_and_its_revert_writes_them_again(
     assert _reverted_from(engine_settings) == [None, None, 1, 2, 3, 4]
 
 
+def test_a_second_revert_of_a_cover_commit_skips_the_cover_a_later_revert_wrote(
+    engine_settings: Settings,
+    music_dir: Path,
+    trashed: list[Path],
+) -> None:
+    folder = _stage_one(engine_settings, music_dir, "One")
+    written = covers.commit_covers(engine_settings)
+    reverted = _revert(engine_settings, written.commit_id)
+    again = _revert(engine_settings, reverted.commit_id)
+
+    result = _revert(engine_settings, written.commit_id)
+
+    assert again.commit_id is not None
+    assert [row.status for row in result.sidecars] == ["skipped_later_changes"]
+    assert result.commit_id is None
+    assert trashed == [music_dir / _target(music_dir, folder)]
+    assert (folder / "cover.jpg").read_bytes() == _jpeg()
+    assert [row[1] for row in _cover_writes(engine_settings)] == ["create", "remove", "create"]
+
+
 def test_a_dry_run_revert_of_a_cover_commit_changes_nothing(
     engine_settings: Settings,
     music_dir: Path,
@@ -1074,6 +1189,123 @@ def test_a_trash_error_leaves_the_cover_and_logs_no_remove_row(
     assert cover.detail is not None
     assert "no Recycle Bin" in cover.detail
     assert (folder / "cover.jpg").read_bytes() == _jpeg()
+    assert [row[1] for row in _cover_writes(engine_settings)] == ["create"]
+
+
+def test_a_restored_cover_that_landed_before_a_crash_is_logged_with_no_write(
+    engine_settings: Settings,
+    music_dir: Path,
+    trashed: list[Path],
+) -> None:
+    folder = _stage_one(engine_settings, music_dir, "One")
+    written = covers.commit_covers(engine_settings)
+    reverted = _revert(engine_settings, written.commit_id)
+    # The crash window: the restore's move landed and its log row did not.
+    (folder / "cover.jpg").write_bytes(_jpeg())
+    landed_at = (folder / "cover.jpg").stat().st_mtime_ns
+
+    again = _revert(engine_settings, reverted.commit_id)
+
+    [cover] = again.sidecars
+    assert cover.status == "reverted"
+    assert again.commit_id is not None
+    assert (folder / "cover.jpg").stat().st_mtime_ns == landed_at
+    assert not (folder / "cover.jpg.tagmend.tmp").exists()
+    assert len(trashed) == 1
+    assert _cover_writes(engine_settings)[-1] == (
+        again.commit_id,
+        "create",
+        "revert",
+        _target(music_dir, folder),
+        _jpeg(),
+    )
+    assert len(_cover_writes(engine_settings)) == 3
+
+
+def _interrupted_revert(settings: Settings, commit_id: int | None) -> int:
+    """Leave an ``applying`` revert of *commit_id*, as a crash after its trash leaves it."""
+    assert commit_id is not None
+    connection = db.connect(settings.db_path)
+    try:
+        schema.apply_schema(connection)
+        stuck = commits.create_commit(
+            connection,
+            origin="revert",
+            message=None,
+            now="2026-10-02T00:00:00+00:00",
+            reverted_from=commit_id,
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    return stuck
+
+
+def test_a_cover_an_interrupted_revert_trashed_is_logged_as_removed(
+    engine_settings: Settings,
+    music_dir: Path,
+    trashed: list[Path],
+) -> None:
+    folder = _stage_one(engine_settings, music_dir, "One")
+    written = covers.commit_covers(engine_settings)
+    _interrupted_revert(engine_settings, written.commit_id)
+    (folder / "cover.jpg").unlink()
+
+    result = _revert(engine_settings, written.commit_id)
+
+    [cover] = result.sidecars
+    assert cover.status == "reverted"
+    assert result.commit_id is not None
+    assert trashed == []
+    assert _cover_writes(engine_settings) == [
+        (written.commit_id, "create", "auto", _target(music_dir, folder), _jpeg()),
+        (result.commit_id, "remove", "revert", _target(music_dir, folder), None),
+    ]
+
+
+class _CommitFailsOnce(sqlite3.Connection):
+    """A ledger connection whose next commit fails once ``armed`` is set."""
+
+    armed: ClassVar[bool] = False
+
+    def commit(self) -> None:
+        if _CommitFailsOnce.armed:
+            _CommitFailsOnce.armed = False
+            message = "disk I/O error"
+            raise sqlite3.OperationalError(message)
+        super().commit()
+
+
+def test_a_cover_trashed_before_a_failed_log_is_reported_as_in_the_trash(
+    engine_settings: Settings,
+    music_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    folder = _stage_one(engine_settings, music_dir, "One")
+    written = covers.commit_covers(engine_settings)
+    bin_folder = tmp_path / "trash"
+    bin_folder.mkdir()
+
+    def trash_then_fail_the_log(path: Path) -> None:
+        shutil.move(path, bin_folder / path.name)
+        _CommitFailsOnce.armed = True
+
+    def connect(db_path: Path) -> sqlite3.Connection:
+        connection = sqlite3.connect(db_path, factory=_CommitFailsOnce)
+        connection.execute("PRAGMA foreign_keys=ON")
+        return connection
+
+    monkeypatch.setattr(trash, "send_to_trash", trash_then_fail_the_log)
+    monkeypatch.setattr(db, "connect", connect)
+
+    result = _revert(engine_settings, written.commit_id)
+
+    [cover] = result.sidecars
+    assert cover.status == covers.COMMIT_ERROR
+    assert cover.detail is not None
+    assert "The cover is in the OS trash" in cover.detail
+    assert not (folder / "cover.jpg").exists()
     assert [row[1] for row in _cover_writes(engine_settings)] == ["create"]
 
 

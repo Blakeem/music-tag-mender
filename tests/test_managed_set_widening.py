@@ -342,6 +342,24 @@ def test_revert_to_an_older_set_version_restores_the_newer_field_from_the_rebase
     assert read_tags(track).tags["artists"] == ["A", "B"]
 
 
+def test_revert_to_an_older_set_version_deletes_a_newer_field_the_rebaseline_saw_absent(
+    engine_settings: Settings,
+    music_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    track = make_track(music_dir / "t.flac", {"genre": ["Rock"]})
+    file_id = _legacy_baseline(engine_settings, monkeypatch, track)
+    staging.stage_tags(engine_settings, file_id=file_id, tags={"artists": ["A"]})
+    staging.commit_tags(engine_settings)
+    assert read_tags(track).tags["artists"] == ["A"]
+
+    result = versioning.revert_tags(engine_settings, file_id, 0)
+
+    assert result.status == "reverted"
+    assert "artists" not in read_tags(track).tags
+    assert read_tags(track).tags["genre"] == ["Rock"]
+
+
 def test_revert_keeps_the_current_value_when_a_commit_first_governs_the_field(
     engine_settings: Settings,
     music_dir: Path,

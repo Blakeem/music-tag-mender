@@ -148,6 +148,15 @@ def test_config_set_without_a_value_for_a_plain_setting_fails() -> None:
     assert config.load_settings().music_path is None
 
 
+def test_config_set_refuses_a_naming_key() -> None:
+    # Only set_naming_pattern validates the pattern and refuses while a path move is staged.
+    result = runner.invoke(app, ["config-set", "naming_pattern", "x"])
+
+    assert result.exit_code == 1
+    assert "set_naming_pattern" in result.stdout
+    assert not config.settings_path().exists()
+
+
 def test_detect_mismatches_lists_the_undecided_exception_files(music_dir: Path) -> None:
     # The flat view keeps a nested file only in exception_rows, so it must be printed from there.
     nested = music_dir / "Lusine" / "2002 - Iron City" / "2002 - Iron City_320" / "Iron City"

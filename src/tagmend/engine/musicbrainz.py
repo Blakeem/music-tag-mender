@@ -48,7 +48,12 @@ from operator import itemgetter
 from typing import TYPE_CHECKING, Final, Literal, Protocol, Self, cast, overload
 
 from tagmend.engine import clock
-from tagmend.engine.lookup_clients import RETRY_ATTEMPTS, PacedHttp, Retry, decode_object
+from tagmend.engine.lookup_clients import (
+    RETRY_ATTEMPTS,
+    PacedHttp,
+    decode_object,
+    retry_throttle_or_server_error,
+)
 from tagmend.engine.store import (
     get_cached_mb_artist,
     get_cached_mb_recording,
@@ -102,7 +107,7 @@ _EXCLUDED_SECONDARY_TYPES: Final = frozenset(
 # Folded into both cache keys so changing the selection or parse rules re-fetches every lookup
 # resolved under the old ones, instead of replaying its stale cached pick forever. The album
 # and recording paths share the excluded-secondary-type set, so one bump must invalidate both.
-_SELECTION_VERSION: Final = "4"
+_SELECTION_VERSION: Final = "5"
 
 # The artist lookup runs its own version token: it has no selection rules to tighten, so a
 # release-group rule change must not re-fetch every artist. Bump only when the fields
@@ -123,11 +128,6 @@ type _Rank = tuple[int, bool]
 
 # A 404 from the artist endpoint is a real answer (no such artist), not a transient failure.
 _HTTP_NOT_FOUND: Final = 404
-
-# MusicBrainz answers 503 when it is throttling and asks clients to back off and retry. A
-# sweep of 876 releases lost 52 of them to this before the retry existed. Every other
-# non-2xx is a real failure and is raised on the first attempt.
-_HTTP_THROTTLED: Final = 503
 
 
 @dataclass(frozen=True, slots=True)
@@ -308,11 +308,21 @@ class MBReleaseSource(Protocol):
         """
 
 
+class MBReleaseCacheSource(MBReleaseSource, Protocol):
+    """The release lookup plus a cache probe, for a caller that caps network lookups.
+
+    Separate from :class:`MBReleaseSource` so a ``resolve_songs`` fake gains no obligation.
+    """
+
+    def has_cached_release(self, mbid: str) -> bool:
+        """Return whether :meth:`release_by_mbid` answers *mbid* without a request."""
+
+
 class MusicBrainzClient:
     """Cached, paced MusicBrainz client for release-group, recording, artist and release lookups.
 
     Implements :class:`MBReleaseGroupCacheSource`, :class:`MBRecordingSource`,
-    :class:`MBArtistSource` and :class:`MBReleaseSource`.
+    :class:`MBArtistSource` and :class:`MBReleaseCacheSource`.
 
     Owns one :class:`httpx.Client` for its lifetime via the context-manager protocol. Use it
     as ``with MusicBrainzClient(...) as client:``. The cache connection is supplied by the
@@ -463,15 +473,26 @@ class MusicBrainzClient:
 
         return self._fetch_and_cache_release(mbid, request_key)
 
+    def has_cached_release(self, mbid: str) -> bool:
+        """Return whether :meth:`release_by_mbid` answers from the cache, hit or negative."""
+        return get_cached_mb_release(self._conn, _release_request_key(mbid)) is not None
+
     # --- internals -------------------------------------------------------------------
 
     def _fetch_and_cache(self, artist: str, album: str, request_key: str) -> MBReleaseGroup | None:
-        """Fetch one release-group query over the network (paced), then cache eagerly."""
-        # Input: one paced network request.
-        body = self._request(artist, album)
+        """Fetch one release-group query over the network (paced), then cache eagerly.
+
+        MusicBrainz matches the quoted title as a phrase, so a tag's edition suffix finds no
+        plain release group. A suffixed title that yields no candidate is searched again plain.
+        """
+        # Input: one paced network request, plus one for the plain title on a suffixed miss.
+        plain_album = _EDITION_SUFFIX.sub("", album).strip()
+        candidates = _album_candidates(self._request(artist, album), album)
+        if not candidates and plain_album and plain_album != album.strip():
+            candidates = _album_candidates(self._request(artist, plain_album), album)
 
         # Process: pick the best usable Album release group matching the request (or None).
-        resolved = _select_album(body, album)
+        resolved = _select_album(candidates, album)
 
         # Output: cache the result eagerly, then return it.
         if resolved is None:
@@ -690,12 +711,14 @@ class MusicBrainzClient:
         """GET *url* and decode its JSON object body, or raise :class:`MusicBrainzError`.
 
         A 404 returns ``None`` only when *not_found_ok*, because a lookup by id treats it as
-        the real answer "no such entity" while a search never answers 404. A 503 that outlasts
-        every attempt is raised like any other failure, so it is never cached.
+        the real answer "no such entity" while a search never answers 404. A 429 or a 5xx is
+        retried under the rule every lookup client shares, since MusicBrainz throttles with a
+        503 and a gateway answers 502 or 504. One that outlasts every attempt is raised like any
+        other failure, so it is never cached.
         """
         response = self._http.send(
             lambda client: client.get(url, params=params),
-            verdict=_throttle_verdict,
+            verdict=retry_throttle_or_server_error,
             error=lambda failure, attempts: MusicBrainzError(
                 f"MusicBrainz {failure} after {attempts} attempt(s) for {what}",
             ),
@@ -710,13 +733,6 @@ class MusicBrainzClient:
 
 
 # --- module helpers ------------------------------------------------------------------
-
-
-def _throttle_verdict(response: httpx.Response) -> httpx.Response | Retry:
-    """Retry MusicBrainz's throttle answer and hand every other response back."""
-    if response.status_code == _HTTP_THROTTLED:
-        return Retry(f"HTTP {response.status_code}")
-    return response
 
 
 def _request_key(artist: str, album: str) -> str:
@@ -1059,26 +1075,35 @@ def _escape(value: str) -> str:
     return value.replace("\\", "\\\\").replace('"', '\\"')
 
 
-def _select_album(body: dict[str, object], requested_album: str) -> MBReleaseGroup | None:
-    """Pick the best usable Album release group from a release-group query response.
+def _album_candidates(
+    body: dict[str, object], requested_album: str
+) -> list[tuple[_Rank, MBReleaseGroup]]:
+    """Return each usable Album release group of a release-group query response, with its rank.
 
-    Keeps only ``primary-type == "Album"`` groups with no excluded secondary type, a title
-    matching *requested_album* (see :func:`_title_matches`) and a non-empty
-    ``first-release-date``. Ranks them by score, then by holding an Official release, since a
-    promo or bootleg group can share the album's title and score and be listed first. Of the
-    groups sharing the top rank, returns the first when they share a first-release year, else
-    ``None``, since the year is then ambiguous (``Weezer`` names several albums). The date is
-    kept exactly as MusicBrainz gives it, which is Picard's ``originaldate`` form.
+    Keeps only groups passing :func:`_is_usable_album_group` with a title matching
+    *requested_album* (see :func:`_title_matches`) and a non-empty ``first-release-date``. The
+    date is kept exactly as MusicBrainz gives it, which is Picard's ``originaldate`` form.
     """
     raw_groups = body.get("release-groups")
     if not isinstance(raw_groups, list):
-        return None
-
-    candidates = [
+        return []
+    return [
         candidate
         for entry in raw_groups
         if (candidate := _candidate(entry, requested_album)) is not None
     ]
+
+
+def _select_album(
+    candidates: list[tuple[_Rank, MBReleaseGroup]], requested_album: str
+) -> MBReleaseGroup | None:
+    """Pick the best of *candidates*, the usable Album release groups for *requested_album*.
+
+    Ranks them by score, then by holding an Official release, since a promo or bootleg group
+    can share the album's title and score and be listed first. Of the groups sharing the top
+    rank, returns the first when they share a first-release year, else ``None``, since the year
+    is then ambiguous (``Weezer`` names several albums).
+    """
     if not candidates:
         return None
 
@@ -1116,15 +1141,11 @@ def _candidate(entry: object, requested_album: str) -> tuple[_Rank, MBReleaseGro
     """Return ``((score, holds Official), MBReleaseGroup)`` for a usable matching Album group."""
     if not isinstance(entry, dict):
         return None
-    if entry.get("primary-type") != "Album":
+    if not _is_usable_album_group(entry):
         return None
 
     title = entry.get("title")
     if not isinstance(title, str) or not _title_matches(requested_album, title):
-        return None
-
-    secondary = entry.get("secondary-types")
-    if isinstance(secondary, list) and any(s in _EXCLUDED_SECONDARY_TYPES for s in secondary):
         return None
 
     original_date = entry.get("first-release-date")
@@ -1213,9 +1234,9 @@ def _usable_release_group(entry: dict[str, object]) -> tuple[str, str, bool] | N
 
     Scans the recording's ``releases``. A release's ``release-group`` qualifies when its
     ``primary-type == "Album"``, it carries no excluded secondary type, and it has a non-empty
-    title. This is :func:`_candidate`'s Album gate with no requested title to match. The first
-    qualifying Official release wins, else the first qualifying release, since a bootleg of
-    the song can be listed ahead of its album.
+    title. :func:`_is_usable_album_group` is the Album gate it shares with :func:`_candidate`,
+    here with no requested title to match. The first qualifying Official release wins, else
+    the first qualifying release, since a bootleg of the song can be listed ahead of its album.
     """
     releases = entry.get("releases")
     if not isinstance(releases, list):
@@ -1228,10 +1249,7 @@ def _usable_release_group(entry: dict[str, object]) -> tuple[str, str, bool] | N
         group = release.get("release-group")
         if not isinstance(group, dict):
             continue
-        if group.get("primary-type") != "Album":
-            continue
-        secondary = group.get("secondary-types")
-        if isinstance(secondary, list) and any(s in _EXCLUDED_SECONDARY_TYPES for s in secondary):
+        if not _is_usable_album_group(group):
             continue
         title = group.get("title")
         if not isinstance(title, str) or not title:
@@ -1243,6 +1261,16 @@ def _usable_release_group(entry: dict[str, object]) -> tuple[str, str, bool] | N
     if not usable:
         return None
     return next((group for group in usable if group[2]), usable[0])
+
+
+def _is_usable_album_group(group: dict[str, object]) -> bool:
+    """Return whether a release group is an Album with no excluded secondary type."""
+    if group.get("primary-type") != "Album":
+        return False
+    secondary = group.get("secondary-types")
+    return not (
+        isinstance(secondary, list) and any(s in _EXCLUDED_SECONDARY_TYPES for s in secondary)
+    )
 
 
 def _holds_official_release(entry: dict[str, object]) -> bool:

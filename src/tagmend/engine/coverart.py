@@ -23,7 +23,11 @@ from typing import TYPE_CHECKING, Final, Literal, Protocol, Self, cast
 
 from tagmend.config import PROJECT_URL, build_user_agent
 from tagmend.engine import clock
-from tagmend.engine.lookup_clients import PacedHttp, Retry, decode_object
+from tagmend.engine.lookup_clients import (
+    PacedHttp,
+    decode_object,
+    retry_throttle_or_server_error,
+)
 from tagmend.engine.store import get_cached_coverart, put_cached_coverart
 from tagmend.engine.validation import require_choice
 from tagmend.log import get_logger
@@ -52,8 +56,6 @@ _LISTING_VERSION: Final = "1"
 _NOT_FOUND_TTL: Final = timedelta(days=7)
 _HTTP_OK: Final = 200
 _HTTP_NOT_FOUND: Final = 404
-_HTTP_TOO_MANY_REQUESTS: Final = 429
-_HTTP_SERVER_ERROR: Final = 500
 
 
 class CoverArtError(RuntimeError):
@@ -195,20 +197,12 @@ class CoverArtClient:
         return self._http.send(
             # httpx follows no redirect by default, and CAA redirects every answer to archive.org.
             lambda client: client.get(url, follow_redirects=True),
-            verdict=_retry_verdict,
+            verdict=retry_throttle_or_server_error,
             error=lambda failure, attempts: CoverArtError(
                 f"{_SOURCE} {failure} after {attempts} attempt(s) for {what}",
             ),
             label=f"coverart {what}",
         )
-
-
-def _retry_verdict(response: httpx.Response) -> httpx.Response | Retry:
-    """Retry a throttle or a server fault and hand every other response back."""
-    status = response.status_code
-    if status == _HTTP_TOO_MANY_REQUESTS or status >= _HTTP_SERVER_ERROR:
-        return Retry(f"HTTP {status}")
-    return response
 
 
 def _request_key(kind: CoverArtKind, mbid: str) -> str:

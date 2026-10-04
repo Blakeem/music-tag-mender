@@ -34,10 +34,25 @@ class _Row:
         ("A1", None),
         (None, None),
         ("", None),
+        ("9" * 5000, None),
     ],
 )
 def test_parse_position(value: str | None, expected: int | None) -> None:
     assert detector_core.parse_position(value) == expected
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("3/12", 12),
+        ("3", None),
+        ("3/x", None),
+        ("1/2/3", 2),
+        (None, None),
+    ],
+)
+def test_parse_total(value: str | None, expected: int | None) -> None:
+    assert detector_core.parse_total(value) == expected
 
 
 @pytest.mark.parametrize(
@@ -116,6 +131,21 @@ def test_album_identity_is_the_release_id_else_the_folded_names_and_date() -> No
     assert by_name != detector_core.album_identity(None, "band", "album", "2001-01-01")
 
 
-def test_release_date_falls_back_to_a_raw_year() -> None:
-    assert detector_core.release_date({"date": " ", "year": "1999"}) == "1999"
-    assert detector_core.release_date({"date": "2001", "year": "1999"}) == "2001"
+@pytest.mark.parametrize(
+    ("filename", "values", "expected"),
+    [
+        ("a.m4a", {"date": " 2001 ", "releasedate": "2002", "year": "1999"}, "2001"),
+        ("a.m4a", {"date": " ", "year": "1999"}, None),
+        ("a.flac", {"date": "2001", "releasedate": "2002", "year": "1999"}, "2002"),
+        ("a.flac", {"date": "2001", "releasedate": " ", "year": "1999"}, "1999"),
+        ("a.ogg", {"date": "2001"}, None),
+        ("a.OPUS", {"releasedate": "2002"}, "2002"),
+        ("a.mp3", {"date": "2001", "releasedate": "2002", "year": "1999"}, None),
+    ],
+)
+def test_release_date_follows_the_field_navidrome_keys_on_by_suffix(
+    filename: str,
+    values: dict[str, str],
+    expected: str | None,
+) -> None:
+    assert detector_core.release_date(values, filename) == expected

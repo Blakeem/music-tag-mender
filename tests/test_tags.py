@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import contextlib
 import io
+import os
+import re
+import stat
 import wave
 from typing import TYPE_CHECKING
 
@@ -32,11 +36,12 @@ from mutagen.id3 import (  # type: ignore[attr-defined]
     MakeID3v1,
     ParseID3v1,
 )
-from mutagen.mp4 import MP4
+from mutagen.mp4 import MP4, Atoms  # type: ignore[attr-defined]
 from mutagen.oggvorbis import OggVorbis
 
 from conftest import make_droppable_frames_mp3, make_track
 from tagmend.engine import tags
+from tagmend.engine.scan import TEMP_SUFFIX
 
 # Import tags so its module-load RegisterFreeformKey runs before make_track writes any
 # ``originaldate`` via raw mutagen easy mode (the M4A freeform atom must be registered).
@@ -724,11 +729,29 @@ def test_mp4_without_an_mdat_atom_has_no_locatable_payload() -> None:
     assert tags._audio_ranges(io.BytesIO(ftyp), tags._Container.MP4, trailer) is None
 
 
+def _payload_byte(path: Path, container: tags._Container) -> int:
+    """Return the offset of one audio payload byte in *path*, located by its *container*."""
+    size = path.stat().st_size
+    with path.open("rb") as handle:
+        if container is tags._Container.ID3:
+            start = tags._id3v2_end(handle)
+            end = tags._read_trailer(handle, size).audio_end
+            return (start + end) // 2
+        if container is tags._Container.MP4:
+            atoms = Atoms(handle)
+            mdat = next(atom for atom in atoms.atoms if atom.name == b"mdat")
+            return int(mdat.offset + mdat.length - 1)
+    # The FLAC template carries no ID3v1 or APEv2 trailer, so its last byte is audio.
+    return size - 1
+
+
+@pytest.mark.parametrize("suffix", [".mp3", ".flac", ".m4a"])
 def test_write_refuses_when_audio_payload_changes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    suffix: str,
 ) -> None:
-    track = make_track(tmp_path / "audio.mp3", {"genre": ["Rock"]})
+    track = make_track(tmp_path / f"audio{suffix}", {"genre": ["Rock"]})
     before = track.read_bytes()
     real_apply = tags._apply_changes
 
@@ -740,10 +763,7 @@ def test_write_refuses_when_audio_payload_changes(
     ) -> None:
         real_apply(path, container, kind, changes)
         data = bytearray(path.read_bytes())
-        with path.open("rb") as handle:
-            start = tags._id3v2_end(handle)
-            end = tags._read_trailer(handle, len(data)).audio_end
-        data[(start + end) // 2] ^= 0xFF
+        data[_payload_byte(path, container)] ^= 0xFF
         path.write_bytes(bytes(data))
 
     monkeypatch.setattr(tags, "_apply_changes", corrupting)
@@ -753,6 +773,77 @@ def test_write_refuses_when_audio_payload_changes(
 
     assert track.read_bytes() == before
     assert not list(tmp_path.glob("*.tagmend.tmp"))
+
+
+def test_write_refuses_to_drop_an_mp4_atom(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    track = make_track(tmp_path / "keep.m4a", {"genre": ["Rock"]})
+    raw = MP4(track)  # type: ignore[no-untyped-call]
+    raw["----:com.apple.iTunes:FOO"] = [b"bar"]
+    raw.save()  # type: ignore[no-untyped-call]
+    before = track.read_bytes()
+    real_apply = tags._apply_changes
+
+    def lossy(
+        path: Path,
+        container: tags._Container,
+        kind: type[FileType],
+        changes: list[tuple[str, list[str] | None]],
+    ) -> None:
+        real_apply(path, container, kind, changes)
+        atoms = MP4(path)  # type: ignore[no-untyped-call]
+        del atoms["----:com.apple.iTunes:FOO"]  # type: ignore[no-untyped-call]
+        atoms.save()  # type: ignore[no-untyped-call]
+
+    monkeypatch.setattr(tags, "_apply_changes", lossy)
+
+    with pytest.raises(TagWriteError, match=re.escape("dropped ----:com.apple.iTunes:FOO")):
+        write_managed_tags(track, {**_managed(track), "genre": ["Jazz"]})
+
+    assert track.read_bytes() == before
+    assert not list(tmp_path.glob("*.tagmend.tmp"))
+
+
+def test_write_to_a_read_only_file_leaves_no_temp_copy(tmp_path: Path) -> None:
+    track = make_track(tmp_path / "locked.mp3", {"genre": ["Rock"]})
+    track.chmod(stat.S_IREAD)
+    try:
+        # POSIX renames onto a read-only file, while Windows refuses the swap.
+        with contextlib.suppress(PermissionError):
+            write_managed_tags(track, {**_managed(track), "genre": ["Jazz"]})
+        assert not track.with_name(track.name + TEMP_SUFFIX).exists()
+    finally:
+        track.chmod(stat.S_IREAD | stat.S_IWRITE)
+
+    assert write_managed_tags(track, {**_managed(track), "genre": ["Blues"]}).written is True
+    assert read_tags(track).tags["genre"] == ["Blues"]
+
+
+def test_write_replaces_a_read_only_leftover_temp_copy(tmp_path: Path) -> None:
+    track = make_track(tmp_path / "left.mp3", {"genre": ["Rock"]})
+    leftover = track.with_name(track.name + TEMP_SUFFIX)
+    leftover.write_bytes(b"stale")
+    leftover.chmod(stat.S_IREAD)
+
+    assert write_managed_tags(track, {**_managed(track), "genre": ["Jazz"]}).written is True
+
+    assert read_tags(track).tags["genre"] == ["Jazz"]
+    assert not leftover.exists()
+
+
+def test_write_flushes_the_temp_copy_before_the_swap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    track = make_track(tmp_path / "flush.mp3", {"genre": ["Rock"]})
+    flushed: list[int] = []
+    monkeypatch.setattr(os, "fsync", flushed.append)
+
+    assert write_managed_tags(track, {**_managed(track), "genre": ["Jazz"]}).written is True
+
+    assert len(flushed) == 1
 
 
 def test_write_opens_the_temp_copy_as_the_original_class(tmp_path: Path) -> None:

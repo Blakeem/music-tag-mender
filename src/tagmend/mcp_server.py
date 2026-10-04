@@ -11,7 +11,6 @@ from __future__ import annotations
 import functools
 import os
 import sqlite3
-from pathlib import Path
 from typing import TYPE_CHECKING, Final, Literal
 
 import mutagen
@@ -46,6 +45,7 @@ from tagmend.engine.coverart import CoverArtError
 from tagmend.engine.lastfm import LastfmError
 from tagmend.engine.library import ScanMode
 from tagmend.engine.musicbrainz import MusicBrainzError
+from tagmend.engine.schema import LedgerSchemaError
 from tagmend.log import get_logger
 
 if TYPE_CHECKING:
@@ -56,7 +56,8 @@ logger = get_logger(__name__)
 mcp = FastMCP("tagmend")
 
 # The failures a tool call can meet in normal use: a bad request, a locked or unreadable
-# file, a ledger another process holds, a lookup service that is down. Anything else is a bug.
+# file, a ledger another process holds, a ledger this build refuses, a lookup service that is
+# down. Anything else is a bug.
 _ENVELOPED_ERRORS: Final = (
     ValueError,
     OSError,
@@ -67,6 +68,7 @@ _ENVELOPED_ERRORS: Final = (
     CoverArtError,
     AcoustidError,
     FpcalcUnavailableError,
+    LedgerSchemaError,
 )
 
 
@@ -93,11 +95,18 @@ def _error_envelope[**P](tool: Callable[P, dict[str, object]]) -> Callable[P, di
 def check_health() -> dict[str, object]:
     """Verify TagMend is ready to use.
 
-    Checks that settings load, the configured music folder is reachable and
-    readable, and the SQLite ledger opens. Returns ``{"ok": True, "ready", "checks"}`` with
-    one entry per check. ``ready`` is True only when every check passes. ``ok`` reports that
-    the request ran. Call this from the MCP Inspector to confirm the environment is wired up
-    correctly before building or running anything else.
+    Runs these checks in order. ``music_path``: the folder is configured, exists and is
+    readable. ``database``: the ledger opens and accepts the schema. ``commits`` and ``paths``:
+    interrupted commits and staged moves, informational, never fail. ``lastfm``:
+    ``lastfm_api_key`` is set and one live Last.fm request succeeds. ``musicbrainz``: one live
+    MusicBrainz request succeeds. ``fpcalc``: fpcalc runs. ``acoustid``: ``acoustid_api_key``
+    is set and AcoustID does not reject it. An unreachable AcoustID passes with a warning. The
+    call makes up to three live network requests.
+
+    Returns ``{"ok": True, "ready", "checks"}``, where each check is ``{name, ok, detail}``.
+    ``ready`` is True only when every check passes, so it needs both API keys, fpcalc and
+    network access. ``ok`` reports that the request ran. Call this from the MCP Inspector to
+    confirm the environment is wired up correctly before building or running anything else.
     """
     settings = load_settings()
     report = health.check_health(settings)
@@ -126,8 +135,12 @@ def scan_library(
             files exist (added/missing/restored) without reading any tags.
 
     Returns:
-        Per-run counts (``added``, ``updated``, ``tags_read``, ``missing_flagged``,
-        ``restored``, ``errors``, ``respelled``, ...) plus ``ok``. ``respelled`` counts known
+        Per-run counts (``total_seen``, ``added``, ``updated``, ``unchanged``, ``tags_read``,
+        ``missing_flagged``, ``restored``, ``errors``, ``respelled``, ``pending_commit``) plus
+        ``error_items`` and ``ok``. ``errors`` counts files the scan could not stat or read, and
+        ``error_items`` lists each one as ``{key, message}`` keyed by the file path.
+        ``pending_commit`` counts files already at a staged move's target, which
+        ``commit_paths`` records. ``respelled`` counts known
         files found under a new spelling of the same path (a case-only rename on Windows),
         which keep their id and history. ``updated`` counts files whose
         on-disk size/mtime signature changed since the last scan. ``tags_read`` counts
@@ -137,7 +150,7 @@ def scan_library(
     """
     result = library.scan_library(
         load_settings(),
-        path=Path(path) if path is not None else None,
+        path=path,
         mode=ScanMode(mode),
     )
     return {"ok": True, **result.to_dict()}
@@ -197,6 +210,14 @@ def stage_tags(
     left empty is dropped (a list left empty clears the field). A value containing a NUL, CR or
     LF is rejected and nothing is staged.
 
+    The call is also refused for an unknown or missing file, a file unreadable on disk, a file
+    with a staged path change (run ``commit_paths`` or ``unstage_paths`` first), a file whose
+    staged change an interrupted commit already wrote (run ``commit_tags`` first), and a file the
+    tag writer would refuse: a container it cannot verify, or an ID3 file whose v2.4 save would
+    drop an unmanaged frame unless the ``id3_droppable_frames`` setting names that frame. A value
+    the container would read back altered, such as a reformatted date or track pair, is refused
+    too.
+
     Args:
         file_id: Stable id of the file (from ``scan_library`` / the snapshot).
         tags: Managed tags to set, as name -> ordered values, e.g. ``{"genre": ["Synthwave"]}``.
@@ -224,9 +245,9 @@ def stage_tags_batch(
     """Stage managed-tag changes for MANY files in one atomic, all-or-nothing call (no disk write).
 
     The batch counterpart of ``stage_tags`` for the mismatch-fix flow: pass one entry per file
-    and every change is staged in a single transaction. If ANY entry is invalid (an unmanaged
-    tag key, an unknown/missing file, or a duplicate ``file_id`` in the batch) the whole batch
-    is rejected and NOTHING is staged. Each entry's ``tags`` is merged onto that file's current
+    and every change is staged in a single transaction. If ANY entry is refused (any
+    ``stage_tags`` refusal, or a duplicate ``file_id`` in the batch) the whole batch is rejected
+    and NOTHING is staged. Each entry's ``tags`` is merged onto that file's current
     managed tags exactly like ``stage_tags``: omitted keys are preserved, and ``{"key": []}``
     deletes. Values are cleaned the same way. They are stripped and NFC-normalized, and a value
     holding a NUL, CR or LF rejects the whole batch. A subsequent
@@ -256,8 +277,8 @@ def stage_tags_batch(
 def unstage_tags(file_id: int) -> dict[str, object]:
     """Remove a pending staged change for one file.
 
-    Returns ``{"ok": True, "removed": <bool>}``, where ``removed`` is ``False`` when the file
-    had nothing staged, or ``{"ok": False, "error": ...}`` if the file id is unknown.
+    Returns ``{"ok": True, "removed": <count>}``, where ``removed`` is 0 when the file had
+    nothing staged, or ``{"ok": False, "error": ...}`` if the file id is unknown.
     """
     removed = staging.unstage_tags(load_settings(), file_id=file_id)
     return {"ok": True, "removed": removed}
@@ -296,7 +317,7 @@ def diff_tags(path: str | None = None) -> dict[str, object]:
     """
     changes = staging.diff_tags(
         load_settings(),
-        path=Path(path) if path is not None else None,
+        path=path,
     )
     return {"ok": True, "changes": [view.to_dict() for view in changes]}
 
@@ -339,7 +360,7 @@ def commit_tags(message: str | None = None, path: str | None = None) -> dict[str
     result = staging.commit_tags(
         load_settings(),
         message=message,
-        path=Path(path) if path is not None else None,
+        path=path,
     )
     return {"ok": True, **result.to_dict()}
 
@@ -416,7 +437,7 @@ def list_files(  # noqa: PLR0913 - cohesive MCP discovery filters
     """
     views = library.list_files(
         load_settings(),
-        path=Path(path) if path is not None else None,
+        path=path,
         limit=limit,
         genre_status=genre_status,
         artist_status=artist_status,
@@ -437,11 +458,12 @@ def get_file(file_id: int) -> dict[str, object]:
     artist_source_artist, artist_source_albumartist, year_status, year_source_artist,
     year_source_album, song_status, song_source_album_mbid, song_source_release_track_mbid,
     mismatch_status, mismatch_source_value}}``,
-    or ``{"ok": False, "error": ...}`` if the id is unknown.
+    or ``{"ok": False, "error", "error_type": "ValueError"}`` if the id is unknown.
     """
     view = library.get_file(load_settings(), file_id)
     if view is None:
-        return {"ok": False, "error": f"unknown file_id={file_id}"}
+        message = f"unknown file_id={file_id}"
+        raise ValueError(message)
     return {"ok": True, "file": view.to_dict()}
 
 
@@ -670,8 +692,9 @@ def detect_release_disagreements(  # noqa: PLR0913 - one parameter per scope/vie
     each row's own tier.
 
     Each distinct release is fetched once and cached, paced at MusicBrainz's requested one
-    request per second. ``release_limit`` caps the releases fetched this call (default 200,
-    about three minutes) and the rest are reported under ``releases_remaining``/``more``.
+    request per second. ``release_limit`` caps the releases fetched over the network this call
+    (default 200, about three minutes). A cached release never counts toward it, so a re-run
+    with the same cap reaches the rest, which are reported under ``releases_remaining``/``more``.
     ``path`` and ``file_ids`` scope the run: the counts describe the run, and no release outside
     it is fetched. ``folder`` narrows the view of a scoped run and wins over ``group``, so a bare
     ``folder`` with neither ``path`` nor ``file_ids`` is refused rather than starting a
@@ -697,7 +720,8 @@ def detect_release_disagreements(  # noqa: PLR0913 - one parameter per scope/vie
             precedence over ``group``. Needs ``path`` or ``file_ids``. Compared as a path like
             ``path``.
         file_ids: Scope the run to these specific file ids.
-        release_limit: Max distinct releases to FETCH this call.
+        release_limit: Max distinct uncached releases to FETCH this call. A cached release
+            never counts toward it.
         limit: Cap the rows returned (or groups, with ``group=true``) without changing any
             count.
         group: Return one compact line per folder instead of flat rows.
@@ -708,15 +732,15 @@ def detect_release_disagreements(  # noqa: PLR0913 - one parameter per scope/vie
         skipped_no_release_mbid, unknown_releases, unmatched_tracks, errors, error_items, groups,
         summary}``, where ``error_items`` is ``{key, message}`` keyed by the release id. Each
         row is ``{file_id, folder, filename, release_mbid, release_title, field, have, want,
-        tier, reason}``. Each group is ``{folder, file_count, flagged,
-        folder_context, tiers, file_ids, flagged_fields, fills, fields, releases}``, where
+        tier, reason}``. Each group is ``{folder, file_count, flagged, tiers, file_ids,
+        flagged_fields, fills, fields, releases}``, where
         ``file_ids`` names the flagged files only and ``releases`` lists ``{release_mbid,
         release_title, file_count}``. On failure, ``{"ok": False, "error": ...}``.
     """
     report = release_disagreements.detect_release_disagreements(
         load_settings(),
         tier=tier,
-        path=Path(path) if path is not None else None,
+        path=path,
         folder=folder,
         file_ids=file_ids,
         release_limit=release_limit,
@@ -827,8 +851,11 @@ def detect_album_conflicts(
     first.
 
     A file's album identity is ``musicbrainz_albumid`` when it carries one, and otherwise the
-    display album artist, the album title and the release date (``date``, else a raw Vorbis
-    ``year``). The display album artist is ``albumartist``, falling back to ``Various
+    display album artist, the album title and the release date. The release date is an M4A's
+    ``date``, a FLAC's or Ogg's ``releasedate`` else ``year``, and none for an MP3, whose
+    ``date`` is a recording date. ``releasedate`` and ``year`` are not managed tags. A split on
+    either one is reported but cannot be staged with ``stage_tags_batch``. The display album
+    artist is ``albumartist``, falling back to ``Various
     Artists`` when the ``compilation`` flag is set, then to ``artist``, then to an
     unknown-artist placeholder. Casing, typographic character choice and whitespace runs are
     cosmetic and never split a folder. Punctuation is NOT
@@ -952,6 +979,7 @@ def stage_covers(
     image: str | None = None,
     limit: int | None = None,
     dry_run: bool = False,  # noqa: FBT001, FBT002 - MCP tool surface, not a Python API
+    note: str | None = None,
 ) -> dict[str, object]:
     """Stage a cover image for each album ``detect_cover_gaps`` reports as ``gap``. Writes no file.
 
@@ -962,7 +990,8 @@ def stage_covers(
        and ``.png`` files are tried in tiers: a name holding ``front``, then a name holding
        ``cover`` and not ``back``, then the one image directly in the folder. Its bytes are
        copied and the owner's file never moves. Two or more images with no single front skip
-       the album as ``ambiguous_images``, with no download.
+       the album as ``ambiguous_images``, with no download. A front image that cannot be read
+       or fails the image check skips the album as ``invalid_image``, also with no CAA lookup.
     3. The Cover Art Archive front of the album's release (``release_mbid``).
     4. The Cover Art Archive front of its release group (``release_group_mbid``).
 
@@ -983,6 +1012,7 @@ def stage_covers(
             album's staged cover. A relative path resolves under ``music_path``.
         limit: Cap the gap albums sourced. ``more`` is true when it cut.
         dry_run: When true, look up CAA listings but download nothing and stage nothing.
+        note: Optional free-text note stored with each staged cover and its eventual write.
 
     Returns:
         ``{"ok": True, staged: [{target_path, album, source_kind, source_ref, origin, format,
@@ -991,7 +1021,7 @@ def stage_covers(
         to ``music_path``. On failure, ``{"ok": False, "error": ...}``.
     """
     result = covers.stage_covers(
-        load_settings(), folder=folder, image=image, limit=limit, dry_run=dry_run
+        load_settings(), folder=folder, image=image, limit=limit, dry_run=dry_run, note=note
     )
     return {"ok": True, **result.to_dict()}
 
@@ -1000,6 +1030,9 @@ def stage_covers(
 @_error_envelope
 def unstage_covers(folder: str | None = None) -> dict[str, object]:
     """Drop the staged covers whose target sits at or under a folder, or every one. Writes no file.
+
+    Refused, dropping nothing, when a matched cover's staged bytes already sit at its target,
+    left by a crash before its log. Run ``commit_covers`` to log those writes first.
 
     Args:
         folder: Compared as a path, and a relative folder resolves under ``music_path``. Omit
@@ -1019,10 +1052,13 @@ def diff_covers(folder: str | None = None, limit: int | None = None) -> dict[str
 
     The sources ``stage_covers`` tries, in order: the owner's ``image``, a front image under the
     album folder, the release's Cover Art Archive front, the release group's front. ``state`` is
-    the first that holds: ``target_taken`` (a file sits at the target: move it away or
-    ``unstage_covers``), ``covered_since_stage`` (an image Navidrome reads as a cover now sits
-    in the folder), ``album_moved`` (a file staged with the cover is gone, or sits outside the
-    target folder and its disc folders: rescan and stage again), else ``ready``.
+    the first that holds, as ``commit_covers`` meets it: ``landed`` (the staged bytes already sit
+    at the target, and ``commit_covers`` logs them), ``album_moved`` (a file staged with the
+    cover is gone, or sits outside the target folder and its disc folders: run
+    ``scan_library``, drop the row with ``unstage_covers(folder=<target folder>)`` and stage
+    again), ``target_taken`` (a file sits at the target: move it away or ``unstage_covers``),
+    ``covered_since_stage`` (an image Navidrome reads as a cover now sits in the folder), else
+    ``ready``.
 
     Args:
         folder: Only covers whose target sits at or under this folder. Compared as a path.
@@ -1044,7 +1080,8 @@ def commit_covers() -> dict[str, object]:
 
     Each cover is a new ``cover.jpg`` or ``cover.png``, and a write never overwrites a file. A
     cover stays staged and is listed under ``errors`` when a file staged with it left the
-    target folder (``album_moved``: rescan and stage again), a file sits at its target
+    target folder (``album_moved``: run ``scan_library``, drop the row with
+    ``unstage_covers(folder=<target folder>)`` and stage again), a file sits at its target
     (``target_taken``), the folder now holds an image Navidrome reads as a cover
     (``covered_since_stage``) or the write failed (``error``). Each ``detail`` names the next
     step. A cover whose staged bytes already sit at its target, left by a crash, is logged with
@@ -1287,12 +1324,13 @@ def get_commit(commit_id: int) -> dict[str, object]:
     status}, "logs": {"tag_revisions": <count>, "path_revisions": <count>, "sidecar_moves":
     <count>, "cover_writes": <count>}}``, where ``logs`` names only the logs holding rows of
     this commit (a tag commit, a path commit with its moved files and sidecars, or a cover
-    commit), or ``{"ok": False, "error": ...}`` if the id is unknown.
+    commit), or ``{"ok": False, "error", "error_type": "ValueError"}`` if the id is unknown.
     """
     settings = load_settings()
     commit = commits.get_commit(settings, commit_id)
     if commit is None:
-        return {"ok": False, "error": f"unknown commit_id={commit_id}"}
+        message = f"unknown commit_id={commit_id}"
+        raise ValueError(message)
     return {
         "ok": True,
         "commit": commit.to_dict(),
@@ -1309,7 +1347,9 @@ def detect_path_deviations(
     group: bool = True,  # noqa: FBT001, FBT002 - MCP tool surface, not a Python API
     limit: int | None = 50,
 ) -> dict[str, object]:
-    """Report files whose path differs from the path the naming pattern renders from their tags.
+    """Report every file whose plan is not ``at_target`` under the path its tags render.
+
+    A hold and a kept staged move count, even on a file that already sits at its render.
 
     Read-only, and allowed while the ``detect_mismatches`` gate is closed. Order: set
     ``container_folders`` (with ``set_naming_pattern``) before the first ``set_mismatch_status``
@@ -1504,10 +1544,11 @@ def unstage_paths(file_id: int | None = None, path: str | None = None) -> dict[s
     ``music_path``. A folder that loses a staged file no longer moves whole, so its sidecar
     moves are dropped too. The call is refused whole, naming them, when any matched file or
     sidecar already sits at its staged target on disk (a crash after the move): run
-    ``commit_paths`` to finish those moves.
+    ``commit_paths`` to finish those moves. A sidecar move a dropped unit held may stage now,
+    and ``sidecars_staged`` counts it. A sidecar row dropped and staged again counts in neither.
 
-    Returns ``{"ok": True, "removed": <count>, "sidecars_removed": <count>}``, or
-    ``{"ok": False, "error": ...}``.
+    Returns ``{"ok": True, "removed": <count>, "sidecars_removed": <count>,
+    "sidecars_staged": <count>}``, or ``{"ok": False, "error": ...}``.
     """
     removed = paths.unstage_paths(load_settings(), file_id=file_id, path=path)
     return {"ok": True, **removed.to_dict()}
@@ -1617,11 +1658,13 @@ def revert_paths(
     """Move one file back to the location of a prior path ``version``, as its own commit.
 
     The move lands under a single-file ``origin='revert'`` commit, so it shows in
-    ``list_commits`` and can itself be undone with ``revert_commit``. Refused while any tag or
-    path change is staged (run ``commit_paths`` to finish an interrupted revert), for a file
-    missing from disk or moved outside TagMend, for an unknown version, and when the old
-    location is taken. The ``detect_mismatches`` gate does not apply, and the restored path may
-    flag again. Get versions from ``history_paths``.
+    ``list_commits`` and can itself be undone with ``revert_commit``. Refused while any tag
+    change, file or sidecar move, or cover is staged, since the whole staging area must be
+    empty. ``diff_covers`` finds a staged cover and ``unstage_covers`` drops it.
+    ``commit_paths`` finishes an interrupted revert. Also refused for a file missing from disk
+    or moved outside TagMend, for an unknown version, and when the old location is taken. The
+    ``detect_mismatches`` gate does not apply, and the restored path may flag again. Get
+    versions from ``history_paths``.
 
     Args:
         file_id: The file to move.
@@ -1666,9 +1709,10 @@ def resolve_genres(
 
     Only ``pending`` files are selected, so repeated ``limit``-capped calls terminate. A real
     run is refused while anything is staged, since staging would replace that pending change.
-    A transient Last.fm error writes nothing, leaves that artist's files ``pending``, and is
+    A Last.fm lookup error writes nothing, leaves that artist's files ``pending``, and is
     counted in ``errors`` and itemized in ``error_items`` (``{key, message}``, keyed by the
-    looked-up artist), so a re-run retries it.
+    looked-up artist), so a re-run retries it. A rejected API key fails every lookup alike, so
+    it stops the call with ``{"ok": False, ...}`` instead.
 
     Args:
         value: Limit to files whose ``artist`` or ``albumartist`` tag equals this value.
@@ -1684,10 +1728,12 @@ def resolve_genres(
     Returns:
         ``{"ok": True, settled, staged_files, no_match, pending_remaining, more, errors,
         error_items, no_match_artists, summary}``, or ``{"ok": False, "error": ...}`` (e.g.
-        pending changes, a negative ``limit``, or no API key configured). ``settled`` counts
-        the selected files that left ``pending``. ``pending_remaining`` recounts the present
-        ``pending`` files in scope. ``more`` is ``settled > 0 and pending_remaining > 0`` and
-        is false on a dry run.
+        a staged tag change, file or sidecar move, or cover (find it with ``diff_tags``,
+        ``diff_paths`` or ``diff_covers``), a negative ``limit``, no API key configured, or a
+        rejected API key).
+        ``settled`` counts the selected files that left ``pending``. ``pending_remaining``
+        recounts the present ``pending`` files in scope. ``more`` is ``settled > 0 and
+        pending_remaining > 0`` and is false on a dry run.
     """
     result = genres.resolve_genres(
         load_settings(),
@@ -1743,28 +1789,29 @@ def resolve_artists(
     the field values it was decided on still match the file, so a revert, a rescan after an
     outside edit or an identity fix re-opens the file on its own.
 
-    Each selected file then records one outcome. A multi-value file, a ``feat`` credit or a
-    held value records ``no_match``, so it stays on the review list. A transient lookup error
-    records nothing, so the file stays ``pending`` and a re-run retries it. Anything else
-    records ``done``. A cascade carrier outside the selection gets no row.
+    Each selected file then records one outcome. A multi-value file, a ``feat`` credit, a value
+    with no correction or a held value records ``no_match``, so it stays on the review list. A
+    lookup error records and caches nothing, so the file stays ``pending`` and a re-run asks
+    again. Anything else records ``done``. A cascade carrier outside the selection gets no row.
 
     It deliberately **skips** (and reports) values in the ``feat``/``ft``/``featuring``
     family, compilation sentinels (``various artists``/``various``/``va``), and empty
     values. Values already exactly canonical stage nothing but are counted under
     ``already_canonical``. Values with no Last.fm correction are reported under
     ``no_correction``. A correction to a MusicBrainz special-purpose placeholder
-    (``[unknown]``, ``[no artist]``, …) is treated as no correction. A transient lookup error
-    is counted in ``errors`` and itemized in ``error_items`` (``{key, message}``, keyed by the
-    value).
+    (``[unknown]``, ``[no artist]``, …) is treated as no correction. A lookup error is
+    counted in ``errors`` and itemized in ``error_items`` (``{key, message}``, keyed by the
+    value). A rejected Last.fm API key fails every lookup alike, so it stops the call with
+    ``{"ok": False, ...}`` instead.
 
     Three classes are **held**: reported so you can act on them, never staged.
     ``shrinks_credit_values`` are names whose canonical form is contained in the current
-    value (``Skrillex & The Doors`` → ``Skrillex``) — a real multi-artist credit, held even
-    when it carries an MBID. ``needs_review_values`` are Last.fm corrections MusicBrainz does
-    not corroborate (no MBID), the "what Last.fm found that MusicBrainz did not" list.
+    value (``Skrillex & The Doors`` → ``Skrillex``), a real multi-artist credit, held even
+    when it carries an MBID. ``needs_review_values`` are corrections Last.fm pairs with no MBID.
+    An MBID on a Last.fm correction is Last.fm's claim, not a MusicBrainz lookup.
     ``name_id_disagreement_values`` are the forensic case: the file names one artist while
     its own MBID names another, and the name is neither a credit nor any alias MusicBrainz
-    records — each entry carries ``from``/``to``/``mbid``/``reason``. A value the library
+    records. Each entry carries ``from``/``to``/``mbid``/``reason``. A value the library
     pairs with more than one MBID lands there too, and neither tier touches it.
 
     Args:
@@ -1785,10 +1832,13 @@ def resolve_artists(
         ``from``/``to``/``mbid``/``source``), multi_artist_files, no_correction_values,
         already_canonical_values, shrinks_credit_values, needs_review_values,
         name_id_disagreement_values, error_items, summary}``, or ``{"ok": False, "error":
-        ...}`` (e.g. pending changes, or no API key configured). ``settled`` counts the
-        selected files that left ``pending`` and ``staged_files`` every staged file, cascade
-        included. ``pending_remaining`` recounts the present ``pending`` files in scope.
-        ``more`` is ``settled > 0 and pending_remaining > 0`` and is false on a dry run.
+        ...}`` (e.g. a staged tag change, file or sidecar move, or cover (find it with
+        ``diff_tags``, ``diff_paths`` or ``diff_covers``), no API key configured, or a rejected
+        API key).
+        ``settled`` counts the selected files that left ``pending`` and ``staged_files`` every
+        staged file, cascade included. ``pending_remaining`` recounts the present ``pending``
+        files in scope. ``more`` is ``settled > 0 and pending_remaining > 0`` and is false on
+        a dry run.
     """
     result = artists.resolve_artists(
         load_settings(),
@@ -2087,8 +2137,9 @@ def resolve_years(
 
     Returns:
         ``{"ok": True, settled, staged_files, no_match, pending_remaining, more, mappings,
-        errors, error_items, summary}``, or ``{"ok": False, "error": ...}`` (e.g. pending
-        changes). ``settled`` counts the selected files that left ``pending``.
+        errors, error_items, summary}``, or ``{"ok": False, "error": ...}`` (e.g. a staged
+        tag change, file or sidecar move, or cover (find it with ``diff_tags``, ``diff_paths``
+        or ``diff_covers``)). ``settled`` counts the selected files that left ``pending``.
         ``pending_remaining`` recounts the present ``pending`` files in scope. ``more`` is
         ``settled > 0 and pending_remaining > 0`` and is false on a dry run.
     """
@@ -2113,22 +2164,22 @@ def list_albums(
     """List distinct album groups with file counts + status (to scope ``resolve_years``).
 
     Groups present files by ``(albumartist-else-artist, album)`` and reports each group's file
-    count, derived year workflow status, and ``blank_originaldate`` — the count of the group's
-    files whose ``originaldate`` is empty. A group with ``blank_originaldate > 0`` is
-    actionable for ``resolve_years`` (it has years to fill); ``year_status: "pending"``
-    alone does NOT mean actionable, since every file may already carry ``originaldate``.
-    Pass ``actionable=True`` to get only those groups instead of paging every group.
-    Returns ``{"ok": True, "albums": [{artist, album, file_count, year_status,
-    blank_originaldate}, ...]}`` in ``(artist, album)`` order. Run ``scan_library`` first to
-    populate the snapshot.
+    count, ``year_status`` and ``blank_originaldate``. ``year_status`` is the derived year
+    status of the group's lowest-id file, so a group whose files differ reads as that file.
+    ``blank_originaldate`` counts the group's files whose ``originaldate`` is blank, in any
+    status. ``actionable=True`` is the filter for the groups ``resolve_years`` will work on.
+    ``year_status: "pending"`` alone does NOT mean actionable, since every file may already
+    carry ``originaldate``. Returns ``{"ok": True, "albums": [{artist, album, file_count,
+    year_status, blank_originaldate}, ...]}`` in ``(artist, album)`` order. Run
+    ``scan_library`` first to populate the snapshot.
 
     Args:
-        year_status: Keep only groups in this derived year workflow state (``pending`` |
-            ``no_identity`` | ``no_match`` | ``manual`` | ``staged`` | ``done``), applied
-            before ``limit``.
-        actionable: Keep only the actionable groups, those with ``blank_originaldate > 0``
-            that ``resolve_years`` can actually fill. Composes with ``year_status`` and is
-            applied before ``limit``.
+        year_status: Keep only groups whose lowest-id file is in this derived year workflow
+            state (``pending`` | ``no_identity`` | ``no_match`` | ``manual`` | ``staged`` |
+            ``done``), applied before ``limit``. The filter tests that file only.
+        actionable: Keep only the groups holding at least one ``pending`` file whose
+            ``originaldate`` is blank, the files ``resolve_years`` looks up. Composes with
+            ``year_status`` and is applied before ``limit``.
         limit: Cap the number of groups returned (applied after ordering + filtering).
             Keeps the payload context-cheap on a large library.
     """
@@ -2243,10 +2294,11 @@ def resolve_songs(  # noqa: PLR0913 - cohesive scope, release path and run knobs
     ``review_values`` rows are proposals and are never staged. A held gated file with a blank
     title gets one with the audio's recording title (``field: "title"``). A gated file with no
     ``artist`` and no ``albumartist`` whose recordings credit one artist gets one with that
-    credit (``field: "artist"``, ``proposal`` and ``musicbrainz_artistid``), whatever its song
-    outcome. ``review_files`` counts the files holding a row. A real call records a verified or
-    filled file ``done`` in the same pass that reports its artist row, so no later call reports
-    that row again. Keep the artist rows from the dry run.
+    credit (``field: "artist"``, ``proposal`` and ``musicbrainz_artistid``) when its folder is
+    checked against its releases or converges, whatever its song outcome there. A rebind folder
+    and a folder a MusicBrainz error stops get none. ``review_files`` counts the files holding a
+    row. A real call records a verified or filled file ``done`` in the same pass that reports its
+    artist row, so no later call reports that row again. Keep the artist rows from the dry run.
 
     Workflow: run ``dry_run=True`` over the whole library first, repeating while ``more`` is
     true, then ``limit=0`` for the free whole-library tally. Review it, then make the real
@@ -2298,8 +2350,10 @@ def resolve_songs(  # noqa: PLR0913 - cohesive scope, release path and run knobs
         held_release_mismatch, held_unconverged, held_no_contribution, review_files,
         lookup_empty, skipped_manual, mappings, rebind_folders, held_values, review_values,
         summary}`` plus ``release`` and
-        ``unassigned`` on the manual release path, or ``{"ok": False, "error": ...}`` (pending
-        changes, no AcoustID key, fpcalc missing). ``more`` is ``cold_folders_remaining > 0``:
+        ``unassigned`` on the manual release path, or ``{"ok": False, "error": ...}`` (a staged
+        tag change, file or sidecar move, or cover (find it with ``diff_tags``, ``diff_paths``
+        or ``diff_covers``), no AcoustID key, fpcalc missing). ``more`` is
+        ``cold_folders_remaining > 0``:
         a held file stays ``pending`` by design, so only a cold folder is new work.
     """
     pairs = (

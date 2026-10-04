@@ -38,9 +38,9 @@ Design notes (the spec):
 * **Correction gate (post-lookup, held not staged):** Last.fm casing is not trustworthy, so
   a case-only difference is already canonical. A canonical name contained in the source is
   a collapsed multi-artist credit (``Skrillex & The Doors`` → ``Skrillex``) and is held
-  regardless of MBID — the ``&``/``with``/``vs`` family the pre-lookup ``feat`` guard cannot
-  see. A correction MusicBrainz does not corroborate (no MBID) is held for review. Held
-  values are reported, never written.
+  regardless of MBID. That is the ``&``/``with``/``vs`` family the pre-lookup ``feat`` guard
+  cannot see. A correction Last.fm pairs with no MBID is held for review. Held values are
+  reported, never written.
 * **Name/id disagreement (held, not staged):** a name MusicBrainz records under neither its
   canonical form nor an alias for the file's own id, or a value the library pairs with two
   different ids, lands in ``name_id_disagreement`` for review.
@@ -48,9 +48,9 @@ Design notes (the spec):
   :data:`tagmend.engine.axis.ARTIST_AXIS`. Every unguarded name value on them is resolved, each
   correction is cascade-staged on every in-scope carrier (present, not ``manual``, not
   multi-value), and each selected file records its highest-ranked value outcome: a multi-value
-  file, a ``feat`` credit or a held value records ``no_match``, a transient error records
-  nothing, anything else records ``done``. An unselected carrier gets no row. MusicBrainz
-  results live in ``musicbrainz_artist_cache`` and getCorrection results in
+  file, a ``feat`` credit, a value with no correction or a held value records ``no_match``, a
+  lookup error records nothing, anything else records ``done``. An unselected carrier gets
+  no row. MusicBrainz results live in ``musicbrainz_artist_cache`` and getCorrection results in
   ``lastfm_correction_cache``.
 
 Like the rest of the conn-owning layer, the public function here owns its connection and
@@ -60,6 +60,7 @@ commits; the building blocks in :mod:`tagmend.engine.store` never commit.
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Final
 
@@ -72,7 +73,7 @@ from tagmend.engine import (
     staging,
     store,
 )
-from tagmend.engine.lastfm import LastfmClient, LastfmError
+from tagmend.engine.lastfm import LastfmClient, LastfmError, LastfmKeyError
 from tagmend.engine.musicbrainz import MusicBrainzClient, MusicBrainzError
 from tagmend.engine.serialize import FieldDict
 from tagmend.engine.text_keys import artist_name_key
@@ -177,13 +178,18 @@ def _is_placeholder(name: str) -> bool:
     return _MB_PLACEHOLDER_RE.match(name.strip()) is not None
 
 
+def _case_key(name: str) -> str:
+    """Return *name* casefolded after NFC, so the two byte-forms of one accent compare equal."""
+    return unicodedata.normalize("NFC", name).casefold()
+
+
 def _is_case_only(value: str, canonical: str) -> bool:
     """Return whether *canonical* differs from *value* by casing alone (or not at all).
 
     Diacritics are deliberately not folded away: ``Antonio`` → ``Antônio`` is a spelling
     fix, not a casing opinion, and must stay eligible for staging.
     """
-    return value.casefold() == canonical.casefold()
+    return _case_key(value) == _case_key(canonical)
 
 
 def _shrinks_credit(value: str, canonical: str) -> bool:
@@ -192,8 +198,8 @@ def _shrinks_credit(value: str, canonical: str) -> bool:
     That shape is a multi-artist credit collapsed onto one member, which no MBID can
     justify. Equality is excluded so an already-canonical value is not read as a shrink.
     """
-    folded_value = value.casefold()
-    folded_canonical = canonical.casefold()
+    folded_value = _case_key(value)
+    folded_canonical = _case_key(canonical)
     return folded_canonical != folded_value and folded_canonical in folded_value
 
 
@@ -290,9 +296,10 @@ def resolve_artists(  # noqa: PLR0913 - cohesive keyword-only scope + injection 
     id field, and on the MusicBrainz tier its own sort field. A corrected ``artists`` element is
     rewritten in place with its aligned ``musicbrainz_artistid`` entry. Every other managed tag
     is preserved. Finally each selected file records its outcome: ``no_match`` for a multi-value
-    file, a ``feat`` credit or a held value, nothing for a transient lookup error or a file that
-    cannot be staged (the file stays ``pending``), ``done`` otherwise. An unselected carrier gets
-    no row.
+    file, a ``feat`` credit, a value with no correction or a held value, nothing for a lookup
+    error or a file that cannot be staged (the file stays ``pending``), ``done`` otherwise. An
+    unselected carrier gets no row. A rejected Last.fm key raises :class:`LastfmKeyError` and
+    stops the call.
 
     *dry_run* returns the proposed ``value → canonical`` mappings and the would-settle and
     would-stage counts and writes nothing. Lookups still run. A cached answer costs nothing and
@@ -512,7 +519,7 @@ def _classify_against_mb(value: str, artist: MBArtist, tally: _Tally) -> None:
     IS trusted (unlike Last.fm's), so it is staged. A value MusicBrainz registers as an
     alias is a name for this artist, so merging it onto the canonical name is what makes one
     artist appear once. Anything else is either a credit that collapses onto one member, or
-    a name MusicBrainz has never heard of for this id — both reported, never staged.
+    a name MusicBrainz has never heard of for this id. Both are reported and never staged.
     """
     if value == artist.name:
         tally.already_canonical_values.append(value)
@@ -577,15 +584,19 @@ def _resolve_one_value(
 ) -> None:
     """Look up one value's correction and route it to exactly one outcome bucket.
 
-    A transient :class:`LastfmError` leaves the value pending (not cached) and is reported,
-    never aborting the run. A correction to a MusicBrainz special-purpose placeholder
-    (``[unknown]``, ``[no artist]``, …) is not a real name and is treated exactly like no
-    correction. The surviving corrections pass the gate in order: case-only (already
-    canonical), credit shrink (held), no MBID (held). A name is therefore only staged when it
-    is a substantive change MusicBrainz corroborates. Every value lands in one bucket.
+    A :class:`LastfmError` leaves the value pending (not cached) and is reported, never
+    aborting the run. A rejected key fails every lookup alike, so its
+    :class:`LastfmKeyError` propagates and stops the call. A correction to a MusicBrainz
+    special-purpose placeholder (``[unknown]``, ``[no artist]``, …) is not a real name and is
+    treated exactly like no correction. The surviving corrections pass the gate in order:
+    case-only (already canonical), credit shrink (held), no MBID (held). A name is therefore
+    only staged when it is a substantive change Last.fm pairs with an MBID. That MBID is
+    Last.fm's claim, not a MusicBrainz lookup. Every value lands in one bucket.
     """
     try:
         correction = client.artist_correction(value)
+    except LastfmKeyError:
+        raise
     except LastfmError as exc:
         logger.warning("last.fm correction error for value=%r: %s", value, exc)
         tally.error_items.append({"key": value, "message": str(exc)})
@@ -638,14 +649,16 @@ def _stage_files(
         if target is None:
             continue
 
-        if not dry_run:
-            try:
+        try:
+            if dry_run:
+                staging.would_stage(settings, conn, file_id=fid, tags=target.tags)
+            else:
                 _stage_target(settings, fid, target)
-            except ValueError as exc:
-                logger.warning("cannot stage artist correction for file_id=%s: %s", fid, exc)
-                tally.error_items.append({"key": f"file_id={fid}", "message": str(exc)})
-                tally.failed_files.add(fid)
-                continue
+        except ValueError as exc:
+            logger.warning("cannot stage artist correction for file_id=%s: %s", fid, exc)
+            tally.error_items.append({"key": f"file_id={fid}", "message": str(exc)})
+            tally.failed_files.add(fid)
+            continue
         tally.staged_files += 1
 
 
@@ -755,7 +768,10 @@ def _stage_target(
 
 
 def _held_values(tally: _Tally) -> set[str]:
-    """Return every value this call reported for review instead of staging."""
+    """Return every value this call reported for review instead of staged.
+
+    A value with no correction is included.
+    """
     held = set(tally.no_correction_values)
     for bucket in (
         tally.needs_review_values,
@@ -774,7 +790,7 @@ def _file_outcome(
     """Return a selected file's highest-ranked value outcome, or ``None`` to write nothing.
 
     Ranked: a multi-value file, then a ``feat`` credit or a held value (``no_match``, so the
-    file stays on the review list), then a transient error (nothing, so it stays ``pending``),
+    file stays on the review list), then a lookup error (nothing, so it stays ``pending``),
     then ``done`` for corrected, already canonical or guarded values.
     """
     if _is_multi_value(tags):

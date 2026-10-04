@@ -359,6 +359,30 @@ def test_release_limit_spends_only_on_uncached_groups(
     assert second.flagged == 2
 
 
+def test_a_tier_view_keeps_each_album_group_of_a_shared_folder_apart(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    mixed = music_dir / "Black Sabbath" / "Mixed"
+    shared = {"albumartist": ["Black Sabbath"], "originaldate": ["1999"]}
+    make_track(mixed / "a.mp3", {**shared, "album": ["Paranoid"]})
+    make_track(mixed / "b.mp3", {**shared, "album": ["Master of Reality"]})
+    scan_library(engine_settings)
+
+    view = year_disagreements.detect_year_disagreements(
+        engine_settings,
+        tier="high",
+        group=True,
+        client=_two_album_source(),
+    )
+
+    assert [(g.album, g.first_release_year, g.flagged, len(g.file_ids)) for g in view.groups] == [
+        ("Master of Reality", "1971", 1, 1),
+        ("Paranoid", "1970", 1, 1),
+    ]
+    assert set(view.groups[0].file_ids).isdisjoint(view.groups[1].file_ids)
+
+
 def test_folder_narrows_the_view_and_wins_over_group(
     engine_settings: Settings,
     music_dir: Path,

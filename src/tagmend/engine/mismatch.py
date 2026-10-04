@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING, Final
 
 from tagmend.engine import axis, axis_status, clock, db, path_keys, schema, store
 from tagmend.engine.detector_core import (
+    MAX_DECIMAL_DIGITS,
     NON_ALBUM_FOLDERS,
     TIER_RANK,
     Tier,
@@ -38,7 +39,7 @@ from tagmend.engine.parsing import parse_filename_track
 from tagmend.engine.path_text import clean_value
 from tagmend.engine.serialize import FieldDict
 from tagmend.engine.text_keys import alnum_ascii_key, loose_key
-from tagmend.engine.validation import check_limit, require_choice
+from tagmend.engine.validation import check_limit, require_choice, require_music_path
 from tagmend.log import get_logger
 
 if TYPE_CHECKING:
@@ -246,7 +247,7 @@ def _ladder_tokens(words: list[str]) -> tuple[str, ...]:
 def _map_token(word: str) -> str:
     """Return *word* as an integer string when numeric, else its ladder alias."""
     # isdecimal, not isdigit: int() rejects the superscripts isdigit accepts.
-    if word.isdecimal():
+    if word.isdecimal() and len(word) <= MAX_DECIMAL_DIGITS:
         return str(int(word))
     return _TOKEN_MAP.get(word, word)
 
@@ -359,16 +360,8 @@ def layout_of(settings: Settings, folder: str, filename: str) -> Layout:
 
     Raises :class:`ValueError` when no music path is configured.
     """
-    music_path = _require_music_path(settings)
+    music_path = require_music_path(settings)
     return _layout(_path_parts(folder, music_path), filename, _container_keys(settings))
-
-
-def _require_music_path(settings: Settings) -> Path:
-    """Return ``music_path``, or raise :class:`ValueError` when it is not configured."""
-    if settings.music_path is None:
-        message = "music_path not configured. Run `tagmend config-set music_path <dir>`"
-        raise ValueError(message)
-    return settings.music_path
 
 
 def _container_keys(settings: Settings) -> frozenset[str]:
@@ -707,6 +700,18 @@ class _Judged:
     others: tuple[Difference, ...]
 
 
+def top_folder_names_artist(top: str, albumartist: str | None, artist: str | None) -> bool:
+    """Whether *top* names ``albumartist``, else ``artist`` or its primary artist, on the ladder.
+
+    Both values are already under the path value rule, ``None`` when blank after it.
+    """
+    if albumartist is not None:
+        return _same_name(top, albumartist)
+    if artist is None:
+        return False
+    return _same_name(top, artist) or _same_name(top, _primary_artist(artist))
+
+
 def _check_top(file: _FileInput, layout: Layout) -> _TopCheck | None:
     """Compare the top folder with ``albumartist``, else ``artist``. ``None`` gives no signal."""
     top = layout.top_folder
@@ -717,17 +722,16 @@ def _check_top(file: _FileInput, layout: Layout) -> _TopCheck | None:
         return _TopCheck(
             tag_value=file.shown("albumartist"),
             path_value=top,
-            differs=not _same_name(top, albumartist),
+            differs=not top_folder_names_artist(top, albumartist, None),
             fallback=False,
         )
     artist = file.value("artist")
     if artist is None:
         return None
-    agrees = _same_name(top, artist) or _same_name(top, _primary_artist(artist))
     return _TopCheck(
         tag_value=file.shown("artist"),
         path_value=top,
-        differs=not agrees,
+        differs=not top_folder_names_artist(top, None, artist),
         fallback=True,
     )
 
@@ -1184,6 +1188,20 @@ def _names_of(item: _Judged) -> frozenset[str]:
     return frozenset(names)
 
 
+def _read_state(
+    item: _Judged,
+    stored: Mapping[int, store.MismatchStatusRow],
+    versions: Mapping[int, int],
+) -> MismatchState:
+    """Read judged *item* against its stored decision, at its current path version."""
+    return _state(
+        item.file,
+        _names_of(item),
+        stored.get(item.file.file_id),
+        _location(item.file, versions),
+    )
+
+
 def _judge_all(
     files: list[_FileInput],
     music_path: Path | None,
@@ -1237,7 +1255,7 @@ def _classify(
     """Classify every present file into a full :class:`MismatchesReport` (pure core).
 
     The reliability guard and the group tiers see every file. Each file is then read against its
-    stored decision (:func:`_state`). It joins ``rows`` while a comparison is unsilenced and
+    stored decision (:func:`_read_state`). It joins ``rows`` while a comparison is unsilenced and
     ``exception_rows`` while its class is.
     """
     judged = _judge_all(files, music_path, container_keys)
@@ -1251,12 +1269,7 @@ def _classify(
     exception_rows: list[MismatchRow] = []
     tally = _Tally()
     for item in judged:
-        state = _state(
-            item.file,
-            _names_of(item),
-            stored.get(item.file.file_id),
-            _location(item.file, versions),
-        )
+        state = _read_state(item, stored, versions)
         tally.add(item, state)
         if not state.unsilenced:
             continue
@@ -1533,7 +1546,7 @@ def detect_mismatches(  # noqa: PLR0913 - cohesive keyword-only view parameters
     outside ``music_path``.
     """
     check_limit(limit)
-    music_path = _require_music_path(settings)
+    music_path = require_music_path(settings)
     validate_tier(tier)
     require_choice("comparison", comparison, COMPARISONS)
     folder_key = None if folder is None else path_keys.folder_arg_key(settings, folder)
@@ -1584,25 +1597,21 @@ def file_states(
 ) -> dict[int, MismatchState]:
     """Return the reading of every present file, or of the present files among *file_ids*.
 
-    The one status reading behind :func:`detect_mismatches`, ``list_files``, ``get_file`` and the
-    library stats. Without ``music_path`` no folder level can be named, so only the filename
-    comparisons run. Reads only, on the caller's connection.
+    The reading behind :func:`check_files`, ``list_files``, ``get_file`` and the library stats.
+    It shares :func:`_read_state` with :func:`detect_mismatches`, so the gate and the commit
+    check read a file alike. Without ``music_path`` no folder level can be named, so only the
+    filename comparisons run. Reads only, on the caller's connection.
     """
     wanted = None if file_ids is None else set(file_ids)
+    stored = store.load_mismatch_statuses(conn)
+    versions = store.path_versions(conn)
     judged = _judge_all(
         _load_inputs(conn, near=wanted),
         settings.music_path,
         _container_keys(settings),
     )
-    stored = store.load_mismatch_statuses(conn)
-    versions = store.path_versions(conn)
     return {
-        item.file.file_id: _state(
-            item.file,
-            _names_of(item),
-            stored.get(item.file.file_id),
-            _location(item.file, versions),
-        )
+        item.file.file_id: _read_state(item, stored, versions)
         for item in judged
         if wanted is None or item.file.file_id in wanted
     }
@@ -1652,7 +1661,7 @@ def check_files(
     records. A missing file is not judged. Raises :class:`ValueError` when no music path is
     configured.
     """
-    _require_music_path(settings)
+    require_music_path(settings)
     states = file_states(conn, settings, file_ids)
     return [
         (file_id, name)
@@ -1890,7 +1899,7 @@ def set_mismatch_status(
     by_value = file_ids is None and value is not None
     if by_value:
         _require_value_decision(status, covered)
-    music_path = _require_music_path(settings)
+    music_path = require_music_path(settings)
     rows: dict[int, store.MismatchStatusRow] = {}
     candidates: list[_Judged] = []
 

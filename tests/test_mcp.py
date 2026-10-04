@@ -18,7 +18,7 @@ import mutagen
 import pytest
 from mcp.types import TextContent
 
-from conftest import make_track
+from conftest import make_track, rejecting_lastfm_client
 from tagmend import config, mcp_server
 from tagmend.config import load_settings
 from tagmend.engine import (
@@ -35,8 +35,9 @@ from tagmend.engine import (
 from tagmend.engine.acoustid import AcoustidKeyError, FpcalcUnavailableError
 from tagmend.engine.coverart import CoverArtError
 from tagmend.engine.db import connect
-from tagmend.engine.lastfm import LastfmError
+from tagmend.engine.lastfm import LastfmClient, LastfmError
 from tagmend.engine.musicbrainz import MusicBrainzError
+from tagmend.engine.schema import LedgerSchemaError
 from tagmend.engine.tags import MANAGED_SET_VERSION, read_tags
 
 _N = 3
@@ -274,7 +275,7 @@ def test_unstage_tags_and_empty_commit_are_clean_noops(music_dir: Path) -> None:
     file_id = _scanned_track_id(music_dir)
     mcp_server.stage_tags(file_id, {"genre": ["Synthwave"]})
 
-    assert mcp_server.unstage_tags(file_id) == {"ok": True, "removed": True}
+    assert mcp_server.unstage_tags(file_id) == {"ok": True, "removed": 1}
     assert mcp_server.diff_tags()["changes"] == []
 
     # Nothing staged -> a commit is a clean no-op with no commit id.
@@ -644,6 +645,16 @@ def test_unknown_ids_return_the_error_envelope() -> None:
         assert "9999" in str(payload["error"])
 
 
+def test_get_file_and_get_commit_refuse_an_unknown_id_with_a_value_error() -> None:
+    for payload, id_name in (
+        (mcp_server.get_file(9999), "file_id"),
+        (mcp_server.get_commit(9999), "commit_id"),
+    ):
+        assert payload["ok"] is False
+        assert payload["error_type"] == "ValueError"
+        assert payload["error"] == f"unknown {id_name}=9999"
+
+
 # --- the error envelope ----------------------------------------------------------------
 
 
@@ -659,6 +670,7 @@ def test_unknown_ids_return_the_error_envelope() -> None:
         CoverArtError("Cover Art Archive HTTP 400 for release listing"),
         AcoustidKeyError("AcoustID rejected the API key. Check the acoustid_api_key setting."),
         FpcalcUnavailableError("fpcalc is not on PATH and fpcalc_path is not set"),
+        LedgerSchemaError("ledger schema v99 is newer than this tagmend (v29). Upgrade tagmend."),
     ],
     ids=lambda error: type(error).__name__,
 )
@@ -676,6 +688,27 @@ def test_error_envelope_maps_each_expected_error(
     assert payload["ok"] is False
     assert payload["error_type"] == type(error).__name__
     assert payload["error"] == str(error)
+
+
+@pytest.mark.parametrize("tool", ["resolve_genres", "resolve_artists"])
+def test_a_rejected_lastfm_key_returns_the_key_error_envelope(
+    monkeypatch: pytest.MonkeyPatch,
+    music_dir: Path,
+    tool: str,
+) -> None:
+    make_track(music_dir / "a.mp3", {"artist": ["Daft Punk"], "genre": ["Old"]})
+    mcp_server.scan_library(path=str(music_dir))
+    monkeypatch.setattr(
+        LastfmClient,
+        "from_settings",
+        staticmethod(lambda _settings, conn: rejecting_lastfm_client(conn)),
+    )
+
+    payload = getattr(mcp_server, tool)()
+
+    assert payload["ok"] is False
+    assert payload["error_type"] == "LastfmKeyError"
+    assert "lastfm_api_key" in str(payload["error"])
 
 
 def test_error_envelope_lets_a_bug_raise(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -786,7 +819,7 @@ def test_negative_limit_is_rejected_everywhere(tool_name: str, kwargs: dict[str,
     ("release_mbid", "error"),
     [
         pytest.param(None, "assignments needs release_mbid", id="no-release"),
-        pytest.param("rel-1", "file_id=1 is assigned more than once", id="file-listed-twice"),
+        pytest.param("rel-1", "entry 1: duplicate file_id=1", id="file-listed-twice"),
     ],
 )
 def test_resolve_songs_passes_its_assignments_to_the_engine(
@@ -837,6 +870,7 @@ def test_path_tools_roundtrip(music_dir: Path) -> None:
         "ok": True,
         "removed": 0,
         "sidecars_removed": 0,
+        "sidecars_staged": 0,
     }
 
 
@@ -865,7 +899,10 @@ def test_the_rendered_path_tools_roundtrip(music_dir: Path) -> None:
             "destinations": [str(Path("Artist") / "Artist - Album")],
             "kind": "move",
             "held": {},
-            "example": {"from": str(Path("Artist") / "Album" / "01 One.mp3"), "to": target},
+            "example": {
+                "from_path": str(Path("Artist") / "Album" / "01 One.mp3"),
+                "to_path": target,
+            },
         },
     ]
 

@@ -446,6 +446,22 @@ def test_scan_continues_past_corrupt_file(engine_settings: Settings, music_dir: 
     assert total_tag_values >= _N
 
 
+def test_scan_itemizes_an_unreadable_file_in_error_items(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    make_track(music_dir / "good.mp3", {"artist": ["Artist"]})
+    (music_dir / "broken.mp3").write_bytes(b"not an audio file")
+
+    result = scan_library(engine_settings)
+
+    assert result.errors == 1
+    assert len(result.error_items) == 1
+    item = result.error_items[0]
+    assert Path(item["key"]).name == "broken.mp3"
+    assert item["message"]
+
+
 def test_scan_requires_music_path(tmp_path: Path) -> None:
     settings = Settings(
         music_path=None,
@@ -613,6 +629,18 @@ def test_list_files_filter_limit_counts_matching_lowest_ids(
 
     assert [v.file_id for v in views] == sorted(matching_ids)[:2]
     assert all(v.genre_status == "no_match" for v in views)
+
+
+def test_list_files_limit_zero_returns_nothing_with_or_without_a_filter(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    _populate(music_dir, 2)
+    scan_library(engine_settings)
+
+    assert len(list_files(engine_settings, genre_status="pending")) == 2
+    assert list_files(engine_settings, limit=0) == []
+    assert list_files(engine_settings, limit=0, genre_status="pending") == []
 
 
 def test_list_files_unknown_genre_status_raises(
@@ -1086,6 +1114,16 @@ def test_list_albums_year_status_filter(
     assert [row.album for row in pending] == ["B1"]
 
 
+def test_list_albums_unknown_year_status_raises(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    make_track(music_dir / "a.mp3", {"artist": ["Alpha"], "album": ["A1"]})
+    scan_library(engine_settings)
+    with pytest.raises(ValueError, match="unknown year_status"):
+        list_albums(engine_settings, year_status="bogus")
+
+
 def test_list_albums_ignores_a_missing_file(
     engine_settings: Settings,
     music_dir: Path,
@@ -1121,6 +1159,25 @@ def test_list_albums_actionable_keeps_only_groups_with_blanks(
     assert all(row.blank_originaldate > 0 for row in rows)
     # Unfiltered, the fully-tagged group is still listed.
     assert len(list_albums(engine_settings)) == 2
+
+
+def test_list_albums_actionable_drops_a_blank_group_resolve_years_never_selects(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    manual_track = make_track(music_dir / "a.mp3", {"artist": ["Alpha"], "album": ["A1"]})
+    make_track(music_dir / "b.mp3", {"artist": ["Bravo"], "album": ["B1"]})
+    scan_library(engine_settings)
+    manual_id = _file_row(engine_settings, music_dir, manual_track.name).id
+    axis_status.set_manual_status(
+        engine_settings, axis.YEAR_AXIS, file_ids=[manual_id], value=None, status="manual"
+    )
+
+    actionable = list_albums(engine_settings, actionable=True)
+    every_group = list_albums(engine_settings)
+
+    assert [row.album for row in actionable] == ["B1"]
+    assert [(row.album, row.blank_originaldate) for row in every_group] == [("A1", 1), ("B1", 1)]
 
 
 def test_list_albums_actionable_composes_with_year_status_and_precedes_limit(

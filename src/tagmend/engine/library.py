@@ -1,17 +1,15 @@
-"""Library scan orchestration + stats (M1).
+"""Library scan orchestration + stats.
 
 The single entry point both frontends call: walk the configured (or supplied) music
 folder, reconcile each file against the ``files`` snapshot, read & store tags as the
 chosen :class:`ScanMode` dictates, and flag anything that has disappeared from disk.
-This is the only module here that owns transaction/commit policy and stitches together
-:mod:`scan`, :mod:`tags`, :mod:`store`, :mod:`schema`, and :mod:`db`.
 
 Scan modes:
 
-* ``incremental`` (default) — read tags only when the size/mtime signature changed, the
+* ``incremental`` (default): read tags only when the size/mtime signature changed, the
   file has never had its tags read, or an older tag reader wrote the stored row.
-* ``full`` — re-read tags for every file regardless of signature.
-* ``presence`` — only reconcile existence (added/missing/restored); never read tags.
+* ``full``: re-read tags for every file regardless of signature.
+* ``presence``: only reconcile existence (added, missing, restored). It never reads tags.
 """
 
 from __future__ import annotations
@@ -20,14 +18,25 @@ import os
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING
 
 import mutagen
 
-from tagmend.engine import axis, clock, db, mismatch, path_keys, scan, schema, store, versioning
+from tagmend.engine import (
+    axis,
+    clock,
+    db,
+    mismatch,
+    path_keys,
+    scan,
+    schema,
+    store,
+    versioning,
+    years,
+)
 from tagmend.engine.serialize import FieldDict
 from tagmend.engine.tags import TAG_READER_VERSION, read_tags
-from tagmend.engine.validation import check_limit, require_choice
+from tagmend.engine.validation import check_limit, require_choice, require_music_path
 from tagmend.log import get_logger
 
 if TYPE_CHECKING:
@@ -37,9 +46,6 @@ if TYPE_CHECKING:
     from tagmend.config import Settings
 
 logger = get_logger(__name__)
-
-# The year axis manages one field, the one ``list_albums`` counts blanks of.
-_YEAR_FIELD: Final = axis.YEAR_AXIS.fields[0]
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,13 +59,16 @@ class FileView(FieldDict):
     is_missing: bool
     managed_tags: dict[str, list[str]]
     genre_status: str = "pending"
-    genre_source_artist: str | None = None  # identity a no_match/manual was recorded against
+    # identity the stored done/no_match/manual row was recorded against
+    genre_source_artist: str | None = None
     genre_source_album: str | None = None
     artist_status: str = "pending"
-    artist_source_artist: str | None = None  # values a manual exclusion was recorded against
+    # identity the stored done/no_match/manual row was recorded against
+    artist_source_artist: str | None = None
     artist_source_albumartist: str | None = None
     year_status: str = "pending"
-    year_source_artist: str | None = None  # identity a no_match/manual was recorded against
+    # identity the stored done/no_match/manual row was recorded against
+    year_source_artist: str | None = None
     year_source_album: str | None = None
     song_status: str = "pending"
     song_source_album_mbid: str | None = None  # release ids a done/manual was recorded against
@@ -194,7 +203,7 @@ def _row_matches_status(  # noqa: PLR0913 - cohesive keyword-only status filters
 def list_files(  # noqa: PLR0913 - cohesive keyword-only discovery filters
     settings: Settings,
     *,
-    path: Path | None = None,
+    path: str | os.PathLike[str] | None = None,
     limit: int | None = None,
     genre_status: str | None = None,
     artist_status: str | None = None,
@@ -259,6 +268,8 @@ def list_files(  # noqa: PLR0913 - cohesive keyword-only discovery filters
         # When several are set, a file must satisfy ALL to match.
         matched: list[store.FileRow] = []
         for row in rows:
+            if limit is not None and len(matched) >= limit:
+                break
             if not _row_matches_status(
                 connection,
                 row,
@@ -271,8 +282,6 @@ def list_files(  # noqa: PLR0913 - cohesive keyword-only discovery filters
             ):
                 continue
             matched.append(row)
-            if limit is not None and len(matched) >= limit:
-                break
         return _views(
             connection,
             settings,
@@ -343,23 +352,25 @@ def list_albums(
     """Return each distinct album group with its file count + a representative status.
 
     Groups present files by ``(albumartist-else-artist, album)`` (the album identity) and
-    reports the derived year status of the group's first file plus ``blank_originaldate``,
-    the count of the group's files whose ``originaldate`` tag is empty. Those are the files
-    :func:`tagmend.engine.years.resolve_years` can fill, and ``> 0`` marks an actionable
-    group. A discovery aid for scoping ``resolve_years``. Read-only.
+    reports the derived year status of the group's lowest-id file plus ``blank_originaldate``,
+    the count of the group's files whose ``originaldate`` is blank, in any status. A discovery
+    aid for scoping ``resolve_years``. Read-only.
 
-    *year_status* (when given) keeps only groups whose derived status matches. *actionable*
-    keeps only the actionable groups, those with ``blank_originaldate > 0``. The two
-    compose, and both are applied AFTER ordering and BEFORE *limit*. *limit* (when given)
-    caps the number of rows returned so a large library stays context-cheap. Raises
-    :class:`ValueError` for a negative *limit*.
+    *year_status* (when given) keeps only groups whose lowest-id file has that derived status.
+    *actionable* keeps only the groups holding a ``pending`` file whose ``originaldate`` is
+    blank, the files :func:`tagmend.engine.years.resolve_years` looks up. The two compose, and
+    both are applied AFTER ordering and BEFORE *limit*. *limit* (when given) caps the number of
+    rows returned so a large library stays context-cheap. Raises :class:`ValueError` for an
+    unknown *year_status* or a negative *limit*.
     """
     check_limit(limit)
+    require_choice("year_status", year_status, store.YEAR_WORKFLOW_STATUSES)
+    groups: dict[tuple[str | None, str], list[int]] = {}
+    blanks: dict[tuple[str | None, str], int] = {}
+    fillable: set[tuple[str | None, str]] = set()
     connection = db.connect(settings.db_path)
     try:
         schema.apply_schema(connection)
-        groups: dict[tuple[str | None, str], list[int]] = {}
-        blanks: dict[tuple[str | None, str], int] = {}
         for fid in store.present_file_ids(connection):
             tags = store.get_tags(connection, fid)
             identity = axis.lookup_identity(tags)
@@ -367,8 +378,11 @@ def list_albums(
                 continue
             key = (identity.artist, identity.album)
             groups.setdefault(key, []).append(fid)
-            if not tags.get(_YEAR_FIELD):
-                blanks[key] = blanks.get(key, 0) + 1
+            if years.holds_year(tags):
+                continue
+            blanks[key] = blanks.get(key, 0) + 1
+            if store.derived_status(connection, axis.YEAR_AXIS, fid) == "pending":
+                fillable.add(key)
 
         rows = [
             AlbumRow(
@@ -387,7 +401,7 @@ def list_albums(
     if year_status is not None:
         ordered = [row for row in ordered if row.year_status == year_status]
     if actionable:
-        ordered = [row for row in ordered if row.blank_originaldate > 0]
+        ordered = [row for row in ordered if (row.artist, row.album) in fillable]
     if limit is not None:
         ordered = ordered[:limit]
     return ordered
@@ -413,6 +427,7 @@ class ScanResult(FieldDict):
     missing_flagged: int
     restored: int
     errors: int
+    error_items: tuple[dict[str, str], ...]
     respelled: int
     pending_commit: int
 
@@ -429,6 +444,7 @@ class _Counters:
     missing_flagged: int = 0
     restored: int = 0
     errors: int = 0
+    error_items: list[dict[str, str]] = field(default_factory=list)
     respelled: int = 0
     pending_commit: int = 0
     seen_ids: set[int] = field(default_factory=set)
@@ -444,6 +460,7 @@ class _Counters:
             missing_flagged=self.missing_flagged,
             restored=self.restored,
             errors=self.errors,
+            error_items=tuple(self.error_items),
             respelled=self.respelled,
             pending_commit=self.pending_commit,
         )
@@ -452,7 +469,7 @@ class _Counters:
 def scan_library(
     settings: Settings,
     *,
-    path: Path | None = None,
+    path: str | os.PathLike[str] | None = None,
     mode: ScanMode = ScanMode.INCREMENTAL,
 ) -> ScanResult:
     """Scan *path* (or the configured ``music_path``) into the snapshot.
@@ -476,11 +493,8 @@ def scan_library(
     # relative to the working directory, so joining it onto itself would name a missing folder.
     if path is not None:
         root = path_keys.resolve_folder_arg(settings, path)
-    elif music_path is not None:
-        root = music_path
     else:
-        message = "music_path not configured. Run `tagmend config-set music_path <dir>`"
-        raise ValueError(message)
+        root = require_music_path(settings)
     if not root.exists():
         message = f"music path does not exist: {root}"
         raise ValueError(message)
@@ -583,9 +597,10 @@ def _process_file(
 
     try:
         stat_result = path.stat()
-    except OSError:
-        logger.warning("could not stat %s; skipping", path)
+    except OSError as exc:
+        logger.warning("could not stat %s, skipping: %s", path, exc)
         counters.errors += 1
+        counters.error_items.append({"key": str(path), "message": str(exc)})
         return
 
     size_bytes = stat_result.st_size
@@ -710,6 +725,7 @@ def _try_read_and_store(
     except (mutagen.MutagenError, OSError) as exc:  # type: ignore[attr-defined]
         logger.warning("could not read tags from %s: %s", path, exc)
         counters.errors += 1
+        counters.error_items.append({"key": str(path), "message": str(exc)})
         return
 
     # Stamped before the identical-tags early return below: an unchanged re-read still
@@ -719,10 +735,7 @@ def _try_read_and_store(
     if new_tags == current:
         return
     store.replace_tags(conn, file_id, new_tags, clock.utc_now())
-    # tags_read counts files whose tags were re-read AND actually differed from the
-    # stored snapshot (i.e. re-persisted this run); an identical re-read is an honest
-    # no-op and is not tallied (see test_full_mode_honest_noop_then_reread). This is
-    # distinct from `updated`, which counts size/mtime signature changes.
+    # Counts only re-persisted tag sets, so an identical re-read stays a no-op.
     counters.tags_read += 1
 
 

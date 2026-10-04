@@ -358,6 +358,29 @@ def test_v13_migration_does_not_restamp_on_reapply() -> None:
         conn.close()
 
 
+def test_a_failed_v13_stamp_leaves_no_managed_set_column() -> None:
+    # A column left behind by a failed stamp satisfies the guard, so the stamp never runs again.
+    conn = sqlite3.connect(":memory:")
+    try:
+        apply_schema(conn)
+        file_id = _insert_file(conn)
+        _downgrade_to_v12(conn)
+        _insert_revision_row(conn, file_id, 0, "2026-01-01T00:00:00+00:00")
+        conn.execute(
+            "CREATE TRIGGER tag_revisions_frozen BEFORE UPDATE ON tag_revisions "
+            "BEGIN SELECT RAISE(ABORT, 'frozen'); END",
+        )
+        conn.commit()
+
+        with pytest.raises(sqlite3.IntegrityError, match="frozen"):
+            apply_schema(conn)
+
+        assert "managed_set" not in _columns(conn, "tag_revisions")
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 12
+    finally:
+        conn.close()
+
+
 def _downgrade_to_v13(conn: sqlite3.Connection) -> None:
     """Turn a freshly-applied ledger back into a v13 one (no ``reader_version`` column)."""
     conn.execute("PRAGMA user_version = 13")
@@ -567,6 +590,25 @@ def test_v16_ledger_gains_the_staged_base_signature_in_place() -> None:
             (file_id,),
         ).fetchone()
         assert row == ('{"genre":["Rock"]}', "kept", None, None, None, None)
+    finally:
+        conn.close()
+
+
+def test_a_failed_v17_step_leaves_no_base_signature_column() -> None:
+    # The second ALTER fails on a column the table already holds. The first must roll back with
+    # it, or the guard column stays and the upgrade never adds the second.
+    conn = sqlite3.connect(":memory:")
+    try:
+        apply_schema(conn)
+        conn.execute("ALTER TABLE tag_revisions_staged DROP COLUMN base_size_bytes")
+        conn.execute("PRAGMA user_version = 16")
+        conn.commit()
+
+        with pytest.raises(sqlite3.OperationalError, match="duplicate column"):
+            apply_schema(conn)
+
+        assert "base_size_bytes" not in _staged_columns(conn)
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 16
     finally:
         conn.close()
 
@@ -1544,6 +1586,28 @@ def test_v24_ledger_gains_the_path_staging_columns_in_place() -> None:
         assert row == ("New/a.mp3", "kept", None, None, None, None)
         indexes = {str(r[1]) for r in conn.execute("PRAGMA index_list(path_revisions_staged)")}
         assert "idx_path_revisions_staged_to_key" in indexes
+    finally:
+        conn.close()
+
+
+def test_a_failed_v25_step_leaves_no_path_staging_column() -> None:
+    # The last ALTER fails on a column the table already holds. Every earlier one must roll back
+    # with it, or the guard column stays and the upgrade never adds the rest.
+    conn = sqlite3.connect(":memory:")
+    try:
+        apply_schema(conn)
+        conn.execute("DROP INDEX idx_path_revisions_staged_to_key")
+        for column in _PATH_STAGING_COLUMNS:
+            conn.execute(f"ALTER TABLE path_revisions_staged DROP COLUMN {column}")
+        conn.execute("ALTER TABLE path_revisions_staged ADD COLUMN reverted_from INTEGER")
+        conn.execute("PRAGMA user_version = 24")
+        conn.commit()
+
+        with pytest.raises(sqlite3.OperationalError, match="duplicate column"):
+            apply_schema(conn)
+
+        assert "to_key" not in _path_staged_columns(conn)
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 24
     finally:
         conn.close()
 

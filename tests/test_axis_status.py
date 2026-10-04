@@ -135,8 +135,8 @@ def test_transient_error_writes_nothing(engine_settings: Settings, music_dir: Pa
     library.scan_library(engine_settings)
 
     class _Down(FakeTagSource):
-        def artist_top_tags(self, name: str | None = None, *, mbid: str | None = None) -> None:
-            del name, mbid
+        def artist_top_tags(self, name: str) -> None:
+            del name
             message = "transport error"
             raise LastfmError(message)
 
@@ -351,7 +351,7 @@ def test_unstage_after_a_resolver_stage_reopens(
     file_id = _ids(engine_settings)["t.flac"]
     _resolve_genres(engine_settings)
 
-    assert staging.unstage_tags(engine_settings, file_id=file_id) is True
+    assert staging.unstage_tags(engine_settings, file_id=file_id) == 1
 
     assert _status(engine_settings, file_id) == "pending"
 

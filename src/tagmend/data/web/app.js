@@ -1,6 +1,6 @@
 "use strict";
 
-// Declarative field map: key -> { label, group, type }. Mirrors _KNOWN_KEYS in config.py.
+// Every settings key except naming_pattern and container_folders, which only set_naming_pattern writes.
 const FIELDS = [
   { key: "music_path", label: "Music folder", group: "essential", type: "text" },
   { key: "lastfm_api_key", label: "Last.fm API key", group: "essential", type: "text" },
@@ -21,6 +21,10 @@ const FIELDS = [
 ];
 
 const csrfToken = document.querySelector('meta[name="csrf-token"]').content;
+
+// The values the page last loaded or saved. A save posts only the fields that differ from them,
+// so it never reverts another writer's change or pins a default or env override into settings.json.
+let seedValues = {};
 
 function postJSON(url, body) {
   return fetch(url, {
@@ -59,10 +63,9 @@ function collectPayload() {
   const payload = {};
   for (const field of FIELDS) {
     const input = document.getElementById(field.key);
-    if (field.type === "checkbox") {
-      payload[field.key] = input.checked ? "true" : "false";
-    } else {
-      payload[field.key] = input.value;
+    const value = field.type === "checkbox" ? (input.checked ? "true" : "false") : input.value;
+    if (value !== String(seedValues[field.key] ?? "")) {
+      payload[field.key] = value;
     }
   }
   return payload;
@@ -75,10 +78,10 @@ function setResult(node, ok, message) {
 
 async function load() {
   const seed = await (await fetch("/api/seed")).json();
-  const values = seed.values || {};
+  seedValues = seed.values || {};
   const groups = { essential: document.getElementById("essential"), advanced: document.getElementById("advanced") };
   for (const field of FIELDS) {
-    groups[field.group].append(renderField(field, values[field.key]));
+    groups[field.group].append(renderField(field, seedValues[field.key]));
   }
 }
 
@@ -86,9 +89,14 @@ async function save(event) {
   event.preventDefault();
   const node = document.getElementById("save-result");
   try {
-    const resp = await postJSON("/api/save", collectPayload());
+    const payload = collectPayload();
+    const resp = await postJSON("/api/save", payload);
     const data = await resp.json();
-    setResult(node, resp.ok && data.ok, resp.ok && data.ok ? "Saved." : data.error || "Save failed.");
+    const saved = resp.ok && data.ok;
+    if (saved) {
+      seedValues = { ...seedValues, ...payload };
+    }
+    setResult(node, saved, saved ? "Saved." : data.error || "Save failed.");
   } catch (err) {
     setResult(node, false, String(err));
   }

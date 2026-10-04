@@ -7,14 +7,14 @@ against the same identity on its folder siblings.
 
 A folder holding one album describes one release. Every music server groups tracks into an
 album by some tuple of the release tags, so when a folder's files disagree on that tuple the
-one album is presented as several. The identity used here is the tuple every such scheme
-agrees on:
+one album is presented as several. The identity used here follows Navidrome's album key:
 
 * ``musicbrainz_albumid`` when present. It is an explicit claim about which release this is,
   and it settles the file on its own.
-* otherwise the display album artist, the album title and the release date (``date``, else a
-  raw Vorbis ``year``). The display album artist is ``albumartist``, falling back to
-  ``Various Artists`` when the compilation flag is set, then to ``artist``. The compilation
+* otherwise the display album artist, the album title and the release date. The release date
+  is an M4A's ``date``, a FLAC's or Ogg's ``releasedate`` else ``year``, and none for an MP3,
+  whose ``date`` is a recording date. The display album artist is ``albumartist``, falling
+  back to ``Various Artists`` when the compilation flag is set, then to ``artist``. The compilation
   marker outranks the track artist, which is what keeps a various-artists release with no
   album artist from scattering across every track's artist.
 
@@ -81,6 +81,7 @@ _DETECT_FIELDS: Final = (
     "artist",
     "musicbrainz_albumid",
     "date",
+    "releasedate",
     "year",
     "compilation",
 )
@@ -465,7 +466,7 @@ def _load_inputs(connection: sqlite3.Connection) -> list[_FileInput]:
                 albumartist=values.get("albumartist"),
                 artist=values.get("artist"),
                 release_mbid=values.get("musicbrainz_albumid"),
-                date=release_date(values),
+                date=release_date(values, row.filename),
                 compilation=values.get("compilation"),
             ),
         )

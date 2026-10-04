@@ -42,15 +42,6 @@ def _release(*media: MBMedium) -> MBRelease:
     )
 
 
-def test_text_key_ignores_casing_spacing_and_typographic_quotes() -> None:
-    curly = "Don\N{RIGHT SINGLE QUOTATION MARK}t  Stop"
-    assert release_match.text_key(curly) == release_match.text_key("don't stop")
-
-
-def test_text_key_keeps_other_punctuation_significant() -> None:
-    assert release_match.text_key("Part: One") != release_match.text_key("Part - One")
-
-
 @pytest.mark.parametrize(
     ("value", "expected"),
     [("07", "7"), ("3/12", "3"), ("A1", "A1"), (" B2 /9", "B2"), ("", ""), (None, "")],

@@ -122,6 +122,17 @@ def test_classify_genres_thermostatic_artist_only() -> None:
     ]
 
 
+def test_classify_genres_keeps_the_max_weight_of_two_spellings_in_one_source() -> None:
+    # A trailing weak spelling of synth-pop must not demote it below electronic.
+    artist_tags = [Tag("synthpop", 100), Tag("electronic", 80), Tag("synth pop", 10)]
+
+    result = classify_genres(
+        artist_tags, None, load_vocabulary(), _settings(max_count=1), lookup_artist="X"
+    )
+
+    assert result == ["synth-pop"]
+
+
 def test_classify_genres_daft_punk_artist_plus_album_merge() -> None:
     vocab = load_vocabulary()
     # From spec §6.1 (Daft Punk / Random Access Memories), min_weight=2.
@@ -285,6 +296,16 @@ def test_overlay_extends_existing_genre_with_new_aliases(tmp_path: Path) -> None
     assert vocab.match("8bit") == "chiptune"
 
 
+def test_overlay_with_broken_yaml_raises_a_value_error_naming_the_file(tmp_path: Path) -> None:
+    overlay_yml = tmp_path / "overlay.yml"
+    overlay_yml.write_text("version: 1\ngenres: [unclosed\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="does not parse") as excinfo:
+        load_vocabulary(overlay_path=overlay_yml)
+
+    assert str(overlay_yml) in str(excinfo.value)
+
+
 # --- overlay deny rules --------------------------------------------------------------
 
 _DENY_BASE_VOCAB = (
@@ -383,15 +404,34 @@ def test_overlay_deny_entry_with_unusable_fields_warns_and_denies_nothing(
     assert any("skipping entry" in record.message for record in captured_warnings.records)
 
 
+def test_overlay_deny_names_an_artist_in_any_script(tmp_path: Path) -> None:
+    vocab = _deny_vocabulary(tmp_path, "deny:\n- genre: oi\n  artists: [椎名林檎]\n")
+    settings = _settings()
+
+    named = classify_genres(_CANNONS_TAGS, None, vocab, settings, lookup_artist="椎名林檎")
+    assert named == ["indie pop"]
+    unrelated = classify_genres(_CANNONS_TAGS, None, vocab, settings, lookup_artist="東京事変")
+    assert unrelated == ["indie pop", "oi"]
+
+
+def test_overlay_deny_artist_matches_across_diacritics(tmp_path: Path) -> None:
+    vocab = _deny_vocabulary(tmp_path, "deny:\n- genre: oi\n  artists: [Beyonce]\n")
+
+    result = classify_genres(_CANNONS_TAGS, None, vocab, _settings(), lookup_artist="Beyoncé")
+
+    assert result == ["indie pop"]
+
+
 def test_overlay_deny_artist_folding_to_empty_key_is_skipped(
     tmp_path: Path,
     captured_warnings: pytest.LogCaptureFixture,
 ) -> None:
-    vocab = _deny_vocabulary(tmp_path, "deny:\n- genre: oi\n  artists: [椎名林檎, Cannons]\n")
+    # Quoted, since an unquoted ! starts a YAML tag.
+    vocab = _deny_vocabulary(tmp_path, "deny:\n- genre: oi\n  artists: ['!!!', Cannons]\n")
     settings = _settings()
 
-    # Every name without an ASCII letter or digit shares the empty fold-key.
-    unrelated = classify_genres(_CANNONS_TAGS, None, vocab, settings, lookup_artist="東京事変")
+    # Every name without a letter or digit in any script shares the empty fold-key.
+    unrelated = classify_genres(_CANNONS_TAGS, None, vocab, settings, lookup_artist="???")
     assert unrelated == ["indie pop", "oi"]
     named = classify_genres(_CANNONS_TAGS, None, vocab, settings, lookup_artist="Cannons")
     assert named == ["indie pop"]

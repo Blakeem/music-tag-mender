@@ -29,6 +29,7 @@ from mutagen.id3 import ID3, RVAD, TIT2  # type: ignore[attr-defined]
 
 from tagmend import config
 from tagmend.config import Settings
+from tagmend.engine.lastfm import LastfmClient
 from tagmend.engine.schema import apply_schema
 
 if TYPE_CHECKING:
@@ -95,6 +96,15 @@ def make_droppable_frames_mp3(dest: Path) -> Path:
     return track
 
 
+def make_rvad_mp3(dest: Path, tags: Mapping[str, Sequence[str]]) -> Path:
+    """Write an ID3v2.3 MP3 holding *tags* and an ``RVAD`` frame, which a v2.4 save drops."""
+    track = make_track(dest, tags)
+    frames = ID3(track)  # type: ignore[no-untyped-call]
+    frames.add(RVAD(adjustments=[1, 1], peaks=[1, 1]))  # type: ignore[no-untyped-call]
+    frames.save(track, v2_version=3)
+    return track
+
+
 # The ways a user can type one folder. Upper case names the same folder only where the
 # filesystem ignores case, so that spelling runs on Windows alone.
 FOLDER_SPELLINGS = (
@@ -115,6 +125,13 @@ def spell_folder(folder: Path, spelling: str) -> str:
     if spelling == "slash":
         return text.replace(os.sep, "/")
     return text
+
+
+def rejecting_lastfm_client(conn: sqlite3.Connection) -> LastfmClient:
+    """Return a real :class:`LastfmClient` whose transport answers Last.fm's invalid-key 403."""
+    body = {"error": 10, "message": "Invalid API key - You must be granted a valid key by last.fm"}
+    transport = httpx.MockTransport(lambda _request: httpx.Response(403, json=body))
+    return LastfmClient("rejected-key", conn, rate_per_sec=0.0, transport=transport)
 
 
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
@@ -162,15 +179,7 @@ def _isolate_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """Redirect config/data dirs into a temp location and clear env overrides."""
     monkeypatch.setattr(config, "config_dir", lambda: tmp_path / "config")
     monkeypatch.setattr(config, "data_dir", lambda: tmp_path / "data")
-    for var in (
-        "TAGMEND_MUSIC_PATH",
-        "TAGMEND_LASTFM_API_KEY",
-        "TAGMEND_ACOUSTID_API_KEY",
-        "TAGMEND_FPCALC_PATH",
-        "TAGMEND_DB_PATH",
-        "TAGMEND_NO_BROWSER",
-        "TAGMEND_NO_CONFIG_UI",
-    ):
+    for var in [name for name in os.environ if name.startswith("TAGMEND_")]:
         monkeypatch.delenv(var, raising=False)
 
 

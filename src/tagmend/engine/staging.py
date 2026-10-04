@@ -1,8 +1,8 @@
-"""Tags staging area + commit orchestration (M3 write path).
+"""Tags staging area + commit orchestration.
 
 The git "index → commit" step that sits above the per-file revision log in
 :mod:`tagmend.engine.versioning`. A *staged* change records the desired target managed
-tags for one file (``tag_revisions_staged`` — one pending row per file); a *commit*
+tags for one file (``tag_revisions_staged``, one pending row per file). A *commit*
 groups every currently-staged change under one ``commits`` row, applies each to disk via
 the shared crash-safe loop in :mod:`tagmend.engine.commits`, and appends a real
 ``tag_revisions`` row, turning the staged row into history and deleting it.
@@ -17,14 +17,14 @@ Crash-safety follows PLAN.md §7 (the resume-free model): the staged table *is* 
 journal. The baseline (version 0) is captured at **stage** time, so a crash mid-commit
 followed by a rescan can never capture the wrong v0. A commit flips any lingering
 ``applying`` commit to ``interrupted`` (a crash remnant), then sweeps every still-staged
-row under a **new** commit. Per file, the disk write happens first; then — in ONE DB
-transaction — the revision is appended *and* the staged row deleted, so a revision never
+row under a **new** commit. Per file, the disk write happens first. Then ONE DB
+transaction appends the revision *and* deletes the staged row, so a revision never
 exists without its staged row already gone. Anything still staged was not durably
-committed; the next commit re-applies it idempotently.
+committed, and the next commit re-applies it idempotently.
 
 Like :func:`tagmend.engine.versioning.revert_tags` and
 :func:`tagmend.engine.library.scan_library`, every public function here owns its own
-connection and commit; the building blocks in :mod:`tagmend.engine.store` never commit.
+connection and commit. The building blocks in :mod:`tagmend.engine.store` never commit.
 """
 
 from __future__ import annotations
@@ -42,14 +42,16 @@ from tagmend.engine.tags import (
     MANAGED_SET_VERSION,
     MANAGED_TAGS,
     RELEASE_STAMP_TAGS,
+    check_round_trip,
     ensure_writable,
     governed_tags,
     read_tags,
-    write_managed_tags,
 )
+from tagmend.engine.validation import validate_file_pairs
 from tagmend.log import get_logger
 
 if TYPE_CHECKING:
+    import os
     import sqlite3
     from collections.abc import Sequence
 
@@ -59,7 +61,7 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 # A staged change originates from automated resolution (``auto``) or a manual/LLM
-# decision (``manual``); ``revert`` is never staged. The chosen origin flows into the
+# decision (``manual``). ``revert`` is never staged. The chosen origin flows into the
 # revision the commit appends.
 _STAGED_ORIGINS = frozenset({"auto", "manual"})
 
@@ -90,6 +92,14 @@ _IDENTITY_GROUPS: Final[tuple[tuple[tuple[str, ...], tuple[str, ...]], ...]] = (
 
 # A NUL splits a value inside TagLib, and ID3v2.4 forbids line breaks in a text frame.
 _FORBIDDEN_CHARACTERS: Final = ("\x00", "\r", "\n")
+
+_CHANGED_SINCE_STAGE_DETAIL: Final = (
+    "file changed on disk after it was staged. "
+    "Re-stage it (stage_tags replaces the pending row) or unstage it."
+)
+_LANDED_UNRECORDED: Final = (
+    "an interrupted commit already wrote its staged change. Run commit_tags to record it first"
+)
 
 
 def _clean_values(file_id: int, managed_tags: dict[str, list[str]]) -> dict[str, list[str]]:
@@ -154,13 +164,17 @@ class TagDomain:
     ``droppable_frames`` is the ID3 frame id set every write is given.
     """
 
-    name: str = "tags"
     droppable_frames: frozenset[str] = frozenset()
 
     @property
+    def changed_since_stage_detail(self) -> str:
+        """Re-staging replaces the row with one based on the file as it is now."""
+        return _CHANGED_SINCE_STAGE_DETAIL
+
+    @property
     def per_file_errors(self) -> tuple[type[Exception], ...]:
-        """A locked, read-only or unreadable file fails alone, as it does in ``revert_commit``."""
-        return (OSError, ValueError, mutagen.MutagenError)  # type: ignore[attr-defined]
+        """A locked, read-only or unreadable file, or a refused write, touches no other file."""
+        return versioning.TAG_FILE_ERRORS
 
     def list_staged_file_ids(self, conn: sqlite3.Connection) -> list[int]:
         """Return every staged file id, in file_id order."""
@@ -246,21 +260,17 @@ class TagDomain:
             if stale
             else versioning.compute_diff(versioning.managed_subset(current), staged.managed_tags)
         )
-        before_write = path.stat()
-        audio_proven = False
-        if disk_diff:
-            audio_proven = write_managed_tags(
-                path, staged.managed_tags, droppable_frames=self.droppable_frames
-            ).audio_proven
-
-        # Refresh the live snapshot, append the revision, delete the staged row.
-        fresh = read_tags(path).tags
-        store.replace_tags(conn, file_id, fresh, now)
+        fresh = versioning.write_and_resync(
+            conn,
+            file_id,
+            path,
+            staged.managed_tags,
+            write=bool(disk_diff),
+            droppable_frames=self.droppable_frames,
+            now=now,
+        )
         _record_axis_outcomes(
             conn, file_id, staged=staged, disk_diff=disk_diff, fresh=fresh, now=now
-        )
-        versioning.resync_signature(
-            conn, file_id, path, before_write=before_write, audio_proven=audio_proven, now=now
         )
         version = versioning.append_revision(
             conn,
@@ -271,7 +281,8 @@ class TagDomain:
             note=staged.note,
             commit_id=commit_id,
         )
-        store.delete_staged_tag(conn, file_id)
+        # Only the row read above, so a row another process staged since stays for a commit.
+        store.delete_staged_tag(conn, file_id, staged_at=staged.staged_at)
         return version
 
     def flag_and_drop_missing(self, conn: sqlite3.Connection, file_id: int) -> None:
@@ -298,6 +309,26 @@ def _holds_target(
         return not versioning.compute_diff(disk, target)
     compared = set(target) | governed_tags(latest.managed_set)
     return all(disk.get(key, []) == target.get(key, []) for key in compared)
+
+
+def _landed_unrecorded(
+    conn: sqlite3.Connection,
+    staged: store.StagedTag,
+    signature: os.stat_result,
+    current: dict[str, list[str]],
+) -> bool:
+    """Whether a commit cut by a crash already wrote *staged* to the file and recorded nothing.
+
+    The file's *signature* left the staged base, and its *current* tags hold the staged target.
+    The staged row is that write's only record until the next ``commit_tags`` completes it.
+    """
+    if staged.base_size_bytes is None or staged.base_mtime_ns is None:
+        return False
+    base = (staged.base_size_bytes, staged.base_mtime_ns)
+    if (signature.st_size, signature.st_mtime_ns) == base:
+        return False
+    latest = store.latest_revision(conn, staged.file_id)
+    return _holds_target(versioning.managed_subset(current), staged.managed_tags, latest)
 
 
 def _require_staged(conn: sqlite3.Connection, file_id: int) -> store.StagedTag:
@@ -362,32 +393,28 @@ def _restamp_outcome(  # noqa: PLR0913 - cohesive keyword-only commit-writer inp
     axis.put_outcome(conn, tag_axis, file_id=file_id, status=row.status, tags=fresh, now=now)
 
 
-def _stage_one(  # noqa: PLR0913 - cohesive keyword-only per-file staging payload
+@dataclass(frozen=True, slots=True)
+class _StageInputs:
+    """What :func:`_stage_one` writes from, once every refusal of :func:`_check_stage` passed."""
+
+    base: os.stat_result
+    current: dict[str, list[str]]
+    remaining: dict[str, list[str]]
+
+
+def _check_stage(
     conn: sqlite3.Connection,
     *,
     file_id: int,
     tags: dict[str, list[str]],
-    origin: str,
-    note: str | None,
-    now: str,
     droppable_frames: frozenset[str],
-    fill_only: frozenset[str] = frozenset(),
-) -> bool:
-    """Validate + stage one file's change on an OPEN connection (no commit). Never drifts.
+    fill_only: frozenset[str],
+) -> _StageInputs | None:
+    """Run every refusal of a stage of *tags* on *file_id*, in order, and return its inputs.
 
-    The shared per-file core of :func:`stage_tags` and :func:`stage_tags_batch`: rejects
-    unmanaged keys, cleans every caller-supplied value (:func:`_clean_values`), rejects an
-    unknown or missing *file_id*, lazily captures the version-0 baseline (or the re-baseline
-    :func:`tagmend.engine.versioning.observe_widened_fields` writes), records an external edit
-    as a ``scan`` revision (:func:`tagmend.engine.versioning.observe_drift`), merges
-    *tags* onto the file's current managed subset (P0: omitted keys are preserved),
-    and upserts the staged row with the file's signature as its base, so the commit can refuse
-    a file edited since, and with the caller's surviving keys as its ``supplied_keys``. A file
-    holding a staged path change is refused. A *fill_only* key is dropped when the file on disk
-    already holds a value for it, and when that leaves no caller-supplied key, nothing is staged
-    and ``False`` is returned. A file the writer would refuse under *droppable_frames* is
-    refused. Raises :class:`ValueError` naming *file_id* on any invalid input. Leaves the
-    transaction for the caller to commit or roll back.
+    Shared by :func:`_stage_one` and :func:`would_stage`, so a dry run refuses what the real
+    run refuses. Returns ``None`` when the *fill_only* guard leaves no caller-supplied key.
+    Raises :class:`ValueError` naming *file_id* on any refusal. Writes nothing.
     """
     unmanaged = sorted(set(tags) - MANAGED_TAGS)
     if unmanaged:
@@ -409,11 +436,8 @@ def _stage_one(  # noqa: PLR0913 - cohesive keyword-only per-file staging payloa
         )
         raise ValueError(message)
 
-    # Disk, not the snapshot mirror. The mirror can lag the file (an older tag reader wrote
-    # the row, or nothing rescanned after an upgrade), and BOTH things derived here are
-    # delete-on-absent: the commit removes every managed key missing from the target, and the
-    # baseline is what a revert restores. A stale mirror therefore destroyed a tag the caller
-    # never mentioned, unrecoverably.
+    # The snapshot mirror can lag the file. The target and the baseline both delete what they
+    # lack, so both come from disk.
     path = Path(file_row.folder) / file_row.filename
     try:
         # Stat before the read: an edit landing between the two makes the base older than the
@@ -425,20 +449,70 @@ def _stage_one(  # noqa: PLR0913 - cohesive keyword-only per-file staging payloa
         # vanished or turned unreadable since the scan that wrote its row.
         message = f"cannot read tags from disk for file_id={file_id} ({path}): {exc}"
         raise ValueError(message) from exc
+    existing = store.get_staged_tag(conn, file_id)
+    if existing is not None and _landed_unrecorded(conn, existing, base, current):
+        message = f"file_id={file_id}: {_LANDED_UNRECORDED}"
+        raise ValueError(message)
 
     # A blank-fill decided from the snapshot mirror must still never overwrite a value the
     # file gained on disk since the last scan.
     remaining = _drop_filled(requested, current, fill_only)
     if requested and not remaining:
-        return False
+        return None
 
     # A staged row the writer must refuse would fail every commit and block revert_commit's
     # empty-staging guard until someone unstaged it by hand.
     try:
         ensure_writable(path, droppable_frames=droppable_frames)
+        check_round_trip(path, remaining)
     except (mutagen.MutagenError, OSError, ValueError) as exc:  # type: ignore[attr-defined]
         message = f"cannot stage file_id={file_id}: {exc}"
         raise ValueError(message) from exc
+
+    return _StageInputs(base=base, current=current, remaining=remaining)
+
+
+def _stage_one(  # noqa: PLR0913 - cohesive keyword-only per-file staging payload
+    conn: sqlite3.Connection,
+    *,
+    file_id: int,
+    tags: dict[str, list[str]],
+    origin: str,
+    note: str | None,
+    now: str,
+    droppable_frames: frozenset[str],
+    fill_only: frozenset[str] = frozenset(),
+) -> bool:
+    """Validate + stage one file's change on an OPEN connection (no commit).
+
+    The shared per-file core of :func:`stage_tags` and :func:`stage_tags_batch`. Its refusals
+    (:func:`_check_stage`) are an unmanaged key, a value holding a NUL, CR or LF, an unknown or
+    missing *file_id*, a file holding a staged path change, a file unreadable on disk, a staged
+    change an interrupted commit already wrote and recorded nothing for, a file the writer
+    would refuse under *droppable_frames*, and a supplied value the container cannot store
+    verbatim. Every caller-supplied value is cleaned (:func:`_clean_values`). A *fill_only* key
+    is dropped when the file on disk already holds a value for it, and when that leaves no
+    caller-supplied key, nothing is staged and ``False`` is returned.
+
+    It then lazily captures the version-0 baseline (or the re-baseline
+    :func:`tagmend.engine.versioning.observe_widened_fields` writes), records an external edit
+    as a ``scan`` revision (:func:`tagmend.engine.versioning.observe_drift`), merges
+    *tags* onto the file's current managed subset (P0: omitted keys are preserved),
+    and upserts the staged row with the file's signature as its base, so the commit can refuse
+    a file edited since, and with the caller's surviving keys as its ``supplied_keys``.
+    Raises :class:`ValueError` naming *file_id* on any refusal. Leaves the transaction for the
+    caller to commit or roll back.
+    """
+    inputs = _check_stage(
+        conn,
+        file_id=file_id,
+        tags=tags,
+        droppable_frames=droppable_frames,
+        fill_only=fill_only,
+    )
+    if inputs is None:
+        return False
+    current = inputs.current
 
     # Capture v0 now (resume-free model): freeze the true original before any commit. A file
     # whose latest revision predates the current managed set is re-baselined for the same reason.
@@ -450,9 +524,9 @@ def _stage_one(  # noqa: PLR0913 - cohesive keyword-only per-file staging payloa
 
     # No accidental deletion (P0): merge onto the current managed subset so omitted managed
     # keys are preserved through the commit's delete-on-absent write. The caller's values
-    # win; an explicit empty list still deletes a field.
+    # win, and an explicit empty list still deletes a field.
     target = versioning.managed_subset(current)
-    target.update(remaining)
+    target.update(inputs.remaining)
     changed_fields = versioning.compute_diff(versioning.managed_subset(current), target).keys()
 
     store.upsert_staged_tag(
@@ -462,10 +536,10 @@ def _stage_one(  # noqa: PLR0913 - cohesive keyword-only per-file staging payloa
         origin=origin,
         now=now,
         note=note,
-        base_size_bytes=base.st_size,
-        base_mtime_ns=base.st_mtime_ns,
+        base_size_bytes=inputs.base.st_size,
+        base_mtime_ns=inputs.base.st_mtime_ns,
         changed_fields=changed_fields,
-        supplied_keys=remaining.keys(),
+        supplied_keys=inputs.remaining.keys(),
     )
     return True
 
@@ -481,12 +555,11 @@ def stage_tags(  # noqa: PLR0913 - cohesive keyword-only staging payload
 ) -> bool:
     """Record the desired target managed tags for *file_id* (replacing any pending one).
 
-    Validates *origin* (``auto``/``manual``) then, via the shared :func:`_stage_one` core,
-    that every key is a managed tag and the file is known and not flagged missing. Also
-    captures the version-0 baseline now (read from the file on disk) if the file has none,
-    so a later crash-then-rescan can never record the wrong original. Nothing on disk
-    changes and no further history is recorded until :func:`commit_tags`. Owns its
-    transaction.
+    Validates *origin* (``auto``/``manual``) and refuses everything the shared
+    :func:`_stage_one` core refuses. Also captures the version-0 baseline now (read from the
+    file on disk) if the file has none, so a later crash-then-rescan can never record the wrong
+    original. Nothing on disk changes and no further history is recorded until
+    :func:`commit_tags`. Owns its transaction.
 
     **No accidental deletion (P0).** *tags* is merged *onto* the file's current
     managed subset, so an omitted managed key means "leave it alone", not "delete it":
@@ -532,44 +605,39 @@ def stage_tags(  # noqa: PLR0913 - cohesive keyword-only staging payload
     return staged
 
 
-_BATCH_ENTRY_WIDTH = 2
+def would_stage(
+    settings: Settings,
+    conn: sqlite3.Connection,
+    *,
+    file_id: int,
+    tags: dict[str, list[str]],
+    fill_only: frozenset[str] = frozenset(),
+) -> bool:
+    """Return whether :func:`stage_tags` would stage *tags* on *file_id*. Writes nothing.
 
-
-def _validate_batch_entries(entries: Sequence[object]) -> list[tuple[int, dict[str, list[str]]]]:
-    """Narrow an untyped *entries* sequence to ``(file_id, managed_tags)`` pairs, or raise.
-
-    The parameter is deliberately untyped: under mypy strict these checks would be
-    unreachable against the declared pair type, yet an engine-side caller handing over the
-    MCP-shaped ``{"file_id": .., "tags": ..}`` dict gets its two KEYS destructured instead,
-    so the shape error surfaces as a nonsense ``duplicate file_id=file_id in batch``.
-    Every message names the offending index.
+    A resolver's dry run calls it on its own connection, so a file the real run would refuse
+    raises the same :class:`ValueError` here instead of counting as staged.
     """
-    validated: list[tuple[int, dict[str, list[str]]]] = []
-    for index, entry in enumerate(entries):
-        if not isinstance(entry, tuple):
-            message = f"entry {index}: expected a (file_id, tags) tuple, got {type(entry).__name__}"
-            raise ValueError(message)  # noqa: TRY004 - batch rejections are uniformly ValueError
-        if len(entry) != _BATCH_ENTRY_WIDTH:
-            message = f"entry {index}: expected a (file_id, tags) tuple of 2, got {len(entry)}"
+    inputs = _check_stage(
+        conn,
+        file_id=file_id,
+        tags=tags,
+        droppable_frames=frozenset(settings.id3_droppable_frames),
+        fill_only=fill_only,
+    )
+    return inputs is not None
+
+
+def _checked_tags(tags: object) -> dict[str, list[str]]:
+    """Return one batch entry's *tags* as a managed-tag map, or raise :class:`ValueError`."""
+    if not isinstance(tags, dict):
+        message = f"tags must be a dict of name -> list of values, got {type(tags).__name__}"
+        raise ValueError(message)  # noqa: TRY004 - batch rejections are uniformly ValueError
+    for name, values in tags.items():
+        if not isinstance(values, list) or not all(isinstance(v, str) for v in values):
+            message = f"tags[{name!r}] must be a list of strings"
             raise ValueError(message)
-        file_id, tags = entry
-        if not isinstance(file_id, int) or isinstance(file_id, bool):
-            message = f"entry {index}: file_id must be an integer, got {type(file_id).__name__}"
-            raise ValueError(message)  # noqa: TRY004 - batch rejections are uniformly ValueError
-        if not isinstance(tags, dict):
-            message = (
-                f"entry {index} (file_id={file_id}): tags must be a dict of "
-                f"name -> list of values, got {type(tags).__name__}"
-            )
-            raise ValueError(message)  # noqa: TRY004 - batch rejections are uniformly ValueError
-        for name, values in tags.items():
-            if not isinstance(values, list) or not all(isinstance(v, str) for v in values):
-                message = (
-                    f"entry {index} (file_id={file_id}): tags[{name!r}] must be a list of strings"
-                )
-                raise ValueError(message)
-        validated.append((file_id, cast("dict[str, list[str]]", tags)))
-    return validated
+    return cast("dict[str, list[str]]", tags)
 
 
 def stage_tags_batch(
@@ -581,28 +649,19 @@ def stage_tags_batch(
     """Stage N files' managed-tag changes in ONE connection / ONE transaction (all-or-nothing).
 
     *entries* is a sequence of ``(file_id, managed_tags)`` tuples. Every entry's SHAPE is
-    checked first by :func:`_validate_batch_entries` (a :class:`ValueError` naming the index
-    and what was wrong), then each is validated and staged through the SAME :func:`_stage_one`
-    core as :func:`stage_tags` (unmanaged-key rejection, unknown/missing-file rejection, lazy
-    v0 baseline, merge-onto-current-subset, and the value hygiene :func:`stage_tags` describes:
-    values stripped and NFC-normalized, a NUL, CR or LF rejected), so single and batch can never
-    drift. The ``origin`` is hardcoded ``"manual"`` (this flow never auto-stages, so no origin
-    parameter is exposed). A malformed entry, a duplicate ``file_id`` in one batch, or any
+    checked first by :func:`tagmend.engine.validation.validate_file_pairs` (a
+    :class:`ValueError` naming the index and what was wrong), then each is validated and staged
+    through the SAME :func:`_stage_one` core as :func:`stage_tags`, so single and batch can
+    never drift. The ``origin`` is hardcoded ``"manual"`` (this flow never auto-stages, so no
+    origin parameter is exposed). A malformed entry, a duplicate ``file_id`` in one batch, or any
     invalid entry raises :class:`ValueError` and NOTHING is staged (the shared transaction is
     rolled back on close). A later :func:`commit_tags` groups the whole batch into ONE
     revertible commit. Returns the staged file ids in input order.
 
-    ``tracknumber``/``discnumber`` values are staged VERBATIM (callers supply the full
-    ``"n/total"`` strings); this helper never parses or computes them.
+    ``tracknumber``/``discnumber`` values are never parsed or computed. Callers supply the full
+    ``"n/total"`` strings.
     """
-    validated = _validate_batch_entries(entries)
-
-    seen: set[int] = set()
-    for file_id, _ in validated:
-        if file_id in seen:
-            message = f"duplicate file_id={file_id} in batch"
-            raise ValueError(message)
-        seen.add(file_id)
+    validated = validate_file_pairs(entries, value_name="tags", check_value=_checked_tags)
 
     connection = db.connect(settings.db_path)
     try:
@@ -627,22 +686,42 @@ def stage_tags_batch(
     return staged_ids
 
 
-def unstage_tags(settings: Settings, *, file_id: int) -> bool:
-    """Drop the pending change for *file_id*. Returns ``True`` if a row was removed.
+def _refuse_landed_unstage(conn: sqlite3.Connection, staged: store.StagedTag, path: Path) -> None:
+    """Raise :class:`ValueError` when an interrupted commit already wrote *staged* to *path*.
 
-    A known file with nothing staged returns ``False``, and an unknown *file_id* raises
+    A file that cannot be read shows no landed write, so its unstage proceeds.
+    """
+    try:
+        signature = path.stat()
+        current = read_tags(path).tags
+    except (mutagen.MutagenError, OSError):  # type: ignore[attr-defined]
+        return
+    if _landed_unrecorded(conn, staged, signature, current):
+        message = f"file_id={staged.file_id}: {_LANDED_UNRECORDED}"
+        raise ValueError(message)
+
+
+def unstage_tags(settings: Settings, *, file_id: int) -> int:
+    """Drop the pending change for *file_id*. Returns the count of rows removed, 1 or 0.
+
+    A known file with nothing staged returns 0, and an unknown *file_id* raises
     :class:`ValueError`, so a typo is never read as "nothing staged". A baseline or re-baseline
     captured at stage time stays (history is proportional to staged intent). It is harmless and
-    never re-applied.
+    never re-applied. A staged change an interrupted commit already wrote to the file is refused
+    with :class:`ValueError`, since its row is that write's only record until ``commit_tags``.
     """
     connection = db.connect(settings.db_path)
     try:
         schema.apply_schema(connection)
-        if store.get_file_by_id(connection, file_id) is None:
+        file_row = store.get_file_by_id(connection, file_id)
+        if file_row is None:
             message = f"unknown file_id={file_id}"
             raise ValueError(message)
-        removed = store.get_staged_tag(connection, file_id) is not None
-        if removed:
+        staged = store.get_staged_tag(connection, file_id)
+        if staged is not None and not file_row.is_missing:
+            _refuse_landed_unstage(connection, staged, Path(file_row.folder) / file_row.filename)
+        removed = 0 if staged is None else 1
+        if staged is not None:
             store.delete_staged_tag(connection, file_id)
             connection.commit()
     finally:
@@ -657,7 +736,7 @@ def _current_managed(
     """Return the file's current managed tags, from DISK when it can be read.
 
     The staged target is built from disk, so comparing it against the snapshot mirror would
-    render a field the mirror merely lacks as an addition — a review surface inventing changes
+    render a field the mirror merely lacks as an addition, a review surface inventing changes
     that will not happen. The mirror is the fallback for a file that is gone or unreadable,
     which is the only case where nothing better exists.
     """
@@ -702,7 +781,11 @@ def _stale_identity(
     return stale
 
 
-def diff_tags(settings: Settings, *, path: Path | None = None) -> list[TagDiffView]:
+def diff_tags(
+    settings: Settings,
+    *,
+    path: str | os.PathLike[str] | None = None,
+) -> list[TagDiffView]:
     """Return staged-but-uncommitted tag changes enriched with the current→target diff.
 
     This is ``git diff --staged``. ``current`` is read from the file on disk, the same source
@@ -761,9 +844,9 @@ def commit_tags(
     settings: Settings,
     *,
     message: str | None = None,
-    path: Path | None = None,
+    path: str | os.PathLike[str] | None = None,
 ) -> CommitResult:
-    """Apply every currently-staged tag change as one revertible commit; return a summary.
+    """Apply every currently-staged tag change as one revertible commit and return a summary.
 
     First flips any lingering ``applying`` commit to ``interrupted`` (crash recovery in
     the resume-free model), then sweeps every still-staged row (optionally limited to the

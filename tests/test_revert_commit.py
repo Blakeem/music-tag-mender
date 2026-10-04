@@ -257,6 +257,26 @@ def test_revert_commit_records_and_skips_an_edit_landing_after_its_plan_pass(
     assert observed.diff == {"title": {"from": ["Old"], "to": ["Hand Fixed"]}}
 
 
+def test_revert_commit_skips_a_file_a_later_commit_changed_after_its_plan_pass(
+    engine_settings: Settings,
+    music_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    a = make_track(music_dir / "a.mp3", {"genre": ["Electronic"]})
+    scan_library(engine_settings)
+    a_id = _file_id(engine_settings, music_dir, a.name)
+    target = _stage_and_commit(engine_settings, {a_id: {"genre": ["Synthwave"]}})
+    _stage_and_commit(engine_settings, {a_id: {"genre": ["Darksynth"]}})
+    # The plan pass classified the file before the later commit landed.
+    monkeypatch.setattr(versioning, "_classify_for_revert", lambda *_args: "revertable")
+
+    result = versioning.revert_commit(engine_settings, target)
+
+    assert _outcome(result, a_id).status == "skipped_later_changes"
+    assert read_tags(a).tags["genre"] == ["Darksynth"]
+    assert [r.origin for r in _revisions(engine_settings, a_id)] == ["scan", "manual", "manual"]
+
+
 # --- scenario 3: missing file --------------------------------------------------------
 
 

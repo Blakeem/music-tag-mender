@@ -1,13 +1,13 @@
-"""Read and surgically write the normalized tag set via mutagen (M1 read + M3 write).
+"""Read and surgically write the normalized tag set via mutagen.
 
 Tags are read in mutagen's "easy" mode and normalized into a single canonical,
 lowercase namespace so the rest of the engine never has to care about format-specific
 key spellings (ID3 vs Vorbis vs MP4). A Vorbis spelling map collapses the Picard names
 mutagen leaves raw. Everything else passes through lowercased unchanged.
 
-The write path (:func:`write_managed_tags`, M3) touches only the narrow
+The write path (:func:`write_managed_tags`) touches only the narrow
 :data:`MANAGED_TAGS` set and writes atomically (temp copy + ``os.replace``) so a
-dropped NAS connection mid-write cannot corrupt the original (PLAN.md §7 and §11).
+dropped NAS connection mid-write cannot corrupt the original.
 Before the swap it verifies the temp copy, and refuses with :class:`TagWriteError` when the
 save changed anything outside the target. A container the verifier cannot check is refused
 before any copy, and :func:`ensure_writable` lets staging refuse it before a change is queued.
@@ -22,6 +22,7 @@ import io
 import os
 import re
 import shutil
+import stat
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, BinaryIO, Final, Protocol
@@ -57,13 +58,8 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
-# ``originaldate`` (the original/first-release year) is native on ID3 (``TDOR``) and Vorbis
-# (``ORIGINALDATE``) via mutagen's easy mode, but MP4 has no built-in easy mapping. Register
-# it ONCE at module load so read and write agree on the iTunes freeform atom — never ``©day``
-# (that is ``date``, the reissue year). The atom name is matched CASE-SENSITIVELY and Picard
-# writes it lowercase, so an uppercase registration reads nothing on a Picard-tagged file and
-# writes a second, contradicting atom beside it. Registration is idempotent; importing this
-# module is the single place it happens.
+# EasyMP4 has no ``originaldate`` mapping, and ``©day`` is ``date``, the reissue year. Picard
+# writes the freeform atom lowercase, and an atom name matches case-sensitively.
 EasyMP4Tags.RegisterFreeformKey("originaldate", "originaldate")  # type: ignore[no-untyped-call]
 
 # EasyID3 maps ``albumartistsort`` to ``TXXX:ALBUMARTISTSORT``, a frame Picard does not write:
@@ -79,7 +75,7 @@ EasyID3.RegisterTXXXKey("artists", "ARTISTS")  # type: ignore[no-untyped-call]
 EasyMP4Tags.RegisterFreeformKey("artists", "ARTISTS")  # type: ignore[no-untyped-call]
 
 # The two MusicBrainz ids in :data:`MANAGED_TAGS` that EasyMP4 has no built-in mapping for
-# (the other four — album/albumartist/artist/track ids + album type — are native). Register
+# (the album, albumartist, artist and track ids and the album type are native). Register
 # them here on the SAME iTunes freeform atom names Picard writes (verified against a real
 # Picard-tagged ``.m4a``: ``----:com.apple.iTunes:MusicBrainz Release Group Id`` /
 # ``MusicBrainz Release Track Id``), so read and write agree. EasyID3/Vorbis carry both
@@ -93,14 +89,8 @@ EasyMP4Tags.RegisterFreeformKey(  # type: ignore[no-untyped-call]
     "MusicBrainz Release Track Id",
 )
 
-# The release-stamp fields MP4 needs mapped. ``organization`` is registered for READING only
-# (it is not in the managed set — see the note beside _VORBIS_SPELLINGS), which costs nothing
-# and beats leaving the atom invisible. All but ``releasecountry`` simply have no built-in
-# EasyMP4 entry; ``releasecountry`` HAS one and it points at the wrong atom — mutagen says
-# ``MusicBrainz Release Country`` while Picard writes ``MusicBrainz Album Release Country``, one
-# word apart and invisible without this override. Every name here was read off a real
-# Picard-tagged ``.m4a`` in the library except ``CATALOGNUMBER``, which no sample carried and
-# which follows the uppercase convention the other five share.
+# EasyMP4 lacks these atoms, and its own ``releasecountry`` atom is a word off from Picard's.
+# Each name is Picard's (no sample held CATALOGNUMBER). ``organization`` is read, never managed.
 for _key, _atom in (
     ("organization", "LABEL"),
     ("media", "MEDIA"),
@@ -112,24 +102,15 @@ for _key, _atom in (
 ):
     EasyMP4Tags.RegisterFreeformKey(_key, _atom)  # type: ignore[no-untyped-call]
 
-# Canonical key -> the name Picard uses for the same concept in a Vorbis comment. mutagen has
-# no "easy" layer for Vorbis (``mutagen.File(path, easy=True)`` hands back a plain ``FLAC`` /
-# ``OggVorbis``), so unlike ID3 and MP4 these names are NOT normalized for us and every one
-# that differs from the canonical key has to be mapped here, in both directions. An entry is
-# needed ONLY where the two names differ.
+# Canonical key -> Picard's Vorbis name, only where the two differ. Vorbis has no easy layer, so
+# mutagen leaves these names raw in both directions.
 _VORBIS_SPELLINGS: Final[Mapping[str, str]] = {
     "musicbrainz_albumtype": "releasetype",
     "musicbrainz_albumstatus": "releasestatus",
 }
 
-# NOT here, deliberately: ``organization`` <-> ``label``. Measured on this library, 479 FLACs
-# carry BOTH Vorbis names and on 245 of them the values DIFFER (an original label in
-# ORGANIZATION, the reissue label in LABEL). Collapsing them would pick one and let a later
-# write delete the other, with the baseline holding only the survivor — irreversible. The two
-# above have zero such overlap, so collapsing them is lossless. Until the label pair has a
-# decided rule, both names stay unmapped and unmanaged.
-# The same holds for ``BAND`` and ``ALBUM ARTIST`` against ``ALBUMARTIST``: library FLACs carry a
-# different value in each, and none carries either without ``ALBUMARTIST``.
+# Left unmapped: 245 of 479 library FLACs holding both ``organization`` and ``label`` differ,
+# and ``BAND`` or ``ALBUM ARTIST`` differ from ``ALBUMARTIST``. Collapsing either pair loses data.
 
 # Derived, never hand-written twice: a second literal could drift out of step with the map above.
 _VORBIS_TO_CANONICAL: Final[Mapping[str, str]] = {v: k for k, v in _VORBIS_SPELLINGS.items()}
@@ -153,11 +134,8 @@ ORIGINAL_MANAGED_TAGS: Final[frozenset[str]] = frozenset(
     },
 )
 
-# The 13 identity/MusicBrainz fields the mismatch-fix flow adds: the full wrong-release
-# "stamp" a tagger (Picard) leaves when it matches a track against the wrong MusicBrainz
-# release — identity (``title``/``album``/``date``/``tracknumber``/``discnumber``/the two
-# sort names) plus the album type and the five remaining MB ids. EasyID3/Vorbis carry them
-# natively; EasyMP4 needs the two freeform registrations above.
+# The 13 identity and MusicBrainz fields of a wrong-release stamp. Vorbis spells the album type
+# ``releasetype``, ID3 needs the ``TSO2`` override and MP4 the two freeform registrations above.
 _WIDENED_MANAGED_TAGS: Final[frozenset[str]] = frozenset(
     {
         "title",
@@ -176,11 +154,8 @@ _WIDENED_MANAGED_TAGS: Final[frozenset[str]] = frozenset(
     },
 )
 
-# The release/recording provenance stamp: WHICH PRESSING a file's tags came from. An identity
-# fix rewrites artist/album/title but leaves this block behind, so a rebound file reads
-# "Alice in Chains - Greatest Hits" while its albumstatus still says "bootleg" and its country
-# "RU" — from the Russian bootleg it was wrongly matched to. Managed so the fix flow can clear
-# or replace it in the same commit, and so revert governs it like everything else.
+# The provenance stamp of a file's release, which an identity fix would otherwise leave behind
+# (a bootleg status, a foreign country). Managed so the fix clears it in the same commit.
 RELEASE_STAMP_TAGS: Final[frozenset[str]] = frozenset(
     {
         "musicbrainz_albumstatus",
@@ -197,14 +172,9 @@ RELEASE_STAMP_TAGS: Final[frozenset[str]] = frozenset(
 # it, ``artist`` then being only the display credit. Managed so an artist-name fix renames both.
 _ARTIST_LIST_TAGS: Final[frozenset[str]] = frozenset({"artists"})
 
-# The set of tags TagMend is allowed to write/revert (26 = 5 original + 13 identity + 7 release
-# stamp + the artists list). A CLOSED set: anything outside it (``comment``/``composer``/art…)
-# is never read, written, or deleted, and every key here MUST be provably writable on all four
-# formats. The mismatch-fix flow can repair a poisoned release in one commit, and revert restores
-# every field the target revision's own managed set governed (see
-# :func:`tagmend.engine.versioning._revert_target_tags`).
-# ``date`` (reissue year, MP4 ``©day``) and ``originaldate`` (original year, MP4 freeform) are
-# BOTH managed and kept distinct.
+# The 26 tags TagMend writes and reverts, each writable on all four formats. A key outside the
+# set is never written or deleted. :func:`read_tags` reports every key the file holds, and
+# ``versioning.managed_subset`` narrows a read to this set.
 MANAGED_TAGS: Final[frozenset[str]] = (
     ORIGINAL_MANAGED_TAGS | _WIDENED_MANAGED_TAGS | RELEASE_STAMP_TAGS | _ARTIST_LIST_TAGS
 )
@@ -236,7 +206,7 @@ def governed_tags(managed_set: int) -> frozenset[str]:
 
 # Which reader produced a snapshot row, so an incremental scan can spot rows left behind by
 # an older one and re-read them exactly once. BUMP THIS IN THE SAME COMMIT as any change to
-# what :func:`read_tags` produces (the managed set, a Vorbis spelling, a format registration), or
+# what :func:`read_tags` produces (a Vorbis spelling, a format registration), or
 # every already-scanned file keeps serving the old reader's output to every detector.
 TAG_READER_VERSION: Final = 8
 
@@ -383,7 +353,7 @@ def _normalized_tags(path: Path, audio: FileType | None) -> TrackTags:
     # Input
     tags: Any = {} if audio is None else _taglib_view(path, audio.tags)
 
-    # Process — a file can carry both spellings of one concept (a tagger wrote the Vorbis name,
+    # Process: a file can carry both spellings of one concept (a tagger wrote the Vorbis name,
     # an older TagMend wrote the canonical one). The Vorbis name is what every other reader
     # looks at, so it wins regardless of iteration order.
     normalized: dict[str, list[str]] = {}
@@ -941,6 +911,19 @@ def _apply_changes(
     audio.save()
 
 
+def _discard_temp(tmp: Path) -> None:
+    """Remove a write's temp copy, logging a failure so the caller's own exception propagates.
+
+    Windows refuses to unlink a read-only file, and ``shutil.copy2`` copies that bit.
+    """
+    try:
+        with contextlib.suppress(FileNotFoundError):
+            tmp.chmod(tmp.stat().st_mode | stat.S_IWRITE)
+            tmp.unlink()
+    except OSError as exc:
+        logger.warning("could not remove temp copy %s: %s", tmp, exc)
+
+
 def _require_verifiable(path: Path, audio: FileType) -> _Container:
     """Return *audio*'s container, or raise :class:`TagWriteError` when a write is unverifiable."""
     container = _container_of(audio)
@@ -1001,6 +984,37 @@ def ensure_writable(path: Path, *, droppable_frames: frozenset[str] = frozenset(
         _require_lossless_id3_save(path, droppable_frames=droppable_frames)
 
 
+def check_round_trip(path: Path, managed: Mapping[str, list[str]]) -> None:
+    """Raise :class:`ValueError` for a value in *managed* the container of *path* alters.
+
+    The ID3 and MP4 easy layers parse what they store, such as a timestamp or a track pair, and
+    :func:`read_tags` reads it back reformatted, so the write verifier would refuse every commit.
+    The values pass through the same easy setters and getters the writer and the reader use.
+    """
+    audio = mutagen.File(path, easy=True)  # type: ignore[attr-defined]
+    container = None if audio is None else _container_of(audio)
+    probe: Any
+    easy: Any
+    if container is _Container.ID3:
+        probe, easy = ID3(), EasyID3  # type: ignore[no-untyped-call]
+    elif container is _Container.MP4:
+        probe, easy = MP4Tags(), EasyMP4Tags  # type: ignore[no-untyped-call]
+    else:
+        return
+    for key, values in sorted(managed.items()):
+        if not values:
+            continue
+        try:
+            easy.Set[key](probe, key, list(values))
+            stored = [str(value) for value in easy.Get[key](probe, key)]
+        except ValueError as exc:
+            message = f"{key}={values!r} cannot be stored in {container} tags: {exc}"
+            raise ValueError(message) from exc
+        if stored != list(values):
+            message = f"{key}={values!r} reads back from {container} tags as {stored!r}"
+            raise ValueError(message)
+
+
 def write_managed_tags(
     path: Path,
     managed: dict[str, list[str]],
@@ -1009,31 +1023,23 @@ def write_managed_tags(
 ) -> TagWriteResult:
     """Surgically write the managed-tag set on *path*, leaving all other tags intact.
 
-    For each key in :data:`MANAGED_TAGS`: a non-empty value list in *managed* is written
-    (replacing any existing values); a key absent from *managed* (or mapped to an empty
-    list) is deleted from the file, so reverting to a baseline that lacked a tag removes
-    a later-added one. Keys outside :data:`MANAGED_TAGS` are never read, written, or
-    removed. Passing one raises :class:`ValueError` (a caller bug). Only the keys whose
-    values differ from what :func:`read_tags` reports are touched, so an unchanged frame keeps
-    its encoding. On an MP3, a write that creates the first ID3v2 frame writes every value of
-    *managed* into ID3v2, since TagLib then stops reading ID3v1.
+    For each key in :data:`MANAGED_TAGS`, a non-empty value list in *managed* is written, and a
+    key absent from *managed* or mapped to an empty list is deleted. Keys outside
+    :data:`MANAGED_TAGS` are never written or removed, and passing one raises
+    :class:`ValueError`. Only keys whose values differ from what :func:`read_tags` reports are
+    touched, so an unchanged frame keeps its encoding. On an MP3, a write that creates the first
+    ID3v2 frame writes every value of *managed* into ID3v2, since TagLib then stops reading ID3v1.
 
-    Returns ``written=False`` without touching the file when nothing differs. After a write it
-    returns ``written=True``, and ``audio_proven`` for an ID3 or FLAC file. The write is
-    atomic: tags are applied to a sibling temp copy which then atomically replaces the
-    original via :meth:`Path.replace`, so an interrupted write leaves the original file
-    untouched (PLAN.md §11). Lets :class:`mutagen.MutagenError` / ``OSError``
-    propagate, mirroring :func:`read_tags`.
+    The tags go to a sibling temp copy that is verified, flushed and swapped in with
+    :meth:`Path.replace`, so an interrupted write leaves the original untouched. A container the
+    verifier has no layout for, or a non-Ogg file whose audio payload cannot be located, is
+    refused before the copy. A verification difference raises :class:`TagWriteError`. An ID3
+    frame whose id *droppable_frames* names may be dropped. It is listed in ``dropped_frames``
+    and a warning names it, since no revert restores it. :class:`mutagen.MutagenError` and
+    ``OSError`` propagate.
 
-    The temp copy is verified before the swap: the audio payload hash (not for Ogg, whose
-    pages a save renumbers), every unmanaged tag entry, the presence of ID3v1 and APEv2 blocks,
-    and a re-read of every managed key against *managed*. Any difference deletes the temp copy
-    and raises :class:`TagWriteError` listing each one. A container the verifier has no layout
-    for, or a non-Ogg file whose audio payload cannot be located, is refused before the copy.
-    On an ID3 file, an unmanaged frame whose id *droppable_frames* names may be dropped. The
-    result lists it in ``dropped_frames`` and a warning names it, since no revert restores it.
-    Measured on a 10 MB MP3 on a local SSD, the verification costs about 18 ms of a 34 ms write
-    (two SHA-256 passes and two tag parses).
+    Returns ``written=False`` without touching the file when nothing differs, else
+    ``written=True`` with ``audio_proven`` set for an ID3 or FLAC file.
     """
     # Input / validation
     unknown = set(managed) - MANAGED_TAGS
@@ -1064,9 +1070,11 @@ def write_managed_tags(
 
     # Output: apply the plan to a temp copy, verify it, then atomically swap it in.
     tmp = path.with_name(path.name + TEMP_SUFFIX)
-    shutil.copy2(path, tmp)
+    _discard_temp(tmp)
     replaced = False
     try:
+        shutil.copy2(path, tmp)
+        tmp.chmod(tmp.stat().st_mode | stat.S_IWRITE)
         _apply_changes(tmp, container, kind, changes)
         after = _snapshot(tmp, container, kind)
         violations = _snapshot_violations(before, after, droppable_frames=droppable)
@@ -1077,11 +1085,15 @@ def write_managed_tags(
         if violations:
             raise TagWriteError(path, violations)
         dropped_frames = tuple(sorted({_frame_id(key) for key in _dropped_keys(before, after)}))
+        # The swap frees the original's data at once, so the new bytes must be on disk first.
+        # Windows flushes only a handle opened for writing.
+        with tmp.open("r+b") as handle:
+            os.fsync(handle.fileno())
         tmp.replace(path)
         replaced = True
     finally:
         if not replaced:
-            tmp.unlink(missing_ok=True)
+            _discard_temp(tmp)
     if dropped_frames:
         logger.warning(
             "dropped ID3 frame(s) %s from %s, and no revert can restore them",

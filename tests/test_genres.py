@@ -15,15 +15,16 @@ every axis live in ``test_axis_status.py``.
 
 from __future__ import annotations
 
+import dataclasses
 from typing import TYPE_CHECKING
 
 import mutagen
 import pytest
 
-from conftest import make_track
+from conftest import make_rvad_mp3, make_track, rejecting_lastfm_client
 from tagmend.engine import axis, axis_status, classify, genres, staging, store, versioning
 from tagmend.engine.db import connect
-from tagmend.engine.lastfm import LastfmError, Tag
+from tagmend.engine.lastfm import LastfmError, LastfmKeyError, Tag
 from tagmend.engine.library import ScanMode, list_files, scan_library
 from tagmend.engine.schema import apply_schema
 from tagmend.engine.tags import read_tags, write_managed_tags
@@ -50,7 +51,7 @@ class FakeTagSource:
 
     Maps artist name → top-tag list (or ``None`` for "not on Last.fm"); ``album_top_tags``
     is keyed by ``(artist, album)`` and defaults to ``None`` (no album tags). Records the
-    artist lookups it received so tests can assert on the identity used.
+    artist and album lookups it received so tests can assert on the identity used.
     """
 
     def __init__(
@@ -61,18 +62,14 @@ class FakeTagSource:
         self._artists = artists
         self._albums = albums or {}
         self.artist_lookups: list[str] = []
+        self.album_lookups: list[tuple[str, str]] = []
 
-    def artist_top_tags(
-        self,
-        name: str | None = None,
-        *,
-        mbid: str | None = None,  # protocol parity; phase 1 always looks up by name
-    ) -> list[Tag] | None:
-        assert name is not None
+    def artist_top_tags(self, name: str) -> list[Tag] | None:
         self.artist_lookups.append(name)
         return self._artists.get(name)
 
     def album_top_tags(self, artist: str, album: str) -> list[Tag] | None:
+        self.album_lookups.append((artist, album))
         return self._albums.get((artist, album))
 
 
@@ -151,6 +148,42 @@ def test_albumartist_is_preferred_lookup_identity(
 
     assert result.staged_files == 1
     assert fake.artist_lookups == ["Daft Punk"]  # albumartist beat artist
+
+
+@pytest.mark.parametrize(
+    ("use_album_tags", "expected_lookups", "expected_genres"),
+    [
+        # The album's disco outweighs house, and the cap of 4 then drops techno.
+        (
+            True,
+            [("Daft Punk", "Random Access Memories")],
+            ["electronic", "disco", "house", "dance"],
+        ),
+        (False, [], _EXPECTED_DAFT_PUNK),
+    ],
+)
+def test_album_tags_merge_only_when_the_setting_is_on(
+    engine_settings: Settings,
+    music_dir: Path,
+    use_album_tags: bool,  # noqa: FBT001 - pytest parametrize argument
+    expected_lookups: list[tuple[str, str]],
+    expected_genres: list[str],
+) -> None:
+    make_track(
+        music_dir / "t.flac",
+        {"artist": ["Daft Punk"], "album": ["Random Access Memories"], "genre": ["Old"]},
+    )
+    scan_library(engine_settings)
+
+    fake = FakeTagSource(
+        {"Daft Punk": _DAFT_PUNK_TAGS},
+        albums={("Daft Punk", "Random Access Memories"): [Tag("disco", 90)]},
+    )
+    settings = dataclasses.replace(engine_settings, genre_use_album_tags=use_album_tags)
+    genres.resolve_genres(settings, client=fake)
+
+    assert fake.album_lookups == expected_lookups
+    assert staging.diff_tags(engine_settings)[0].diff["genre"]["to"] == expected_genres
 
 
 def test_overlay_deny_drops_genre_for_the_lookup_artist_only(
@@ -573,16 +606,11 @@ class _FailingTagSource(FakeTagSource):
         super().__init__(artists)
         self._failing = failing
 
-    def artist_top_tags(
-        self,
-        name: str | None = None,
-        *,
-        mbid: str | None = None,
-    ) -> list[Tag] | None:
+    def artist_top_tags(self, name: str) -> list[Tag] | None:
         if name in self._failing:
             message = "Last.fm artist.gettoptags failed after 3 attempt(s): transport error"
             raise LastfmError(message)
-        return super().artist_top_tags(name, mbid=mbid)
+        return super().artist_top_tags(name)
 
 
 def test_lastfm_transport_failure_is_reported_not_raised(
@@ -619,6 +647,29 @@ def test_lastfm_error_is_counted_and_itemized(
             "message": "Last.fm artist.gettoptags failed after 3 attempt(s): transport error",
         },
     ]
+    assert _genre_status(engine_settings, file_id) is None  # still pending
+    assert staging.diff_tags(engine_settings) == []
+
+
+def test_a_rejected_lastfm_key_stops_the_call(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    make_track(music_dir / "a.mp3", {"artist": ["Daft Punk"], "genre": ["Old"]})
+    make_track(music_dir / "b.mp3", {"artist": ["Justice"], "genre": ["Old"]})
+    scan_library(engine_settings)
+    file_id = _file_id(engine_settings, music_dir, "a.mp3")
+
+    conn = connect(engine_settings.db_path)
+    try:
+        with (
+            rejecting_lastfm_client(conn) as client,
+            pytest.raises(LastfmKeyError, match="lastfm_api_key"),
+        ):
+            genres.resolve_genres(engine_settings, client=client)
+    finally:
+        conn.close()
+
     assert _genre_status(engine_settings, file_id) is None  # still pending
     assert staging.diff_tags(engine_settings) == []
 
@@ -743,6 +794,43 @@ def test_dry_run_ignores_the_staging_precondition(
     ]
     with pytest.raises(ValueError, match="commit or unstage"):
         genres.resolve_genres(engine_settings, client=fake)
+
+
+def test_dry_run_itemizes_a_file_removed_from_disk(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    make_track(music_dir / "kept.mp3", {"artist": ["Daft Punk"]})
+    gone = make_track(music_dir / "gone.mp3", {"artist": ["Daft Punk"]})
+    scan_library(engine_settings)
+    gone_id = _file_id(engine_settings, music_dir, "gone.mp3")
+    gone.unlink()  # after the scan, so the file is still selected
+
+    fake = FakeTagSource({"Daft Punk": _DAFT_PUNK_TAGS})
+    result = genres.resolve_genres(engine_settings, client=fake, dry_run=True)
+
+    assert result.settled == 1
+    assert result.staged_files == 1
+    assert [item["key"] for item in result.error_items] == [f"file_id={gone_id}"]
+
+
+def test_dry_run_itemizes_a_file_the_writer_refuses(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    make_track(music_dir / "plain.mp3", {"artist": ["Daft Punk"]})
+    make_rvad_mp3(music_dir / "loud.mp3", {"artist": ["Daft Punk"]})
+    scan_library(engine_settings)
+    loud_id = _file_id(engine_settings, music_dir, "loud.mp3")
+    fake = FakeTagSource({"Daft Punk": _DAFT_PUNK_TAGS})
+
+    preview = genres.resolve_genres(engine_settings, client=fake, dry_run=True)
+    real = genres.resolve_genres(engine_settings, client=fake)
+
+    assert preview.staged_files == real.staged_files == 1
+    assert [item["key"] for item in preview.error_items] == [f"file_id={loud_id}"]
+    assert "RVAD" in preview.error_items[0]["message"]
+    assert preview.error_items == real.error_items
 
 
 # --- revert --------------------------------------------------------------------------

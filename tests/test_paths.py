@@ -373,6 +373,31 @@ def test_crash_in_the_commit_loop_cell(
     assert [r.version for r in paths.history_paths(lib.settings, lib.x)] == [0]
 
 
+def test_a_refused_log_append_moves_the_file_back(
+    lib: _Lib,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stage(lib, (lib.x, _TARGET))
+
+    def refuse(*_args: object, **_kwargs: object) -> None:
+        message = "refused"
+        raise sqlite3.IntegrityError(message)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(store, "insert_path_revision", refuse)
+        result = paths.commit_paths(lib.settings)
+
+    assert result.errors == 1
+    assert (lib.music / _SOURCE).exists()
+    assert not (lib.music / _TARGET).exists()
+    assert _state(lib, lib.x) == paths.AT_SOURCE
+    assert _location(lib, lib.x) == lib.music / _SOURCE
+    assert _staged(lib, lib.x) is not None
+    assert [r.version for r in paths.history_paths(lib.settings, lib.x)] == [0]
+    assert paths.commit_paths(lib.settings).committed == 1
+    assert _location(lib, lib.x) == lib.music / _TARGET
+
+
 def test_a_crashed_move_survives_a_scan_and_the_next_commit_finishes_it(
     lib: _Lib,
     monkeypatch: pytest.MonkeyPatch,
@@ -505,6 +530,37 @@ def test_batch_holds_an_invalid_path(lib: _Lib, to_path: str) -> None:
     with pytest.raises(ValueError, match=rf"file_id={lib.x}\): invalid_path"):
         _stage(lib, (lib.x, to_path))
     assert _staged(lib, lib.x) is None
+
+
+@pytest.mark.parametrize(
+    ("sheet", "content", "track"),
+    [
+        ("album.m3u8", b"#EXTM3U\n#EXTINF:1,One\n01.mp3\n", "01.mp3"),
+        ("album.cue", 'FILE "Café.mp3" MP3\n'.encode("cp1252"), "Café.mp3"),
+    ],
+    ids=["utf8_playlist", "ansi_cue_sheet"],
+)
+def test_batch_holds_a_file_a_playlist_or_an_ansi_cue_sheet_names(
+    engine_settings: Settings,
+    music_dir: Path,
+    sheet: str,
+    content: bytes,
+    track: str,
+) -> None:
+    source = _SOURCE.with_name(track)
+    extra = () if source == _SOURCE else (source,)
+    _library(engine_settings, music_dir, *extra)
+    (music_dir / _SOURCE.parent / sheet).write_bytes(content)
+    file_id = _id_at(engine_settings, music_dir / source)
+
+    with pytest.raises(ValueError, match=rf"file_id={file_id}\): {paths.CUE_REFERENCE}"):
+        paths.stage_paths_batch(engine_settings, entries=[(file_id, str(_TARGET))])
+
+
+def test_batch_ignores_a_playlist_comment_naming_the_file(lib: _Lib) -> None:
+    (lib.music / _SOURCE.parent / "album.m3u").write_bytes(b"#01.mp3\n")
+
+    assert _stage(lib, (lib.x, _TARGET)) == [lib.x]
 
 
 def test_batch_holds_an_absolute_path_outside_music_path(lib: _Lib, tmp_path: Path) -> None:
@@ -687,7 +743,9 @@ def test_a_folder_part_reuses_the_on_disk_spelling(lib: _Lib) -> None:
 @pytest.mark.skipif(sys.platform != "win32", reason="NTFS ignores case")
 def test_a_target_naming_the_files_own_entry_in_another_folder_spelling(lib: _Lib) -> None:
     new = Path("Artist") / "New"
-    _stage(lib, (lib.x, new / "01.mp3"), (lib.y, Path("Artist") / "NEW" / "02.mp3"))
+    # One call spells a new folder once, so only two calls record the second spelling.
+    _stage(lib, (lib.x, new / "01.mp3"))
+    _stage(lib, (lib.y, Path("Artist") / "NEW" / "02.mp3"))
     assert paths.commit_paths(lib.settings).committed == 2
     on_disk = lib.music / new / "02.mp3"
     assert Path(_row(lib, lib.y).folder).name == "NEW"
@@ -724,6 +782,19 @@ def test_a_target_naming_the_files_own_entry_in_another_folder_spelling(lib: _Li
 def test_respell_folders_keeps_an_absent_folder_and_the_filename(lib: _Lib) -> None:
     respelled = paths.respell_folders(lib.music, str(Path("Artist") / "New" / "ONE.mp3"))
     assert respelled == str(Path("Artist") / "New" / "ONE.mp3")
+
+
+@pytest.mark.skipif(path_keys.path_key("A") == "A", reason="only a case-folding key respells")
+def test_a_batch_stages_two_casings_of_one_new_folder_under_the_first_spelling(lib: _Lib) -> None:
+    first = Path("Artist") / "New Album" / "01.mp3"
+
+    _stage(lib, (lib.x, first), (lib.y, Path("Artist") / "new album" / "02.mp3"))
+
+    staged = [_staged(lib, file_id) for file_id in (lib.x, lib.y)]
+    assert [row.to_path if row else None for row in staged] == [
+        str(first),
+        str(first.with_name("02.mp3")),
+    ]
 
 
 def test_the_pruner_removes_emptied_folders_up_to_music_path(
@@ -789,6 +860,72 @@ def test_the_volume_check_refuses_a_case_blind_posix_volume(
     assert check.ok
     assert "ignores case" in check.detail
     assert (lib.music / _SOURCE.with_name("02.mp3")).exists()
+
+
+def _probe_as_posix(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str]]:
+    """Make path keys keep case, as on POSIX, and record each pair of names the probe compares."""
+    compared: list[tuple[str, str]] = []
+    samefile = Path.samefile
+
+    def spy(self: Path, other: str | os.PathLike[str]) -> bool:
+        compared.append((self.name, Path(other).name))
+        return samefile(self, other)
+
+    monkeypatch.setattr(path_keys, "path_key", lambda p: os.path.normpath(os.fspath(p)))
+    monkeypatch.setattr(Path, "samefile", spy)
+    return compared
+
+
+def test_the_volume_probe_swaps_a_name_inside_music_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A mount point's own name is resolved by its parent volume, so only a name inside it tells.
+    music = tmp_path / "music"
+    (music / "Zebra").mkdir(parents=True)
+    (music / "Artist").mkdir()
+    (music / "2001").mkdir()
+    case_blind = (music / "aRTIST").exists()
+    compared = _probe_as_posix(monkeypatch)
+
+    assert paths._case_blind_volume(music) is case_blind
+    assert compared == ([("Artist", "aRTIST")] if case_blind else [])
+
+
+def test_the_volume_probe_falls_back_to_music_path_itself_when_empty(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    music = tmp_path / "music"
+    music.mkdir()
+    case_blind = (tmp_path / "MUSIC").exists()
+    compared = _probe_as_posix(monkeypatch)
+
+    assert paths._case_blind_volume(music) is case_blind
+    assert compared == ([("music", "MUSIC")] if case_blind else [])
+
+
+# --- the pruner and links --------------------------------------------------------------
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="directory junctions are a Windows feature")
+def test_the_pruner_stops_at_a_junction_and_never_removes_it(tmp_path: Path) -> None:
+    import _winapi  # noqa: PLC0415 - Windows-only module
+
+    music = tmp_path / "music"
+    music.mkdir()
+    target = tmp_path / "target"
+    (target / "Empty").mkdir(parents=True)
+    (target / "Other").mkdir()
+    (target / "Other" / "b.mp3").write_bytes(bytes(1))
+    _winapi.CreateJunction(str(target), str(music / "Vinyl"))
+
+    removed = paths._prune(music, music / "Vinyl" / "Empty")
+
+    assert removed == [music / "Vinyl" / "Empty"]
+    assert (music / "Vinyl").is_junction()
+    assert (target / "Other" / "b.mp3").exists()
+    assert (music / "Vinyl" / "Other" / "b.mp3").exists()
 
 
 # --- revert ------------------------------------------------------------------------------
@@ -985,6 +1122,18 @@ def test_check_components_and_check_length() -> None:
     assert len(paths.check_components(str(Path("lpt1.txt") / "x?.mp3"))) == 2
     assert paths.check_length(Path("/m"), "a.mp3") == []
     assert paths.check_length(Path("/m"), str(Path("b" * 100) / ("c" * 200)))
+
+
+def test_check_length_counts_the_full_path_in_utf16_units() -> None:
+    # An astral character is one code point but two UTF-16 units, and MAX_PATH counts units.
+    music = Path("/m")
+    folder = "x" * 120
+    astral = "\U0001f3b5" * 2
+    padding = 258 - len(str(music / folder / f"{astral}.mp3"))
+    relative = str(Path(folder) / f"{astral}{'x' * padding}.mp3")
+
+    assert len(str(music / relative)) == 258
+    assert paths.check_length(music, relative) == ["the full path is 260 UTF-16 units, over 259"]
 
 
 # --- forbidden calls -----------------------------------------------------------------------

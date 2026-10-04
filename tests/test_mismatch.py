@@ -293,9 +293,24 @@ def test_filename_track_reads_each_numbering_shape() -> None:
         _mk(9, "311/Album", "311 - Album - 04 - Amber.mp3", albumartist="311", tracknumber="4"),
         # A blank track tag gives no signal.
         _mk(10, "H/Album", "09 Song.mp3", albumartist="H"),
+        _mk(
+            11,
+            "I/Album",
+            "I - Album - 2-05 - Song.mp3",
+            albumartist="I",
+            album="Album",
+            tracknumber="5",
+            discnumber="1",
+        ),
+        _mk(12, "J/Album", "205 Song.mp3", albumartist="J", tracknumber="5", discnumber="1"),
     ]
 
-    assert _flags(files) == {2: {FILENAME_TRACK}, 5: {FILENAME_TRACK}}
+    assert _flags(files) == {
+        2: {FILENAME_TRACK},
+        5: {FILENAME_TRACK},
+        11: {FILENAME_TRACK},
+        12: {FILENAME_TRACK},
+    }
 
 
 def test_filename_track_accepts_a_continuous_count_only_across_discs() -> None:
@@ -449,6 +464,13 @@ def test_a_blank_tag_never_flags() -> None:
 
     assert report.rows == []
     assert report.exception_rows == []
+
+
+def test_a_number_too_long_for_int_stays_a_word() -> None:
+    word = "9" * 5000
+
+    assert mismatch._map_token(word) == word
+    assert mismatch._map_token("007") == "7"
 
 
 def test_a_path_rendered_from_the_tags_never_flags() -> None:

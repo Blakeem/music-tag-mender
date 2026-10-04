@@ -1,6 +1,6 @@
 """Blank-``album`` gap detection: group gapped files by folder, source a fill, propose it.
 
-A grouped detect/report tool (decision-r2 C6). It groups files whose ``album`` tag is blank
+A grouped detect/report tool. It groups files whose ``album`` tag is blank
 across ALL ordinals by their folder and tries three grounding sources in order. The
 **sibling** source fills blank files from a unanimous non-blank album value shared by their
 folder mates. The **folder-parse** source fills a folder with no sibling values at all from its
@@ -17,19 +17,18 @@ The recording source's ONLY side effect is its persistent lookup cache
 (``musicbrainz_recording_cache``): tags, status, and staging are untouched, so a re-run after
 the first pass is network-free.
 
-**Binding safety constraint (decision-r2 non-negotiable #1):** the ``stage_tags_batch``
-merge does not guard against overwriting a present ``album`` — so a proposal is *only ever*
-emitted for a file whose ``album`` is blank across every ordinal. That blank predicate
-scans all ordinals via :func:`tagmend.engine.axis.first_nonblank` over
-:func:`tagmend.engine.store.get_tags` (NOT the ordinal-0-only ``load_tag_values``), exactly
-mirroring ``resolve_years``' ``skipped_no_album`` gate, so a file carrying a non-blank
-album at any ordinal can never appear in a proposal.
+**Binding safety constraint:** the ``stage_tags_batch`` merge does not guard against
+overwriting a present ``album``, so a proposal is *only ever* emitted for a file whose
+``album`` is blank across every ordinal. That blank predicate is
+:func:`tagmend.engine.axis.first_nonblank` over :func:`tagmend.engine.store.get_tags`, which
+scans all ordinals (NOT the ordinal-0-only ``load_tag_values``), so a file carrying a
+non-blank album at any ordinal can never appear in a proposal.
 
-Mirrors :mod:`tagmend.engine.mismatch` in shape (frozen result dataclasses with hand-written
-``to_dict``, one group row per folder, ``limit``/``folder`` narrowing that leaves the
-library-wide counts intact). Like the rest of the conn-owning layer, :func:`detect_album_gaps`
-owns its connection (``connect`` → ``apply_schema`` → ``try/finally`` close); the only commits
-are the recording client's cache writes.
+Mirrors :mod:`tagmend.engine.mismatch` in shape (frozen result dataclasses that serialize
+through ``FieldDict`` in field order, one group row per folder, ``limit``/``folder`` narrowing
+that leaves the library-wide counts intact). Like the rest of the conn-owning layer,
+:func:`detect_album_gaps` owns its connection (``connect`` → ``apply_schema`` →
+``try/finally`` close).
 """
 
 from __future__ import annotations
@@ -58,11 +57,11 @@ logger = get_logger(__name__)
 
 # Fraction of a folder's filenames that must fold-contain the parsed album token before a
 # folder-parse candidate is proposed (self-corroboration gate). Measured anchors: Bradley
-# Nowell 14/14 proposes; Maphra YouTube 0/8 and Sublime Misc 0/35 propose nothing.
+# Nowell 14/14 proposes. Maphra YouTube 0/8 and Sublime Misc 0/35 propose nothing.
 _CORROBORATION_THRESHOLD: Final = 0.6
 
-# Minimum unanimous sibling witnesses for a green (bulk-stageable) proposal; a single
-# witness (n=1) is never green — one witness is not corroboration.
+# Minimum unanimous sibling witnesses for a green (bulk-stageable) proposal. A single
+# witness (n=1) is never green, since one witness is not corroboration.
 _GREEN_MIN_WITNESSES: Final = 2
 
 # Folded placeholder tokens that are never a real album title. A unanimous sibling value
@@ -91,7 +90,7 @@ _REASON_N1_WEAK: Final = "n1_weak"
 _REASON_FOLDER_PARSE: Final = "folder_parse"
 _REASON_MB_RECORDING: Final = "mb_recording"
 
-# The fixed provenance note for a review-confidence proposal (decision-r2 C6).
+# The fixed provenance note for a review-confidence proposal.
 _NOTE_MB_RECORDING: Final = "musicbrainz: recording search"
 
 
@@ -196,7 +195,7 @@ def _is_genre_like(value: str, vocab: Vocabulary) -> bool:
     Two signals: the whole value is a known genre, or EVERY whitespace-separated word of it
     is one. The all-words rule catches concatenated genre strings whose compound has no
     vocabulary key (the live ``"Reggaeton Dembow"`` trap) while sparing real titles that
-    merely contain a genre word (``"House of Balloons"`` — ``of`` is not a genre).
+    merely contain a genre word (``"House of Balloons"``, where ``of`` is not a genre).
     """
     if vocab.match(value) is not None:
         return True
@@ -208,7 +207,7 @@ def _sibling_reason(value: str, witnesses: int, vocab: Vocabulary) -> str | None
     """Return the confirm reason for a unanimous sibling *value*, or ``None`` when green.
 
     Green-light (``None``) requires ALL of: ``witnesses >= _GREEN_MIN_WITNESSES``, the value
-    is not genre-like (:func:`_is_genre_like` — whole-value or all-words vocabulary match),
+    is not genre-like (:func:`_is_genre_like`: whole-value or all-words vocabulary match),
     and its fold-key is not a placeholder. Otherwise the most informative confirm reason is
     returned: a genre string first, then a placeholder label, then a single-witness (n=1)
     value.
@@ -261,19 +260,19 @@ def _folder_parse_source(
 ) -> tuple[str, list[AlbumGapProposal]]:
     """Build the folder-parse proposals for an all-blank folder, gated by self-corroboration.
 
-    Parses the folder's leaf name; a parsed album is proposed (always ``confirm``, never
+    Parses the folder's leaf name. A parsed album is proposed (always ``confirm``, never
     green) only when the fraction of the folder's filenames that fold-contain the album
     token meets :data:`_CORROBORATION_THRESHOLD`. A folder that does not parse, or parses but
     is not corroborated, stays blank.
     """
-    parsed = parsing.parse_folder(Path(folder).name)
-    if parsed is None:
+    album = parsing.parse_folder(Path(folder).name)
+    if album is None:
         return _SOURCE_STAYS_BLANK, []
 
     total = len(folder_files)
     if total == 0:  # pragma: no cover - a gap group always has at least the blank file(s)
         return _SOURCE_STAYS_BLANK, []
-    hits = sum(1 for f in folder_files if parsing.fold_contains(f.filename, parsed.album))
+    hits = sum(1 for f in folder_files if parsing.fold_contains(f.filename, album))
     if hits / total < _CORROBORATION_THRESHOLD:
         return _SOURCE_STAYS_BLANK, []
 
@@ -282,7 +281,7 @@ def _folder_parse_source(
         AlbumGapProposal(
             file_id=f.file_id,
             filename=f.filename,
-            proposed=parsed.album,
+            proposed=album,
             confidence=_CONF_CONFIRM,
             reason=_REASON_FOLDER_PARSE,
             note=note,
@@ -290,6 +289,16 @@ def _folder_parse_source(
         for f in blank_files
     ]
     return _SOURCE_FOLDER_PARSE, proposals
+
+
+def _recording_query(f: _FileInput) -> tuple[str, str] | None:
+    """Return the ``(artist, title)`` the recording source searches for *f*, or ``None``.
+
+    The source and the gate that decides whether a client is built share this one rule.
+    """
+    if f.album is not None or not f.writable or f.artist is None or f.title is None:
+        return None
+    return f.artist, f.title
 
 
 def _recording_source(
@@ -309,18 +318,20 @@ def _recording_source(
     proposals: list[AlbumGapProposal] = []
     error_items: list[dict[str, str]] = []
     for f in blank_files:
-        if f.artist is None or f.title is None:
+        query = _recording_query(f)
+        if query is None:
             continue
+        artist, title = query
         try:
-            resolved = client.recording_search(f.artist, f.title)
+            resolved = client.recording_search(artist, title)
         except MusicBrainzError as exc:
             logger.warning(
                 "musicbrainz recording error for artist=%r title=%r: %s",
-                f.artist,
-                f.title,
+                artist,
+                title,
                 exc,
             )
-            error_items.append({"key": f"{f.artist} - {f.title}", "message": str(exc)})
+            error_items.append({"key": f"{artist} - {title}", "message": str(exc)})
             continue
         if resolved is None:
             continue
@@ -539,14 +550,7 @@ def _has_recording_candidates(report: AlbumGapsReport, files: list[_FileInput]) 
     blank_folders = {g.folder for g in report.groups if g.source == _SOURCE_STAYS_BLANK}
     if not blank_folders:
         return False
-    return any(
-        f.folder in blank_folders
-        and f.album is None
-        and f.writable
-        and f.artist is not None
-        and f.title is not None
-        for f in files
-    )
+    return any(f.folder in blank_folders and _recording_query(f) is not None for f in files)
 
 
 def _resolve_recording_source(
@@ -558,8 +562,8 @@ def _resolve_recording_source(
 ) -> AlbumGapsReport:
     """Re-classify with the recording source active, using *client* or a lazily-built real one.
 
-    The real :class:`MusicBrainzClient` caches into *conn* (its ONLY ledger writes) and paces
-    itself. A fake injected via *client* bypasses both. Re-running the two pure sources is cheap
+    The real :class:`MusicBrainzClient` caches into *conn* and paces itself. A fake injected
+    via *client* bypasses both. Re-running the two pure sources is cheap
     and keeps the source ordering in one place.
     """
     with lookup_clients.injected_or_owned(
@@ -592,9 +596,7 @@ def detect_album_gaps(
     only for files those two leave blank AND that carry a non-blank artist and title.
     *use_musicbrainz* (default True) skips it entirely for a local-only, network-free run.
     The client is built LAZILY, only when such candidates exist, so a run without any never
-    opens an HTTP client. MB results are cached, so a re-run after the first pass is
-    network-free. Those cache writes are the tool's ONLY ledger writes (tags, status and
-    staging are untouched). A failed lookup is counted in ``errors`` and itemized in
+    opens an HTTP client. A failed lookup is counted in ``errors`` and itemized in
     ``error_items``, never folded into ``stays_blank``. *client* lets callers inject an
     :class:`tagmend.engine.musicbrainz.MBRecordingSource` (a fake in tests).
 

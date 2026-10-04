@@ -55,6 +55,12 @@ def test_the_default_pattern_parses_into_three_components() -> None:
     assert _DEFAULT.tag_names() == ("album", "albumartist", "artist", "title", "tracknumber")
 
 
+def test_tag_names_include_a_managed_tag_inside_a_group() -> None:
+    pattern = naming.parse_pattern("{albumartist}/{album}[ ({genre})]/{tracknumber:02} {title}")
+
+    assert pattern.tag_names() == ("album", "albumartist", "genre", "title", "tracknumber")
+
+
 def test_the_computed_names_are_not_tags() -> None:
     assert not naming.COMPUTED_NAMES & MANAGED_TAGS
 
@@ -138,6 +144,18 @@ def test_a_disc_total_above_one_makes_an_album_multi_disc() -> None:
     ]
 
 
+def test_distinct_bare_disc_numbers_make_an_album_multi_disc() -> None:
+    inputs = [
+        _input(1, discnumber="1", tracknumber="1"),
+        _input(2, discnumber="2", tracknumber="1"),
+    ]
+
+    assert [Path(p).name for p in _paths(inputs)] == [
+        "Artist - Album - 1-01 - Song 1.flac",
+        "Artist - Album - 2-01 - Song 2.flac",
+    ]
+
+
 def test_a_single_disc_album_renders_no_prefix() -> None:
     inputs = [_input(1, discnumber="1/1"), _input(2, discnumber="1")]
 
@@ -211,6 +229,34 @@ def test_a_width_pads_a_position_and_leaves_other_values_as_written() -> None:
     inputs = [_input(1, tracknumber="4/12"), _input(2, tracknumber="A1")]
 
     assert [Path(p).name for p in _paths(inputs, pattern)] == ["004 Song 1.flac", "A1 Song 2.flac"]
+
+
+def test_a_position_drops_its_total_with_or_without_a_width() -> None:
+    bare = naming.parse_pattern("{albumartist}/{album}/{discnumber}-{tracknumber} {title}")
+    padded = naming.parse_pattern("{albumartist}/{album}/{tracknumber:02} {title}")
+    item = _input(1, discnumber="1/2", tracknumber="3/12", title="T", suffix=".mp3")
+
+    assert Path(_paths([item], bare)[0]).name == "1-3 T.mp3"
+    assert Path(_paths([item], padded)[0]).name == "03 T.mp3"
+
+
+def test_a_width_pads_a_position_as_the_disc_value_reads_it() -> None:
+    pattern = naming.parse_pattern("{albumartist}/{album}/{discnumber:02} {title}")
+    item = _input(1, discnumber=chr(0xFF12), title="T")
+
+    assert Path(_paths([item], pattern)[0]).name == "02 T.flac"
+
+
+def test_a_number_too_long_for_int_never_aborts_the_library() -> None:
+    inputs = [
+        _input(1),
+        _input(2, tracknumber="9" * 5000),
+        _input(3, discnumber="1/" + "9" * 5000),
+    ]
+
+    rendered = naming.render_library(_DEFAULT, inputs)
+
+    assert sorted(rendered) == [1, 2, 3]
 
 
 def test_a_required_disc_folder_renders_per_disc_and_holds_a_single_disc_album() -> None:

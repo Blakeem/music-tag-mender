@@ -29,15 +29,23 @@ _RELEASE_ID = "rel-1"
 
 
 class FakeReleaseSource:
-    """An in-memory :class:`tagmend.engine.musicbrainz.MBReleaseSource` for DI in tests."""
+    """An in-memory :class:`tagmend.engine.musicbrainz.MBReleaseCacheSource` for DI in tests."""
 
-    def __init__(self, table: dict[str, MBRelease | None]) -> None:
+    def __init__(
+        self,
+        table: dict[str, MBRelease | None],
+        cached: frozenset[str] = frozenset(),
+    ) -> None:
         self._table = table
+        self._cached = cached
         self.lookups: list[str] = []
 
     def release_by_mbid(self, mbid: str, *, fresh: bool = False) -> MBRelease | None:
         self.lookups.append(mbid)
         return self._table.get(mbid)
+
+    def has_cached_release(self, mbid: str) -> bool:
+        return mbid in self._cached
 
 
 def _track(  # noqa: PLR0913 - one keyword per track field, cohesive by design
@@ -424,6 +432,31 @@ def test_limit_caps_the_releases_fetched_and_reports_the_remainder() -> None:
     assert report.more is True
 
 
+def test_a_cached_release_does_not_spend_the_release_limit() -> None:
+    # A re-run with the same cap must reach the release the previous run left behind.
+    source = FakeReleaseSource(
+        {
+            "rel-a": _release(_track("1", "A"), mbid="rel-a", title="A Album"),
+            "rel-b": _release(_track("1", "B"), mbid="rel-b", title="B Album"),
+            "rel-c": _release(_track("1", "C"), mbid="rel-c", title="C Album"),
+        },
+        cached=frozenset({"rel-a"}),
+    )
+    files = [
+        _f(1, release_mbid="rel-a", album="Wrong A"),
+        _f(2, release_mbid="rel-b", album="Wrong B"),
+        _f(3, release_mbid="rel-c", album="Wrong C"),
+    ]
+    report = _classify(files, source, release_limit=1)
+
+    assert source.lookups == ["rel-a", "rel-b"]
+    assert (report.releases_attempted, report.releases_checked) == (2, 2)
+    assert report.releases_remaining == 1
+    assert report.more is True
+    assert {r.file_id for r in report.rows} == {1, 2}
+    assert "Re-run, or raise release_limit" in report.summary
+
+
 def test_groups_summarize_one_folder_each() -> None:
     report = _run([_f(1, album="Wrong Album"), _f(2, title="Wrong Title")])
 
@@ -433,7 +466,6 @@ def test_groups_summarize_one_folder_each() -> None:
     assert group.file_count == 2
     assert group.flagged == 2
     assert group.flagged_fields == 2
-    assert group.folder_context == 0
     assert group.tiers == {"medium": 2}
     assert group.file_ids == [1, 2]
     assert group.fields == {"album": 1, "title": 1}
@@ -909,6 +941,30 @@ def test_a_genuinely_wrong_number_on_a_vinyl_release_still_disagrees() -> None:
     assert report.rows[0].field == "tracknumber"
 
 
+def test_a_wrong_number_on_a_vinyl_release_proposes_the_position_a_stamp_writes() -> None:
+    vinyl = _release(
+        _track("A1", "Song One", position=1),
+        _track("A2", "Song Two", position=2),
+    )
+    report = _run([_f(tracknumber="7", release_track_mbid="rt-2", recording_mbid="rec-2")], vinyl)
+
+    row = next(r for r in report.rows if r.field == "tracknumber")
+    assert (row.have, row.want) == ("7", "2")
+    assert row.reason == "the release says 'A2' (position 2)"
+
+
+def test_a_blank_number_on_a_vinyl_release_fills_the_position_a_stamp_writes() -> None:
+    vinyl = _release(
+        _track("A1", "Song One", position=1),
+        _track("A2", "Song Two", position=2),
+    )
+    report = _run([_f(tracknumber=None, release_track_mbid="rt-2", recording_mbid="rec-2")], vinyl)
+
+    assert [(r.field, r.want) for r in report.fill_rows if r.field == "tracknumber"] == [
+        ("tracknumber", "2"),
+    ]
+
+
 def test_a_curly_apostrophe_is_not_a_disagreement() -> None:
     # MusicBrainz writes typographic punctuation. No consumer distinguishes the two forms,
     # and folding them keeps the report about differences that matter.
@@ -984,6 +1040,9 @@ def test_releases_checked_counts_what_was_actually_fetched() -> None:
                 message = "boom"
                 raise MusicBrainzError(message)
             return _release(_track("1", "Song One"), mbid="rel-b")
+
+        def has_cached_release(self, mbid: str) -> bool:
+            return False
 
     report = _classify(
         [_f(1, release_mbid="rel-a"), _f(2, release_mbid="rel-b", album="Wrong")],

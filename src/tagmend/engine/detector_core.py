@@ -38,6 +38,9 @@ NON_ALBUM_FOLDERS: Final = frozenset(
 # A tracknumber/discnumber may be stored as "7" or as the "7/12" slash form. Only the part
 # before the slash is the position.
 _SLASH: Final = "/"
+# Python refuses int() on a decimal string over 4300 digits, and one hostile tag must not
+# abort a whole-library pass.
+MAX_DECIMAL_DIGITS: Final = 100
 
 # The values Go's ``strconv.ParseBool`` accepts, which is what a server actually tests the
 # compilation tag with. ``yes`` is a real tag value in the wild and reads as false.
@@ -127,10 +130,21 @@ def album_identity(
     return ("name", display_key(album_artist), display_key(album or ""), (date or "").strip())
 
 
-def release_date(values: Mapping[str, str]) -> str | None:
+# The tags Navidrome reads as an album's releasedate, first value first, by file suffix. An MP3's
+# date (TDRC) and a FLAC's or Ogg's DATE feed its recordingdate instead, not its album key.
+_VORBIS_RELEASE_DATE: Final = ("releasedate", "year")
+_RELEASE_DATE_FIELDS: Final[dict[str, tuple[str, ...]]] = {
+    ".m4a": ("date",),
+    ".flac": _VORBIS_RELEASE_DATE,
+    ".ogg": _VORBIS_RELEASE_DATE,
+    ".opus": _VORBIS_RELEASE_DATE,
+}
+
+
+def release_date(values: Mapping[str, str], filename: str) -> str | None:
     """Return the release date :func:`album_identity` compares, from one file's tag values."""
-    # A raw Vorbis YEAR is the only release-date spelling no alias maps to ``date``.
-    return (values.get("date") or "").strip() or values.get("year")
+    fields = _RELEASE_DATE_FIELDS.get(Path(filename).suffix.lower(), ())
+    return next((values[f].strip() for f in fields if values.get(f, "").strip()), None)
 
 
 def group_by_key[T, K](items: Iterable[T], key: Callable[[T], K]) -> dict[K, list[T]]:
@@ -246,11 +260,20 @@ def narrow[D: DataclassInstance, R: _TieredRow, G: _HasFolder](  # noqa: PLR0913
     )
 
 
+def position_head(value: str | None) -> str:
+    """Return the ``n`` of an ``n`` / ``n/total`` tag value as written, stripped."""
+    return (value or "").split(_SLASH, 1)[0].strip()
+
+
 def parse_position(value: str | None) -> int | None:
     """Return the position of an ``n`` / ``n/total`` tag value, or ``None`` if unusable."""
-    if not value:
-        return None
-    head = value.split(_SLASH, 1)[0].strip()
+    head = position_head(value)
     # isdecimal, not isdigit: isdigit accepts superscripts and enclosed digits that int()
     # rejects, and one such tag would abort the whole run.
-    return int(head) if head.isdecimal() else None
+    return int(head) if head.isdecimal() and len(head) <= MAX_DECIMAL_DIGITS else None
+
+
+def parse_total(value: str | None) -> int | None:
+    """Return the total of an ``n/total`` tag value, or ``None`` when it carries none."""
+    _, slash, tail = (value or "").partition(_SLASH)
+    return parse_position(tail) if slash else None

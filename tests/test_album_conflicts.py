@@ -389,14 +389,24 @@ def test_groups_are_sorted_by_folder() -> None:
     assert [g.folder for g in report.groups] == [r"C:\m\A", r"C:\m\Z"]
 
 
-def test_a_context_folder_never_appears_under_a_tier_filter() -> None:
-    files = [
-        _f(1, folder=r"C:\m\B\Singles", album="One"),
-        _f(2, folder=r"C:\m\B\Singles", filename="b.mp3", album="Two"),
-    ]
-    report = _view(_classify(files), tier="medium", folder_key=None, limit=None)
+def test_a_context_folder_never_appears_under_a_tier_filter(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    singles = music_dir / "Band" / "Singles"
+    make_track(singles / "a.mp3", {"album": ["One"], "albumartist": ["Band"]})
+    make_track(singles / "b.mp3", {"album": ["Two"], "albumartist": ["Band"]})
+    scan_library(engine_settings)
 
-    assert report.rows == []
+    unfiltered = album_conflicts.detect_album_conflicts(engine_settings)
+    assert unfiltered.folder_context_rows != []
+    tier = unfiltered.folder_context_rows[0].tier
+
+    flat = album_conflicts.detect_album_conflicts(engine_settings, tier=tier)
+    grouped = album_conflicts.detect_album_conflicts(engine_settings, tier=tier, group=True)
+
+    assert flat.folder_context_rows == []
+    assert grouped.groups == []
 
 
 # --- end to end through the real tool ------------------------------------------------
@@ -421,16 +431,32 @@ def test_detect_album_conflicts_end_to_end(
     assert report.medium == 1
 
 
-def test_date_is_read_from_every_format_end_to_end(
+def test_an_mp3_date_split_is_one_album_end_to_end(
     engine_settings: Settings,
     music_dir: Path,
 ) -> None:
-    # The release date lives in ``date`` for every container, so a date split is visible.
+    # An MP3's date is its recording date, which Navidrome leaves out of the album key.
     album = music_dir / "Band" / "Album"
     shared = {"album": ["Real Album"], "albumartist": ["Band"]}
     make_track(album / "a.mp3", {**shared, "date": ["2005"]})
-    make_track(album / "b.m4a", {**shared, "date": ["2005"]})
-    make_track(album / "c.flac", {**shared, "date": ["2006"]})
+    make_track(album / "b.mp3", {**shared, "date": ["2005"]})
+    make_track(album / "c.mp3", {**shared, "date": ["2006"]})
+    scan_library(engine_settings)
+
+    report = album_conflicts.detect_album_conflicts(engine_settings)
+
+    assert report.flagged == 0
+
+
+def test_a_flac_releasedate_split_is_flagged_end_to_end(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    album = music_dir / "Band" / "Album"
+    shared = {"album": ["Real Album"], "albumartist": ["Band"], "date": ["2005"]}
+    make_track(album / "a.flac", {**shared, "releasedate": ["2005"]})
+    make_track(album / "b.flac", {**shared, "releasedate": ["2005"]})
+    make_track(album / "c.flac", {**shared, "releasedate": ["2006"]})
     scan_library(engine_settings)
 
     report = album_conflicts.detect_album_conflicts(engine_settings)

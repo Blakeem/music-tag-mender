@@ -1,12 +1,14 @@
-"""Pure data access for the snapshot, the revision logs, and the staging areas (M1 + M3).
+"""Pure data access for the snapshot, the revision logs, and the staging areas.
 
 Covers the ``files`` / ``file_tags`` snapshot, the append-only ``tag_revisions``,
 ``path_revisions``, ``sidecar_moves`` and ``cover_writes`` histories, and the
 ``tag_revisions_staged``, ``path_revisions_staged``, ``sidecar_moves_staged`` and
-``cover_writes_staged`` staging areas (git's index). Every function takes an open
-:class:`sqlite3.Connection` and does one focused thing, with no scanning, tag reading or commit
-policy. That orchestration lives in :mod:`tagmend.engine.library`,
-:mod:`tagmend.engine.versioning`, :mod:`tagmend.engine.staging` and :mod:`tagmend.engine.paths`.
+``cover_writes_staged`` staging areas (git's index). It also holds the Last.fm, MusicBrainz and
+Cover Art Archive lookup caches, the tag-axis derived status, the ``file_mismatch_status``
+decisions and the scope selector. Every function takes an open :class:`sqlite3.Connection` and
+does one focused thing, with no scanning, tag reading or commit policy. That orchestration
+lives in :mod:`tagmend.engine.library`, :mod:`tagmend.engine.versioning`,
+:mod:`tagmend.engine.staging` and :mod:`tagmend.engine.paths`.
 The ``commits``-table ops and the shared commit loop live in :mod:`tagmend.engine.commits`.
 SQLite hands back ``Any``, so this module casts at the boundary and the rest of the engine stays
 strictly typed.
@@ -22,13 +24,10 @@ from typing import TYPE_CHECKING, Final, cast
 
 from tagmend.engine import axis, db, path_keys
 from tagmend.engine.tags import MANAGED_SET_VERSION, TAG_READER_VERSION
-from tagmend.log import get_logger
 
 if TYPE_CHECKING:
     import sqlite3
     from collections.abc import Collection
-
-logger = get_logger(__name__)
 
 
 def _dump_json(obj: object) -> str:
@@ -96,11 +95,7 @@ def get_file(conn: sqlite3.Connection, folder: str, filename: str) -> FileRow | 
 
 
 def get_file_by_id(conn: sqlite3.Connection, file_id: int) -> FileRow | None:
-    """Return the file row with the given stable ``id``, or ``None``.
-
-    Used by the revert path, which knows a file by its durable ``file_id`` and needs
-    its current on-disk ``(folder, filename)`` to write tags back.
-    """
+    """Return the file row with the given stable ``id``, or ``None``."""
     cursor = conn.execute(
         f"SELECT {_FILE_COLUMNS} FROM files WHERE id = ?",  # noqa: S608
         (file_id,),
@@ -146,7 +141,7 @@ def insert_file(  # noqa: PLR0913 - keyword-only insert payload, all columns req
         ),
     )
     new_id = cursor.lastrowid
-    if new_id is None:  # pragma: no cover - defensive; INTEGER PK always assigns one
+    if new_id is None:  # pragma: no cover - defensive, since an INTEGER PK always assigns one
         message = "insert_file did not return a row id"
         raise RuntimeError(message)
     return int(new_id)
@@ -280,7 +275,7 @@ def list_files(conn: sqlite3.Connection, *, limit: int | None = None) -> list[Fi
 
 
 def compute_stats(conn: sqlite3.Connection) -> dict[str, object]:
-    """Return library-wide counts for the ``stats`` command / MCP tool.
+    """Return library-wide counts for ``get_library_stats``.
 
     The mismatch block needs the path comparator and the settings, so
     :func:`tagmend.engine.library.get_library_stats` adds it.
@@ -305,10 +300,7 @@ def compute_stats(conn: sqlite3.Connection) -> dict[str, object]:
         "unprocessed": unprocessed,
         "total_tag_values": total_tag_values,
         "by_ext": by_ext,
-        "genre": status_counts(conn, axis.GENRE_AXIS),
-        "artist": status_counts(conn, axis.ARTIST_AXIS),
-        "year": status_counts(conn, axis.YEAR_AXIS),
-        "song": status_counts(conn, axis.SONG_AXIS),
+        **{tag_axis.name: status_counts(conn, tag_axis) for tag_axis in axis.TAG_AXES},
     }
 
 
@@ -318,7 +310,7 @@ def _scalar_int(conn: sqlite3.Connection, sql: str) -> int:
     return 0 if row is None else db.as_int(row[0])
 
 
-# --- tag_revisions (append-only history; PLAN.md §7) -------------------------------
+# --- tag_revisions (append-only history, PLAN.md §7) -------------------------------
 
 # Valid ``origin`` values. ``scan`` = an observation of the file on disk (the version-0
 # baseline, or a re-baseline under a newer managed set), ``auto``/``manual`` = normal writes,
@@ -390,7 +382,7 @@ def insert_revision(  # noqa: PLR0913 - cohesive append-only revision payload
     commit_id: int | None = None,
     note: str | None = None,
 ) -> None:
-    """Append one revision row. Append-only — never updates or deletes.
+    """Append one revision row. It never updates or deletes.
 
     Every row is stamped with the CURRENT
     :data:`~tagmend.engine.tags.MANAGED_SET_VERSION`, which is what lets revert read a tag
@@ -449,7 +441,7 @@ def get_revision(conn: sqlite3.Connection, file_id: int, version: int) -> Revisi
 def revisions_for_commit(conn: sqlite3.Connection, commit_id: int) -> list[Revision]:
     """Return every revision row created by *commit_id*, in ``file_id`` order.
 
-    The commit's per-file change set — what :func:`tagmend.engine.versioning.revert_commit`
+    The commit's per-file change set: what :func:`tagmend.engine.versioning.revert_commit`
     classifies and undoes. Baselines (``commit_id`` NULL) never appear here.
     """
     cursor = conn.execute(
@@ -483,8 +475,8 @@ def revisions_after(conn: sqlite3.Connection, file_id: int, version: int) -> lis
 def max_version(conn: sqlite3.Connection, file_id: int) -> int | None:
     """Return *file_id*'s highest revision number, or ``None`` if it has none yet.
 
-    This is the single source of truth for "has this file been versioned?" and for the
-    current revision (the latest row). ``None`` means no baseline has been captured.
+    ``None`` means no baseline has been captured. :func:`latest_revision` reads the current
+    revision.
     """
     row = conn.execute(
         "SELECT MAX(version) FROM tag_revisions WHERE file_id = ?",
@@ -495,14 +487,20 @@ def max_version(conn: sqlite3.Connection, file_id: int) -> int | None:
     return db.as_int(row[0])
 
 
-# --- staged tags (the git "index"; PLAN.md §7) --------------------------------------
+# --- staged tags (the git "index", PLAN.md §7) --------------------------------------
 
-# The ``commits`` table ops and the shared commit loop live in
-# :mod:`tagmend.engine.commits`; staged rows here no longer carry a ``commit_id``.
-_STAGED_TAG_COLUMNS = (
-    "file_id, managed_tags, origin, note, staged_at, base_size_bytes, base_mtime_ns, "
-    "changed_fields, supplied_keys"
+_STAGED_TAG_FIELDS: Final = (
+    "file_id",
+    "managed_tags",
+    "origin",
+    "note",
+    "staged_at",
+    "base_size_bytes",
+    "base_mtime_ns",
+    "changed_fields",
+    "supplied_keys",
 )
+_STAGED_TAG_COLUMNS: Final = ", ".join(_STAGED_TAG_FIELDS)
 
 
 @dataclass(frozen=True, slots=True)
@@ -562,7 +560,7 @@ def upsert_staged_tag(  # noqa: PLR0913 - cohesive keyword-only staging payload
 ) -> None:
     """Insert or replace the single pending change for *file_id*.
 
-    A re-stage overwrites any prior pending change; the ``file_id`` PK keeps exactly one
+    A re-stage overwrites any prior pending change. The ``file_id`` PK keeps exactly one
     pending change per file (the latest staged target wins). *base_size_bytes* and
     *base_mtime_ns* record the file's signature at stage time. A ``None`` pair skips the
     commit's changed-since-stage check. *changed_fields* names the fields the target changes
@@ -570,14 +568,10 @@ def upsert_staged_tag(  # noqa: PLR0913 - cohesive keyword-only staging payload
     """
     changed_json = None if changed_fields is None else _dump_json(sorted(changed_fields))
     supplied_json = None if supplied_keys is None else _dump_json(sorted(supplied_keys))
+    placeholders = ", ".join("?" for _ in _STAGED_TAG_FIELDS)
     conn.execute(
-        """
-        INSERT OR REPLACE INTO tag_revisions_staged (
-            file_id, managed_tags, origin, note, staged_at, base_size_bytes, base_mtime_ns,
-            changed_fields, supplied_keys
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
+        f"INSERT OR REPLACE INTO tag_revisions_staged ({_STAGED_TAG_COLUMNS}) "  # noqa: S608
+        f"VALUES ({placeholders})",
         (
             file_id,
             _dump_json(managed_tags),
@@ -616,23 +610,33 @@ def list_staged_tags_under(conn: sqlite3.Connection, root_key: str) -> list[Stag
     Joins ``files`` on the same key range as :func:`tracked_files_under`, in file_id order.
     """
     low, high = path_keys.subtree_bounds(root_key)
+    columns = ", ".join(f"s.{name}" for name in _STAGED_TAG_FIELDS)
     cursor = conn.execute(
-        """
-        SELECT s.file_id, s.managed_tags, s.origin, s.note, s.staged_at,
-               s.base_size_bytes, s.base_mtime_ns, s.changed_fields, s.supplied_keys
-        FROM tag_revisions_staged s
-        JOIN files f ON f.id = s.file_id
-        WHERE f.path_key >= ? AND f.path_key < ?
-        ORDER BY s.file_id
-        """,
+        f"SELECT {columns} FROM tag_revisions_staged s JOIN files f ON f.id = s.file_id "  # noqa: S608
+        "WHERE f.path_key >= ? AND f.path_key < ? ORDER BY s.file_id",
         (low, high),
     )
     return [_row_to_staged_tag(tuple(row)) for row in cursor.fetchall()]
 
 
-def delete_staged_tag(conn: sqlite3.Connection, file_id: int) -> None:
-    """Remove the pending change for *file_id* (no-op if none)."""
-    conn.execute("DELETE FROM tag_revisions_staged WHERE file_id = ?", (file_id,))
+def delete_staged_tag(
+    conn: sqlite3.Connection,
+    file_id: int,
+    *,
+    staged_at: str | None = None,
+) -> None:
+    """Remove the pending change for *file_id* (no-op if none).
+
+    *staged_at* removes it only while it is still the row staged then, so a row another
+    process staged since survives.
+    """
+    if staged_at is None:
+        conn.execute("DELETE FROM tag_revisions_staged WHERE file_id = ?", (file_id,))
+        return
+    conn.execute(
+        "DELETE FROM tag_revisions_staged WHERE file_id = ? AND staged_at = ?",
+        (file_id, staged_at),
+    )
 
 
 def staged_origins(conn: sqlite3.Connection, file_ids: list[int]) -> set[str]:
@@ -647,7 +651,7 @@ def staged_origins(conn: sqlite3.Connection, file_ids: list[int]) -> set[str]:
     return {str(row[0]) for row in cursor.fetchall()}
 
 
-# --- lastfm_cache (persistent parsed-tag cache; PLAN — Last.fm genre tagging) --------
+# --- lastfm_cache (persistent parsed-tag cache, PLAN.md Last.fm genre tagging) --------
 
 
 def get_cached_tags(
@@ -684,7 +688,7 @@ def put_cached_tags(
     """Insert or replace the cached lookup for *request_key*.
 
     A re-fetch overwrites any prior cached value. ``tags`` is stored as a JSON array of
-    ``[name, weight]`` pairs; pass ``found=False`` with ``tags=[]`` to negative-cache.
+    ``[name, weight]`` pairs. Pass ``found=False`` with ``tags=[]`` to negative-cache.
     """
     payload = [[name, weight] for name, weight in tags]
     conn.execute(
@@ -838,7 +842,7 @@ def put_cached_mb_release_group(  # noqa: PLR0913 - cohesive keyword-only cache 
     )
 
 
-# --- musicbrainz_recording_cache (persistent recording-search cache; album-gaps tier) ----
+# --- musicbrainz_recording_cache (persistent recording-search cache, album-gaps tier) ----
 
 
 @dataclass(frozen=True, slots=True)
@@ -1086,10 +1090,7 @@ def put_cached_coverart(
     )
 
 
-# --- file_<axis>_status: the tag-axis classifier (genre, artist, year) ----------------
-#
-# The row access lives in :mod:`tagmend.engine.axis`. This section derives the user-facing
-# status from a row, the staging area and the current tags of a present file.
+# --- staging-area guards (every staging table) ---------------------------------------
 
 
 def is_staged(conn: sqlite3.Connection, file_id: int) -> bool:
@@ -1126,6 +1127,12 @@ def any_move_staged(conn: sqlite3.Connection) -> bool:
     return bool(row[0])
 
 
+# --- file_<axis>_status: the tag-axis classifier (genre, artist, year, song) ----------
+#
+# The row access lives in :mod:`tagmend.engine.axis`. This section derives the user-facing
+# status from a row, the staging area and the current tags of a present file.
+
+
 def _staged_alters(
     staged: StagedTag | None,
     current: dict[str, list[str]],
@@ -1137,21 +1144,7 @@ def _staged_alters(
     return any(staged.managed_tags.get(name, []) != current.get(name, []) for name in fields)
 
 
-def has_staged_change_for(
-    conn: sqlite3.Connection,
-    file_id: int,
-    fields: tuple[str, ...],
-) -> bool:
-    """Return whether *file_id*'s pending staged change actually alters any of *fields*.
-
-    Field-aware "staged": a staged row that touches only ``genre`` is not artist-staged, and
-    vice versa. ``None`` (no staged row) is not staged.
-    """
-    return _staged_alters(get_staged_tag(conn, file_id), get_tags(conn, file_id), fields)
-
-
-# The user-facing workflow states of each tag axis. Single source of truth for the
-# ``list_files(<axis>_status=...)`` filters and the stats counts.
+# Re-exports of each tag axis's workflow states for the ``list_files(<axis>_status=...)`` filters.
 GENRE_WORKFLOW_STATUSES: Final = axis.GENRE_AXIS.workflow_statuses
 ARTIST_WORKFLOW_STATUSES: Final = axis.ARTIST_AXIS.workflow_statuses
 YEAR_WORKFLOW_STATUSES: Final = axis.YEAR_AXIS.workflow_statuses
@@ -1556,10 +1549,11 @@ def upsert_staged_path(conn: sqlite3.Connection, staged: StagedPath) -> None:
     another file's row holding the same ``to_key``. That conflict raises
     :class:`sqlite3.IntegrityError` instead.
     """
+    placeholders = ", ".join("?" for _ in _STAGED_PATH_FIELDS)
     conn.execute(
         f"""
         INSERT INTO path_revisions_staged ({_STAGED_PATH_COLUMNS})
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES ({placeholders})
         ON CONFLICT(file_id) DO UPDATE SET
           to_path = excluded.to_path, to_key = excluded.to_key, origin = excluded.origin,
           note = excluded.note, staged_at = excluded.staged_at,
@@ -1639,7 +1633,7 @@ def staged_path_file_ids(conn: sqlite3.Connection, file_ids: list[int]) -> list[
     return [db.as_int(row[0]) for row in cursor.fetchall()]
 
 
-# --- sidecar_moves_staged and sidecar_moves (the non-audio files of a moving album) -----
+# --- sidecar_moves_staged (the non-audio files of a moving album) ----------------------
 
 _SIDECAR_STAGED_FIELDS: Final = (
     "from_key",
@@ -1975,6 +1969,8 @@ def cover_write_content(conn: sqlite3.Connection, write_id: int) -> bytes | None
     return None if row is None or row[0] is None else bytes(row[0])
 
 
+# --- sidecar_moves (the append-only log of sidecar moves) -------------------------------
+
 _SIDECAR_MOVE_COLUMNS: Final = (
     "id, commit_id, created_at, origin, reverted_from, from_path, to_path, from_key, to_key, "
     "unit_key, size_bytes, mtime_ns, note"
@@ -2079,15 +2075,19 @@ def sidecar_moved_from_after(conn: sqlite3.Connection, commit_id: int, key: str)
     return bool(row[0])
 
 
+# --- files and file_tags readers, and the scope selector --------------------------------
+
+
 def distinct_artists(conn: sqlite3.Connection) -> list[tuple[str, int]]:
-    """Return each distinct ``artist`` tag value with its file count, ordered by value."""
+    """Return each distinct ``artist`` tag value with its present-file count, ordered by value."""
     cursor = conn.execute(
         """
-        SELECT value, COUNT(DISTINCT file_id)
-        FROM file_tags
-        WHERE name = 'artist'
-        GROUP BY value
-        ORDER BY value
+        SELECT t.value, COUNT(DISTINCT t.file_id)
+        FROM file_tags t
+        JOIN files f ON f.id = t.file_id
+        WHERE t.name = 'artist' AND f.is_missing = 0
+        GROUP BY t.value
+        ORDER BY t.value
         """,
     )
     return [(str(row[0]), db.as_int(row[1])) for row in cursor.fetchall()]
@@ -2101,9 +2101,8 @@ def load_tag_values(
 
     One ``SELECT`` over ``file_tags`` filtered to *names* at ``ordinal = 0`` (each tag's
     primary value), so a caller needing a few scalar fields across the whole library avoids
-    the N+1 :func:`get_tags` loop. A file missing every requested tag is simply absent from
-    the result; a file with only some carries only those. Mirrors the read-only, aggregate
-    style of :func:`distinct_artists`.
+    the N+1 :func:`get_tags` loop. A file missing every requested tag is absent from the
+    result. A file with only some carries only those.
     """
     if not names:
         return {}
@@ -2167,8 +2166,8 @@ def files_in_scope(
     a value scope.
     """
     if file_ids is not None:
-        require_known_file_ids(conn, file_ids)
-        return _files_in_scope_by_ids(conn, file_ids)
+        _require_known_file_ids(conn, file_ids)
+        return sorted(set(file_ids))
     if album is not None and value is None:
         message = "album narrows a value scope, so it needs value"
         raise ValueError(message)
@@ -2178,7 +2177,7 @@ def files_in_scope(
     return [db.as_int(row[0]) for row in cursor.fetchall()]
 
 
-def require_known_file_ids(conn: sqlite3.Connection, file_ids: list[int]) -> None:
+def _require_known_file_ids(conn: sqlite3.Connection, file_ids: list[int]) -> None:
     """Raise :class:`ValueError` naming every id in *file_ids* that ``files`` does not hold."""
     if not file_ids:
         return
@@ -2192,18 +2191,6 @@ def require_known_file_ids(conn: sqlite3.Connection, file_ids: list[int]) -> Non
     if unknown:
         message = f"unknown file_id(s): {unknown}"
         raise ValueError(message)
-
-
-def _files_in_scope_by_ids(conn: sqlite3.Connection, file_ids: list[int]) -> list[int]:
-    """Return the subset of *file_ids* that exist in ``files``, in ascending id order."""
-    if not file_ids:
-        return []
-    placeholders = ",".join("?" for _ in file_ids)
-    cursor = conn.execute(
-        f"SELECT id FROM files WHERE id IN ({placeholders}) ORDER BY id",  # noqa: S608
-        tuple(file_ids),
-    )
-    return [db.as_int(row[0]) for row in cursor.fetchall()]
 
 
 def _files_in_scope_by_value(

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import unicodedata
+
 from tagmend.engine import text_keys
 
 
@@ -34,6 +36,15 @@ def test_alnum_script_key_folds_latin_and_keeps_other_scripts() -> None:
     assert text_keys.alnum_script_key("+") == ""
 
 
+def test_display_key_ignores_casing_spacing_and_typographic_quotes() -> None:
+    curly = "Don\N{RIGHT SINGLE QUOTATION MARK}t  Stop"
+    assert text_keys.display_key(curly) == text_keys.display_key("don't stop")
+
+
+def test_display_key_keeps_other_punctuation_significant() -> None:
+    assert text_keys.display_key("Part: One") != text_keys.display_key("Part - One")
+
+
 def test_keys_disagree_where_documented() -> None:
     assert text_keys.alnum_key("Röyksopp") != text_keys.alnum_ascii_key("Röyksopp")
     assert text_keys.display_key("The Crow: City") != text_keys.display_key("The Crow- City")
@@ -44,3 +55,11 @@ def test_keys_disagree_where_documented() -> None:
     assert text_keys.artist_name_key("Static\u2010X") == text_keys.artist_name_key("static x")
     assert text_keys.artist_name_key("It\u201as") == text_keys.artist_name_key("It's")
     assert text_keys.title_key("東京事変") != ""
+
+
+def test_artist_name_key_equates_both_byte_forms_of_one_accent() -> None:
+    composed = unicodedata.normalize("NFC", "Björk")
+    decomposed = unicodedata.normalize("NFD", "Björk")
+
+    assert composed != decomposed
+    assert text_keys.artist_name_key(decomposed) == text_keys.artist_name_key(composed)

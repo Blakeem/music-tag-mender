@@ -282,7 +282,11 @@ def test_baseline_captured_at_stage_survives_rescan(
     write_managed_tags(track, {"genre": ["Synthwave"]})
     scan_library(engine_settings, mode=ScanMode.FULL)
 
-    # Re-stage a different target; v0 already exists so no new baseline is captured.
+    # The landed write is recorded first. Then v0 already exists, so the re-stage of a
+    # different target captures no new baseline.
+    with pytest.raises(ValueError, match="interrupted commit already wrote"):
+        staging.stage_tags(engine_settings, file_id=file_id, tags={"genre": ["Darksynth"]})
+    staging.commit_tags(engine_settings)
     staging.stage_tags(engine_settings, file_id=file_id, tags={"genre": ["Darksynth"]})
 
     staging.commit_tags(engine_settings)
@@ -313,7 +317,7 @@ def test_commit_continues_past_an_unwritable_file(
             raise OSError(message)
         return real_write(path, managed, droppable_frames=droppable_frames)
 
-    monkeypatch.setattr(staging, "write_managed_tags", write_unless_locked)
+    monkeypatch.setattr(versioning, "write_managed_tags", write_unless_locked)
     result = staging.commit_tags(engine_settings)
 
     assert result.committed == 2
@@ -329,7 +333,7 @@ def test_commit_continues_past_an_unwritable_file(
     assert read_tags(locked).tags["genre"] == ["Rock"]
     assert result.to_dict()["errors"] == 1
 
-    monkeypatch.setattr(staging, "write_managed_tags", real_write)
+    monkeypatch.setattr(versioning, "write_managed_tags", real_write)
     retry = staging.commit_tags(engine_settings)
 
     assert retry.committed == 1
@@ -351,7 +355,7 @@ def test_commit_error_envelope_via_mcp(music_dir: Path, monkeypatch: pytest.Monk
         message = f"file in use by another process: {path} ({len(managed)} tags)"
         raise OSError(message)
 
-    monkeypatch.setattr(staging, "write_managed_tags", always_locked)
+    monkeypatch.setattr(versioning, "write_managed_tags", always_locked)
     payload = mcp_server.commit_tags()
 
     assert payload["ok"] is True
@@ -639,6 +643,121 @@ def test_stage_rejects_control_characters(engine_settings: Settings, music_dir: 
 
     assert _staged(engine_settings, good_id) is None
     assert _staged(engine_settings, bad_id) is None
+
+
+@pytest.mark.parametrize(
+    ("name", "field", "value"),
+    [("t.m4a", "tracknumber", "01/12"), ("t.mp3", "date", "2005/03/01"), ("t.mp3", "genre", "17")],
+)
+def test_stage_refuses_a_value_the_container_reformats(
+    engine_settings: Settings,
+    music_dir: Path,
+    name: str,
+    field: str,
+    value: str,
+) -> None:
+    track = make_track(music_dir / name, {"genre": ["Rock"]})
+    scan_library(engine_settings)
+    file_id = _file_id(engine_settings, music_dir, track.name)
+
+    with pytest.raises(ValueError, match=f"cannot stage file_id={file_id}: {field}="):
+        staging.stage_tags(engine_settings, file_id=file_id, tags={field: [value]})
+
+    assert _staged(engine_settings, file_id) is None
+
+
+def test_stage_keeps_a_flac_track_pair_verbatim(engine_settings: Settings, music_dir: Path) -> None:
+    track = make_track(music_dir / "t.flac", {"genre": ["Rock"]})
+    scan_library(engine_settings)
+    file_id = _file_id(engine_settings, music_dir, track.name)
+
+    staging.stage_tags(engine_settings, file_id=file_id, tags={"tracknumber": ["01/12"]})
+    result = staging.commit_tags(engine_settings)
+
+    assert result.committed == 1
+    assert read_tags(track).tags["tracknumber"] == ["01/12"]
+
+
+def test_commit_keeps_a_row_another_process_staged_during_its_write(
+    engine_settings: Settings,
+    music_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    track = make_track(music_dir / "t.flac", {"genre": ["Rock"]})
+    scan_library(engine_settings)
+    file_id = _file_id(engine_settings, music_dir, track.name)
+    staging.stage_tags(engine_settings, file_id=file_id, tags={"genre": ["Jazz"]})
+    real_write = write_managed_tags
+
+    def write_then_restage(
+        path: Path, managed: dict[str, list[str]], *, droppable_frames: frozenset[str] = frozenset()
+    ) -> TagWriteResult:
+        written = real_write(path, managed, droppable_frames=droppable_frames)
+        other = connect(engine_settings.db_path)
+        try:
+            store.upsert_staged_tag(
+                other,
+                file_id=file_id,
+                managed_tags={"genre": ["Blues"]},
+                origin="manual",
+                now="2099-01-01T00:00:00.000000+00:00",
+            )
+            other.commit()
+        finally:
+            other.close()
+        return written
+
+    monkeypatch.setattr(versioning, "write_managed_tags", write_then_restage)
+    result = staging.commit_tags(engine_settings)
+
+    assert result.committed == 1
+    assert read_tags(track).tags["genre"] == ["Jazz"]
+    newer = _staged(engine_settings, file_id)
+    assert newer is not None
+    assert newer.managed_tags == {"genre": ["Blues"]}
+
+
+def _stage_then_land(settings: Settings, track: Path) -> int:
+    """Stage a change on *track* and write it to disk with no commit, as a crash leaves it."""
+    scan_library(settings)
+    file_id = _file_id(settings, track.parent, track.name)
+    staging.stage_tags(settings, file_id=file_id, tags={"genre": ["Jazz"]})
+    staged = _staged(settings, file_id)
+    assert staged is not None
+    write_managed_tags(track, staged.managed_tags)
+    return file_id
+
+
+def test_restaging_a_write_that_landed_before_a_crash_is_refused(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    track = make_track(music_dir / "t.flac", {"genre": ["Rock"]})
+    file_id = _stage_then_land(engine_settings, track)
+
+    with pytest.raises(ValueError, match="interrupted commit already wrote"):
+        staging.stage_tags(engine_settings, file_id=file_id, tags={"genre": ["Pop"]})
+    result = staging.commit_tags(engine_settings)
+
+    assert result.committed == 1
+    revisions = _revisions(engine_settings, file_id)
+    assert [(r.origin, r.commit_id) for r in revisions] == [
+        ("scan", None),
+        ("manual", result.commit_id),
+    ]
+
+
+def test_unstaging_a_write_that_landed_before_a_crash_is_refused(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    track = make_track(music_dir / "t.flac", {"genre": ["Rock"]})
+    file_id = _stage_then_land(engine_settings, track)
+
+    with pytest.raises(ValueError, match="Run commit_tags to record it first"):
+        staging.unstage_tags(engine_settings, file_id=file_id)
+
+    assert _staged(engine_settings, file_id) is not None
 
 
 def test_stage_refuses_a_container_the_writer_cannot_verify(

@@ -53,14 +53,13 @@ def test_decide_launch_missing_key_is_true(tmp_path: Path) -> None:
 # --- build_seed ----------------------------------------------------------------------
 
 
-def test_build_seed_masks_key_and_flags_present(tmp_path: Path) -> None:
+def test_build_seed_masks_the_lastfm_key(tmp_path: Path) -> None:
     settings = _settings(music_path=tmp_path, lastfm_api_key="super-secret")
     seed = configui.build_seed(settings)
 
     values = seed["values"]
     assert isinstance(values, dict)
     assert values["lastfm_api_key"] == configui.MASK_PLACEHOLDER
-    assert seed["has_lastfm_api_key"] is True
     # The real key must never reach the browser.
     assert "super-secret" not in str(seed)
 
@@ -70,7 +69,6 @@ def test_build_seed_unset_key_has_no_placeholder() -> None:
     values = seed["values"]
     assert isinstance(values, dict)
     assert values["lastfm_api_key"] == ""
-    assert seed["has_lastfm_api_key"] is False
 
 
 def test_build_seed_exposes_musicbrainz_contact() -> None:
@@ -112,6 +110,12 @@ def test_build_seed_joins_the_droppable_frame_ids() -> None:
     assert values["id3_droppable_frames"] == "RVAD;NCON"
 
 
+def test_build_seed_holds_every_key_but_the_naming_keys() -> None:
+    values = configui.build_seed(_settings())["values"]
+    assert isinstance(values, dict)
+    assert set(values) == config.KNOWN_KEYS - config.NAMING_KEYS
+
+
 # --- validate_and_normalize ----------------------------------------------------------
 
 
@@ -149,6 +153,25 @@ def test_validate_rejects_unknown_key() -> None:
     with pytest.raises(configui.ValidationError) as excinfo:
         configui.validate_and_normalize({"bogus": "x"})
     assert excinfo.value.status == HTTPStatus.BAD_REQUEST
+
+
+def test_validate_rejects_a_naming_key() -> None:
+    # Only set_naming_pattern validates the folders and refuses while a path move is staged.
+    with pytest.raises(configui.ValidationError) as excinfo:
+        configui.validate_and_normalize({"container_folders": "x"})
+    assert excinfo.value.status == HTTPStatus.BAD_REQUEST
+    assert "set_naming_pattern" in excinfo.value.message
+
+
+@pytest.mark.parametrize(
+    ("key", "raw"),
+    [("genre_stage_limit", "-5"), ("id3_droppable_frames", "bad!")],
+)
+def test_validate_rejects_a_value_load_settings_would_discard(key: str, raw: str) -> None:
+    with pytest.raises(configui.ValidationError) as excinfo:
+        configui.validate_and_normalize({key: raw})
+    assert excinfo.value.status == HTTPStatus.UNPROCESSABLE_ENTITY
+    assert key in excinfo.value.message
 
 
 def test_validate_rejects_bad_int() -> None:
@@ -288,7 +311,7 @@ def test_server_seed_is_masked_and_no_store(server: tuple[str, str]) -> None:
     assert response.status_code == HTTPStatus.OK
     assert response.headers["cache-control"] == "no-store"
     assert "real-key" not in response.text
-    assert response.json()["has_lastfm_api_key"] is True
+    assert response.json()["values"]["lastfm_api_key"] == configui.MASK_PLACEHOLDER
 
 
 def test_server_save_persists(server: tuple[str, str]) -> None:

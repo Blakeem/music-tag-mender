@@ -113,7 +113,7 @@ def lookup_identity(tags: Mapping[str, list[str]]) -> LookupIdentity:
     return LookupIdentity(artist=lookup_artist, album=lookup_album)
 
 
-def _album_identity(tags: Mapping[str, list[str]]) -> Identity | None:
+def _genre_identity(tags: Mapping[str, list[str]]) -> Identity | None:
     """Genre identity: (albumartist-else-artist, album), ``None`` without either artist field."""
     lookup = lookup_identity(tags)
     if lookup.artist is None:
@@ -163,7 +163,7 @@ GENRE_AXIS: Final = Axis(
     source_columns=("source_artist", "source_album"),
     workflow_statuses=_TAG_AXIS_STATUSES,
     scope_fields=("artist", "albumartist"),
-    identity=_album_identity,
+    identity=_genre_identity,
 )
 
 ARTIST_AXIS: Final = Axis(
@@ -248,7 +248,7 @@ def field_values(axis: Axis, tags: Mapping[str, list[str]]) -> dict[str, list[st
     return {name: list(tags.get(name, [])) for name in axis.fields}
 
 
-# --- outcome rows (the three tag axes) -----------------------------------------------
+# --- outcome rows (the tag axes) -----------------------------------------------------
 
 
 @dataclass(frozen=True, slots=True)

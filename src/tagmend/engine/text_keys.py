@@ -1,7 +1,8 @@
 """Comparison keys. Each one folds away the differences its comparison treats as cosmetic.
 
 * :func:`alnum_key` treats casing and every character outside ``[a-z0-9]`` as cosmetic.
-* :func:`alnum_ascii_key` also treats ligatures and diacritics as cosmetic.
+* :func:`alnum_ascii_key` treats casing, ligatures and diacritics as cosmetic by folding each
+  letter to its base letter, then drops every character outside ``[a-z0-9]``.
 * :func:`alnum_script_key` is :func:`alnum_ascii_key` that keeps every letter with no ASCII form.
 * :func:`display_key` treats casing, typographic character choice and whitespace runs as cosmetic.
 * :func:`artist_name_key` also treats a dash written for a word break as cosmetic.
@@ -66,9 +67,9 @@ def alnum_ascii_key(s: str) -> str:
 
     Casefold, translate the residual ligatures NFKD leaves intact (``æ`` → ``ae`` …),
     NFKD-decompose and drop combining marks (diacritics), then strip everything outside
-    ``[a-z0-9]``. Deliberately a **superset** of :func:`alnum_key` (casefold + strip only):
-    the detectors also need the Unicode/ligature folding so ``Leæther Strip`` ==
-    ``Leaether Strip`` and ``Dååth`` == ``Daath``.
+    ``[a-z0-9]``. Unlike :func:`alnum_key`, which lowercases and drops every non-ASCII letter,
+    this folds each one to its base letter, so neither key's equivalences contain the other's.
+    The detectors need ``Leæther Strip`` == ``Leaether Strip`` and ``Dååth`` == ``Daath``.
     """
     translated = s.casefold().translate(_LIGATURE_TABLE)
     decomposed = unicodedata.normalize("NFKD", translated)
@@ -124,11 +125,8 @@ def artist_name_key(value: str) -> str:
 
     Used only to decide whether two spellings are the same name. Never used as a value.
     """
-    # MusicBrainz writes a word break as a dash where taggers write a space. The key is compared
-    # only against names recorded for the file's own MBID, so it never merges two artists.
-    typographic = "".join(TYPOGRAPHIC.get(ch, ch) for ch in value)
-    folded = typographic.replace("-", " ")
-    return " ".join(folded.casefold().split())
+    # MusicBrainz writes a word break as a dash where taggers write a space.
+    return " ".join(display_key(value).replace("-", " ").split())
 
 
 def loose_key(value: str) -> str:

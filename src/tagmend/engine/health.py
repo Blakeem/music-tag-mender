@@ -1,9 +1,7 @@
-"""Health check / readiness probe (M0).
+"""Readiness probe behind ``tagmend check-health`` and the ``check_health`` MCP tool.
 
-Verifies that the environment is wired up: settings resolve, the configured music
-folder is reachable and readable, and the SQLite ledger can be opened. Surfaced both
-as ``tagmend check-health`` (CLI) and the ``check_health`` MCP tool, so the very first
-thing we can do — before any feature exists — is confirm we're ready to build.
+It checks the music folder, the SQLite ledger with its interrupted commits and staged paths,
+one live call each to Last.fm, MusicBrainz and AcoustID, and the fpcalc binary.
 """
 
 from __future__ import annotations
@@ -11,8 +9,6 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final
-
-import httpx
 
 from tagmend.engine import commits, db, paths, scan, schema
 from tagmend.engine.acoustid import (
@@ -27,10 +23,13 @@ from tagmend.engine.acoustid import (
 )
 from tagmend.engine.lastfm import LastfmClient, LastfmError
 from tagmend.engine.musicbrainz import MusicBrainzClient, MusicBrainzError
+from tagmend.engine.serialize import FieldDict
 from tagmend.log import get_logger
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+    import httpx
 
     from tagmend.config import Settings
 
@@ -50,7 +49,7 @@ _FPCALC_HINT: Final = (
 
 
 @dataclass(frozen=True, slots=True)
-class Check:
+class Check(FieldDict):
     """The result of one individual readiness check."""
 
     name: str
@@ -73,7 +72,7 @@ class HealthReport:
         """JSON-serializable form, suitable for returning from an MCP tool."""
         return {
             "ready": self.ready,
-            "checks": [{"name": c.name, "ok": c.ok, "detail": c.detail} for c in self.checks],
+            "checks": [check.to_dict() for check in self.checks],
         }
 
 
@@ -114,7 +113,7 @@ def _check_music_path(music_path: Path | None) -> Check:
         return Check(
             name=name,
             ok=False,
-            detail="not configured — run `tagmend config-set music_path <dir>`",
+            detail="not configured: run `tagmend config-set music_path <dir>`",
         )
     if not music_path.exists():
         return Check(name=name, ok=False, detail=f"does not exist: {music_path}")
@@ -234,7 +233,7 @@ def _check_lastfm(
 
     A missing key fails immediately with **no HTTP attempted** (genre + artist resolution
     both need it). With a key, one ``artist.getCorrection`` round-trip against an empty
-    throwaway cache proves the key + network are live; any client/HTTP error is caught so
+    throwaway cache proves the key + network are live. Any client/HTTP error is caught so
     no exception escapes.
     """
     name = "lastfm"
@@ -243,7 +242,7 @@ def _check_lastfm(
         return Check(
             name=name,
             ok=False,
-            detail="not configured — set lastfm_api_key (needed by resolve_genres/resolve_artists)",
+            detail="not configured: set lastfm_api_key (needed by resolve_genres/resolve_artists)",
         )
 
     conn = _memory_conn()
@@ -271,9 +270,9 @@ def _check_musicbrainz(
 ) -> Check:
     """Confirm MusicBrainz is reachable (one live release-group search).
 
-    No API key is required — just the configured ``User-Agent``. One
+    No API key is required, only the configured ``User-Agent``. One
     ``album_first_release`` round-trip against an empty throwaway cache proves the network
-    is live; any client/HTTP error is caught so no exception escapes.
+    is live. Any client/HTTP error is caught so no exception escapes.
     """
     name = "musicbrainz"
 
@@ -288,7 +287,7 @@ def _check_musicbrainz(
             max_attempts=1,
         ) as client:
             client.album_first_release(_MB_PING_ARTIST, _MB_PING_ALBUM)
-    except (MusicBrainzError, httpx.HTTPError) as exc:
+    except MusicBrainzError as exc:
         return Check(name=name, ok=False, detail=f"unreachable: {exc}")
     finally:
         conn.close()

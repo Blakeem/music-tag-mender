@@ -53,15 +53,16 @@ from tagmend.engine.detector_core import (
 )
 from tagmend.engine.musicbrainz import MusicBrainzClient, MusicBrainzError
 from tagmend.engine.serialize import FieldDict
+from tagmend.engine.text_keys import display_key
 from tagmend.engine.validation import check_limit
 from tagmend.log import get_logger
 
 if TYPE_CHECKING:
+    import os
     import sqlite3
-    from pathlib import Path
 
     from tagmend.config import Settings
-    from tagmend.engine.musicbrainz import MBRelease, MBReleaseSource, MBTrack
+    from tagmend.engine.musicbrainz import MBRelease, MBReleaseCacheSource, MBTrack
 
 logger = get_logger(__name__)
 
@@ -125,6 +126,18 @@ class _FileInput:
     artist_mbids: tuple[str, ...] = ()
 
 
+@dataclass(slots=True)
+class _Lookups:
+    """Every release's lookup outcome for one run."""
+
+    found: dict[str, MBRelease] = field(default_factory=dict)
+    attempted: int = 0
+    checked: int = 0
+    remaining: int = 0
+    unknown: int = 0
+    error_items: list[dict[str, str]] = field(default_factory=list)
+
+
 # --- public result types -------------------------------------------------------------
 
 
@@ -162,7 +175,6 @@ class ReleaseDisagreementGroup(FieldDict):
     folder: str
     file_count: int
     flagged: int
-    folder_context: int
     tiers: dict[str, int]
     file_ids: list[int]
     flagged_fields: int
@@ -172,7 +184,7 @@ class ReleaseDisagreementGroup(FieldDict):
 
 
 @dataclass(frozen=True, slots=True)
-class ReleaseDisagreementsReport:
+class ReleaseDisagreementsReport(FieldDict):
     """Immutable summary of one :func:`detect_release_disagreements` run, JSON-ready for the tool.
 
     ``flagged`` counts files with at least one contradiction and ``flagged_fields`` counts the
@@ -188,6 +200,7 @@ class ReleaseDisagreementsReport:
     medium: int
     low: int
     fills: int
+    fill_rows: list[ReleaseDisagreementRow]
     releases_attempted: int
     releases_checked: int
     releases_remaining: int
@@ -196,35 +209,10 @@ class ReleaseDisagreementsReport:
     unknown_releases: int
     unmatched_tracks: int
     errors: int
-    summary: str
-    fill_rows: list[ReleaseDisagreementRow] = field(default_factory=list)
     error_items: list[dict[str, str]] = field(default_factory=list)
     groups: list[ReleaseDisagreementGroup] = field(default_factory=list)
-
-    def to_dict(self) -> dict[str, object]:
-        """JSON-serializable form for the MCP tool."""
-        return {
-            "rows": [r.to_dict() for r in self.rows],
-            "total_files": self.total_files,
-            "flagged": self.flagged,
-            "flagged_fields": self.flagged_fields,
-            "high": self.high,
-            "medium": self.medium,
-            "low": self.low,
-            "fills": self.fills,
-            "fill_rows": [r.to_dict() for r in self.fill_rows],
-            "releases_attempted": self.releases_attempted,
-            "releases_checked": self.releases_checked,
-            "releases_remaining": self.releases_remaining,
-            "more": self.more,
-            "skipped_no_release_mbid": self.skipped_no_release_mbid,
-            "unknown_releases": self.unknown_releases,
-            "unmatched_tracks": self.unmatched_tracks,
-            "errors": self.errors,
-            "error_items": [dict(e) for e in self.error_items],
-            "groups": [g.to_dict() for g in self.groups],
-            "summary": self.summary,
-        }
+    # Last, so the payload ends with it. Keyword-only keeps it required after the defaults.
+    summary: str = field(kw_only=True)
 
 
 # --- comparison helpers --------------------------------------------------------------
@@ -277,18 +265,71 @@ def _artist_axis_owns_spelling(
     return bool(have) and len(credit_mbids) == 1 and file_mbids == credit_mbids
 
 
-# --- pure classifier -----------------------------------------------------------------
+def _track_number_reason(track: MBTrack, want_number: str) -> str:
+    """Return the tracknumber reason, naming the position when the release numbers otherwise."""
+    if release_match.position(track.number) == want_number:
+        return f"the release says {track.number!r}"
+    return f"the release says {track.number!r} (position {track.position})"
 
 
-def _release_expectations(release: MBRelease) -> dict[str, str]:
-    """Return the release-level values every file on this release should carry."""
-    return {
-        "album": release.title,
-        "albumartist": release.artist_credit,
-        "date": release.date,
-        "releasecountry": release.country,
-        "musicbrainz_albumstatus": release_match.album_status(release),
-    }
+# --- lookups -------------------------------------------------------------------------
+
+
+def _look_up(
+    release_mbids: list[str],
+    client: MBReleaseCacheSource,
+    *,
+    release_limit: int | None,
+) -> _Lookups:
+    """Look up each release once, spending *release_limit* only on uncached ones.
+
+    A cached answer costs no request, so it never counts toward the cap. That is what lets a
+    re-run with the same cap reach the releases the previous run left behind. ``None`` caps
+    nothing.
+    """
+    lookups = _Lookups()
+    network_budget = release_limit
+    for release_mbid in release_mbids:
+        cached = client.has_cached_release(release_mbid)
+        if not cached and network_budget == 0:
+            lookups.remaining += 1
+            continue
+        if not cached and network_budget is not None:
+            network_budget -= 1
+        lookups.attempted += 1
+        try:
+            release = client.release_by_mbid(release_mbid)
+        except MusicBrainzError as exc:
+            logger.warning("musicbrainz release error for mbid=%r: %s", release_mbid, exc)
+            lookups.error_items.append({"key": release_mbid, "message": str(exc)})
+            continue
+        lookups.checked += 1
+        if release is None:
+            lookups.unknown += 1
+            continue
+        lookups.found[release_mbid] = release
+    return lookups
+
+
+# --- classifier ----------------------------------------------------------------------
+
+
+def _release_expectations(
+    file: _FileInput,
+    release: MBRelease,
+) -> tuple[tuple[str, str | None, str], ...]:
+    """Return each release-level field as ``(field, the file's value, the release's value)``."""
+    return (
+        ("album", file.album, release.title),
+        ("albumartist", file.albumartist, release.artist_credit),
+        ("date", file.date, release.date),
+        ("releasecountry", file.releasecountry, release.country),
+        (
+            "musicbrainz_albumstatus",
+            file.musicbrainz_albumstatus,
+            release_match.album_status(release),
+        ),
+    )
 
 
 def _compare_one(
@@ -324,10 +365,10 @@ def _compare_one(
             _REASON_UNMATCHED,
         )
 
-    for field_name, want in _release_expectations(release).items():
+    for field_name, have_raw, want in _release_expectations(file, release):
         if not want:
             continue
-        have = (getattr(file, field_name) or "").strip()
+        have = (have_raw or "").strip()
         if field_name == "albumartist" and _artist_axis_owns_spelling(
             have, file.albumartist_mbids, release.artist_mbids
         ):
@@ -335,7 +376,7 @@ def _compare_one(
         agrees = (
             _date_agrees(have, want)
             if field_name == "date"
-            else release_match.text_key(have) == release_match.text_key(want)
+            else display_key(have) == display_key(want)
         )
         if not agrees:
             add(
@@ -377,16 +418,15 @@ def _compare_track(
             ),
         )
 
+    # The stamp writes the sequential position, so a vinyl side number is never proposed.
+    want_number = (
+        str(track.position) if track.position > 0 else release_match.position(track.number)
+    )
     have_number = release_match.position(file.tracknumber)
     if have_number and not release_match.track_number_agrees(have_number, track):
-        add(
-            "tracknumber",
-            have_number,
-            release_match.position(track.number),
-            f"the release says {track.number!r}",
-        )
-    elif not have_number and track.number:
-        add("tracknumber", "", release_match.position(track.number), "")
+        add("tracknumber", have_number, want_number, _track_number_reason(track, want_number))
+    elif not have_number and want_number:
+        add("tracknumber", "", want_number, "")
 
     for field_name, have_raw, want in (
         ("title", file.title, track.title),
@@ -404,7 +444,7 @@ def _compare_track(
             have, file.artist_mbids, track.artist_mbids
         ):
             continue
-        if want and release_match.text_key(have) != release_match.text_key(want):
+        if want and display_key(have) != display_key(want):
             add(field_name, have, want, f"the release says {want!r}")
 
     return rows
@@ -412,12 +452,12 @@ def _compare_track(
 
 def _classify(
     files: list[_FileInput],
-    client: MBReleaseSource,
+    client: MBReleaseCacheSource,
     *,
     release_limit: int | None,
 ) -> ReleaseDisagreementsReport:
     """Compare every in-scope file against the release it names, one lookup per release."""
-    # Input: group by release so each is fetched at most once, in first-seen order.
+    # Input: group by release so each is looked up at most once, in first-seen order.
     by_release: dict[str, list[_FileInput]] = defaultdict(list)
     skipped = 0
     for f in files:
@@ -427,29 +467,11 @@ def _classify(
             continue
         by_release[release_mbid].append(f)
 
-    order = list(by_release)
-    cap = release_limit if release_limit is not None else len(order)
-    to_check = order[:cap]
-
     # Process: one lookup per release, then every field of every file on it.
+    lookups = _look_up(list(by_release), client, release_limit=release_limit)
     rows: list[ReleaseDisagreementRow] = []
-    errors: list[dict[str, str]] = []
-    unknown = 0
     unmatched = 0
-    fetched = 0
-    titles: dict[str, str] = {}
-    for release_mbid in to_check:
-        try:
-            release = client.release_by_mbid(release_mbid)
-        except MusicBrainzError as exc:
-            logger.warning("musicbrainz release error for mbid=%r: %s", release_mbid, exc)
-            errors.append({"key": release_mbid, "message": str(exc)})
-            continue
-        fetched += 1
-        if release is None:
-            unknown += 1
-            continue
-        titles[release_mbid] = release.title
+    for release_mbid, release in lookups.found.items():
         for f in by_release[release_mbid]:
             track = _match_track(f, release)
             if track is None:
@@ -460,6 +482,7 @@ def _classify(
     contradictions = [r for r in rows if not r.is_fill]
     fills = [r for r in rows if r.is_fill]
     tiers = tiers_by_file(contradictions)
+    titles = {release_mbid: release.title for release_mbid, release in lookups.found.items()}
     return ReleaseDisagreementsReport(
         rows=ordered(contradictions),
         total_files=len(files),
@@ -469,27 +492,27 @@ def _classify(
         medium=tiers.get(Tier.MEDIUM.value, 0),
         low=tiers.get(Tier.LOW.value, 0),
         fills=len(fills),
-        releases_attempted=len(to_check),
-        releases_checked=fetched,
-        releases_remaining=len(order) - len(to_check),
-        more=len(order) > len(to_check),
+        fill_rows=ordered(fills),
+        releases_attempted=lookups.attempted,
+        releases_checked=lookups.checked,
+        releases_remaining=lookups.remaining,
+        more=lookups.remaining > 0,
         skipped_no_release_mbid=skipped,
-        unknown_releases=unknown,
+        unknown_releases=lookups.unknown,
         unmatched_tracks=unmatched,
-        errors=len(errors),
+        errors=len(lookups.error_items),
+        error_items=lookups.error_items,
+        groups=_build_groups(rows, files, titles),
         summary=_summarize(
             rows=contradictions,
             fills=len(fills),
             tiers=tiers,
-            checked=fetched,
-            remaining=len(order) - len(to_check),
-            unknown=unknown,
+            checked=lookups.checked,
+            remaining=lookups.remaining,
+            unknown=lookups.unknown,
             unmatched=unmatched,
-            errors=len(errors),
+            errors=len(lookups.error_items),
         ),
-        fill_rows=ordered(fills),
-        error_items=errors,
-        groups=_build_groups(rows, files, titles),
     )
 
 
@@ -522,7 +545,6 @@ def _build_groups(
             folder=folder,
             file_count=len(files_by_folder.get(folder, [])),
             flagged=0,
-            folder_context=0,
             tiers={},
             file_ids=[],
             flagged_fields=0,
@@ -579,7 +601,10 @@ def _summarize(  # noqa: PLR0913 - one keyword per reported count, cohesive by d
     if unknown:
         head += f" {unknown} release id(s) are unknown to MusicBrainz."
     if remaining:
-        head += f" {remaining} release(s) not yet checked. Raise release_limit to reach them."
+        head += (
+            f" {remaining} release(s) not yet checked. Re-run, or raise release_limit, to "
+            f"reach them."
+        )
     if errors:
         head += f" {errors} release lookup(s) errored and stay pending. Re-run to retry."
     return head
@@ -635,13 +660,13 @@ def detect_release_disagreements(  # noqa: PLR0913 - cohesive keyword-only scope
     settings: Settings,
     *,
     tier: str | None = None,
-    path: Path | None = None,
+    path: str | os.PathLike[str] | None = None,
     folder: str | None = None,
     file_ids: list[int] | None = None,
     release_limit: int | None = None,
     limit: int | None = None,
     group: bool = False,
-    client: MBReleaseSource | None = None,
+    client: MBReleaseCacheSource | None = None,
 ) -> ReleaseDisagreementsReport:
     """Report files whose tags contradict the MusicBrainz release their album id names.
 
@@ -650,13 +675,13 @@ def detect_release_disagreements(  # noqa: PLR0913 - cohesive keyword-only scope
     *path* and *file_ids* scope the RUN: the counts then describe only that scope, and no
     release outside it is fetched. *path* takes the folder itself and every folder under it.
     *folder* and *tier* narrow the VIEW alone, so the counts still describe the whole run.
-    *folder* names exactly one folder and wins over *group*. *release_limit* caps the number of
-    distinct releases fetched this call (default 200, about three minutes at MusicBrainz's
-    requested one request per second) and the remainder is reported via
-    ``releases_remaining``/``more``. *limit* caps the rows (or groups) returned without changing
-    any count. *path* and *folder* are compared as paths
-    (:func:`tagmend.engine.path_keys.folder_arg_key`). *client* injects an
-    :class:`tagmend.engine.musicbrainz.MBReleaseSource` for tests. Raises :class:`ValueError`
+    *folder* names exactly one folder and wins over *group*. *release_limit* caps the distinct
+    releases fetched over the network this call (default 200, about three minutes at
+    MusicBrainz's requested one request per second). A cached release never counts toward it,
+    and the releases not reached are reported via ``releases_remaining``/``more``. *limit* caps
+    the rows (or groups) returned without changing any count. *path* and *folder* are compared
+    as paths (:func:`tagmend.engine.path_keys.folder_arg_key`). *client* injects an
+    :class:`tagmend.engine.musicbrainz.MBReleaseCacheSource` for tests. Raises :class:`ValueError`
     for a *folder* with neither *path* nor *file_ids*, an unknown *tier*, a negative
     *release_limit* or *limit*, or a *path* or *folder* outside ``music_path``.
     """

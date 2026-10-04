@@ -207,6 +207,14 @@ def test_distinct_artists_counts_files(db_conn: sqlite3.Connection) -> None:
     assert store.distinct_artists(db_conn) == [("A", 2), ("B", 1)]
 
 
+def test_distinct_artists_skips_missing_files(db_conn: sqlite3.Connection) -> None:
+    ids = _seed_library(db_conn)
+    store.flag_missing(db_conn, ids["a1"], _LATER)
+    assert store.distinct_artists(db_conn) == [("A", 1), ("B", 1)]
+    store.flag_missing(db_conn, ids["b1"], _LATER)
+    assert store.distinct_artists(db_conn) == [("A", 1)]
+
+
 def test_files_in_scope_all(db_conn: sqlite3.Connection) -> None:
     ids = _seed_library(db_conn)
     assert store.files_in_scope(db_conn) == sorted(ids.values())
@@ -398,13 +406,6 @@ def test_manual_and_staged_beat_no_identity(db_conn: sqlite3.Connection) -> None
     staged = _insert(db_conn, filename="s.mp3", artist=None)
     _stage(db_conn, staged)
     assert _status(db_conn, staged) == "staged"
-
-
-def test_has_staged_change_for_is_field_specific(db_conn: sqlite3.Connection) -> None:
-    file_id = _insert(db_conn)
-    _stage_field(db_conn, file_id, "artist")
-    assert store.has_staged_change_for(db_conn, file_id, ("artist", "albumartist")) is True
-    assert store.has_staged_change_for(db_conn, file_id, ("genre",)) is False
 
 
 def test_field_aware_split_staged(db_conn: sqlite3.Connection) -> None:

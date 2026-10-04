@@ -16,18 +16,19 @@ post-lookup correction gate (case-only, credit shrink, no MBID) has its own sect
 
 from __future__ import annotations
 
+import unicodedata
 from typing import TYPE_CHECKING, NamedTuple
 
 import mutagen
 import pytest
 
-from conftest import make_track
+from conftest import make_rvad_mp3, make_track, rejecting_lastfm_client
 from tagmend.engine import artists, axis, axis_status, staging, store, versioning
 from tagmend.engine.db import connect
-from tagmend.engine.lastfm import ArtistCorrection, LastfmError
+from tagmend.engine.lastfm import ArtistCorrection, LastfmError, LastfmKeyError
 from tagmend.engine.library import list_files as library_list
 from tagmend.engine.library import scan_library
-from tagmend.engine.musicbrainz import MBArtist
+from tagmend.engine.musicbrainz import MBArtist, MusicBrainzError
 from tagmend.engine.schema import apply_schema
 from tagmend.engine.tags import read_tags
 
@@ -63,6 +64,15 @@ def _file_id(settings: Settings, folder: Path, filename: str) -> int:
         row = store.get_file(conn, str(folder), filename)
         assert row is not None
         return row.id
+    finally:
+        conn.close()
+
+
+def _artist_outcome(settings: Settings, file_id: int) -> axis.OutcomeRow | None:
+    conn = connect(settings.db_path)
+    try:
+        apply_schema(conn)
+        return axis.get_outcome(conn, axis.ARTIST_AXIS, file_id)
     finally:
         conn.close()
 
@@ -337,6 +347,29 @@ def test_lookup_error_is_counted_and_itemized(
     assert result.error_items == [{"key": "Obscure Band", "message": "transport error"}]
     assert result.to_dict()["error_items"] == result.error_items
     assert result.staged_files == 0
+    # A transient error writes no outcome row, so the file stays pending for a re-run.
+    assert _artist_outcome(engine_settings, _file_id(engine_settings, music_dir, "t.mp3")) is None
+
+
+def test_a_rejected_lastfm_key_stops_the_call(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    make_track(music_dir / "t.mp3", {"artist": ["Obscure Band"]})
+    make_track(music_dir / "u.mp3", {"artist": ["Other Band"]})
+    scan_library(engine_settings)
+
+    conn = connect(engine_settings.db_path)
+    try:
+        with (
+            rejecting_lastfm_client(conn) as client,
+            pytest.raises(LastfmKeyError, match="lastfm_api_key"),
+        ):
+            artists.resolve_artists(engine_settings, client=client)
+    finally:
+        conn.close()
+
+    assert staging.diff_tags(engine_settings) == []
 
 
 def test_result_follows_the_resolver_contract(engine_settings: Settings) -> None:
@@ -421,7 +454,7 @@ def test_normal_correction_still_stages_with_mbid_alongside_placeholder(
     assert read_tags(good).tags["musicbrainz_artistid"] == ["mbid-1"]
 
 
-# --- (7c) the correction gate: only substantive, MusicBrainz-backed names stage ------
+# --- (7c) the correction gate: a substantive name Last.fm pairs with an MBID stages --
 
 
 class _GateCase(NamedTuple):
@@ -435,13 +468,13 @@ class _GateCase(NamedTuple):
 
 
 _GATE_CASES = [
-    # A collapsed multi-artist credit is held whether or not MusicBrainz backs it.
+    # A collapsed multi-artist credit is held whether or not Last.fm pairs it with an MBID.
     _GateCase("Skrillex & The Doors", "Skrillex", "mbid-skrillex", "shrinks_credit", 0),
     _GateCase("The Offspring & Redman", "The Offspring", None, "shrinks_credit", 0),
     # Last.fm casing is not trustworthy, so a case-only difference is already canonical.
     _GateCase("Dååth", "DÅÅTH", "mbid-daath", "already_canonical", 0),
     _GateCase("ChthoniC", "Chthonic", None, "already_canonical", 0),
-    # A rename MusicBrainz does not corroborate is held for review, never silent.
+    # A rename Last.fm pairs with no MBID is held for review, never silent.
     _GateCase("Travis Scott", "Travi$ Scott", None, "needs_review", 0),
     # Diacritics are a spelling fix, not casing — with an MBID it stages.
     _GateCase("Antonio Carlos Jobim", "Antônio Carlos Jobim", "mbid-jobim", "corrected_values", 1),
@@ -595,6 +628,27 @@ def test_dry_run_returns_mappings_but_stages_nothing(
         },
     ]
     assert len(staging.diff_tags(engine_settings)) == 0  # nothing actually staged
+
+
+def test_dry_run_itemizes_a_file_the_writer_refuses(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    make_track(music_dir / "plain.mp3", {"artist": ["Miami Nights '84"]})
+    make_rvad_mp3(music_dir / "loud.mp3", {"artist": ["Miami Nights '84"]})
+    scan_library(engine_settings)
+    loud_id = _file_id(engine_settings, music_dir, "loud.mp3")
+    fake = FakeCorrectionSource(
+        {"Miami Nights '84": ArtistCorrection("Miami Nights 1984", "mbid-1")},
+    )
+
+    preview = artists.resolve_artists(engine_settings, client=fake, dry_run=True)
+    real = artists.resolve_artists(engine_settings, client=fake)
+
+    assert preview.staged_files == real.staged_files == 1
+    assert [item["key"] for item in preview.error_items] == [f"file_id={loud_id}"]
+    assert "RVAD" in preview.error_items[0]["message"]
+    assert preview.error_items == real.error_items
 
 
 def test_dry_run_ignores_empty_staging_precondition(
@@ -957,6 +1011,39 @@ def test_mb_tier_fixes_casing_that_the_lastfm_tier_would_ignore(
     assert lastfm.lookups == []
 
 
+class _FailingArtistSource(FakeArtistSource):
+    """A :class:`FakeArtistSource` whose every lookup fails transiently."""
+
+    def artist_by_mbid(self, mbid: str) -> MBArtist | None:
+        self.lookups.append(mbid)
+        message = "transport error"
+        raise MusicBrainzError(message)
+
+
+def test_mb_tier_transient_error_keeps_the_value_from_lastfm(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    make_track(
+        music_dir / "a.mp3",
+        {"artist": ["Solar Feelds"], "musicbrainz_artistid": ["mbid-1"]},
+    )
+    scan_library(engine_settings)
+    file_id = _file_id(engine_settings, music_dir, "a.mp3")
+
+    lastfm = FakeCorrectionSource({"Solar Feelds": ArtistCorrection("Solar Fields", "other-mbid")})
+    mb = _FailingArtistSource({})
+    result = artists.resolve_artists(engine_settings, client=lastfm, mb_client=mb)
+
+    assert mb.lookups == ["mbid-1"]
+    # A Last.fm answer would overwrite the file's own MBID with Last.fm's id.
+    assert lastfm.lookups == []
+    assert result.errors == 1
+    assert result.error_items == [{"key": "Solar Feelds", "message": "transport error"}]
+    assert result.staged_files == 0
+    assert _artist_outcome(engine_settings, file_id) is None
+
+
 def test_mb_tier_merges_a_registered_alias_onto_the_canonical_name(
     engine_settings: Settings,
     music_dir: Path,
@@ -1001,6 +1088,46 @@ def test_mb_tier_matches_an_alias_under_typographic_folding(
     assert result.corrected_values == 1
     assert result.mappings[0]["to"] == "Jean\u2010Michel Jarre"
     assert result.mappings[0]["source"] == "musicbrainz"
+
+
+def test_mb_tier_stages_a_decomposed_spelling_of_the_canonical_name(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    composed = unicodedata.normalize("NFC", "Björk")
+    make_track(
+        music_dir / "a.mp3",
+        {
+            "artist": [unicodedata.normalize("NFD", composed)],
+            "musicbrainz_artistid": ["mbid-1"],
+        },
+    )
+    scan_library(engine_settings)
+
+    result = artists.resolve_artists(
+        engine_settings,
+        client=FakeCorrectionSource({}),
+        mb_client=FakeArtistSource({"mbid-1": _mb(composed)}),
+    )
+
+    assert [(m["to"], m["source"]) for m in result.mappings] == [(composed, "musicbrainz")]
+    assert result.name_id_disagreement_values == []
+
+
+def test_lastfm_tier_reads_a_decomposed_casing_difference_as_canonical(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    decomposed = unicodedata.normalize("NFD", "björk")
+    make_track(music_dir / "a.mp3", {"artist": [decomposed]})
+    scan_library(engine_settings)
+
+    correction = ArtistCorrection(unicodedata.normalize("NFC", "Björk"), "mbid-1")
+    fake = FakeCorrectionSource({decomposed: correction})
+    result = artists.resolve_artists(engine_settings, client=fake)
+
+    assert result.already_canonical_values == [decomposed]
+    assert result.staged_files == 0
 
 
 def test_mb_tier_leaves_an_exactly_canonical_name_alone(

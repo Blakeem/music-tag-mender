@@ -1,4 +1,4 @@
-"""Append-only tag-revision history + revert (M3).
+"""Append-only tag-revision history + revert.
 
 The heart of TagMend's safety story. Every managed-tag change to a file appends a new
 row to ``tag_revisions`` keyed ``(file_id, version)``. Version 0 is the original as-found
@@ -23,7 +23,7 @@ it as a ``scan`` revision (:func:`observe_drift`) before writing over it.
 
 Transaction ownership mirrors the rest of the engine: :func:`ensure_baseline`,
 :func:`observe_widened_fields`, :func:`observe_drift`, :func:`append_revision` and
-:func:`resync_signature` take an open connection and never commit (building blocks a future
+:func:`write_and_resync` take an open connection and never commit (building blocks a future
 cascade can batch inside one transaction). :func:`revert_tags` owns its own connection and
 commit, like :func:`tagmend.engine.library.scan_library`, because it pairs a disk write with
 DB writes as one atomic user-facing action.
@@ -59,6 +59,13 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
+# A locked, read-only or unreadable file, or a write the verifier refuses, fails that file alone.
+TAG_FILE_ERRORS: Final[tuple[type[Exception], ...]] = (
+    OSError,
+    ValueError,
+    mutagen.MutagenError,  # type: ignore[attr-defined]
+)
+
 
 def managed_subset(tags: dict[str, list[str]]) -> dict[str, list[str]]:
     """Narrow a full tag map to just the managed keys actually present."""
@@ -73,7 +80,7 @@ def compute_diff(
 
     Both inputs are already managed-only. List equality is order-sensitive, since a
     tag's multi-value order is meaningful (e.g. ``genre = [primary, secondary]``).
-    An added tag has ``from=[]``; a removed tag has ``to=[]``; unchanged tags are
+    An added tag has ``from=[]`` and a removed tag has ``to=[]``. Unchanged tags are
     omitted, so an empty result means "nothing changed".
     """
     diff: dict[str, dict[str, list[str]]] = {}
@@ -91,13 +98,12 @@ def ensure_baseline(
     *,
     managed_tags: dict[str, list[str]],
     now: str,
-    origin: str = "scan",
 ) -> bool:
     """Capture version 0 for *file_id* if it has none yet (idempotent).
 
-    *managed_tags* may be a full tag map; only the managed subset is snapshotted. The
-    baseline carries an empty diff. Returns ``True`` if a baseline was written, ``False``
-    if one already existed. Does not commit.
+    *managed_tags* may be a full tag map, and only the managed subset is snapshotted. The
+    baseline is a ``scan`` revision with an empty diff. Returns ``True`` if a baseline was
+    written, ``False`` if one already existed. Does not commit.
     """
     if store.max_version(conn, file_id) is not None:
         return False
@@ -105,7 +111,7 @@ def ensure_baseline(
         conn,
         file_id=file_id,
         version=0,
-        origin=origin,
+        origin="scan",
         managed_tags=managed_subset(managed_tags),
         diff={},
         now=now,
@@ -205,10 +211,10 @@ def append_revision(  # noqa: PLR0913 - cohesive revision-append inputs
 ) -> int | None:
     """Append a new revision recording the change from the latest snapshot to *managed_tags*.
 
-    *managed_tags* may be a full tag map; only the managed subset is compared/stored.
+    *managed_tags* may be a full tag map, and only the managed subset is compared/stored.
     *commit_id* groups this change with the other files in the same commit (``None`` for
     an ungrouped edit). Returns the new version number, or ``None`` when nothing managed
-    actually changed (no row is written — the log stays meaningful). Raises
+    actually changed (no row is written, so the log stays meaningful). Raises
     :class:`ValueError` if no baseline exists yet (call :func:`ensure_baseline` first).
     Does not commit.
     """
@@ -237,20 +243,31 @@ def append_revision(  # noqa: PLR0913 - cohesive revision-append inputs
     return version
 
 
-def resync_signature(  # noqa: PLR0913 - cohesive keyword-only resync inputs
+def write_and_resync(  # noqa: PLR0913 - cohesive keyword-only write inputs
     conn: sqlite3.Connection,
     file_id: int,
     path: Path,
+    target: dict[str, list[str]],
     *,
-    before_write: os.stat_result,
-    audio_proven: bool,
+    write: bool,
+    droppable_frames: frozenset[str],
     now: str,
-) -> None:
-    """Re-sync the files-row signature to *path*'s bytes after a tag write. Does not commit.
+) -> dict[str, list[str]]:
+    """Write *target* to *path* when *write* holds, then re-sync the ledger to the file's bytes.
 
-    The next incremental scan then sees the file as unchanged. A write that proved the decoded
-    audio unchanged also carries the fingerprint row to the new signature.
+    The live ``file_tags`` snapshot takes the re-read tags and the files-row signature the new
+    stat, so the next incremental scan sees the file as unchanged. A write that proved the
+    decoded audio unchanged also carries the fingerprint row to the new signature. Returns the
+    re-read tags. Does not commit.
     """
+    before_write = path.stat()
+    audio_proven = False
+    if write:
+        audio_proven = write_managed_tags(
+            path, target, droppable_frames=droppable_frames
+        ).audio_proven
+    fresh = read_tags(path).tags
+    store.replace_tags(conn, file_id, fresh, now)
     stat_result = path.stat()
     store.update_signature(
         conn,
@@ -266,6 +283,7 @@ def resync_signature(  # noqa: PLR0913 - cohesive keyword-only resync inputs
             before=(before_write.st_size, before_write.st_mtime_ns),
             after=(stat_result.st_size, stat_result.st_mtime_ns),
         )
+    return fresh
 
 
 def _revert_target_tags(
@@ -411,18 +429,14 @@ def _revert_file(  # noqa: PLR0913 - cohesive keyword-only per-file revert input
     # Disk write first, before the revert row: a write failure aborts with no row. A revert
     # that moves nothing skips the write, so it never rewrites the file.
     planned = _planned_revert(conn, target, current)
-    before_write = path.stat()
-    audio_proven = False
-    if compute_diff(current, planned):
-        audio_proven = write_managed_tags(
-            path, planned, droppable_frames=droppable_frames
-        ).audio_proven
-
-    # Refresh the live snapshot so file_tags reflects the actual on-disk state.
-    reverted_tags = read_tags(path).tags
-    store.replace_tags(conn, file_id, reverted_tags, now)
-    resync_signature(
-        conn, file_id, path, before_write=before_write, audio_proven=audio_proven, now=now
+    reverted_tags = write_and_resync(
+        conn,
+        file_id,
+        path,
+        planned,
+        write=bool(compute_diff(current, planned)),
+        droppable_frames=droppable_frames,
+        now=now,
     )
 
     # Append the revert (always, even on an empty diff).
@@ -477,7 +491,7 @@ def revert_tags(
     Every disk mutation is a commit (PLAN.md §7): the revert revision lands under a
     fresh single-file commit row, so it shows in ``list_commits`` and can itself be
     undone with :func:`revert_commit`. Refuses if the file has a pending staged change
-    (commit or unstage it first — a staged target computed against the pre-revert
+    (commit or unstage it first, since a staged target computed against the pre-revert
     state would silently override the revert at the next commit), or a staged path change,
     since a tag write replaces the file the move is about to carry.
 
@@ -558,11 +572,11 @@ def revert_tags(
     )
 
 
-# --- commit-level revert (group undo; PLAN.md §7 "reverting a whole commit_id") ------
+# --- commit-level revert (group undo, PLAN.md §7 "reverting a whole commit_id") ------
 
 
 # The two plan-pass kinds that go on to :func:`_revert_file`. A 'noop' file is still
-# processed (the revert revision is always appended) — only its reported status differs.
+# processed (the revert revision is always appended). Only its reported status differs.
 _PROCESSABLE_KINDS: Final = frozenset({"revertable", "noop"})
 
 
@@ -704,42 +718,13 @@ def revert_commit(
     :func:`tagmend.engine.covers.revert_cover_commit`, which sends each cover it created to the
     OS trash (:func:`tagmend.engine.trash.send_to_trash`) and writes each cover it removed again.
     A commit with no tag, path or cover row raises :class:`ValueError`, and so does *path* on a
-    tag or cover commit. The rest of this docstring describes a tag commit.
-
-    The group counterpart of :func:`revert_tags` (PLAN.md §7: "reverting a whole
-    ``commit_id`` undoes an entire run"). For each revision the target commit created,
-    the file is restored to the snapshot just before it (``version - 1``, the
-    baseline when the commit created version 1), appended as a new revision under ONE
-    fresh ``origin='revert'`` commit whose ``reverted_from`` records the undone
-    commit. History stays append-only: nothing is destroyed, and the revert commit can
-    itself be reverted.
-
-    Skip + report: a file changed again by a LATER commit or revert, or edited outside TagMend,
-    is skipped (status ``skipped_later_changes``), never silently rolled past. An outside edit
-    is recorded as a ``scan`` revision first. Revert it per-file if that is really wanted. A
-    drift-free ``scan`` re-baseline is not a change. Missing files are
-    reported, a per-file disk failure is recorded as ``error`` and the rest of the group
-    still completes.
+    tag or cover commit. A tag commit is undone by :func:`_revert_tag_commit`.
 
     Guards: the target must exist and not be ``status='applying'`` (run ``commit_tags``,
     ``commit_paths`` or ``commit_covers`` to recover an interrupted run first). ``interrupted``
     targets are allowed (reverts whatever they durably committed). The staging area, tag, path
     and cover rows alike, must be EMPTY: commit or unstage pending work before rolling back
-    (git's "commit or stash first").
-
-    A file already holding its pre-commit state is reported ``noop``: the revert revision
-    is still appended (revert is always audited), but it is not counted as ``reverted``,
-    so the summary never claims a change that did not happen.
-
-    *dry_run* returns the full per-file classification without touching anything
-    (``commit_id`` is ``None``, ``status='reverted'`` means "would be reverted",
-    ``noop`` means "would change nothing"). The preview reads each planned file from disk
-    to tell those two apart.
-
-    Crash recovery is resume-free, like ``commit_tags``: just run it again. Files
-    already reverted by the crashed run now have a later revision and report as
-    ``skipped_later_changes``, so nothing is double-reverted. Owns its transactions
-    (per-file durability, mirroring the commit loop).
+    (git's "commit or stash first"). Owns its connection.
     """
     connection = db.connect(settings.db_path)
     try:
@@ -761,105 +746,158 @@ def revert_commit(
                 trash=trash.send_to_trash,
             )
         _require_tag_commit(commit_id, logs, path)
+        return _revert_tag_commit(connection, settings, commit_id, note=note, dry_run=dry_run)
+    finally:
+        connection.close()
 
-        # Plan pass (read-only): classify every file the target commit changed.
-        planned: list[tuple[Revision, str]] = [
-            (revision, _classify_for_revert(connection, revision))
-            for revision in store.revisions_for_commit(connection, commit_id)
+
+def _revert_tag_commit(
+    connection: sqlite3.Connection,
+    settings: Settings,
+    commit_id: int,
+    *,
+    note: str | None,
+    dry_run: bool,
+) -> commits.RevertCommitResult:
+    """Undo the tag commit *commit_id* on the caller's open *connection*, which it never closes.
+
+    The group counterpart of :func:`revert_tags` (PLAN.md §7: "reverting a whole
+    ``commit_id`` undoes an entire run"). For each revision the target commit created,
+    the file is restored to the snapshot just before it (``version - 1``, the
+    baseline when the commit created version 1), appended as a new revision under ONE
+    fresh ``origin='revert'`` commit whose ``reverted_from`` records the undone
+    commit. History stays append-only: nothing is destroyed, and the revert commit can
+    itself be reverted.
+
+    Skip + report: a file changed again by a LATER commit or revert, or edited outside TagMend,
+    is skipped (status ``skipped_later_changes``), never silently rolled past. Both are checked
+    in the plan pass and again just before the file is written. An outside edit is recorded as a
+    ``scan`` revision first. Revert it per-file if that is really wanted. A drift-free ``scan``
+    re-baseline is not a change. Missing files are reported, a per-file disk failure is
+    recorded as ``error`` and the rest of the group still completes.
+
+    A file already holding its pre-commit state is reported ``noop``: the revert revision
+    is still appended (revert is always audited), but it is not counted as ``reverted``,
+    so the summary never claims a change that did not happen.
+
+    *dry_run* returns the full per-file classification without touching anything
+    (``commit_id`` is ``None``, ``status='reverted'`` means "would be reverted",
+    ``noop`` means "would change nothing"). The preview reads each planned file from disk
+    to tell those two apart.
+
+    Crash recovery is resume-free, like ``commit_tags``: just run it again. Files
+    already reverted by the crashed run now have a later revision and report as
+    ``skipped_later_changes``, so nothing is double-reverted. Commits per file, mirroring the
+    commit loop.
+    """
+    # Plan pass (read-only): classify every file the target commit changed.
+    planned: list[tuple[Revision, str]] = [
+        (revision, _classify_for_revert(connection, revision))
+        for revision in store.revisions_for_commit(connection, commit_id)
+    ]
+    processable = [revision for revision, kind in planned if kind in _PROCESSABLE_KINDS]
+
+    if dry_run or not processable:
+        outcomes = [
+            commits.FileRevertOutcome(
+                file_id=revision.file_id,
+                target_version=revision.version - 1 if kind in _PROCESSABLE_KINDS else None,
+                new_version=None,
+                status="reverted" if kind == "revertable" else kind,
+            )
+            for revision, kind in planned
         ]
-        processable = [revision for revision, kind in planned if kind in _PROCESSABLE_KINDS]
+        return commits.summarize_revert(
+            commit_id=None,
+            reverted_from=commit_id,
+            dry_run=dry_run,
+            outcomes=outcomes,
+        )
 
-        if dry_run or not processable:
-            outcomes = [
+    new_commit = commits.create_commit(
+        connection,
+        origin="revert",
+        message=note,
+        now=clock.utc_now(),
+        reverted_from=commit_id,
+    )
+    connection.commit()  # commit row durable before any per-file work
+
+    outcomes = []
+    for revision, kind in planned:
+        if kind not in _PROCESSABLE_KINDS:
+            outcomes.append(
                 commits.FileRevertOutcome(
                     file_id=revision.file_id,
-                    target_version=revision.version - 1 if kind in _PROCESSABLE_KINDS else None,
+                    target_version=None,
                     new_version=None,
-                    status="reverted" if kind == "revertable" else kind,
-                )
-                for revision, kind in planned
-            ]
-            return commits.summarize_revert(
-                commit_id=None,
-                reverted_from=commit_id,
-                dry_run=dry_run,
-                outcomes=outcomes,
+                    status=kind,
+                ),
             )
-
-        new_commit = commits.create_commit(
-            connection,
-            origin="revert",
-            message=note,
-            now=clock.utc_now(),
-            reverted_from=commit_id,
-        )
-        connection.commit()  # commit row durable before any per-file work
-
-        outcomes = []
-        for revision, kind in planned:
-            if kind not in _PROCESSABLE_KINDS:
+            continue
+        # A later commit landing after the plan pass is skipped too. This runs before
+        # _observe_durably, whose re-baseline would count as a later revision.
+        if not _no_later_changes(connection, revision.file_id, revision.version):
+            outcomes.append(
+                commits.FileRevertOutcome(
+                    file_id=revision.file_id,
+                    target_version=None,
+                    new_version=None,
+                    status="skipped_later_changes",
+                ),
+            )
+            continue
+        try:
+            restored, file_path = _revert_plan(connection, revision.file_id, revision.version - 1)
+            # An external edit landing after the plan pass is kept and skipped the same way.
+            if _observe_durably(connection, restored, file_path):
                 outcomes.append(
                     commits.FileRevertOutcome(
                         file_id=revision.file_id,
                         target_version=None,
                         new_version=None,
-                        status=kind,
+                        status="skipped_later_changes",
                     ),
                 )
                 continue
-            try:
-                restored, path = _revert_plan(connection, revision.file_id, revision.version - 1)
-                # An external edit landing after the plan pass is kept and skipped the same way.
-                if _observe_durably(connection, restored, path):
-                    outcomes.append(
-                        commits.FileRevertOutcome(
-                            file_id=revision.file_id,
-                            target_version=None,
-                            new_version=None,
-                            status="skipped_later_changes",
-                        ),
-                    )
-                    continue
-                new_version, changed = _revert_file(
-                    connection,
-                    revision.file_id,
-                    revision.version - 1,
-                    note=note,
-                    commit_id=new_commit,
-                    droppable_frames=frozenset(settings.id3_droppable_frames),
-                )
-                connection.commit()  # disk already done inside; revision now durable
-            except (OSError, ValueError, mutagen.MutagenError) as exc:  # type: ignore[attr-defined]
-                connection.rollback()
-                logger.warning(
-                    "revert_commit %d: file_id=%d failed: %s",
-                    commit_id,
-                    revision.file_id,
-                    exc,
-                )
-                outcomes.append(
-                    commits.FileRevertOutcome(
-                        file_id=revision.file_id,
-                        target_version=revision.version - 1,
-                        new_version=None,
-                        status="error",
-                        detail=str(exc),
-                    ),
-                )
-                continue
+            new_version, changed = _revert_file(
+                connection,
+                revision.file_id,
+                revision.version - 1,
+                note=note,
+                commit_id=new_commit,
+                droppable_frames=frozenset(settings.id3_droppable_frames),
+            )
+            connection.commit()  # the disk write is done, so the revision is now durable
+        except TAG_FILE_ERRORS as exc:
+            connection.rollback()
+            logger.warning(
+                "revert_commit %d: file_id=%d failed: %s",
+                commit_id,
+                revision.file_id,
+                exc,
+            )
             outcomes.append(
                 commits.FileRevertOutcome(
                     file_id=revision.file_id,
                     target_version=revision.version - 1,
-                    new_version=new_version,
-                    status="reverted" if changed else "noop",
+                    new_version=None,
+                    status="error",
+                    detail=str(exc),
                 ),
             )
+            continue
+        outcomes.append(
+            commits.FileRevertOutcome(
+                file_id=revision.file_id,
+                target_version=revision.version - 1,
+                new_version=new_version,
+                status="reverted" if changed else "noop",
+            ),
+        )
 
-        commits.set_commit_status(connection, new_commit, "applied")
-        connection.commit()
-    finally:
-        connection.close()
+    commits.set_commit_status(connection, new_commit, "applied")
+    connection.commit()
 
     result = commits.summarize_revert(
         commit_id=new_commit,

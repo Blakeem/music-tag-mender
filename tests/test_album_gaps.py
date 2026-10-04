@@ -792,6 +792,28 @@ def test_a_blank_file_the_writer_cannot_verify_is_counted_never_proposed(
     assert "1 file(s) get no proposal" in report.summary
 
 
+def test_a_file_deleted_outside_tagmend_is_no_sibling_witness(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    folder = music_dir / "Band" / "Album"
+    make_track(folder / "a.mp3", {"artist": ["Band"], "title": ["A"]})
+    make_track(folder / "b.mp3", {"artist": ["Band"], "album": ["Paranoid"]})
+    make_track(folder / "c.mp3", {"artist": ["Band"], "album": ["Paranoid"]})
+    scan_library(engine_settings)
+    (folder / "b.mp3").unlink()
+    (folder / "c.mp3").unlink()
+    scan_library(engine_settings)
+
+    report = detect_album_gaps(engine_settings, use_musicbrainz=False)
+
+    assert report.total_files == 1
+    assert report.green == 0
+    group = _group_for(report, folder)
+    assert group is not None
+    assert group.sibling_histogram == {}
+
+
 # --- MCP wiring ----------------------------------------------------------------------
 
 

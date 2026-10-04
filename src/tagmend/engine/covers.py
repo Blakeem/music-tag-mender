@@ -163,8 +163,8 @@ class CoverGapsReport(FieldDict):
 
 
 @dataclass(frozen=True, slots=True)
-class _Track:
-    """One present file reduced to what the cover rules read."""
+class AlbumTrack:
+    """One present file reduced to what the album grouping and the cover rules read."""
 
     file_id: int
     folder: str
@@ -188,7 +188,7 @@ class _Library:
     folder_keys: tuple[str, ...]
 
 
-def _load_tracks(conn: sqlite3.Connection, music_path: Path) -> list[_Track]:
+def load_album_tracks(conn: sqlite3.Connection, music_path: Path) -> list[AlbumTrack]:
     """Read every present file under ``music_path`` and the tags the album identity compares.
 
     The files come in file id order. A row left under an earlier ``music_path`` is skipped,
@@ -196,7 +196,7 @@ def _load_tracks(conn: sqlite3.Connection, music_path: Path) -> list[_Track]:
     """
     music_key = path_keys.path_key(music_path)
     tag_values = store.load_tag_values(conn, _FIELDS)
-    tracks: list[_Track] = []
+    tracks: list[AlbumTrack] = []
     for row in store.list_files(conn):
         if row.is_missing or not path_keys.is_within(path_keys.path_key(row.folder), music_key):
             continue
@@ -211,7 +211,7 @@ def _load_tracks(conn: sqlite3.Connection, music_path: Path) -> list[_Track]:
             release_date(values, row.filename),
         )
         tracks.append(
-            _Track(
+            AlbumTrack(
                 file_id=row.id,
                 folder=row.folder,
                 folder_key=path_keys.path_key(row.folder),
@@ -225,7 +225,7 @@ def _load_tracks(conn: sqlite3.Connection, music_path: Path) -> list[_Track]:
     return tracks
 
 
-def _index_library(music_path: Path, tracks: list[_Track]) -> _Library:
+def _index_library(music_path: Path, tracks: list[AlbumTrack]) -> _Library:
     """Return the identities of the present audio in each folder."""
     grouped = group_by_key(tracks, lambda track: track.folder_key)
     identities = {key: frozenset(t.identity for t in members) for key, members in grouped.items()}
@@ -283,6 +283,11 @@ def _is_cover_name(name: str) -> bool:
     return any(fnmatch.fnmatchcase(name.lower(), pattern) for pattern in COVER_PATTERNS)
 
 
+def cover_images_in(folder: str) -> list[str]:
+    """Return the names of the images directly in *folder* that Navidrome reads as a cover."""
+    return [name for name in _direct_images(folder) if _is_cover_name(name)]
+
+
 def _covered_by_file(library: _Library, folders: tuple[str, ...], keys: frozenset[str]) -> bool:
     """Whether a cover image sits in one of *folders*, or in the parent Navidrome also reads."""
     images = {folder: _direct_images(folder) for folder in folders}
@@ -297,7 +302,7 @@ def _covered_by_file(library: _Library, folders: tuple[str, ...], keys: frozense
     return any(_is_cover_name(name) for name in _direct_images(parent))
 
 
-def _covered_by_picture(members: list[_Track]) -> bool:
+def _covered_by_picture(members: list[AlbumTrack]) -> bool:
     """Whether any of *members* embeds a picture, probed in file id order up to the first hit."""
     for track in members:
         path = Path(track.folder) / track.filename
@@ -355,7 +360,7 @@ def _images_under(target: str | None) -> tuple[str, ...]:
     )
 
 
-def _plan_album(settings: Settings, library: _Library, members: list[_Track]) -> AlbumCover:
+def _plan_album(settings: Settings, library: _Library, members: list[AlbumTrack]) -> AlbumCover:
     """Return the cover status of the album whose present files are *members*, in id order."""
     # Input
     first = members[0]
@@ -400,7 +405,7 @@ def plan_album_covers(
     parent rules still read the whole library. Raises :class:`ValueError` without ``music_path``.
     """
     music_path = require_music_path(settings)
-    tracks = _load_tracks(conn, music_path)
+    tracks = load_album_tracks(conn, music_path)
     library = _index_library(music_path, tracks)
 
     albums = group_by_key(tracks, lambda track: track.identity)
@@ -879,7 +884,7 @@ def _target_taken(folder: str, name: str) -> bool:
 
 def _shows_cover(folder: str) -> bool:
     """Whether *folder* holds an image Navidrome reads as an album cover."""
-    return any(_is_cover_name(name) for name in _direct_images(folder))
+    return bool(cover_images_in(folder))
 
 
 def _place(music_path: Path, album: AlbumCover, picked: _Source | _Skip) -> _Pick | _Skip:

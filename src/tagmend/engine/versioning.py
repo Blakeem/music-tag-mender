@@ -40,17 +40,19 @@ from typing import TYPE_CHECKING, Final
 import mutagen
 
 from tagmend.engine import (
-    acoustid,
     clock,
     commits,
     covers,
     db,
     ledger_lock,
     paths,
+    pictures,
+    resync,
     schema,
     store,
     trash,
 )
+from tagmend.engine.resync import TAG_FILE_ERRORS
 from tagmend.engine.serialize import FieldDict
 from tagmend.engine.tags import (
     MANAGED_SET_VERSION,
@@ -69,13 +71,6 @@ if TYPE_CHECKING:
     from tagmend.engine.store import Revision
 
 logger = get_logger(__name__)
-
-# A locked, read-only or unreadable file, or a write the verifier refuses, fails that file alone.
-TAG_FILE_ERRORS: Final[tuple[type[Exception], ...]] = (
-    OSError,
-    ValueError,
-    mutagen.MutagenError,  # type: ignore[attr-defined]
-)
 
 
 def managed_subset(tags: dict[str, list[str]]) -> dict[str, list[str]]:
@@ -266,10 +261,8 @@ def write_and_resync(  # noqa: PLR0913 - cohesive keyword-only write inputs
 ) -> dict[str, list[str]]:
     """Write *target* to *path* when *write* holds, then re-sync the ledger to the file's bytes.
 
-    The live ``file_tags`` snapshot takes the re-read tags and the files-row signature the new
-    stat, so the next incremental scan sees the file as unchanged. A write that proved the
-    decoded audio unchanged also carries the fingerprint row to the new signature. Returns the
-    re-read tags. Does not commit.
+    :func:`tagmend.engine.resync.resync_snapshot` does the re-sync. Returns the re-read tags.
+    Does not commit.
     """
     before_write = path.stat()
     audio_proven = False
@@ -277,24 +270,14 @@ def write_and_resync(  # noqa: PLR0913 - cohesive keyword-only write inputs
         audio_proven = write_managed_tags(
             path, target, droppable_frames=droppable_frames
         ).audio_proven
-    fresh = read_tags(path).tags
-    store.replace_tags(conn, file_id, fresh, now)
-    stat_result = path.stat()
-    store.update_signature(
+    return resync.resync_snapshot(
         conn,
         file_id,
-        size_bytes=stat_result.st_size,
-        mtime_ns=stat_result.st_mtime_ns,
+        path,
+        before=(before_write.st_size, before_write.st_mtime_ns),
+        audio_proven=audio_proven,
         now=now,
     )
-    if audio_proven:
-        acoustid.rekey_fingerprint(
-            conn,
-            file_id,
-            before=(before_write.st_size, before_write.st_mtime_ns),
-            after=(stat_result.st_size, stat_result.st_mtime_ns),
-        )
-    return fresh
 
 
 def _revert_target_tags(
@@ -701,7 +684,9 @@ def _require_tag_commit(
 ) -> None:
     """Refuse a commit holding no tag log row, and a *path* scope, which only a path commit has."""
     if "tag_revisions" not in logs:
-        message = f"commit {commit_id} holds no change in the tag, path or cover log to revert"
+        message = (
+            f"commit {commit_id} holds no change in the tag, path, cover or picture log to revert"
+        )
         raise ValueError(message)
     if path is not None:
         message = (
@@ -720,18 +705,24 @@ def _require_revertable(conn: sqlite3.Connection, commit_id: int) -> None:
     if target.status == "applying":
         message = (
             f"commit {commit_id} is still applying (interrupted run?) - "
-            "run commit_tags, commit_paths or commit_covers to recover, then retry"
+            "run commit_tags, commit_paths, commit_covers or commit_pictures to recover, "
+            "then retry"
         )
         raise ValueError(message)
     if store.any_staged(conn):
         raise ValueError(paths.STAGING_NOT_EMPTY)
 
 
-def _require_whole_cover_commit(commit_id: int, path: str | os.PathLike[str] | None) -> None:
-    """Refuse a *path* scope on a cover commit, since only a path commit has one."""
+def _require_whole_commit(
+    commit_id: int,
+    path: str | os.PathLike[str] | None,
+    *,
+    changed: str,
+) -> None:
+    """Refuse a *path* scope on a cover or picture commit, since only a path commit has one."""
     if path is not None:
         message = (
-            f"commit {commit_id} wrote covers, and path= selects the files of a path commit "
+            f"commit {commit_id} {changed}, and path= selects the files of a path commit "
             "only. Revert it whole"
         )
         raise ValueError(message)
@@ -754,14 +745,17 @@ def revert_commit(
     at or under it now. A commit whose rows sit in ``cover_writes`` is undone by
     :func:`tagmend.engine.covers.revert_cover_commit`, which sends each cover it created to the
     OS trash (:func:`tagmend.engine.trash.send_to_trash`) and writes each cover it removed again.
-    A commit with no tag, path or cover row raises :class:`ValueError`, and so does *path* on a
-    tag or cover commit. A tag commit is undone by :func:`_revert_tag_commit`.
+    A commit whose rows sit in ``picture_writes`` is undone by
+    :func:`tagmend.engine.pictures.revert_picture_commit`, which writes each embedded picture it
+    removed back into its file and removes each one it restored. A commit with no tag, path,
+    cover or picture row raises :class:`ValueError`, and so does *path* on a tag, cover or
+    picture commit. A tag commit is undone by :func:`_revert_tag_commit`.
 
     Guards: the target must exist and not be ``status='applying'`` (run ``commit_tags``,
-    ``commit_paths`` or ``commit_covers`` to recover an interrupted run first). ``interrupted``
-    targets are allowed (reverts whatever they durably committed). The staging area, tag, path
-    and cover rows alike, must be EMPTY: commit or unstage pending work before rolling back
-    (git's "commit or stash first"). Owns its connection.
+    ``commit_paths``, ``commit_covers`` or ``commit_pictures`` to recover an interrupted run
+    first). ``interrupted`` targets are allowed (reverts whatever they durably committed). The
+    staging area, tag, path, cover and picture rows alike, must be EMPTY: commit or unstage
+    pending work before rolling back (git's "commit or stash first"). Owns its connection.
     """
     connection = db.connect(settings.db_path)
     try:
@@ -773,7 +767,7 @@ def revert_commit(
                 connection, settings, commit_id, note=note, dry_run=dry_run, path=path
             )
         if "cover_writes" in logs:
-            _require_whole_cover_commit(commit_id, path)
+            _require_whole_commit(commit_id, path, changed="wrote covers")
             return covers.revert_cover_commit(
                 connection,
                 settings,
@@ -781,6 +775,11 @@ def revert_commit(
                 note=note,
                 dry_run=dry_run,
                 trash=trash.send_to_trash,
+            )
+        if "picture_writes" in logs:
+            _require_whole_commit(commit_id, path, changed="changed embedded pictures")
+            return pictures.revert_picture_commit(
+                connection, settings, commit_id, note=note, dry_run=dry_run
             )
         _require_tag_commit(commit_id, logs, path)
         return _revert_tag_commit(connection, settings, commit_id, note=note, dry_run=dry_run)

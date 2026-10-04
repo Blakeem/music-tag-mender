@@ -154,9 +154,9 @@ def _check_database(db_path: Path) -> Check:
 def _check_interrupted_commits(db_path: Path) -> Check:
     """Report any commit left ``applying`` by a crash. Informational, it never fails the report.
 
-    A lingering ``applying`` commit is recovered by running ``commit_tags``, ``commit_paths`` or
-    ``commit_covers`` again, or the interrupted revert again (the resume-free model), so this is a
-    hint, not a readiness blocker.
+    A lingering ``applying`` commit is recovered by running ``commit_tags``, ``commit_paths``,
+    ``commit_covers`` or ``commit_pictures`` again, or the interrupted revert again (the
+    resume-free model), so this is a hint, not a readiness blocker.
     An ``applying`` commit while another holder has the mutation lock is still running, so it
     gets no advice. It always reports ``ok=True``. Real ledger problems are caught by
     :func:`_check_database`.
@@ -189,8 +189,9 @@ def _check_interrupted_commits(db_path: Path) -> Check:
         name=name,
         ok=True,
         detail=(
-            f"{len(interrupted)} interrupted run(s) ({ids}). Run commit_tags, commit_paths or "
-            "commit_covers to recover, or rerun an interrupted revert_tags or revert_commit"
+            f"{len(interrupted)} interrupted run(s) ({ids}). Run commit_tags, commit_paths, "
+            "commit_covers or commit_pictures to recover, or rerun an interrupted revert_tags or "
+            "revert_commit"
         ),
     )
 

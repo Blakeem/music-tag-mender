@@ -29,7 +29,7 @@ def test_apply_schema_stamps_current_version(db_conn: sqlite3.Connection) -> Non
     # db_conn already applied the schema; the stamp must match the constant the code ships.
     version = db_conn.execute("PRAGMA user_version").fetchone()[0]
     assert version == SCHEMA_VERSION
-    assert SCHEMA_VERSION == 30
+    assert SCHEMA_VERSION == 33
 
 
 def test_apply_schema_creates_genre_tables(db_conn: sqlite3.Connection) -> None:
@@ -1911,5 +1911,133 @@ def test_v29_cache_rows_keep_their_other_columns_when_the_unread_ones_drop() -> 
         ]
         recording = conn.execute("SELECT * FROM musicbrainz_recording_cache").fetchall()
         assert recording == [("rec-k", 1, "Paranoid", "2026-10-03T00:00:00+00:00")]
+    finally:
+        conn.close()
+
+
+def test_v30_ledger_gains_file_pictures_keeping_its_files() -> None:
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.execute("PRAGMA foreign_keys=ON")
+        apply_schema(conn)
+        file_id = _insert_file(conn)
+        conn.execute("DROP INDEX idx_file_pictures_sha256")
+        conn.execute("DROP TABLE file_pictures")
+        conn.execute("PRAGMA user_version = 30")
+        conn.commit()
+
+        apply_schema(conn)  # the in-place upgrade
+
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        assert _columns(conn, "file_pictures") == [
+            "file_id",
+            "ordinal",
+            "picture_type",
+            "mime",
+            "description",
+            "size_bytes",
+            "sha256",
+        ]
+        indexes = {str(row[1]) for row in conn.execute("PRAGMA index_list(file_pictures)")}
+        assert "idx_file_pictures_sha256" in indexes
+        assert conn.execute("SELECT id FROM files").fetchall() == [(file_id,)]
+        conn.execute(
+            "INSERT INTO file_pictures VALUES (?, 0, 3, 'image/jpeg', '', 4, 'abc')",
+            (file_id,),
+        )
+        conn.execute("DELETE FROM files WHERE id = ?", (file_id,))
+        assert conn.execute("SELECT COUNT(*) FROM file_pictures").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_v31_ledger_gains_picture_writes_staged_keeping_its_files() -> None:
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.execute("PRAGMA foreign_keys=ON")
+        apply_schema(conn)
+        file_id = _insert_file(conn)
+        conn.execute("DROP TABLE picture_writes_staged")
+        conn.execute("PRAGMA user_version = 31")
+        conn.commit()
+
+        apply_schema(conn)  # the in-place upgrade
+
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        assert _columns(conn, "picture_writes_staged") == [
+            "file_id",
+            "sha256",
+            "ordinal",
+            "picture_type",
+            "mime",
+            "description",
+            "attributes",
+            "content",
+            "size_bytes",
+            "origin",
+            "note",
+            "staged_at",
+        ]
+        assert conn.execute("SELECT id FROM files").fetchall() == [(file_id,)]
+        conn.execute(
+            "INSERT INTO picture_writes_staged VALUES "
+            "(?, 'abc', 0, 3, 'image/jpeg', '', '{}', x'00', 1, 'manual', NULL, 'now')",
+            (file_id,),
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="UNIQUE"):
+            conn.execute(
+                "INSERT INTO picture_writes_staged VALUES "
+                "(?, 'abc', 1, 3, 'image/jpeg', '', '{}', x'00', 1, 'manual', NULL, 'now')",
+                (file_id,),
+            )
+    finally:
+        conn.close()
+
+
+_INSERT_PICTURE_WRITE = (
+    "INSERT INTO picture_writes (commit_id, created_at, origin, action, file_id, version, path, "
+    "sha256, ordinal, mime, description, attributes, content, size_bytes) "
+    "VALUES (1, 'now', 'manual', ?, ?, ?, '/lib/a.flac', 'abc', 0, 'image/jpeg', '', '{}', "
+    "x'00', 1)"
+)
+
+
+def test_v32_ledger_gains_the_append_only_picture_writes_keeping_its_files() -> None:
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.execute("PRAGMA foreign_keys=ON")
+        apply_schema(conn)
+        file_id = _insert_file(conn)
+        conn.execute("DROP TABLE picture_writes")
+        conn.execute("PRAGMA user_version = 32")
+        conn.commit()
+        assert "picture_writes" not in _table_names(conn)
+
+        apply_schema(conn)  # the in-place upgrade
+
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        assert conn.execute("SELECT id FROM files").fetchall() == [(file_id,)]
+        assert {
+            "idx_picture_writes_commit_id",
+            "idx_picture_writes_file_id_version",
+        } <= _schema_objects(conn, "index")
+        assert {"picture_writes_no_update", "picture_writes_no_delete"} <= _schema_objects(
+            conn, "trigger"
+        )
+        conn.execute(
+            "INSERT INTO commits (created_at, origin, status) VALUES ('now', 'manual', 'applied')"
+        )
+        conn.execute(_INSERT_PICTURE_WRITE, ("remove", file_id, 1))
+        with pytest.raises(sqlite3.IntegrityError, match="UNIQUE"):
+            conn.execute(_INSERT_PICTURE_WRITE, ("restore", file_id, 1))
+        with pytest.raises(sqlite3.IntegrityError, match="CHECK"):
+            conn.execute(_INSERT_PICTURE_WRITE, ("rename", file_id, 2))
+        with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+            conn.execute("UPDATE picture_writes SET note = 'rewritten'")
+        with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+            conn.execute("DELETE FROM files WHERE id = ?", (file_id,))
+        assert conn.execute("SELECT action, version FROM picture_writes").fetchall() == [
+            ("remove", 1),
+        ]
     finally:
         conn.close()

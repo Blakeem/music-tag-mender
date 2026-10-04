@@ -725,7 +725,7 @@ def test_error_envelope_lets_a_bug_raise(monkeypatch: pytest.MonkeyPatch) -> Non
 def test_every_tool_is_enveloped() -> None:
     tools = mcp_server.mcp._tool_manager.list_tools()
 
-    assert len(tools) == 51
+    assert len(tools) == 56
     assert [tool.name for tool in tools if not hasattr(tool.fn, "__wrapped__")] == []
 
 
@@ -793,11 +793,13 @@ _NEGATIVE_LIMIT_CALLS = [
     ("detect_album_conflicts", {"limit": -1}),
     ("detect_album_gaps", {"limit": -1}),
     ("detect_cover_gaps", {"limit": -1}),
+    ("detect_picture_duplicates", {"limit": -1}),
     ("detect_release_disagreements", {"limit": -1}),
     ("detect_release_disagreements", {"release_limit": -1}),
     ("detect_year_disagreements", {"limit": -1}),
     ("detect_year_disagreements", {"release_limit": -1}),
     ("detect_path_deviations", {"limit": -1}),
+    ("diff_pictures", {"limit": -1}),
 ]
 
 

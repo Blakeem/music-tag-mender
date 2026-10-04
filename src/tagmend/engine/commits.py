@@ -10,10 +10,10 @@ is a tag edit or a file move:
 * the :class:`RevisionDomain` seam plus the one shared :func:`run_commit` loop that
   carries the delicate no-durable-write-before-the-disk-action crash invariant.
 
-It deliberately imports none of :mod:`tagmend.engine.staging`, :mod:`tagmend.engine.paths`
-and :mod:`tagmend.engine.versioning` (which import it back), so there is no import cycle: a
-concrete domain (``staging.TagDomain``, ``paths.PathDomain``) implements the Protocol and is
-passed in.
+It deliberately imports none of :mod:`tagmend.engine.staging`, :mod:`tagmend.engine.paths`,
+:mod:`tagmend.engine.pictures` and :mod:`tagmend.engine.versioning` (which import it back), so
+there is no import cycle. A concrete domain (``staging.TagDomain``, ``paths.PathDomain``,
+``pictures.PictureDomain``) implements the Protocol and is passed in.
 
 Like the rest of the data-access layer, the ``commits``-table functions take an open
 connection and **never commit**. The orchestrator owns the transaction. The one
@@ -307,7 +307,7 @@ def summarize_revert(
 
 
 class RevisionDomain(Protocol):
-    """A domain (tags | paths) the shared commit loop drives, one staged file at a time.
+    """A domain (tags | paths | pictures) the shared commit loop drives, one staged file at a time.
 
     Concrete, generics-free, SQL-name-free: a staged item is referenced only by its
     ``file_id`` and the domain reads its own payload. Not ``@runtime_checkable``, since it is

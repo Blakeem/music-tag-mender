@@ -13,6 +13,7 @@ rather than the dummy byte file ``temp_library`` produces.
 
 from __future__ import annotations
 
+import base64
 import logging
 import os
 import shutil
@@ -21,13 +22,15 @@ import struct
 import sys
 import wave
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import httpx
 import mutagen
 import pytest
 import send2trash
+from mutagen.flac import Picture
 from mutagen.id3 import APIC, ID3, RVAD, TIT2, TPE1  # type: ignore[attr-defined]
+from mutagen.mp4 import MP4Cover
 
 from tagmend import config
 from tagmend.config import Settings
@@ -143,6 +146,43 @@ def make_chunk_id3_track(dest: Path) -> Path:
     audio.tags.add(cover)
     audio.save()
     return dest
+
+
+# (picture type, mime, description, image bytes)
+type PictureImage = tuple[int, str, str, bytes]
+
+
+def _flac_picture(image: PictureImage) -> Any:
+    picture: Any = Picture()  # type: ignore[no-untyped-call]
+    picture.type, picture.mime, picture.desc, picture.data = image
+    return picture
+
+
+def vorbis_picture_value(image: PictureImage) -> str:
+    """Return *image* as an Ogg ``metadata_block_picture`` value."""
+    return base64.b64encode(_flac_picture(image).write()).decode("ascii")
+
+
+def embed_pictures(path: Path, images: Sequence[PictureImage]) -> None:
+    """Replace the pictures embedded in *path* with *images*, as its container stores each."""
+    audio: Any = mutagen.File(path)  # type: ignore[attr-defined]
+    if audio.tags is None:
+        audio.add_tags()
+    suffix = path.suffix.lower()
+    if suffix == ".mp3":
+        audio.tags.delall("APIC")
+        for kind, mime, desc, data in images:
+            audio.tags.add(APIC(encoding=3, mime=mime, type=kind, desc=desc, data=data))  # type: ignore[no-untyped-call]
+    elif suffix == ".flac":
+        audio.clear_pictures()
+        for image in images:
+            audio.add_picture(_flac_picture(image))
+    elif suffix == ".m4a":
+        formats = {"image/jpeg": MP4Cover.FORMAT_JPEG, "image/png": MP4Cover.FORMAT_PNG}
+        audio["covr"] = [MP4Cover(data, imageformat=formats[mime]) for _, mime, _, data in images]  # type: ignore[no-untyped-call]
+    else:
+        audio["metadata_block_picture"] = [vorbis_picture_value(image) for image in images]
+    audio.save()
 
 
 # The ways a user can type one folder. Upper case names the same folder only where the

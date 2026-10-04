@@ -347,6 +347,11 @@ _FILE_VIEW = library.FileView(
     song_source_release_track_mbid="track-1",
     mismatch_status="legit_ignore",
     mismatch_source_value={"covers": ["album"], "inputs": {"album": "Album"}},
+    pictures=(
+        library.PictureView(
+            ordinal=0, picture_type=3, mime="image/jpeg", size_bytes=4, sha256="abc"
+        ),
+    ),
 )
 _FILE_VIEW_DICT: dict[str, object] = {
     "file_id": 1,
@@ -369,6 +374,9 @@ _FILE_VIEW_DICT: dict[str, object] = {
     "song_source_release_track_mbid": "track-1",
     "mismatch_status": "legit_ignore",
     "mismatch_source_value": {"covers": ["album"], "inputs": {"album": "Album"}},
+    "pictures": [
+        {"ordinal": 0, "picture_type": 3, "mime": "image/jpeg", "size_bytes": 4, "sha256": "abc"},
+    ],
 }
 _ARTIST_ROW = library.ArtistRow(artist="Artist", file_count=3)
 _ARTIST_ROW_DICT: dict[str, object] = {"artist": "Artist", "file_count": 3}

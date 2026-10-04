@@ -43,6 +43,7 @@ from tagmend.engine import (
     db,
     ledger_lock,
     path_keys,
+    resync,
     schema,
     store,
     versioning,
@@ -203,7 +204,7 @@ class TagDomain:
     @property
     def per_file_errors(self) -> tuple[type[Exception], ...]:
         """A locked, read-only or unreadable file, or a refused write, touches no other file."""
-        return versioning.TAG_FILE_ERRORS
+        return resync.TAG_FILE_ERRORS
 
     def list_staged_file_ids(self, conn: sqlite3.Connection) -> list[int]:
         """Return every staged file id, in file_id order."""

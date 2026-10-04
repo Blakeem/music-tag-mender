@@ -6,14 +6,15 @@ The tables, by role:
   revision, staging and status tables reference. Its ``path_key`` is the path's identity key
   from :mod:`tagmend.engine.path_keys`. The UNIQUE index ``idx_files_path_key`` keeps one row per
   key. The column is nullable. A NULL key never collides, so every engine insert sets it.
-  ``file_tags`` holds the file's tag values, one row per value.
+  ``file_tags`` holds the file's tag values, one row per value. ``file_pictures`` holds the
+  file's embedded pictures, one row per picture with the image's SHA-256 and size but no bytes.
 * Change tracking, modelled on git: ``commits`` holds one row per commit with its status. The
   statuses are documented beside ``_COMMIT_STATUSES`` in :mod:`tagmend.engine.commits`.
   ``tag_revisions`` and ``path_revisions`` are the per-file histories, keyed
   ``(file_id, version)``. Version 0 is the baseline. ``reverted_to_version``, on
   ``tag_revisions``, ``path_revisions`` and ``path_revisions_staged``, holds the version a revert
-  restores. ``reverted_from``, on ``commits``, ``cover_writes`` and both sidecar tables, holds the
-  row a revert undid.
+  restores. ``reverted_from``, on ``commits``, ``cover_writes``, ``picture_writes`` and both sidecar
+  tables, holds the row a revert undid.
 * Staging, git's index: ``tag_revisions_staged`` and ``path_revisions_staged`` hold one pending
   target per file. Each row keeps the file's signature at stage time, which the commit checks.
 * Sidecars: ``sidecar_moves`` logs each non-audio file that moved with its album folder. Its rows
@@ -22,6 +23,10 @@ The tables, by role:
   by depth. ``sidecar_moves_staged`` holds the pending sidecar moves.
 * Covers: ``cover_writes_staged`` holds one pending cover image per album folder, bytes
   included. ``cover_writes`` logs each cover file a commit created or removed.
+* Pictures: ``picture_writes_staged`` holds one pending removal per file and embedded picture
+  SHA-256, the picture's bytes and attributes included. ``picture_writes`` logs each embedded
+  picture a commit removed or restored, with its bytes. Its ``version`` is a per-file sequence and
+  its ``path`` the file's absolute path at the write.
 * Axis status: ``file_genre_status``, ``file_artist_status``, ``file_year_status`` and
   ``file_song_status`` each hold at most one outcome row per file (:mod:`tagmend.engine.axis`).
   Each axis names its own two identity columns. ``file_mismatch_status`` holds one path decision
@@ -37,7 +42,8 @@ Every path in ``path_revisions``, ``path_revisions_staged``, ``sidecar_moves``,
 ``sidecar_moves_staged``, ``cover_writes`` and ``cover_writes_staged`` is relative to
 ``music_path``.
 
-``tag_revisions``, ``path_revisions``, ``sidecar_moves`` and ``cover_writes`` are append-only.
+``tag_revisions``, ``path_revisions``, ``sidecar_moves``, ``cover_writes`` and ``picture_writes``
+are append-only.
 :func:`apply_append_only_triggers` creates the triggers that abort an ``UPDATE`` or ``DELETE`` on
 them. It also creates one that aborts a ``tag_revisions`` insert with no ``managed_set``.
 
@@ -71,7 +77,7 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
-SCHEMA_VERSION: Final = 30
+SCHEMA_VERSION: Final = 33
 
 
 class LedgerSchemaError(RuntimeError):
@@ -112,6 +118,23 @@ CREATE TABLE IF NOT EXISTS file_tags (
 
 _FILE_TAGS_INDEX_DDL: Final = (
     "CREATE INDEX IF NOT EXISTS idx_file_tags_name_value ON file_tags(name, value)"
+)
+
+_FILE_PICTURES_DDL: Final = """
+CREATE TABLE IF NOT EXISTS file_pictures (
+  file_id      INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+  ordinal      INTEGER NOT NULL,
+  picture_type INTEGER,
+  mime         TEXT NOT NULL,
+  description  TEXT NOT NULL,
+  size_bytes   INTEGER NOT NULL,
+  sha256       TEXT NOT NULL,
+  PRIMARY KEY (file_id, ordinal)
+)
+"""
+
+_FILE_PICTURES_INDEX_DDL: Final = (
+    "CREATE INDEX IF NOT EXISTS idx_file_pictures_sha256 ON file_pictures(sha256)"
 )
 
 _COMMITS_DDL: Final = """
@@ -304,6 +327,59 @@ _COVER_DDL: Final = (
     "CREATE INDEX IF NOT EXISTS idx_cover_writes_path_key ON cover_writes(path_key)",
 )
 
+# The row keeps the picture's bytes and container attributes, since after a crash between the
+# write and its log it is the only copy of the removed picture.
+_PICTURE_WRITES_STAGED_DDL: Final = """
+CREATE TABLE IF NOT EXISTS picture_writes_staged (
+  file_id      INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+  sha256       TEXT NOT NULL,
+  ordinal      INTEGER NOT NULL,
+  picture_type INTEGER,
+  mime         TEXT NOT NULL,
+  description  TEXT NOT NULL,
+  attributes   TEXT NOT NULL,
+  content      BLOB NOT NULL,
+  size_bytes   INTEGER NOT NULL,
+  origin       TEXT NOT NULL,
+  note         TEXT,
+  staged_at    TEXT NOT NULL,
+  PRIMARY KEY (file_id, sha256)
+)
+"""
+
+# Every row keeps its picture's bytes and attributes, so a revert can write a removed picture back.
+_PICTURE_WRITES_DDL: Final = """
+CREATE TABLE IF NOT EXISTS picture_writes (
+  id            INTEGER PRIMARY KEY,
+  commit_id     INTEGER NOT NULL REFERENCES commits(id),
+  created_at    TEXT NOT NULL,
+  origin        TEXT NOT NULL,
+  action        TEXT NOT NULL CHECK (action IN ('remove', 'restore')),
+  reverted_from INTEGER REFERENCES picture_writes(id),
+  file_id       INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+  version       INTEGER NOT NULL,
+  path          TEXT NOT NULL,
+  sha256        TEXT NOT NULL,
+  ordinal       INTEGER NOT NULL,
+  picture_type  INTEGER,
+  mime          TEXT NOT NULL,
+  description   TEXT NOT NULL,
+  attributes    TEXT NOT NULL,
+  content       BLOB NOT NULL,
+  size_bytes    INTEGER NOT NULL,
+  note          TEXT
+)
+"""
+
+# Each table precedes its indexes. The unique index also serves the lookups by file.
+_PICTURE_DDL: Final = (
+    _PICTURE_WRITES_STAGED_DDL,
+    _PICTURE_WRITES_DDL,
+    "CREATE INDEX IF NOT EXISTS idx_picture_writes_commit_id ON picture_writes(commit_id)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_picture_writes_file_id_version "
+    "ON picture_writes(file_id, version)",
+)
+
 # ``found = 0`` means Last.fm lacks the artist or album, unlike a found row with no tags.
 # ``tags`` holds JSON ``[name, weight]`` pairs, ``[]`` when there are none. See PLAN.md §8.
 _LASTFM_CACHE_DDL: Final = """
@@ -478,7 +554,13 @@ _REVISIONS_COMMIT_INDEX_DDL: Final = (
     "CREATE INDEX IF NOT EXISTS idx_path_revisions_commit_id ON path_revisions(commit_id)",
 )
 
-_APPEND_ONLY_LOGS: Final = ("tag_revisions", "path_revisions", "sidecar_moves", "cover_writes")
+_APPEND_ONLY_LOGS: Final = (
+    "tag_revisions",
+    "path_revisions",
+    "sidecar_moves",
+    "cover_writes",
+    "picture_writes",
+)
 
 # Revert reads an omitted tag by the revision's managed set, so a NULL would silently change
 # what a revert deletes. SQLite cannot add NOT NULL to an existing column, so a trigger does.
@@ -1172,6 +1254,8 @@ def apply_schema(connection: sqlite3.Connection) -> None:
     connection.execute(_FILES_PATH_KEY_INDEX_DDL)
     connection.execute(_FILE_TAGS_DDL)
     connection.execute(_FILE_TAGS_INDEX_DDL)
+    connection.execute(_FILE_PICTURES_DDL)
+    connection.execute(_FILE_PICTURES_INDEX_DDL)
     connection.execute(_COMMITS_DDL)
     connection.execute(_TAG_REVISIONS_DDL)
     connection.execute(_PATH_REVISIONS_DDL)
@@ -1192,7 +1276,7 @@ def apply_schema(connection: sqlite3.Connection) -> None:
     connection.execute(_FINGERPRINT_CACHE_DDL)
     connection.execute(_ACOUSTID_CACHE_DDL)
     connection.execute(_COVERART_CACHE_DDL)
-    for ddl in (*_SIDECAR_DDL, *_COVER_DDL, *_REVISIONS_COMMIT_INDEX_DDL):
+    for ddl in (*_SIDECAR_DDL, *_COVER_DDL, *_REVISIONS_COMMIT_INDEX_DDL, *_PICTURE_DDL):
         connection.execute(ddl)
     apply_append_only_triggers(connection)
     connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")

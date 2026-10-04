@@ -36,7 +36,7 @@ from tagmend.engine import (
     years,
 )
 from tagmend.engine.serialize import FieldDict
-from tagmend.engine.tags import TAG_READER_VERSION, read_tags
+from tagmend.engine.tags import TAG_READER_VERSION, read_pictures, read_tags
 from tagmend.engine.validation import check_limit, require_choice, require_music_path
 from tagmend.log import get_logger
 
@@ -47,6 +47,17 @@ if TYPE_CHECKING:
     from tagmend.config import Settings
 
 logger = get_logger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class PictureView(FieldDict):
+    """One picture embedded in a file, as the snapshot recorded it at the last tag read."""
+
+    ordinal: int
+    picture_type: int | None
+    mime: str
+    size_bytes: int
+    sha256: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,6 +87,7 @@ class FileView(FieldDict):
     song_source_release_track_mbid: str | None = None
     mismatch_status: str = "pending"
     mismatch_source_value: dict[str, object] | None = None  # the decision's snapshot
+    pictures: tuple[PictureView, ...] = ()
 
 
 def _axis_view(
@@ -129,6 +141,16 @@ def _to_view(
         conn, axis.SONG_AXIS, row.id
     )
     mismatch_status, mismatch_source = _mismatch_view(mismatch_state)
+    pictures = tuple(
+        PictureView(
+            ordinal=picture.ordinal,
+            picture_type=picture.picture_type,
+            mime=picture.mime,
+            size_bytes=picture.size_bytes,
+            sha256=picture.sha256,
+        )
+        for picture in store.get_pictures(conn, row.id)
+    )
     return FileView(
         file_id=row.id,
         folder=row.folder,
@@ -150,6 +172,7 @@ def _to_view(
         song_source_release_track_mbid=song_release_track_mbid,
         mismatch_status=mismatch_status,
         mismatch_source_value=mismatch_source,
+        pictures=pictures,
     )
 
 
@@ -718,7 +741,7 @@ def _try_read_and_store(
     *,
     current: dict[str, list[str]] | None,
 ) -> None:
-    """Read tags from disk and persist them only if they actually changed.
+    """Read tags and pictures from disk and persist each only if it actually changed.
 
     *current* is the already-stored tag map for an existing file (to avoid a no-op
     write that would dishonestly bump ``tags_updated_at``), or ``None`` for a brand
@@ -726,6 +749,7 @@ def _try_read_and_store(
     """
     try:
         new_tags = read_tags(path).tags
+        new_pictures = store.picture_rows(read_pictures(path))
     except (mutagen.MutagenError, OSError) as exc:  # type: ignore[attr-defined]
         logger.warning("could not read tags from %s: %s", path, exc)
         counters.errors += 1
@@ -736,6 +760,8 @@ def _try_read_and_store(
     # refreshed the row with the current reader, and stamping only where replace_tags runs
     # would leave the ~99% that match stale and re-read on every incremental scan.
     store.stamp_reader_version(conn, file_id)
+    if store.get_pictures(conn, file_id) != new_pictures:
+        store.replace_pictures(conn, file_id, new_pictures)
     if new_tags == current:
         return
     store.replace_tags(conn, file_id, new_tags, clock.utc_now())

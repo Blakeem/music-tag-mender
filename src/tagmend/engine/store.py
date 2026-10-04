@@ -1,14 +1,15 @@
 """Pure data access for the snapshot, the revision logs, and the staging areas.
 
-Covers the ``files`` / ``file_tags`` snapshot, the append-only ``tag_revisions``,
-``path_revisions``, ``sidecar_moves`` and ``cover_writes`` histories, and the
-``tag_revisions_staged``, ``path_revisions_staged``, ``sidecar_moves_staged`` and
-``cover_writes_staged`` staging areas (git's index). It also holds the Last.fm, MusicBrainz and
-Cover Art Archive lookup caches, the tag-axis derived status, the ``file_mismatch_status``
-decisions and the scope selector. Every function takes an open :class:`sqlite3.Connection` and
-does one focused thing, with no scanning, tag reading or commit policy. That orchestration
-lives in :mod:`tagmend.engine.library`, :mod:`tagmend.engine.versioning`,
-:mod:`tagmend.engine.staging` and :mod:`tagmend.engine.paths`.
+Covers the ``files`` / ``file_tags`` / ``file_pictures`` snapshot, the append-only
+``tag_revisions``, ``path_revisions``, ``sidecar_moves``, ``cover_writes`` and ``picture_writes``
+histories, and the ``tag_revisions_staged``, ``path_revisions_staged``, ``sidecar_moves_staged``,
+``cover_writes_staged`` and ``picture_writes_staged`` staging areas (git's index). It also holds
+the Last.fm, MusicBrainz and Cover Art Archive lookup caches, the tag-axis derived status, the
+``file_mismatch_status`` decisions and the scope selector. Every function takes an open
+:class:`sqlite3.Connection` and does one focused thing, with no scanning, tag reading or commit
+policy. That orchestration lives in :mod:`tagmend.engine.library`,
+:mod:`tagmend.engine.versioning`, :mod:`tagmend.engine.staging`, :mod:`tagmend.engine.paths` and
+:mod:`tagmend.engine.pictures`.
 The ``commits``-table ops and the shared commit loop live in :mod:`tagmend.engine.commits`.
 SQLite hands back ``Any``, so this module casts at the boundary and the rest of the engine stays
 strictly typed.
@@ -27,7 +28,9 @@ from tagmend.engine.tags import MANAGED_SET_VERSION, TAG_READER_VERSION
 
 if TYPE_CHECKING:
     import sqlite3
-    from collections.abc import Collection
+    from collections.abc import Collection, Sequence
+
+    from tagmend.engine.tags import EmbeddedPicture
 
 
 def _dump_json(obj: object) -> str:
@@ -246,6 +249,93 @@ def stamp_reader_version(conn: sqlite3.Connection, file_id: int) -> None:
         "UPDATE files SET reader_version = ? WHERE id = ?",
         (TAG_READER_VERSION, file_id),
     )
+
+
+@dataclass(frozen=True, slots=True)
+class PictureRow:
+    """One ``file_pictures`` row: an embedded picture of a file, without its bytes."""
+
+    ordinal: int
+    picture_type: int | None
+    mime: str
+    description: str
+    size_bytes: int
+    sha256: str
+
+
+_PICTURE_COLUMNS = "ordinal, picture_type, mime, description, size_bytes, sha256"
+
+
+def _row_to_picture(row: Sequence[object]) -> PictureRow:
+    """Build a typed :class:`PictureRow` from the :data:`_PICTURE_COLUMNS` of a raw sqlite row."""
+    return PictureRow(
+        ordinal=db.as_int(row[0]),
+        picture_type=None if row[1] is None else db.as_int(row[1]),
+        mime=str(row[2]),
+        description=str(row[3]),
+        size_bytes=db.as_int(row[4]),
+        sha256=str(row[5]),
+    )
+
+
+def picture_rows(pictures: Sequence[EmbeddedPicture]) -> list[PictureRow]:
+    """Return the ``file_pictures`` rows of *pictures*, dropping the image bytes."""
+    return [
+        PictureRow(
+            ordinal=picture.ordinal,
+            picture_type=picture.picture_type,
+            mime=picture.mime,
+            description=picture.description,
+            size_bytes=picture.size_bytes,
+            sha256=picture.sha256,
+        )
+        for picture in pictures
+    ]
+
+
+def get_pictures(conn: sqlite3.Connection, file_id: int) -> list[PictureRow]:
+    """Return the stored pictures of *file_id* in ordinal order."""
+    cursor = conn.execute(
+        f"SELECT {_PICTURE_COLUMNS} FROM file_pictures WHERE file_id = ? ORDER BY ordinal",  # noqa: S608
+        (file_id,),
+    )
+    return [_row_to_picture(tuple(row)) for row in cursor.fetchall()]
+
+
+def replace_pictures(
+    conn: sqlite3.Connection,
+    file_id: int,
+    pictures: Sequence[PictureRow],
+) -> None:
+    """Replace every stored picture of *file_id* with *pictures*."""
+    conn.execute("DELETE FROM file_pictures WHERE file_id = ?", (file_id,))
+    conn.executemany(
+        f"INSERT INTO file_pictures (file_id, {_PICTURE_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?)",  # noqa: S608
+        [
+            (
+                file_id,
+                picture.ordinal,
+                picture.picture_type,
+                picture.mime,
+                picture.description,
+                picture.size_bytes,
+                picture.sha256,
+            )
+            for picture in pictures
+        ],
+    )
+
+
+def load_present_pictures(conn: sqlite3.Connection) -> dict[int, list[PictureRow]]:
+    """Return ``{file_id: pictures}`` for every present file holding one, each in ordinal order."""
+    cursor = conn.execute(
+        f"SELECT file_id, {_PICTURE_COLUMNS} FROM file_pictures "  # noqa: S608
+        "WHERE file_id IN (SELECT id FROM files WHERE is_missing = 0) ORDER BY file_id, ordinal",
+    )
+    pictures: dict[int, list[PictureRow]] = {}
+    for row in cursor.fetchall():
+        pictures.setdefault(db.as_int(row[0]), []).append(_row_to_picture(tuple(row)[1:]))
+    return pictures
 
 
 def mark_reader_stale(conn: sqlite3.Connection, file_id: int) -> None:
@@ -1082,7 +1172,7 @@ def is_staged(conn: sqlite3.Connection, file_id: int) -> bool:
 
 
 def any_staged(conn: sqlite3.Connection) -> bool:
-    """Return whether ANY tag change, file move, sidecar move or cover is staged.
+    """Return whether ANY tag change, file move, sidecar move, cover or picture removal is staged.
 
     The clean-staging-area guard for commit-level revert and the resolvers: rolling back with
     work still staged would interleave a revert with half-staged intent, so the revert refuses
@@ -1092,7 +1182,8 @@ def any_staged(conn: sqlite3.Connection) -> bool:
         "SELECT EXISTS(SELECT 1 FROM tag_revisions_staged) "
         "OR EXISTS(SELECT 1 FROM path_revisions_staged) "
         "OR EXISTS(SELECT 1 FROM sidecar_moves_staged) "
-        "OR EXISTS(SELECT 1 FROM cover_writes_staged)",
+        "OR EXISTS(SELECT 1 FROM cover_writes_staged) "
+        "OR EXISTS(SELECT 1 FROM picture_writes_staged)",
     ).fetchone()
     return bool(row[0])
 
@@ -1423,14 +1514,16 @@ def commit_log_counts(conn: sqlite3.Connection, commit_id: int) -> dict[str, int
         "SELECT (SELECT COUNT(*) FROM tag_revisions WHERE commit_id = ?), "
         "(SELECT COUNT(*) FROM path_revisions WHERE commit_id = ?), "
         "(SELECT COUNT(*) FROM sidecar_moves WHERE commit_id = ?), "
-        "(SELECT COUNT(*) FROM cover_writes WHERE commit_id = ?)",
-        (commit_id, commit_id, commit_id, commit_id),
+        "(SELECT COUNT(*) FROM cover_writes WHERE commit_id = ?), "
+        "(SELECT COUNT(*) FROM picture_writes WHERE commit_id = ?)",
+        (commit_id, commit_id, commit_id, commit_id, commit_id),
     ).fetchone()
     counts = {
         "tag_revisions": db.as_int(row[0]),
         "path_revisions": db.as_int(row[1]),
         "sidecar_moves": db.as_int(row[2]),
         "cover_writes": db.as_int(row[3]),
+        "picture_writes": db.as_int(row[4]),
     }
     return {log: count for log, count in counts.items() if count}
 
@@ -1946,6 +2039,268 @@ def cover_write_content(conn: sqlite3.Connection, write_id: int) -> bytes | None
     """Return the bytes the ``cover_writes`` row *write_id* holds, ``None`` when it holds none."""
     row = conn.execute("SELECT content FROM cover_writes WHERE id = ?", (write_id,)).fetchone()
     return None if row is None or row[0] is None else bytes(row[0])
+
+
+# --- picture_writes_staged (one pending picture removal per file and digest) ------------
+
+_STAGED_PICTURE_FIELDS: Final = (
+    "file_id",
+    "sha256",
+    "ordinal",
+    "picture_type",
+    "mime",
+    "description",
+    "size_bytes",
+    "origin",
+    "note",
+    "staged_at",
+)
+_STAGED_PICTURE_COLUMNS: Final = ", ".join(_STAGED_PICTURE_FIELDS)
+
+
+@dataclass(frozen=True, slots=True)
+class StagedPicture:
+    """One pending picture removal, without its bytes or attributes.
+
+    ``ordinal`` is the picture's position in its file at stage time. The removal takes every copy
+    of ``sha256`` the file holds.
+    """
+
+    file_id: int
+    sha256: str
+    ordinal: int
+    picture_type: int | None
+    mime: str
+    description: str
+    size_bytes: int
+    origin: str
+    note: str | None
+    staged_at: str
+
+
+def _row_to_staged_picture(row: tuple[object, ...]) -> StagedPicture:
+    """Build a typed :class:`StagedPicture` from a raw sqlite tuple."""
+    return StagedPicture(
+        file_id=db.as_int(row[0]),
+        sha256=str(row[1]),
+        ordinal=db.as_int(row[2]),
+        picture_type=None if row[3] is None else db.as_int(row[3]),
+        mime=str(row[4]),
+        description=str(row[5]),
+        size_bytes=db.as_int(row[6]),
+        origin=str(row[7]),
+        note=None if row[8] is None else str(row[8]),
+        staged_at=str(row[9]),
+    )
+
+
+def upsert_staged_picture(
+    conn: sqlite3.Connection,
+    staged: StagedPicture,
+    *,
+    attributes: str,
+    content: bytes,
+) -> None:
+    """Stage one picture removal with its *attributes* JSON and its *content*.
+
+    It replaces the row already staged for the same file and digest.
+    """
+    placeholders = ", ".join("?" for _ in (*_STAGED_PICTURE_FIELDS, "attributes", "content"))
+    conn.execute(
+        f"INSERT OR REPLACE INTO picture_writes_staged ({_STAGED_PICTURE_COLUMNS}, attributes, "  # noqa: S608
+        f"content) VALUES ({placeholders})",
+        (
+            staged.file_id,
+            staged.sha256,
+            staged.ordinal,
+            staged.picture_type,
+            staged.mime,
+            staged.description,
+            staged.size_bytes,
+            staged.origin,
+            staged.note,
+            staged.staged_at,
+            attributes,
+            content,
+        ),
+    )
+
+
+def list_staged_pictures(
+    conn: sqlite3.Connection,
+    root_key: str | None = None,
+) -> list[StagedPicture]:
+    """Return the pending picture removals, without bytes, in file id then digest order.
+
+    *root_key* keeps the rows whose file lives in that folder or under it, on the key range of
+    :func:`tracked_files_under`.
+    """
+    columns = ", ".join(f"s.{name}" for name in _STAGED_PICTURE_FIELDS)
+    sql = f"SELECT {columns} FROM picture_writes_staged s JOIN files f ON f.id = s.file_id"  # noqa: S608
+    bounds: tuple[str, ...] = ()
+    if root_key is not None:
+        sql += " WHERE f.path_key >= ? AND f.path_key < ?"
+        bounds = path_keys.subtree_bounds(root_key)
+    cursor = conn.execute(f"{sql} ORDER BY s.file_id, s.sha256", bounds)
+    return [_row_to_staged_picture(tuple(row)) for row in cursor.fetchall()]
+
+
+def staged_pictures_of_file(conn: sqlite3.Connection, file_id: int) -> list[StagedPicture]:
+    """Return the pending picture removals of *file_id*, without bytes, in digest order."""
+    cursor = conn.execute(
+        f"SELECT {_STAGED_PICTURE_COLUMNS} FROM picture_writes_staged "  # noqa: S608
+        "WHERE file_id = ? ORDER BY sha256",
+        (file_id,),
+    )
+    return [_row_to_staged_picture(tuple(row)) for row in cursor.fetchall()]
+
+
+def staged_picture_payload(
+    conn: sqlite3.Connection,
+    file_id: int,
+    sha256: str,
+) -> tuple[str, bytes] | None:
+    """Return the attributes JSON and the bytes of a pending removal, ``None`` if none is staged."""
+    row = conn.execute(
+        "SELECT attributes, content FROM picture_writes_staged WHERE file_id = ? AND sha256 = ?",
+        (file_id, sha256),
+    ).fetchone()
+    return None if row is None else (str(row[0]), bytes(row[1]))
+
+
+def delete_staged_picture(conn: sqlite3.Connection, file_id: int, sha256: str) -> None:
+    """Remove the pending removal of *sha256* from *file_id* (no-op if none)."""
+    conn.execute(
+        "DELETE FROM picture_writes_staged WHERE file_id = ? AND sha256 = ?", (file_id, sha256)
+    )
+
+
+def staged_picture_overlaps(conn: sqlite3.Connection) -> tuple[list[int], list[int]]:
+    """Return the files with a pending picture removal and a staged tag change, then a staged move.
+
+    Each list is in file id order.
+    """
+    tagged = conn.execute(
+        "SELECT DISTINCT p.file_id FROM picture_writes_staged p "
+        "JOIN tag_revisions_staged t ON t.file_id = p.file_id ORDER BY p.file_id"
+    ).fetchall()
+    moved = conn.execute(
+        "SELECT DISTINCT p.file_id FROM picture_writes_staged p "
+        "JOIN path_revisions_staged m ON m.file_id = p.file_id ORDER BY p.file_id"
+    ).fetchall()
+    return [db.as_int(row[0]) for row in tagged], [db.as_int(row[0]) for row in moved]
+
+
+# --- picture_writes (the append-only log of embedded pictures removed or restored) ------
+
+
+@dataclass(frozen=True, slots=True)
+class PictureWrite:
+    """One ``picture_writes`` row to append. ``path`` is the file's absolute path at the write.
+
+    ``attributes`` is the picture's attributes JSON and ``content`` its bytes, which every row
+    keeps.
+    """
+
+    commit_id: int
+    created_at: str
+    origin: str
+    action: str
+    reverted_from: int | None
+    file_id: int
+    version: int
+    path: str
+    sha256: str
+    ordinal: int
+    picture_type: int | None
+    mime: str
+    description: str
+    attributes: str
+    content: bytes
+    size_bytes: int
+    note: str | None
+
+
+def insert_picture_write(conn: sqlite3.Connection, write: PictureWrite) -> None:
+    """Append one ``picture_writes`` row. The append-only triggers refuse rewrites."""
+    conn.execute(
+        """
+        INSERT INTO picture_writes
+          (commit_id, created_at, origin, action, reverted_from, file_id, version, path, sha256,
+           ordinal, picture_type, mime, description, attributes, content, size_bytes, note)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            write.commit_id,
+            write.created_at,
+            write.origin,
+            write.action,
+            write.reverted_from,
+            write.file_id,
+            write.version,
+            write.path,
+            write.sha256,
+            write.ordinal,
+            write.picture_type,
+            write.mime,
+            write.description,
+            write.attributes,
+            write.content,
+            write.size_bytes,
+            write.note,
+        ),
+    )
+
+
+_PICTURE_WRITE_ROW_COLUMNS: Final = "id, action, file_id, version, sha256, ordinal"
+
+
+@dataclass(frozen=True, slots=True)
+class PictureWriteRow:
+    """One logged ``picture_writes`` row, without its bytes or attributes."""
+
+    id: int
+    action: str
+    file_id: int
+    version: int
+    sha256: str
+    ordinal: int
+
+
+def picture_writes_for_commit(conn: sqlite3.Connection, commit_id: int) -> list[PictureWriteRow]:
+    """Return every ``picture_writes`` row *commit_id* appended, in file id then version order."""
+    cursor = conn.execute(
+        f"SELECT {_PICTURE_WRITE_ROW_COLUMNS} FROM picture_writes "  # noqa: S608
+        "WHERE commit_id = ? ORDER BY file_id, version",
+        (commit_id,),
+    )
+    return [
+        PictureWriteRow(
+            id=db.as_int(row[0]),
+            action=str(row[1]),
+            file_id=db.as_int(row[2]),
+            version=db.as_int(row[3]),
+            sha256=str(row[4]),
+            ordinal=db.as_int(row[5]),
+        )
+        for row in cursor.fetchall()
+    ]
+
+
+def picture_write_payload(conn: sqlite3.Connection, write_id: int) -> tuple[str, bytes] | None:
+    """Return the attributes JSON and the bytes the ``picture_writes`` row *write_id* holds."""
+    row = conn.execute(
+        "SELECT attributes, content FROM picture_writes WHERE id = ?", (write_id,)
+    ).fetchone()
+    return None if row is None else (str(row[0]), bytes(row[1]))
+
+
+def latest_picture_version(conn: sqlite3.Connection, file_id: int) -> int:
+    """Return the highest ``picture_writes`` version of *file_id*, 0 when it has none."""
+    row = conn.execute(
+        "SELECT COALESCE(MAX(version), 0) FROM picture_writes WHERE file_id = ?", (file_id,)
+    ).fetchone()
+    return db.as_int(row[0])
 
 
 # --- sidecar_moves (the append-only log of sidecar moves) -------------------------------

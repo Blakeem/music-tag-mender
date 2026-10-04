@@ -55,7 +55,8 @@ don't collapse into single entities.
 
 ## 3. Non-goals (v1)
 
-- Editing embedded album art.
+- Embedding album art. TagMend only removes an embedded picture that belongs to another album, and
+  an album's cover goes in its folder.
 - A GUI. The MCP client *is* the UI.
 - Streaming-service or DRM'd files.
 
@@ -459,7 +460,7 @@ Every tag axis (genre, artist, year, song) runs one workflow. Its state is the a
 
 - **Stage before write.** A resolver or `stage_*` tool only stages, and every resolver takes
   `dry_run`. Nothing reaches disk until an explicit `commit_tags`, `commit_paths`,
-  `commit_covers` or revert call.
+  `commit_covers`, `commit_pictures` or revert call.
 - **Version 0 baseline** captured before the first write → always revertible.
 - **Surgical writes.** Only the narrow managed-tag set. `ALBUMARTIST` is the merge
   key for collapsing duplicate artists. Per-track `ARTIST` is touched cautiously. The artist
@@ -473,6 +474,8 @@ Every tag axis (genre, artist, year, song) runs one workflow. Its state is the a
   individually revertible.
 - **Cover writes never overwrite.** `commit_covers` creates each cover as a new file and logs it
   in the append-only `cover_writes` table. `revert_commit` sends a written cover to the OS trash.
+- **Removed pictures are kept.** `commit_pictures` logs each embedded picture it removes, bytes
+  included, in the append-only `picture_writes` table. `revert_commit` writes it back.
 
 ---
 
@@ -481,9 +484,9 @@ Every tag axis (genre, artist, year, song) runs one workflow. Its state is the a
 The tags side organizes into a **symmetric family** mirroring git, so the paths
 side (§18) reads identically: `stage_/unstage_/diff_/commit_/history_/revert_` × the
 domain (`tags` | `paths`), plus domain-neutral discovery (`list_files`, `get_file`) and
-commit inspection (`list_commits`, `get_commit`). `covers` is the third domain of the stage and
-commit family. It has no `history_covers` or `revert_covers` and reverts only through
-`revert_commit`.
+commit inspection (`list_commits`, `get_commit`). `covers` and `pictures` are the third and
+fourth domains of the stage and commit family. Neither has a `history_` or `revert_` tool, and
+each reverts only through `revert_commit`.
 
 The tool contract is the `@mcp.tool()` docstrings in `src/tagmend/mcp_server.py`. The naming
 grammar and call shapes are in CLAUDE.md "Tool naming". Both domains run through the same

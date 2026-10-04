@@ -32,6 +32,8 @@ from tagmend.engine import (
     mismatch,
     path_deviations,
     paths,
+    picture_duplicates,
+    pictures,
     release_disagreements,
     songs,
     staging,
@@ -435,8 +437,9 @@ def list_files(  # noqa: PLR0913 - cohesive MCP discovery filters
         managed_tags, genre_status, genre_source_artist, genre_source_album,
         artist_status, artist_source_artist, artist_source_albumartist, year_status,
         year_source_artist, year_source_album, song_status, song_source_release_mbid,
-        song_source_release_track_mbid, mismatch_status, mismatch_source_value}, ...]}``,
-        or ``{"ok": False, "error": ...}`` on a bad request.
+        song_source_release_track_mbid, mismatch_status, mismatch_source_value, pictures},
+        ...]}``, or ``{"ok": False, "error": ...}`` on a bad request. ``pictures`` lists the
+        file's embedded pictures as ``{ordinal, picture_type, mime, size_bytes, sha256}``.
     """
     views = library.list_files(
         load_settings(),
@@ -460,7 +463,7 @@ def get_file(file_id: int) -> dict[str, object]:
     managed_tags, genre_status, genre_source_artist, genre_source_album, artist_status,
     artist_source_artist, artist_source_albumartist, year_status, year_source_artist,
     year_source_album, song_status, song_source_release_mbid, song_source_release_track_mbid,
-    mismatch_status, mismatch_source_value}}``,
+    mismatch_status, mismatch_source_value, pictures}}``, ``pictures`` as ``list_files`` shows it,
     or ``{"ok": False, "error", "error_type": "ValueError"}`` if the id is unknown.
     """
     view = library.get_file(load_settings(), file_id)
@@ -980,6 +983,44 @@ def detect_cover_gaps(
 
 @mcp.tool()
 @_error_envelope
+def detect_picture_duplicates(
+    path: str | None = None,
+    limit: int | None = None,
+) -> dict[str, object]:
+    """Find each embedded picture that the albums of two or more album artists hold.
+
+    A shared picture marks albums that may carry another album's art, such as the front an
+    art fetcher matched by album title alone. The owner decides which album holds the right
+    one. A wrong picture that no other album shares is not found. Navidrome shows a track's
+    embedded picture as that song's cover, and as the album's cover when no ``cover.*``,
+    ``folder.*`` or ``front.*`` image sits in the album's folders. Albums are grouped as
+    ``detect_cover_gaps`` groups them. Albums of one album artist sharing a picture are not
+    reported. Pure read over the snapshot, so run ``scan_library`` first.
+
+    Args:
+        path: Keep a duplicate when one of its albums has a file in this folder or a folder
+            under it, with every album of that duplicate in the row. The counts and
+            ``empty_pictures`` cover the files under it. Compared as a path, and a relative
+            path resolves under ``music_path``.
+        limit: Cap the duplicates returned. Counts are unaffected.
+
+    Returns:
+        ``{"ok": True, files_with_pictures, distinct_pictures, unread_files, duplicates,
+        empty_pictures, summary}``. ``unread_files`` counts the files whose pictures the
+        snapshot does not know yet. ``duplicates`` is sorted by album count, then file count,
+        both descending. Each is ``{sha256, size_bytes, mime, album_artists, albums}``, and each
+        album ``{album_artist, album, folders, files, album_files, file_ids, cover_images}``.
+        ``cover_images`` names the cover images directly in ``folders``, so an album listing
+        one keeps a cover once the picture is gone. ``empty_pictures`` lists ``{file_id, path}``
+        for each file holding a zero-byte picture, which Navidrome cannot show. On failure,
+        ``{"ok": False, "error": ...}``.
+    """
+    report = picture_duplicates.detect_picture_duplicates(load_settings(), path=path, limit=limit)
+    return {"ok": True, **report.to_dict()}
+
+
+@mcp.tool()
+@_error_envelope
 def stage_covers(
     path: str | None = None,
     image: str | None = None,
@@ -1110,6 +1151,116 @@ def commit_covers() -> dict[str, object]:
         ``{"ok": False, "error": ...}``.
     """
     result = covers.commit_covers(load_settings())
+    return {"ok": True, **result.to_dict()}
+
+
+@mcp.tool()
+@_error_envelope
+def stage_pictures(
+    path: str,
+    sha256: str | None = None,
+    dry_run: bool = False,  # noqa: FBT001, FBT002 - MCP tool surface, not a Python API
+    note: str | None = None,
+) -> dict[str, object]:
+    """Stage the removal of pictures embedded in the files of a folder. Writes no file.
+
+    The flow: ``detect_picture_duplicates`` names the picture, ``stage_pictures(path=<album
+    folder>, sha256=<digest>)`` stages its removal, ``diff_pictures`` reviews it and
+    ``commit_pictures`` writes it. Navidrome then shows the album cover for each song. An album
+    left with no cover appears in ``detect_cover_gaps`` as a gap for ``stage_covers``.
+
+    The files are read from disk, so each staged row holds the picture's current bytes. Two
+    copies of one picture in a file make one row, and the commit removes both. Each row has
+    origin ``manual``, and staging a picture again replaces its row. A file is skipped as
+    ``unreadable`` when it cannot be read, and as ``unwritable`` when it holds a selected picture
+    that a picture write would refuse.
+
+    Args:
+        path: The files in this folder and every folder under it. Compared as a path, and a
+            relative path resolves under ``music_path``.
+        sha256: Only the pictures with this SHA-256, 64 hex characters in either case. Omit to
+            select every embedded picture of those files.
+        dry_run: When true, read the same files and stage nothing.
+        note: Optional free-text note stored with each staged row.
+
+    Returns:
+        ``{"ok": True, dry_run, staged: [{file_id, path, sha256, picture_type, mime,
+        size_bytes}, ...], skipped: [{file_id, path, reason, detail}, ...], summary}``. Each
+        ``path`` is the file's absolute path. On failure, ``{"ok": False, "error": ...}``.
+    """
+    result = pictures.stage_pictures(
+        load_settings(), path=path, sha256=sha256, dry_run=dry_run, note=note
+    )
+    return {"ok": True, **result.to_dict()}
+
+
+@mcp.tool()
+@_error_envelope
+def unstage_pictures(path: str | None = None, sha256: str | None = None) -> dict[str, object]:
+    """Drop the staged picture removals of a folder's files, or every one. Writes no file.
+
+    Refused, dropping nothing, when a matched row's file no longer holds its picture, a removal
+    a crash cut before its log. Its row holds the only copy of the picture, so run
+    ``commit_pictures`` to log that removal first.
+
+    Args:
+        path: Only the files in this folder and every folder under it. Compared as a path, and
+            a relative path resolves under ``music_path``. Omit to cover every file.
+        sha256: Only the rows of the picture with this SHA-256.
+
+    Returns:
+        ``{"ok": True, "removed": <count>}``, or ``{"ok": False, "error": ...}``.
+    """
+    removed = pictures.unstage_pictures(load_settings(), path=path, sha256=sha256)
+    return {"ok": True, "removed": removed}
+
+
+@mcp.tool()
+@_error_envelope
+def diff_pictures(path: str | None = None, limit: int | None = None) -> dict[str, object]:
+    """Show the staged picture removals, each with its state on disk now. Read-only.
+
+    ``state`` is the first that holds, as ``commit_pictures`` meets it: ``missing`` (the file is
+    gone or flagged missing), ``landed`` (the file no longer holds the picture, so the commit
+    logs the removal with no write), else ``ready``.
+
+    Args:
+        path: Only the files in this folder and every folder under it. Compared as a path, and
+            a relative path resolves under ``music_path``.
+        limit: Cap the rows returned.
+
+    Returns:
+        ``{"ok": True, "changes": [{file_id, path, sha256, picture_type, mime, size_bytes, state,
+        origin, note, staged_at}, ...]}``, in file id then digest order. Each ``path`` is the
+        file's absolute path.
+    """
+    views = pictures.diff_pictures(load_settings(), path=path, limit=limit)
+    return {"ok": True, "changes": [view.to_dict() for view in views]}
+
+
+@mcp.tool()
+@_error_envelope
+def commit_pictures() -> dict[str, object]:
+    """Remove every staged picture from its file as one commit.
+
+    Each file loses every copy of each staged picture and keeps every other entry. Each copy
+    removed appends a ``remove`` row with the picture's bytes to ``picture_writes``. A staged
+    picture the file no longer holds, left by a crash, is logged with no write. A file gone from
+    disk is flagged missing and its rows dropped. A file that fails to write (locked by a
+    player, read-only) reports ``status: "error"`` with a ``detail`` and keeps its rows. A
+    commit left ``applying`` by a crash is marked interrupted first. Refused while a file with a
+    staged picture also has a staged tag change or move: run ``commit_tags`` or
+    ``commit_paths``, or the matching unstage tool, first. ``revert_commit`` undoes a picture
+    commit and writes each removed picture back from its logged bytes.
+
+    Returns:
+        ``{"ok": True, commit_id, committed, noop, missing, changed_since_stage, errors,
+        outcomes: [{file_id, version, status, detail}, ...], missing_files: [{file_id, path},
+        ...]}``. ``committed`` counts the files changed and logged, and ``version`` is the
+        file's highest ``picture_writes`` version. ``commit_id`` is ``null`` when nothing was
+        staged. On failure, ``{"ok": False, "error": ...}``.
+    """
+    result = pictures.commit_pictures(load_settings())
     return {"ok": True, **result.to_dict()}
 
 
@@ -1264,7 +1415,10 @@ def revert_commit(
     to the path it left, and a revert of that revert moves them forward again. A cover commit
     (from ``commit_covers``) sends each cover it wrote to the OS trash (the Windows Recycle
     Bin), never a permanent delete, and a revert of that revert writes each cover again from
-    its logged bytes. ``get_commit`` names the logs a commit changed.
+    its logged bytes. A picture commit (from ``commit_pictures``) writes each embedded picture
+    it removed back into its file at its old position, with identical bytes and attributes,
+    and a revert of that revert removes them again. ``get_commit`` names the logs a commit
+    changed.
 
     The group counterpart of ``revert_tags`` and ``revert_paths``. All reverts land under ONE
     new ``origin='revert'`` commit whose ``reverted_from`` records the undone commit, so the
@@ -1273,11 +1427,11 @@ def revert_commit(
 
     Safety rules. A file changed again by a LATER commit, or edited outside TagMend, is skipped
     and reported as ``skipped_later_changes``. Revert it per file with ``revert_tags`` or
-    ``revert_paths`` if that is really wanted. The staging area must be empty, tag, path and
-    cover rows alike, so commit or unstage pending work first, and run ``commit_paths`` to
-    finish an interrupted path revert. Missing files are reported, not fatal. A path whose old
-    location is taken now is reported as an ``error``. Use ``dry_run=true`` to preview the
-    exact per-file plan without touching anything.
+    ``revert_paths`` if that is really wanted. The staging area must be empty, tag, path,
+    cover and picture rows alike, so commit or unstage pending work first, and run
+    ``commit_paths`` to finish an interrupted path revert. Missing files are reported, not
+    fatal. A path whose old location is taken now is reported as an ``error``. Use
+    ``dry_run=true`` to preview the exact per-file plan without touching anything.
 
     Args:
         commit_id: The commit to undo (from ``list_commits``).
@@ -1300,10 +1454,12 @@ def revert_commit(
         cover under ``"sidecars"`` with its own path as both paths. A cover is
         ``skipped_later_changes`` when a later commit wrote its path or moved it, ``missing``
         when gone, ``changed`` when its bytes differ (it stays), and ``error`` when the trash
-        refuses it (a drive with no Recycle Bin) or a file sits where a cover goes back.
+        refuses it (a drive with no Recycle Bin) or a file sits where a cover goes back. A
+        picture commit's result has one outcome per file. A file is ``skipped_later_changes``
+        when a later picture commit changed it, and ``error`` when its write fails.
         Returns ``{"ok": False, "error": ...}`` if the commit id is unknown, the commit is
-        still ``applying``, the commit holds no change in any log, ``path`` is given for a tag
-        or cover commit, or the staging area is not empty.
+        still ``applying``, the commit holds no change in any log, ``path`` is given for a tag,
+        cover or picture commit, or the staging area is not empty.
     """
     result = versioning.revert_commit(
         load_settings(),
@@ -1335,9 +1491,10 @@ def get_commit(commit_id: int) -> dict[str, object]:
 
     Returns ``{"ok": True, "commit": {commit_id, created_at, origin, message, reverted_from,
     status}, "logs": {"tag_revisions": <count>, "path_revisions": <count>, "sidecar_moves":
-    <count>, "cover_writes": <count>}}``, where ``logs`` names only the logs holding rows of
-    this commit (a tag commit, a path commit with its moved files and sidecars, or a cover
-    commit), or ``{"ok": False, "error", "error_type": "ValueError"}`` if the id is unknown.
+    <count>, "cover_writes": <count>, "picture_writes": <count>}}``, where ``logs`` names only
+    the logs holding rows of this commit (a tag commit, a path commit with its moved files and
+    sidecars, a cover commit or a picture commit), or ``{"ok": False, "error", "error_type":
+    "ValueError"}`` if the id is unknown.
     """
     settings = load_settings()
     commit = commits.get_commit(settings, commit_id)

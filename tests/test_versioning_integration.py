@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 from conftest import make_track
-from tagmend.engine import commits, health, store, versioning
+from tagmend.engine import commits, health, resync, store, versioning
 from tagmend.engine.db import connect
 from tagmend.engine.library import scan_library
 from tagmend.engine.schema import apply_append_only_triggers, apply_schema
@@ -442,7 +442,7 @@ def test_revert_failing_after_its_write_stays_applying_until_its_rerun_records_i
 
     with monkeypatch.context() as patch:
         patch.setattr(versioning, "write_managed_tags", write_and_note)
-        patch.setattr(versioning, "read_tags", read_until_written)
+        patch.setattr(resync, "read_tags", read_until_written)
         with pytest.raises(OSError, match="share dropped"):
             versioning.revert_tags(engine_settings, file_id, 0)
 

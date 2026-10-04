@@ -615,7 +615,7 @@ def test_managed_set_version_5_registered() -> None:
     assert MANAGED_SETS[3] == MANAGED_SETS[4] - {"artists"}
     assert MANAGED_SETS[4] == MANAGED_TAGS - ALBUMARTIST_ALIASES
     assert {"album artist", "album_artist"} == ALBUMARTIST_ALIASES
-    assert TAG_READER_VERSION == 10
+    assert TAG_READER_VERSION == 11
 
 
 _ALBUM_ARTIST_ALIAS_ENTRIES = {

@@ -63,11 +63,10 @@ The owner decides each one. TagMend never deletes a file.
   and `artists` "J.Viewz".
 - Kept credits. ATOI, Fats, Penny, A. Hartung, Beatniks, Wumpscut and 8 collaboration credits stay
   as tagged. The owner may override any of them.
-- Wrong embedded art. 80 files in 7 albums carry another album's embedded front picture, from an
-  old art fetcher that matched on the album title. Six "Greatest Hits" albums carry the Linkin
-  Park front, and Ozzy Osbourne "Down To Earth" carries the Jem front. The picture feature
-  (`detect_picture_duplicates` and a tracked picture removal) is planned. Once it lands, the owner
-  reviews the duplicates it reports.
+- Small covers. Six albums show a 200 px `Folder.jpg` from an old art fetcher. Since commit 410
+  removed their wrong embedded pictures, their songs show it too. Each image shows the right
+  album. Navidrome reads `cover.*` first, but `stage_covers` skips an album that shows a cover. So
+  a larger front needs a hand write or a new stage option.
 - Artist page. `resolve_artists` stops at `artist_stage_limit` (300) files a call and does not
   read past files staging refuses, as the other resolvers do. A page full of refused files repeats
   on every call. The owner's `id3_droppable_frames` keeps this rare. The fix candidate ports the

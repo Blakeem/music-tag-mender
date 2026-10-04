@@ -107,7 +107,7 @@ _EXCLUDED_SECONDARY_TYPES: Final = frozenset(
 # Folded into both cache keys so changing the selection or parse rules re-fetches every lookup
 # resolved under the old ones, instead of replaying its stale cached pick forever. The album
 # and recording paths share the excluded-secondary-type set, so one bump must invalidate both.
-_SELECTION_VERSION: Final = "5"
+_SELECTION_VERSION: Final = "6"
 
 # The artist lookup runs its own version token: it has no selection rules to tighten, so a
 # release-group rule change must not re-fetch every artist. Bump only when the fields
@@ -137,20 +137,16 @@ class MBReleaseGroup:
     album_title: str
     original_date: str
     release_group_mbid: str
-    release_mbid: str | None
 
 
 @dataclass(frozen=True, slots=True)
 class MBRecording:
     """A MusicBrainz recording's resolved album for the review-only album-gaps tier.
 
-    ``album_title`` is the release group's title (the proposed ``album`` fill).
-    ``release_group_mbid`` and ``recording_mbid`` are carried for provenance and audit.
+    ``album_title`` is the release group's title, the proposed ``album`` fill.
     """
 
     album_title: str
-    release_group_mbid: str
-    recording_mbid: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -247,10 +243,16 @@ class MBRelease:
 
 
 class MusicBrainzError(RuntimeError):
-    """A MusicBrainz lookup failed transiently (HTTP non-2xx).
+    """A MusicBrainz lookup failed and nothing was cached, so a re-run asks again.
 
-    These are deliberately **not** cached so a re-run retries them.
+    Raised for a malformed body and an HTTP non-2xx other than 429, 5xx, or a 404 that a lookup
+    by id reads as not found. A failure that outlasted the retries raises the subclass
+    :class:`MusicBrainzUnavailableError`.
     """
+
+
+class MusicBrainzUnavailableError(MusicBrainzError):
+    """MusicBrainz stayed unreachable, throttled or failing through every retry, as in an outage."""
 
 
 class MBReleaseGroupSource(Protocol):
@@ -385,7 +387,7 @@ class MusicBrainzClient:
         """Return *album* by *artist*'s original first-release resolution, or ``None``.
 
         Cache first (positive or negative), else one paced network query. Raises
-        :class:`MusicBrainzError` on a transient failure (caches nothing).
+        :class:`MusicBrainzError` on a lookup failure (caches nothing).
         """
         request_key = _request_key(artist, album)
 
@@ -398,7 +400,6 @@ class MusicBrainzClient:
                 album_title=row.album_title,
                 original_date=row.original_date,
                 release_group_mbid=row.release_group_mbid or "",
-                release_mbid=row.release_mbid,
             )
 
         return self._fetch_and_cache(artist, album, request_key)
@@ -412,7 +413,7 @@ class MusicBrainzClient:
 
         Cache first (positive or negative) in ``musicbrainz_recording_cache``, else one paced
         network query against the recording endpoint. Raises :class:`MusicBrainzError` on a
-        transient failure (caches nothing). Review-only: the caller never auto-stages the result.
+        lookup failure (caches nothing). Review-only: the caller never auto-stages the result.
         """
         request_key = _recording_request_key(artist, title)
 
@@ -421,11 +422,7 @@ class MusicBrainzClient:
             found, row = cached
             if not found or row.album_title is None:
                 return None
-            return MBRecording(
-                album_title=row.album_title,
-                release_group_mbid=row.release_group_mbid or "",
-                recording_mbid=row.recording_mbid,
-            )
+            return MBRecording(album_title=row.album_title)
 
         return self._fetch_and_cache_recording(artist, title, request_key)
 
@@ -503,7 +500,6 @@ class MusicBrainzClient:
                     found=False,
                     album_title=None,
                     original_date=None,
-                    release_mbid=None,
                     release_group_mbid=None,
                     now=now,
                 ),
@@ -516,7 +512,6 @@ class MusicBrainzClient:
                 found=True,
                 album_title=resolved.album_title,
                 original_date=resolved.original_date,
-                release_mbid=resolved.release_mbid,
                 release_group_mbid=resolved.release_group_mbid,
                 now=now,
             ),
@@ -555,8 +550,6 @@ class MusicBrainzClient:
                     request_key=request_key,
                     found=False,
                     album_title=None,
-                    release_group_mbid=None,
-                    recording_mbid=None,
                     now=now,
                 ),
             )
@@ -567,8 +560,6 @@ class MusicBrainzClient:
                 request_key=request_key,
                 found=True,
                 album_title=resolved.album_title,
-                release_group_mbid=resolved.release_group_mbid,
-                recording_mbid=resolved.recording_mbid,
                 now=now,
             ),
         )
@@ -713,13 +704,13 @@ class MusicBrainzClient:
         A 404 returns ``None`` only when *not_found_ok*, because a lookup by id treats it as
         the real answer "no such entity" while a search never answers 404. A 429 or a 5xx is
         retried under the rule every lookup client shares, since MusicBrainz throttles with a
-        503 and a gateway answers 502 or 504. One that outlasts every attempt is raised like any
-        other failure, so it is never cached.
+        503 and a gateway answers 502 or 504. One that outlasts every attempt raises
+        :class:`MusicBrainzUnavailableError`, so it is never cached.
         """
         response = self._http.send(
             lambda client: client.get(url, params=params),
             verdict=retry_throttle_or_server_error,
-            error=lambda failure, attempts: MusicBrainzError(
+            error=lambda failure, attempts: MusicBrainzUnavailableError(
                 f"MusicBrainz {failure} after {attempts} attempt(s) for {what}",
             ),
             label=f"musicbrainz {what}",
@@ -1163,7 +1154,6 @@ def _candidate(entry: object, requested_album: str) -> tuple[_Rank, MBReleaseGro
             album_title=title,
             original_date=original_date,
             release_group_mbid=release_group_mbid,
-            release_mbid=_first_release_mbid(entry),
         ),
     )
 
@@ -1186,8 +1176,8 @@ def _select_recording(body: dict[str, object]) -> MBRecording | None:
 
     Keeps only recordings that have a release whose release group is ``primary-type ==
     "Album"`` with no excluded secondary type. Ranks them as :func:`_select_album` does, by
-    score and then by an Official release, and returns the release-group title and ids of the
-    first top-ranked recording, or ``None`` when nothing usable exists. A tie stays answered,
+    score and then by an Official release, and returns the release-group title of the first
+    top-ranked recording, or ``None`` when nothing usable exists. A tie stays answered,
     since a human reviews every album this lookup proposes.
     """
     raw_recordings = body.get("recordings")
@@ -1212,25 +1202,15 @@ def _recording_candidate(entry: object) -> tuple[_Rank, MBRecording] | None:
     release_group = _usable_release_group(entry)
     if release_group is None:
         return None
-    title, release_group_mbid, official = release_group
+    title, official = release_group
 
     raw_score = entry.get("score")
     score = raw_score if isinstance(raw_score, int) else 0
-
-    rec_id = entry.get("id")
-    recording_mbid = rec_id if isinstance(rec_id, str) and rec_id else None
-    return (
-        (score, official),
-        MBRecording(
-            album_title=title,
-            release_group_mbid=release_group_mbid,
-            recording_mbid=recording_mbid,
-        ),
-    )
+    return (score, official), MBRecording(album_title=title)
 
 
-def _usable_release_group(entry: dict[str, object]) -> tuple[str, str, bool] | None:
-    """Return ``(title, release_group_mbid, official)`` for the recording's best Album release.
+def _usable_release_group(entry: dict[str, object]) -> tuple[str, bool] | None:
+    """Return ``(title, official)`` for the recording's best Album release.
 
     Scans the recording's ``releases``. A release's ``release-group`` qualifies when its
     ``primary-type == "Album"``, it carries no excluded secondary type, and it has a non-empty
@@ -1242,7 +1222,7 @@ def _usable_release_group(entry: dict[str, object]) -> tuple[str, str, bool] | N
     if not isinstance(releases, list):
         return None
 
-    usable: list[tuple[str, str, bool]] = []
+    usable: list[tuple[str, bool]] = []
     for release in releases:
         if not isinstance(release, dict):
             continue
@@ -1254,13 +1234,11 @@ def _usable_release_group(entry: dict[str, object]) -> tuple[str, str, bool] | N
         title = group.get("title")
         if not isinstance(title, str) or not title:
             continue
-        rgid = group.get("id")
-        release_group_mbid = rgid if isinstance(rgid, str) else ""
-        usable.append((title, release_group_mbid, release.get("status") == _OFFICIAL))
+        usable.append((title, release.get("status") == _OFFICIAL))
 
     if not usable:
         return None
-    return next((group for group in usable if group[2]), usable[0])
+    return next((group for group in usable if group[1]), usable[0])
 
 
 def _is_usable_album_group(group: dict[str, object]) -> bool:
@@ -1281,16 +1259,3 @@ def _holds_official_release(entry: dict[str, object]) -> bool:
     return any(
         isinstance(release, dict) and release.get("status") == _OFFICIAL for release in releases
     )
-
-
-def _first_release_mbid(entry: dict[str, object]) -> str | None:
-    """Return the first release's MBID from a release group's ``releases`` list, if any."""
-    releases = entry.get("releases")
-    if not isinstance(releases, list) or not releases:
-        return None
-    first = releases[0]
-    if isinstance(first, dict):
-        rid = first.get("id")
-        if isinstance(rid, str) and rid:
-            return rid
-    return None

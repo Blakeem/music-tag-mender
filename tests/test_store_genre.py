@@ -544,7 +544,6 @@ def test_mb_cache_negative_round_trip(db_conn: sqlite3.Connection) -> None:
         found=False,
         album_title=None,
         original_date=None,
-        release_mbid=None,
         release_group_mbid=None,
         now=_NOW,
     )
@@ -562,7 +561,6 @@ def test_mb_cache_found_round_trip(db_conn: sqlite3.Connection) -> None:
         found=True,
         album_title="Paranoid",
         original_date="1970",
-        release_mbid="rel-1",
         release_group_mbid="rg-1",
         now=_NOW,
     )
@@ -572,5 +570,4 @@ def test_mb_cache_found_round_trip(db_conn: sqlite3.Connection) -> None:
     assert found is True
     assert row.album_title == "Paranoid"
     assert row.original_date == "1970"
-    assert row.release_mbid == "rel-1"
     assert row.release_group_mbid == "rg-1"

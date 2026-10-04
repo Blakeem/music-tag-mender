@@ -36,6 +36,12 @@ def test_alnum_script_key_folds_latin_and_keeps_other_scripts() -> None:
     assert text_keys.alnum_script_key("+") == ""
 
 
+def test_title_key_keeps_other_scripts_apart_and_folds_diacritics() -> None:
+    assert text_keys.title_key("Часть 1") != text_keys.title_key("Глава 1")
+    assert text_keys.title_key("Café") == text_keys.title_key("Cafe")
+    assert text_keys.title_key("+") == "+"
+
+
 def test_display_key_ignores_casing_spacing_and_typographic_quotes() -> None:
     curly = "Don\N{RIGHT SINGLE QUOTATION MARK}t  Stop"
     assert text_keys.display_key(curly) == text_keys.display_key("don't stop")

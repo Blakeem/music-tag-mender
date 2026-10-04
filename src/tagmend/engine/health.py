@@ -10,7 +10,7 @@ import sqlite3
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final
 
-from tagmend.engine import commits, db, paths, scan, schema
+from tagmend.engine import commits, db, ledger_lock, paths, scan, schema
 from tagmend.engine.acoustid import (
     AcoustidClient,
     AcoustidError,
@@ -155,10 +155,14 @@ def _check_interrupted_commits(db_path: Path) -> Check:
     """Report any commit left ``applying`` by a crash. Informational, it never fails the report.
 
     A lingering ``applying`` commit is recovered by running ``commit_tags``, ``commit_paths`` or
-    ``commit_covers`` again (the resume-free model), so this is a hint, not a readiness blocker.
-    It always reports ``ok=True``. Real ledger problems are caught by :func:`_check_database`.
+    ``commit_covers`` again, or the interrupted revert again (the resume-free model), so this is a
+    hint, not a readiness blocker.
+    An ``applying`` commit while another holder has the mutation lock is still running, so it
+    gets no advice. It always reports ``ok=True``. Real ledger problems are caught by
+    :func:`_check_database`.
     """
     name = "commits"
+    running = False
     try:
         connection = db.connect(db_path)
         try:
@@ -166,18 +170,27 @@ def _check_interrupted_commits(db_path: Path) -> Check:
             interrupted = commits.get_applying_commits(connection)
         finally:
             connection.close()
+        running = bool(interrupted) and ledger_lock.held_elsewhere(db_path)
     except (sqlite3.Error, OSError, RuntimeError) as exc:
         return Check(name=name, ok=True, detail=f"(could not check interrupted runs: {exc})")
 
     if not interrupted:
         return Check(name=name, ok=True, detail="no interrupted runs")
     ids = ", ".join(str(c.id) for c in interrupted)
+    if running:
+        return Check(
+            name=name,
+            ok=True,
+            detail=(
+                f"{len(interrupted)} commit(s) ({ids}) running in another TagMend process or call"
+            ),
+        )
     return Check(
         name=name,
         ok=True,
         detail=(
             f"{len(interrupted)} interrupted run(s) ({ids}). Run commit_tags, commit_paths or "
-            "commit_covers to recover"
+            "commit_covers to recover, or rerun an interrupted revert_tags or revert_commit"
         ),
     )
 

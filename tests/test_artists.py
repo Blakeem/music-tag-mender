@@ -16,6 +16,7 @@ post-lookup correction gate (case-only, credit shrink, no MBID) has its own sect
 
 from __future__ import annotations
 
+import dataclasses
 import unicodedata
 from typing import TYPE_CHECKING, NamedTuple
 
@@ -725,6 +726,23 @@ def test_limit_caps_files_and_reports_pending(
     assert first.more is True
 
 
+def test_an_omitted_limit_caps_the_selection_at_the_setting(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    for name in ("a.mp3", "b.mp3", "c.mp3"):
+        make_track(music_dir / name, {"artist": [f"{name[0].upper()} '84"]})
+    scan_library(engine_settings)
+    capped = dataclasses.replace(engine_settings, artist_stage_limit=2)
+    fake = FakeCorrectionSource({})
+
+    result = artists.resolve_artists(capped, client=fake)
+
+    assert (result.settled, result.pending_remaining, result.more) == (2, 1, True)
+    assert fake.lookups == ["A '84", "B '84"]
+    assert "Call again to continue" in result.summary
+
+
 def test_two_identical_dry_runs_reprocess_the_same_values(
     engine_settings: Settings,
     music_dir: Path,
@@ -1202,7 +1220,7 @@ def test_mb_tier_reports_a_name_that_is_no_name_for_its_own_mbid(
         {
             "from": "Tattooed Corpse",
             "to": "Emily Browning",
-            "mbid": "mbid-1",
+            "mbids": ["mbid-1"],
             "reason": "no name MusicBrainz records for this id",
         },
     ]
@@ -1259,6 +1277,14 @@ def test_a_value_carrying_two_different_mbids_is_reported_not_staged(
 
     assert result.staged_files == 0
     assert result.name_id_disagreement == 1
+    assert result.name_id_disagreement_values == [
+        {
+            "from": "Ambiguous",
+            "to": None,
+            "mbids": ["mbid-1", "mbid-2"],
+            "reason": "the library pairs this name with more than one MusicBrainz id",
+        },
+    ]
     # Neither tier may act on a value the library cannot even identify consistently.
     assert mb.lookups == []
     assert lastfm.lookups == []

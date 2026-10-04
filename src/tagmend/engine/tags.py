@@ -74,6 +74,66 @@ EasyID3.RegisterTextKey("albumartistsort", "TSO2")  # type: ignore[no-untyped-ca
 EasyID3.RegisterTXXXKey("artists", "ARTISTS")  # type: ignore[no-untyped-call]
 EasyMP4Tags.RegisterFreeformKey("artists", "ARTISTS")  # type: ignore[no-untyped-call]
 
+# Navidrome shows the union of ``ALBUMARTIST`` and these two aliases, so each alias is managed
+# and a stage can leave one spelling. ID3 holds each in a ``TXXX`` frame, MP4 in a freeform atom.
+_ALBUMARTIST_ALIAS_FIELDS: Final[Mapping[str, str]] = {
+    "album artist": "ALBUM ARTIST",
+    "album_artist": "ALBUM_ARTIST",
+}
+_ALBUMARTIST_ALIAS_FRAMES: Final[frozenset[str]] = frozenset(
+    f"TXXX:{field}" for field in _ALBUMARTIST_ALIAS_FIELDS.values()
+)
+
+
+def _alias_frame_of(frame_key: str) -> str | None:
+    """Return the albumartist alias ``TXXX`` frame *frame_key* names in any ASCII case, or ``None``.
+
+    TagLib upper-cases the ASCII letters of a ``TXXX`` description, so Navidrome reads
+    ``TXXX:album artist`` as the ``album artist`` alias.
+    """
+    folded = frame_key.upper() if frame_key.isascii() else None
+    return folded if folded in _ALBUMARTIST_ALIAS_FRAMES else None
+
+
+def _register_alias_txxx_key(key: str, desc: str) -> None:
+    """Register *key* on every ``TXXX`` frame whose description is *desc* in any ASCII case.
+
+    A read joins every case variant, as TagLib does, and a write or a clear removes each one, so
+    the file keeps one spelling.
+    """
+    frame_key = f"TXXX:{desc}"
+    EasyID3.RegisterTXXXKey(key, desc)  # type: ignore[no-untyped-call]
+    add_frame = EasyID3.Set[key]
+
+    def variants(id3: ID3) -> list[str]:
+        held = list(id3.keys())  # type: ignore[no-untyped-call]
+        return [name for name in held if _alias_frame_of(name) == frame_key]
+
+    def getter(id3: ID3, _key: str) -> list[str]:
+        held = variants(id3)
+        if not held:
+            raise KeyError(frame_key)
+        return [str(text) for variant in held for text in id3[variant]]
+
+    def deleter(id3: ID3, _key: str) -> None:
+        held = variants(id3)
+        if not held:
+            raise KeyError(frame_key)
+        for variant in held:
+            del id3[variant]  # type: ignore[no-untyped-call]
+
+    def setter(id3: ID3, key: str, value: list[str]) -> None:
+        for variant in variants(id3):
+            del id3[variant]  # type: ignore[no-untyped-call]
+        add_frame(id3, key, value)
+
+    EasyID3.RegisterKey(key, getter, setter, deleter)  # type: ignore[no-untyped-call]
+
+
+for _alias, _field in _ALBUMARTIST_ALIAS_FIELDS.items():
+    _register_alias_txxx_key(_alias, _field)
+    EasyMP4Tags.RegisterFreeformKey(_alias, _field)  # type: ignore[no-untyped-call]
+
 # The two MusicBrainz ids in :data:`MANAGED_TAGS` that EasyMP4 has no built-in mapping for
 # (the album, albumartist, artist and track ids and the album type are native). Register
 # them here on the SAME iTunes freeform atom names Picard writes (verified against a real
@@ -110,7 +170,8 @@ _VORBIS_SPELLINGS: Final[Mapping[str, str]] = {
 }
 
 # Left unmapped: 245 of 479 library FLACs holding both ``organization`` and ``label`` differ,
-# and ``BAND`` or ``ALBUM ARTIST`` differ from ``ALBUMARTIST``. Collapsing either pair loses data.
+# and ``BAND`` can differ from ``ALBUMARTIST``. Collapsing either pair loses data. ``BAND`` stays
+# unmanaged, since Navidrome does not read it as an album artist.
 
 # Derived, never hand-written twice: a second literal could drift out of step with the map above.
 _VORBIS_TO_CANONICAL: Final[Mapping[str, str]] = {v: k for k, v in _VORBIS_SPELLINGS.items()}
@@ -172,26 +233,35 @@ RELEASE_STAMP_TAGS: Final[frozenset[str]] = frozenset(
 # it, ``artist`` then being only the display credit. Managed so an artist-name fix renames both.
 _ARTIST_LIST_TAGS: Final[frozenset[str]] = frozenset({"artists"})
 
-# The 26 tags TagMend writes and reverts, each writable on all four formats. A key outside the
+# The albumartist aliases, each its own key so that staging can clear the ones a change leaves.
+ALBUMARTIST_ALIASES: Final[frozenset[str]] = frozenset(_ALBUMARTIST_ALIAS_FIELDS)
+
+# The 28 tags TagMend writes and reverts, each writable on all four formats. A key outside the
 # set is never written or deleted. :func:`read_tags` reports every key the file holds, and
 # ``versioning.managed_subset`` narrows a read to this set.
 MANAGED_TAGS: Final[frozenset[str]] = (
-    ORIGINAL_MANAGED_TAGS | _WIDENED_MANAGED_TAGS | RELEASE_STAMP_TAGS | _ARTIST_LIST_TAGS
+    ORIGINAL_MANAGED_TAGS
+    | _WIDENED_MANAGED_TAGS
+    | RELEASE_STAMP_TAGS
+    | _ARTIST_LIST_TAGS
+    | ALBUMARTIST_ALIASES
 )
 
 # Which managed set governed a given revision, so revert can tell "this tag was empty then"
 # from "this tag was not tracked then". Version 1 is the pre-widening five-tag set, version 2
 # adds the thirteen identity fields, version 3 the seven release-stamp fields, version 4 the
-# ``artists`` list. Every new revision is stamped with :data:`MANAGED_SET_VERSION`, and
-# :func:`governed_tags` looks a stamp up here. Widening the set again means a new entry and a
-# bump, never editing an existing entry, since stored revisions point at it.
-MANAGED_SET_VERSION: Final = 4
+# ``artists`` list, version 5 the two albumartist aliases. Every new revision is stamped with
+# :data:`MANAGED_SET_VERSION`, and :func:`governed_tags` looks a stamp up here. Widening the set
+# again means a new entry and a bump, never editing an existing entry, since stored revisions
+# point at it.
+MANAGED_SET_VERSION: Final = 5
 
 MANAGED_SETS: Final[Mapping[int, frozenset[str]]] = {
     1: ORIGINAL_MANAGED_TAGS,
     2: ORIGINAL_MANAGED_TAGS | _WIDENED_MANAGED_TAGS,
     3: ORIGINAL_MANAGED_TAGS | _WIDENED_MANAGED_TAGS | RELEASE_STAMP_TAGS,
-    4: MANAGED_TAGS,
+    4: ORIGINAL_MANAGED_TAGS | _WIDENED_MANAGED_TAGS | RELEASE_STAMP_TAGS | _ARTIST_LIST_TAGS,
+    5: MANAGED_TAGS,
 }
 
 
@@ -208,7 +278,7 @@ def governed_tags(managed_set: int) -> frozenset[str]:
 # an older one and re-read them exactly once. BUMP THIS IN THE SAME COMMIT as any change to
 # what :func:`read_tags` produces (a Vorbis spelling, a format registration), or
 # every already-scanned file keeps serving the old reader's output to every detector.
-TAG_READER_VERSION: Final = 8
+TAG_READER_VERSION: Final = 10
 
 
 @dataclass(frozen=True, slots=True)
@@ -332,6 +402,22 @@ def _taglib_view(path: Path, tags: _EasyTags | None) -> _EasyTags:
     return id3v2_only
 
 
+def _easy_id3_view(frames: ID3) -> dict[str, list[str]]:
+    """Read a raw ID3 tag through the getters the easy MP3 layer registers, in its key order.
+
+    mutagen has no easy class for WAV or AIFF and hands back raw frames, so without this an MP3
+    and a WAV holding one frame would read under two keys.
+    """
+    view: dict[str, list[str]] = {}
+    for pattern, getter in EasyID3.Get.items():
+        lister = EasyID3.List.get(pattern)
+        keys = [pattern] if lister is None else lister(frames, pattern)
+        for key in keys:
+            with contextlib.suppress(KeyError):
+                view[key] = getter(frames, key)
+    return view
+
+
 def read_tags(path: Path) -> TrackTags:
     """Read and normalize the tags on *path*.
 
@@ -340,6 +426,8 @@ def read_tags(path: Path) -> TrackTags:
     decide how to record a read failure. An ID3v2.3 ``TYER`` that starts with a full
     ``YYYY-MM-DD`` date mutagen cannot convert reads as that ``date`` when no other date exists.
     An MP3 reads ID3v2 alone when it holds a frame, else ID3v1, as TagLib reads it apart from APEv2.
+    A WAV or AIFF ID3 tag reads under the MP3 keys. Any other value that is not a list of
+    strings, such as a WMA attribute, is skipped.
     """
     return _normalized_tags(path, mutagen.File(path, easy=True))  # type: ignore[attr-defined]
 
@@ -351,7 +439,10 @@ def _normalized_tags(path: Path, audio: FileType | None) -> TrackTags:
     weighs the file name when it sniffs and the temp name carries no audio extension.
     """
     # Input
-    tags: Any = {} if audio is None else _taglib_view(path, audio.tags)
+    raw_tags: Any = None if audio is None else audio.tags
+    tags: Any = (
+        _easy_id3_view(raw_tags) if isinstance(raw_tags, ID3) else _taglib_view(path, raw_tags)
+    )
 
     # Process: a file can carry both spellings of one concept (a tagger wrote the Vorbis name,
     # an older TagMend wrote the canonical one). The Vorbis name is what every other reader
@@ -359,6 +450,8 @@ def _normalized_tags(path: Path, audio: FileType | None) -> TrackTags:
     normalized: dict[str, list[str]] = {}
     from_vorbis_spelling: set[str] = set()
     for raw_key, raw_values in tags.items():
+        if not isinstance(raw_values, list) or not all(isinstance(v, str) for v in raw_values):
+            continue
         lowered = str(raw_key).lower()
         key = _VORBIS_TO_CANONICAL.get(lowered, lowered)
         native = lowered in _VORBIS_TO_CANONICAL
@@ -689,7 +782,7 @@ def _id3_entries(source: Path | BinaryIO) -> dict[str, list[str]]:
             entries.setdefault(frame_id, []).append(_digest(repr(frame)))
     managed = frozenset(_ID3_FRAMES.values())
     for key, frame in frames.items():
-        if key not in managed:
+        if key not in managed and _alias_frame_of(key) is None:
             entries.setdefault(key, []).append(_digest(repr(frame)))
     return entries
 

@@ -38,6 +38,9 @@ flagged, because every file needs the same fix.
 A file with a blank ``album`` is skipped. It has no release identity to contradict, it is a
 gap rather than a conflict, and :mod:`tagmend.engine.album_gaps` already reports it. Counting
 it here would double-report it and let a blank identity win the majority vote.
+
+Navidrome trims neither ``albumartist`` nor ``album``, so a file whose value is whitespace-only
+or padded gets a low row even when its whole folder agrees, unless a split row names it.
 """
 
 from __future__ import annotations
@@ -106,6 +109,10 @@ _REASON_NO_ALBUMARTIST: Final = (
 )
 _REASON_NON_ALBUM: Final = (
     "folder name says it is not one album, so several releases here are expected"
+)
+_REASON_EDGE_WHITESPACE: Final = (
+    "this file's album artist or album title is blank or carries leading or trailing "
+    "whitespace, which Navidrome shows as written. Give every file the trimmed value"
 )
 
 
@@ -344,6 +351,88 @@ def _compilation_identity(files: list[_FileInput]) -> str:
     return VARIOUS_ARTISTS + " - " + _DISC_SUFFIX.sub("", files[0].album or "").strip()
 
 
+def _has_edge_whitespace(value: str | None) -> bool:
+    """Return whether *value* is whitespace-only or carries leading or trailing whitespace."""
+    return value is not None and value != value.strip()
+
+
+def _trimmed(file: _FileInput) -> _FileInput:
+    """Return *file* with its album artist and album title trimmed, as the remedy leaves them."""
+    return replace(
+        file,
+        albumartist=None if file.albumartist is None else file.albumartist.strip(),
+        album=None if file.album is None else file.album.strip(),
+    )
+
+
+def _edge_whitespace_rows(files: list[_FileInput]) -> list[AlbumConflictRow]:
+    """Return one low row per file whose album artist or album title carries edge whitespace.
+
+    Navidrome trims neither value, so every folder sibling may agree and still show a blank or
+    padded name. ``majority_identity`` names the identity the trimmed file takes.
+    """
+    return [
+        AlbumConflictRow(
+            file_id=f.file_id,
+            folder=f.folder,
+            filename=f.filename,
+            album=f.album,
+            albumartist=f.albumartist,
+            release_mbid=f.release_mbid,
+            date=f.date,
+            identity=f.identity_label,
+            majority_identity=_trimmed(f).identity_label,
+            tier=Tier.LOW.value,
+            reason=_REASON_EDGE_WHITESPACE,
+        )
+        for f in files
+        if _has_edge_whitespace(f.albumartist) or _has_edge_whitespace(f.album)
+    ]
+
+
+def _edge_whitespace_group(
+    folder: str,
+    file_count: int,
+    members: list[_FileInput],
+    folder_rows: list[AlbumConflictRow],
+) -> AlbumConflictGroup:
+    """Return the group of a folder whose files share one identity and only edge whitespace."""
+    titled = [f for f in members if (f.album or "").strip()]
+    flagged_ids = {r.file_id for r in folder_rows}
+    return AlbumConflictGroup(
+        folder=folder,
+        file_count=file_count,
+        flagged=0,
+        folder_context=0,
+        identities=len({f.identity for f in titled}),
+        majority_identity=folder_rows[0].majority_identity,
+        majority_files=sum(1 for f in titled if f.file_id not in flagged_ids),
+        tiers={},
+        file_ids=[],
+    )
+
+
+def _fold_edge_whitespace(
+    groups: list[AlbumConflictGroup],
+    rows: list[AlbumConflictRow],
+    files: list[_FileInput],
+    folder_sizes: Counter[str],
+) -> list[AlbumConflictGroup]:
+    """Refold every group over its flagged *rows*, adding one for a whitespace-only folder."""
+    rows_by_folder = group_by_folder(rows)
+    files_by_folder = group_by_folder(files)
+    by_folder = {g.folder: g for g in groups}
+    for folder, folder_rows in rows_by_folder.items():
+        if folder not in by_folder:
+            by_folder[folder] = _edge_whitespace_group(
+                folder, folder_sizes[folder], files_by_folder[folder], folder_rows
+            )
+    return [
+        _refold_group(g, rows_by_folder[g.folder]) if g.folder in rows_by_folder else g
+        for g in by_folder.values()
+    ]
+
+
 def _first_index(files: list[_FileInput], identity: tuple[str, ...]) -> int:
     """Return the position of the first file carrying *identity* (for stable tie-breaking)."""
     return next(i for i, f in enumerate(files) if f.identity == identity)
@@ -387,6 +476,10 @@ def _classify(files: list[_FileInput]) -> AlbumConflictsReport:
             file_ids=[],
         )
         groups.append(base if context_reason else _refold_group(base, folder_rows))
+    # A file a split row already names gets no second row, so ``flagged`` stays a file count.
+    split_ids = {r.file_id for r in rows + context_rows}
+    rows.extend(r for r in _edge_whitespace_rows(files) if r.file_id not in split_ids)
+    groups = _fold_edge_whitespace(groups, rows, files, folder_sizes)
     groups.sort(key=lambda g: g.folder)
 
     # Output: the whole-library counts, which no later narrowing changes.

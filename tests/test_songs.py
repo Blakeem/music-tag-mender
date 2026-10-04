@@ -134,6 +134,8 @@ class Slot:
     position: int
     track_count: int = 4
     date: int = 2000
+    medium: int = 1
+    medium_count: int = 1
 
 
 def _track_id(release: str, position: int) -> str:
@@ -164,11 +166,11 @@ def _recording(
                 "title": f"{slot.release} title",
                 "country": "US",
                 "date": {"year": slot.date},
-                "medium_count": 1,
-                "track_count": slot.track_count,
+                "medium_count": slot.medium_count,
+                "track_count": slot.track_count * slot.medium_count,
                 "mediums": [
                     {
-                        "position": 1,
+                        "position": slot.medium,
                         "format": "CD",
                         "track_count": slot.track_count,
                         "tracks": [
@@ -359,6 +361,100 @@ def test_convergence_floor_holds_a_folder_too_few_voters_share(
     assert result.staged_files == 0
     assert result.settled == 0
     assert staging.diff_tags(engine_settings) == []
+
+
+_ALBUM_X = "rel-album-x"
+_SINGLE = "rel-single"
+_SEVEN = "07 Song Seven.flac"
+
+
+def _album_track_kit() -> Kit:
+    """Song Seven sits on the 12-track Album X and on an earlier Official 1-track single."""
+    titles = [f"Song {n}" for n in range(1, 13)]
+    titles[6] = "Song Seven"
+    album = _release(_ALBUM_X, titles)
+    single = _release(_SINGLE, ["Song Seven"], recordings=["rec-7"])
+    slots = (Slot(_ALBUM_X, 7, track_count=12, date=2001), Slot(_SINGLE, 1, 1, date=1999))
+    body = _body(_recording("rec-7", "Song Seven", *slots))
+    return Kit(acoustid=FakeAcoustid({f"fp-{_SEVEN}": body}), releases=FakeReleases(album, single))
+
+
+def _album_track_folder(music_dir: Path, tracknumber: str) -> None:
+    tags = {**_BASE_TAGS, "album": ["Album X"], "title": ["Song Seven"]}
+    make_track(music_dir / "Album X" / _SEVEN, {**tags, "tracknumber": [tracknumber]})
+
+
+def test_a_one_file_folder_converges_on_the_album_its_track_total_names(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    _album_track_folder(music_dir, "7/12")
+    library.scan_library(engine_settings)
+
+    result = _resolve(engine_settings, _album_track_kit())
+
+    assert (result.verified_files, result.held_disagreement) == (1, 0)
+    assert staging.diff_tags(engine_settings) == []
+
+
+def test_a_one_file_folder_without_totals_is_held_for_the_manual_release_path(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    _album_track_folder(music_dir, "7")
+    library.scan_library(engine_settings)
+
+    result = _resolve(engine_settings, _album_track_kit())
+
+    assert (result.held_unconverged, result.staged_files, result.settled) == (1, 0, 0)
+    assert [row["reason"] for row in result.held_values] == ["needs_release_mbid"]
+    assert staging.diff_tags(engine_settings) == []
+
+
+def _two_disc_release(mbid: str, titles: Sequence[str]) -> MBRelease:
+    """Return a release whose first disc plays ``rec-N`` and whose second plays bonus tracks."""
+    release = _release(mbid, titles)
+    first = release.media[0]
+    bonus = tuple(
+        replace(
+            track,
+            recording_mbid=f"rec-bonus-{track.position}",
+            release_track_mbid=f"{mbid}-d2t{track.position}",
+        )
+        for track in first.tracks
+    )
+    return replace(release, media=(first, replace(first, position=2, tracks=bonus)))
+
+
+def test_a_deluxe_disc_folder_converges_on_the_deluxe_its_disc_total_names(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    titles = [f"Song {n}" for n in range(1, 13)]
+    names = [f"{n:02d} Song {n}.flac" for n in range(1, 13)]
+    for n, name in enumerate(names, 1):
+        tags = {"title": [f"Song {n}"], "tracknumber": [str(n)], "discnumber": ["1/2"]}
+        make_track(music_dir / "Deluxe" / "CD1" / name, {**_BASE_TAGS, **tags})
+    library.scan_library(engine_settings)
+    bodies = {
+        f"fp-{name}": _body(
+            _recording(
+                f"rec-{n}",
+                f"Song {n}",
+                Slot("rel-standard", n, 12),
+                Slot("rel-deluxe", n, 12, date=2010, medium_count=2),
+            ),
+        )
+        for n, name in enumerate(names, 1)
+    }
+    releases = FakeReleases(
+        _release("rel-standard", titles), _two_disc_release("rel-deluxe", titles)
+    )
+
+    result = _resolve(engine_settings, Kit(acoustid=FakeAcoustid(bodies), releases=releases))
+
+    assert (result.verified_files, result.held_disagreement) == (12, 0)
+    assert "rel-standard" not in releases.lookups
 
 
 # --- dry-run refusals ----------------------------------------------------------------
@@ -833,6 +929,24 @@ def test_weak_evidence_is_held_as_no_contribution(
     assert (held["file_id"], held["reason"]) == (ids[_NAMES[3]], reason)
     assert _NAMES[3] not in _diffs(engine_settings)
     assert _status(engine_settings, ids[_NAMES[3]]) == "pending"
+
+
+@pytest.mark.parametrize(
+    ("title", "stem", "holds"),
+    [
+        pytest.param("Часть 1", "05 Глава 1", False, id="cyrillic-title-sharing-only-a-digit"),
+        pytest.param("Глава 1", "05 Глава 1", True, id="cyrillic-title-the-stem-names"),
+        pytest.param("Cafe", "01 Café", True, id="ascii-title-of-an-accented-stem"),
+        pytest.param("Café", "01 Cafe", True, id="accented-title-of-an-ascii-stem"),
+        pytest.param("!!!", "01 !!!", True, id="punctuation-title-falls-back-to-loose-key"),
+    ],
+)
+def test_stem_check_folds_the_title_and_stem_with_one_script_aware_key(
+    title: str,
+    stem: str,
+    holds: bool,  # noqa: FBT001
+) -> None:
+    assert songs._stem_holds(title, stem) is holds
 
 
 # --- slot collisions -----------------------------------------------------------------

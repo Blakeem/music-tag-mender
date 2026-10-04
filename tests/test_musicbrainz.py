@@ -16,12 +16,14 @@ from tagmend.engine import musicbrainz
 from tagmend.engine.musicbrainz import (
     MusicBrainzClient,
     MusicBrainzError,
+    MusicBrainzUnavailableError,
     _artist_request_key,
     _recording_request_key,
     _release_from_json,
     _release_request_key,
     _release_to_json,
     _request_key,
+    _title_matches,
 )
 from tagmend.engine.store import (
     get_cached_mb_artist,
@@ -141,7 +143,6 @@ def test_returns_album_original_year(db_conn: sqlite3.Connection) -> None:
     assert album.original_date == "1970-09-18"  # the full date, as MusicBrainz gives it
     assert album.album_title == "Paranoid"
     assert album.release_group_mbid == "rg-1"
-    assert album.release_mbid == "rel-1"
     assert len(calls) == 1
 
 
@@ -456,6 +457,13 @@ def test_selection_version_changes_recording_request_key(monkeypatch: pytest.Mon
     assert _recording_request_key("Black Sabbath", "War Pigs") != before
 
 
+def test_script_aware_title_key_bumped_selection_version() -> None:
+    # Token "5" cached picks under the ASCII-only title key, which decided both pairs the other way.
+    assert _title_matches("Cafe", "Café")
+    assert not _title_matches("Часть 1", "Глава 1")
+    assert musicbrainz._SELECTION_VERSION not in {"4", "5"}
+
+
 # --- transient errors ----------------------------------------------------------------
 
 
@@ -592,8 +600,6 @@ def test_recording_search_returns_album(db_conn: sqlite3.Connection) -> None:
 
     assert recording is not None
     assert recording.album_title == "Paranoid"
-    assert recording.release_group_mbid == "rg-1"
-    assert recording.recording_mbid == "rec-1"
     assert len(calls) == 1
 
 
@@ -607,8 +613,6 @@ def test_recording_search_picks_highest_scoring(db_conn: sqlite3.Connection) -> 
         recording = client.recording_search("Artist", "Title")
     assert recording is not None
     assert recording.album_title == "High"
-    assert recording.release_group_mbid == "rg-hi"
-    assert recording.recording_mbid == "rec-hi"
 
 
 def test_recording_search_tie_prefers_the_recording_on_an_official_album(
@@ -633,7 +637,6 @@ def test_recording_search_tie_prefers_the_recording_on_an_official_album(
         recording = client.recording_search("Team Sleep", "Ever (Foreign Flag)")
     assert recording is not None
     assert recording.album_title == "Team Sleep"
-    assert recording.recording_mbid == "rec-album"
 
 
 def test_recording_search_takes_the_official_release_of_one_recording(
@@ -658,7 +661,6 @@ def test_recording_search_takes_the_official_release_of_one_recording(
         recording = client.recording_search("Team Sleep", "Ever (Foreign Flag)")
     assert recording is not None
     assert recording.album_title == "Team Sleep"
-    assert recording.release_group_mbid == "rg-album"
 
 
 def test_recording_search_falls_back_to_a_release_that_is_not_official(
@@ -689,7 +691,7 @@ def test_recording_search_full_tie_keeps_the_first(db_conn: sqlite3.Connection) 
     with client:
         recording = client.recording_search("Artist", "Title")
     assert recording is not None
-    assert recording.recording_mbid == "rec-first"
+    assert recording.album_title == "First"
 
 
 def test_recording_search_skips_non_album_release_group(db_conn: sqlite3.Connection) -> None:
@@ -1467,7 +1469,7 @@ def test_a_503_that_never_clears_raises_and_caches_nothing(
 ) -> None:
     responses = [httpx.Response(503, text="busy") for _ in range(4)]
     client, calls = _client(db_conn, responses, sleep=lambda _s: None)
-    with client, pytest.raises(MusicBrainzError):
+    with client, pytest.raises(MusicBrainzUnavailableError):
         client.release_by_mbid("rel-1")
 
     # Three attempts, then it gives up rather than hammering.

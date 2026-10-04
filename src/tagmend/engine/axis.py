@@ -202,7 +202,7 @@ SONG_AXIS: Final = Axis(
     name="song",
     fields=("title", "tracknumber", "discnumber"),
     status_table="file_song_status",
-    source_columns=("source_album_mbid", "source_release_track_mbid"),
+    source_columns=("source_release_mbid", "source_release_track_mbid"),
     workflow_statuses=frozenset({"pending", "manual", "staged", "done"}),
     # No lookup name field exists on this axis, so a value scopes a whole album.
     scope_fields=("album",),

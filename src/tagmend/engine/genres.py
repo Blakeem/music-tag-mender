@@ -12,8 +12,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from tagmend.engine import axis, axis_resolver, classify, staging, store
-from tagmend.engine.lastfm import LastfmClient, LastfmError, LastfmKeyError
+from tagmend.engine import axis, axis_resolver, classify, ledger_lock, staging, store
+from tagmend.engine.lastfm import (
+    LastfmClient,
+    LastfmError,
+    LastfmKeyError,
+    LastfmUnavailableError,
+)
 from tagmend.engine.serialize import FieldDict
 
 if TYPE_CHECKING:
@@ -47,6 +52,7 @@ class ResolveGenresResult(FieldDict):
 # --- staging orchestration -----------------------------------------------------------
 
 
+@ledger_lock.mutating
 def resolve_genres(  # noqa: PLR0913 - cohesive keyword-only scope + injection params
     settings: Settings,
     *,
@@ -60,13 +66,15 @@ def resolve_genres(  # noqa: PLR0913 - cohesive keyword-only scope + injection p
     """Look up Last.fm genres for the in-scope ``pending`` files and stage the result.
 
     Scope is *file_ids* when given, else every file carrying *value* as ``artist`` or
-    ``albumartist`` (narrowed to *album* when given), else the whole library. The selection is
-    the first *limit* (default ``genre_stage_limit``) present files in scope that derive
-    ``pending``. They are grouped by ``(artist, album)``, and per group Last.fm top tags are
-    looked up and classified. Each selected file then settles: ``done`` when the resolved genres
-    equal its current ones, ``done`` and staged (``origin='auto'``, only ``genre`` changed) when
-    they differ, ``no_match`` when nothing usable came back. A Last.fm lookup error leaves the
-    group ``pending`` and is reported, never aborting the call. A rejected key raises
+    ``albumartist`` (narrowed to *album* when given), else the whole library. The call settles
+    up to *limit* (default ``genre_stage_limit``) present files in scope that derive ``pending``,
+    in file-id order, and reads past a file staging refuses. They are grouped by
+    ``(artist, album)``, and per group Last.fm top tags are looked up and classified. Each
+    selected file then settles: ``done`` when the resolved genres equal its current ones,
+    ``done`` and staged (``origin='auto'``, only ``genre`` changed) when they differ,
+    ``no_match`` when nothing usable came back. A Last.fm lookup error leaves the group
+    ``pending`` and is reported, and the call reads past it. A :class:`LastfmUnavailableError`
+    also stops the call reading past refused files and failed groups. A rejected key raises
     :class:`LastfmKeyError` and stops the call. A file that cannot be staged is reported in
     ``error_items`` under ``file_id=<id>`` and stays ``pending``.
 
@@ -85,7 +93,8 @@ def resolve_genres(  # noqa: PLR0913 - cohesive keyword-only scope + injection p
         axis_=axis.GENRE_AXIS,
         build_client=lambda conn: LastfmClient.from_settings(settings, conn),
         lookup=lambda source, identity: _resolve_group(settings, identity, vocab, source) or None,
-        transient_error=LastfmError,
+        lookup_error=LastfmError,
+        unavailable_error=LastfmUnavailableError,
         group_key=_artist_key,
         stage=lambda conn, fid, resolved, dry_run: _stage_resolved(
             settings, conn, fid, resolved, dry_run=dry_run

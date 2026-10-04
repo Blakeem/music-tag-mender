@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Final
 
-from tagmend.engine import axis, clock, db, schema, store
+from tagmend.engine import axis, clock, db, ledger_lock, schema, store
 from tagmend.engine.validation import require_choice
 from tagmend.log import get_logger
 
@@ -73,6 +73,7 @@ def apply_status(
     return len(scoped)
 
 
+@ledger_lock.mutating
 def set_manual_status(
     settings: Settings,
     axis_: axis.Axis,
@@ -97,6 +98,7 @@ def set_manual_status(
     return affected
 
 
+@ledger_lock.mutating
 def reset_status(
     settings: Settings,
     axis_: axis.Axis,

@@ -48,7 +48,7 @@ from tagmend.engine.detector_core import (
     validate_tier,
 )
 from tagmend.engine.serialize import FieldDict
-from tagmend.engine.text_keys import alnum_script_key, display_key, loose_key
+from tagmend.engine.text_keys import display_key, title_key
 from tagmend.engine.validation import check_limit
 from tagmend.log import get_logger
 
@@ -184,7 +184,7 @@ def _is_context_folder(files: list[_FileInput]) -> str | None:
 
 def _tier_for(peers: list[_FileInput]) -> tuple[Tier, str]:
     """Classify one slot's colliding files by how their titles and containers compare."""
-    titles = {alnum_script_key(f.title) or loose_key(f.title) for f in peers if f.title}
+    titles = {title_key(f.title) for f in peers if f.title}
     if len(titles) > 1:
         return Tier.HIGH, _REASON_HIGH
     if len({f.ext.lower() for f in peers}) > 1:

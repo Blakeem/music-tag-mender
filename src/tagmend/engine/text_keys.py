@@ -7,7 +7,7 @@
 * :func:`display_key` treats casing, typographic character choice and whitespace runs as cosmetic.
 * :func:`artist_name_key` also treats a dash written for a word break as cosmetic.
 * :func:`loose_key` treats Unicode compatibility forms, casing and whitespace as cosmetic.
-* :func:`title_key` is :func:`alnum_key`, or :func:`loose_key` for a title it empties.
+* :func:`title_key` is :func:`alnum_script_key`, or :func:`loose_key` for a title it empties.
 * :func:`year_key` treats everything after a date's leading four-digit year as cosmetic.
 
 A key decides whether two spellings are the same. It is never written to disk.
@@ -130,18 +130,17 @@ def artist_name_key(value: str) -> str:
 
 
 def loose_key(value: str) -> str:
-    """Return an NFKC casefold key with whitespace removed, for titles :func:`alnum_key` empties.
+    """Return an NFKC casefold key with no whitespace, for a title :func:`alnum_script_key` empties.
 
-    :func:`alnum_key` strips everything outside ``[a-z0-9]``, so a title written wholly in a
-    non-Latin script or in symbols (``Спутник``, ``東京事変``, ``+``) folds to ``""`` and could
-    never match itself. This keeps those characters instead of dropping them.
+    A title of symbols only (``+``, ``!!!``) has no letter or digit, so :func:`alnum_script_key`
+    folds it to ``""`` and it could never match itself. This keeps those characters.
     """
     return "".join(unicodedata.normalize("NFKC", value).casefold().split())
 
 
 def title_key(title: str) -> str:
-    """Return *title*'s comparison key: its :func:`alnum_key`, or :func:`loose_key` when empty."""
-    return alnum_key(title) or loose_key(title)
+    """Return *title*'s comparison key: :func:`alnum_script_key`, else :func:`loose_key`."""
+    return alnum_script_key(title) or loose_key(title)
 
 
 def year_key(value: str | None) -> str | None:

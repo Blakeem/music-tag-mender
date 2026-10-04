@@ -17,7 +17,9 @@ import logging
 import os
 import shutil
 import sqlite3
+import struct
 import sys
+import wave
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -25,7 +27,7 @@ import httpx
 import mutagen
 import pytest
 import send2trash
-from mutagen.id3 import ID3, RVAD, TIT2  # type: ignore[attr-defined]
+from mutagen.id3 import APIC, ID3, RVAD, TIT2, TPE1  # type: ignore[attr-defined]
 
 from tagmend import config
 from tagmend.config import Settings
@@ -103,6 +105,44 @@ def make_rvad_mp3(dest: Path, tags: Mapping[str, Sequence[str]]) -> Path:
     frames.add(RVAD(adjustments=[1, 1], peaks=[1, 1]))  # type: ignore[no-untyped-call]
     frames.save(track, v2_version=3)
     return track
+
+
+# 8000 Hz as the 80-bit extended float an AIFF COMM chunk holds. The stdlib aifc is deprecated.
+_AIFF_8000_HZ = b"\x40\x0b\xfa\x00\x00\x00\x00\x00\x00\x00"
+
+
+def _iff_chunk(chunk_id: bytes, data: bytes) -> bytes:
+    return chunk_id + struct.pack(">L", len(data)) + data
+
+
+def make_chunk_id3_track(dest: Path) -> Path:
+    """Write a silent WAV or AIFF, by *dest*'s suffix, titled ``Song`` by ``Band`` with a cover.
+
+    Both keep their ID3 tag in a chunk, and mutagen has no easy class for either.
+    """
+    frames = 800
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.suffix.lower() == ".wav":
+        with wave.open(str(dest), "wb") as stream:
+            stream.setnchannels(1)
+            stream.setsampwidth(2)
+            stream.setframerate(8000)
+            stream.writeframes(bytes(frames * 2))
+    else:
+        comm = struct.pack(">hLh", 1, frames, 16) + _AIFF_8000_HZ
+        ssnd = struct.pack(">LL", 0, 0) + bytes(frames * 2)
+        form = b"AIFF" + _iff_chunk(b"COMM", comm) + _iff_chunk(b"SSND", ssnd)
+        dest.write_bytes(_iff_chunk(b"FORM", form))
+    audio = mutagen.File(dest)  # type: ignore[attr-defined]
+    audio.add_tags()
+    audio.tags.add(TIT2(encoding=3, text=["Song"]))  # type: ignore[no-untyped-call]
+    audio.tags.add(TPE1(encoding=3, text=["Band"]))  # type: ignore[no-untyped-call]
+    cover = APIC(  # type: ignore[no-untyped-call]
+        encoding=3, mime="image/png", type=3, desc="", data=b"\x89PNG"
+    )
+    audio.tags.add(cover)
+    audio.save()
+    return dest
 
 
 # The ways a user can type one folder. Upper case names the same folder only where the

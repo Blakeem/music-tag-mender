@@ -144,9 +144,10 @@ def list_commits_in(conn: sqlite3.Connection, *, limit: int | None = None) -> li
 def mark_interrupted(conn: sqlite3.Connection) -> int:
     """Flip every lingering ``applying`` commit to ``interrupted`` and return the count.
 
-    Single-user model: any commit still ``applying`` at the start of a new commit is a
-    crash remnant. Its already-committed files keep their revisions. Its leftover staged
-    rows stay staged and the new commit sweeps them up. Does not commit.
+    Every caller holds :func:`tagmend.engine.ledger_lock.mutation_lock`, which admits one
+    mutating call per ledger, so any commit still ``applying`` here is a crash remnant. Its
+    already-committed files keep their revisions. Its leftover staged rows stay staged and the
+    new commit sweeps them up. Does not commit.
     """
     cursor = conn.execute(
         "UPDATE commits SET status = 'interrupted' WHERE status = 'applying'",

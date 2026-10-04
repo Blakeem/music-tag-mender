@@ -1286,6 +1286,38 @@ def test_set_by_value_defers_only_the_carriers_that_flag(
     assert set(_stored(engine_settings)) == {jem_id}
 
 
+def test_set_by_value_defers_carriers_across_release_folders(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    ozzy = _make_mislabeled_library(music_dir)
+    live = music_dir / "Ozzy Osbourne" / "(2002) Ozzy Osbourne - Live"
+    make_track(live / "01 Paranoid.mp3", {"albumartist": ["Jem"], "artist": ["Ozzy Osbourne"]})
+    make_track(live / "02 Crazy Train.mp3", {"albumartist": ["Ozzy Osbourne"], "artist": ["Ozzy"]})
+    scan_library(engine_settings)
+    jem_ids = [
+        _ozzy_ids(engine_settings, ozzy)[0],
+        _file_id(engine_settings, live, "01 Paranoid.mp3"),
+    ]
+
+    with pytest.raises(ValueError, match="these files span 2"):
+        mismatch.set_mismatch_status(
+            engine_settings,
+            status=MISFILED_DEFERRED,
+            covers=[TOP_FOLDER_ARTIST],
+            file_ids=jem_ids,
+        )
+    result = mismatch.set_mismatch_status(
+        engine_settings,
+        status=MISFILED_DEFERRED,
+        covers=[TOP_FOLDER_ARTIST],
+        value="Jem",
+    )
+
+    assert (result.affected, result.skipped_unflagged) == (2, 0)
+    assert set(_stored(engine_settings)) == set(jem_ids)
+
+
 def _guard_library(settings: Settings, music_dir: Path) -> dict[str, int]:
     """The mislabeled Ozzy group plus a second flagged group. Return the ids by role."""
     ozzy = _make_mislabeled_library(music_dir)

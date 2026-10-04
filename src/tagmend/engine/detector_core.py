@@ -102,10 +102,11 @@ def display_album_artist(
     """Return the album artist a server would group a file under.
 
     The compilation marker outranks the track artist, so a various-artists release with no
-    album artist stays one album instead of scattering across every track's artist.
+    album artist stays one album instead of scattering across every track's artist. Navidrome
+    trims no album artist, so a whitespace value is returned as written.
     """
-    if albumartist and albumartist.strip():
-        return albumartist.strip()
+    if albumartist:
+        return albumartist
     if (compilation or "").strip() in COMPILATION_TRUE:
         return VARIOUS_ARTISTS
     if artist and artist.strip():

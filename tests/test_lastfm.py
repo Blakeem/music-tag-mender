@@ -20,6 +20,7 @@ from tagmend.engine.lastfm import (
     LastfmClient,
     LastfmError,
     LastfmKeyError,
+    LastfmUnavailableError,
     Tag,
     _request_key,
 )
@@ -380,7 +381,7 @@ def test_transport_error_exhausts_into_lastfm_error(db_conn: sqlite3.Connection)
         db_conn,
         [httpx.ConnectError("connection dropped")] * 3,
     )
-    with client, pytest.raises(LastfmError) as raised:
+    with client, pytest.raises(LastfmUnavailableError) as raised:
         client.artist_top_tags("Anybody")
     assert isinstance(raised.value.__cause__, httpx.ConnectError)
     assert "api_key" not in str(raised.value)  # the request URL carries the key

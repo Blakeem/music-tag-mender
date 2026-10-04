@@ -36,9 +36,20 @@ from typing import TYPE_CHECKING, Final, cast
 
 import mutagen
 
-from tagmend.engine import axis, clock, commits, db, path_keys, schema, store, versioning
+from tagmend.engine import (
+    axis,
+    clock,
+    commits,
+    db,
+    ledger_lock,
+    path_keys,
+    schema,
+    store,
+    versioning,
+)
 from tagmend.engine.serialize import FieldDict
 from tagmend.engine.tags import (
+    ALBUMARTIST_ALIASES,
     MANAGED_SET_VERSION,
     MANAGED_TAGS,
     RELEASE_STAMP_TAGS,
@@ -134,6 +145,24 @@ def _drop_filled(
         key: values
         for key, values in requested.items()
         if key not in fill_only or not any(value.strip() for value in current.get(key, []))
+    }
+
+
+def _albumartist_alias_clears(
+    requested: dict[str, list[str]],
+    current: dict[str, list[str]],
+) -> dict[str, list[str]]:
+    """Return a clear of each albumartist alias *current* holds and *requested* leaves out.
+
+    Navidrome shows the union of every albumartist spelling, so a stage that sets ``albumartist``
+    and keeps an alias would show the old album artist beside the new one.
+    """
+    if "albumartist" not in requested:
+        return {}
+    return {
+        alias: []
+        for alias in sorted(ALBUMARTIST_ALIASES)
+        if alias in current and alias not in requested
     }
 
 
@@ -498,8 +527,10 @@ def _stage_one(  # noqa: PLR0913 - cohesive keyword-only per-file staging payloa
     :func:`tagmend.engine.versioning.observe_widened_fields` writes), records an external edit
     as a ``scan`` revision (:func:`tagmend.engine.versioning.observe_drift`), merges
     *tags* onto the file's current managed subset (P0: omitted keys are preserved),
-    and upserts the staged row with the file's signature as its base, so the commit can refuse
-    a file edited since, and with the caller's surviving keys as its ``supplied_keys``.
+    clears each albumartist alias a change to ``albumartist`` leaves out
+    (:func:`_albumartist_alias_clears`), and upserts the staged row with the file's signature as
+    its base, so the commit can refuse a file edited since, and with the caller's surviving keys
+    as its ``supplied_keys``.
     Raises :class:`ValueError` naming *file_id* on any refusal. Leaves the transaction for the
     caller to commit or roll back.
     """
@@ -527,6 +558,7 @@ def _stage_one(  # noqa: PLR0913 - cohesive keyword-only per-file staging payloa
     # win, and an explicit empty list still deletes a field.
     target = versioning.managed_subset(current)
     target.update(inputs.remaining)
+    target.update(_albumartist_alias_clears(inputs.remaining, current))
     changed_fields = versioning.compute_diff(versioning.managed_subset(current), target).keys()
 
     store.upsert_staged_tag(
@@ -544,6 +576,7 @@ def _stage_one(  # noqa: PLR0913 - cohesive keyword-only per-file staging payloa
     return True
 
 
+@ledger_lock.mutating
 def stage_tags(  # noqa: PLR0913 - cohesive keyword-only staging payload
     settings: Settings,
     *,
@@ -640,6 +673,7 @@ def _checked_tags(tags: object) -> dict[str, list[str]]:
     return cast("dict[str, list[str]]", tags)
 
 
+@ledger_lock.mutating
 def stage_tags_batch(
     settings: Settings,
     *,
@@ -701,6 +735,7 @@ def _refuse_landed_unstage(conn: sqlite3.Connection, staged: store.StagedTag, pa
         raise ValueError(message)
 
 
+@ledger_lock.mutating
 def unstage_tags(settings: Settings, *, file_id: int) -> int:
     """Drop the pending change for *file_id*. Returns the count of rows removed, 1 or 0.
 
@@ -840,6 +875,7 @@ def _commit_origin(origins: set[str]) -> str:
     return "auto" if origins == {"auto"} else "manual"
 
 
+@ledger_lock.mutating
 def commit_tags(
     settings: Settings,
     *,

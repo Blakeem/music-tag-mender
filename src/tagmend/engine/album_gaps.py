@@ -311,7 +311,7 @@ def _recording_source(
     folder). Each blank file carrying a non-blank ``artist`` AND ``title`` is looked up
     ``(artist, title)`` against the recording's release-group title, and a hit becomes a
     ``review`` proposal (never green). Files lacking artist or title are never sent to
-    MusicBrainz. A transient :class:`MusicBrainzError` leaves that file unproposed without
+    MusicBrainz. A :class:`MusicBrainzError` leaves that file unproposed without
     aborting the folder and is returned as one error item. With no hits the folder is
     ``lookup_error`` when any lookup failed, else ``stays_blank``.
     """

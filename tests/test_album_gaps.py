@@ -55,7 +55,7 @@ class FakeMBRecordingSource:
 
 
 def _rec(album_title: str) -> MBRecording:
-    return MBRecording(album_title=album_title, release_group_mbid="rg-1", recording_mbid="rec-1")
+    return MBRecording(album_title=album_title)
 
 
 def _mk(  # noqa: PLR0913 - cohesive keyword-only test-input fields

@@ -49,7 +49,6 @@ def _release(title: str, date: str) -> MBReleaseGroup:
         album_title=title,
         original_date=date,
         release_group_mbid=f"rg-{title}",
-        release_mbid=None,
     )
 
 

@@ -114,6 +114,7 @@ def build_seed(settings: Settings) -> dict[str, object]:
         "genre_use_album_tags": "true" if settings.genre_use_album_tags else "false",
         "lastfm_rate_per_sec": str(settings.lastfm_rate_per_sec),
         "genre_stage_limit": str(settings.genre_stage_limit),
+        "artist_stage_limit": str(settings.artist_stage_limit),
         "musicbrainz_rate_per_sec": str(settings.musicbrainz_rate_per_sec),
         "musicbrainz_contact": settings.musicbrainz_contact,
         "year_stage_limit": str(settings.year_stage_limit),

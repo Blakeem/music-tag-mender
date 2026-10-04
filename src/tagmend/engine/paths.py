@@ -94,6 +94,7 @@ from tagmend.engine import (
     clock,
     commits,
     db,
+    ledger_lock,
     mismatch,
     naming,
     path_keys,
@@ -1644,6 +1645,7 @@ class StagePathsBatchResult:
         }
 
 
+@ledger_lock.mutating
 def stage_paths_batch(
     settings: Settings,
     *,
@@ -2316,6 +2318,7 @@ def _write_plan(
         )
 
 
+@ledger_lock.mutating
 def stage_paths(
     settings: Settings,
     *,
@@ -2424,6 +2427,7 @@ class NamingSettings(FieldDict):
     settings_path: str
 
 
+@ledger_lock.mutating
 def set_naming_pattern(
     settings: Settings,
     *,
@@ -2526,6 +2530,7 @@ def _refuse_landed(
     raise ValueError(message)
 
 
+@ledger_lock.mutating
 def unstage_paths(
     settings: Settings,
     *,
@@ -2842,6 +2847,7 @@ def _pattern_message(settings: Settings) -> str:
     return f"naming pattern {naming.pattern_text(settings)}"
 
 
+@ledger_lock.mutating
 def commit_paths(
     settings: Settings,
     *,
@@ -3042,6 +3048,7 @@ def _require_revert_source(
     return source
 
 
+@ledger_lock.mutating
 def revert_paths(
     settings: Settings,
     file_id: int,

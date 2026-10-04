@@ -10,6 +10,7 @@ const FIELDS = [
   { key: "genre_use_album_tags", label: "Use album tags for genre", group: "advanced", type: "checkbox" },
   { key: "lastfm_rate_per_sec", label: "Last.fm requests/sec", group: "advanced", type: "text" },
   { key: "genre_stage_limit", label: "Genre stage limit", group: "advanced", type: "text" },
+  { key: "artist_stage_limit", label: "Artist stage limit", group: "advanced", type: "text" },
   { key: "musicbrainz_rate_per_sec", label: "MusicBrainz requests/sec", group: "advanced", type: "text" },
   { key: "musicbrainz_contact", label: "MusicBrainz contact (email or URL)", group: "advanced", type: "text" },
   { key: "year_stage_limit", label: "Year stage limit", group: "advanced", type: "text" },

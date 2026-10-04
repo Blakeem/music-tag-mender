@@ -772,7 +772,6 @@ class MBReleaseGroupRow:
 
     album_title: str | None
     original_date: str | None
-    release_mbid: str | None
     release_group_mbid: str | None
 
 
@@ -788,7 +787,7 @@ def get_cached_mb_release_group(
     """
     cursor = conn.execute(
         """
-        SELECT found, album_title, original_date, release_mbid, release_group_mbid
+        SELECT found, album_title, original_date, release_group_mbid
         FROM musicbrainz_release_group_cache WHERE request_key = ?
         """,
         (request_key,),
@@ -800,8 +799,7 @@ def get_cached_mb_release_group(
     album = MBReleaseGroupRow(
         album_title=None if row[1] is None else str(row[1]),
         original_date=None if row[2] is None else str(row[2]),
-        release_mbid=None if row[3] is None else str(row[3]),
-        release_group_mbid=None if row[4] is None else str(row[4]),
+        release_group_mbid=None if row[3] is None else str(row[3]),
     )
     return (found, album)
 
@@ -813,7 +811,6 @@ def put_cached_mb_release_group(  # noqa: PLR0913 - cohesive keyword-only cache 
     found: bool,
     album_title: str | None,
     original_date: str | None,
-    release_mbid: str | None,
     release_group_mbid: str | None,
     now: str,
 ) -> None:
@@ -825,17 +822,15 @@ def put_cached_mb_release_group(  # noqa: PLR0913 - cohesive keyword-only cache 
     conn.execute(
         """
         INSERT OR REPLACE INTO musicbrainz_release_group_cache (
-            request_key, found, album_title, original_date,
-            release_mbid, release_group_mbid, fetched_at
+            request_key, found, album_title, original_date, release_group_mbid, fetched_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?)
         """,
         (
             request_key,
             1 if found else 0,
             album_title,
             original_date,
-            release_mbid,
             release_group_mbid,
             now,
         ),
@@ -850,8 +845,6 @@ class MBRecordingRow:
     """One cached MusicBrainz recording-search lookup (a found recording's resolved fields)."""
 
     album_title: str | None
-    release_group_mbid: str | None
-    recording_mbid: str | None
 
 
 def get_cached_mb_recording(
@@ -866,8 +859,7 @@ def get_cached_mb_recording(
     """
     cursor = conn.execute(
         """
-        SELECT found, album_title, release_group_mbid, recording_mbid
-        FROM musicbrainz_recording_cache WHERE request_key = ?
+        SELECT found, album_title FROM musicbrainz_recording_cache WHERE request_key = ?
         """,
         (request_key,),
     )
@@ -875,22 +867,16 @@ def get_cached_mb_recording(
     if row is None:
         return None
     found = bool(row[0])
-    recording = MBRecordingRow(
-        album_title=None if row[1] is None else str(row[1]),
-        release_group_mbid=None if row[2] is None else str(row[2]),
-        recording_mbid=None if row[3] is None else str(row[3]),
-    )
+    recording = MBRecordingRow(album_title=None if row[1] is None else str(row[1]))
     return (found, recording)
 
 
-def put_cached_mb_recording(  # noqa: PLR0913 - cohesive keyword-only cache payload
+def put_cached_mb_recording(
     conn: sqlite3.Connection,
     *,
     request_key: str,
     found: bool,
     album_title: str | None,
-    release_group_mbid: str | None,
-    recording_mbid: str | None,
     now: str,
 ) -> None:
     """Insert or replace the cached recording-search lookup for *request_key*.
@@ -901,18 +887,11 @@ def put_cached_mb_recording(  # noqa: PLR0913 - cohesive keyword-only cache payl
     conn.execute(
         """
         INSERT OR REPLACE INTO musicbrainz_recording_cache (
-            request_key, found, album_title, release_group_mbid, recording_mbid, fetched_at
+            request_key, found, album_title, fetched_at
         )
-        VALUES (?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?)
         """,
-        (
-            request_key,
-            1 if found else 0,
-            album_title,
-            release_group_mbid,
-            recording_mbid,
-            now,
-        ),
+        (request_key, 1 if found else 0, album_title, now),
     )
 
 

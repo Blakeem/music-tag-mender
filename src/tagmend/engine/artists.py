@@ -62,12 +62,13 @@ from __future__ import annotations
 import re
 import unicodedata
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Final, TypedDict
 
 from tagmend.engine import (
     axis,
     clock,
     db,
+    ledger_lock,
     lookup_clients,
     schema,
     staging,
@@ -205,6 +206,13 @@ def _shrinks_credit(value: str, canonical: str) -> bool:
 
 # --- result types --------------------------------------------------------------------
 
+# A held name/id disagreement. ``to`` is ``None`` when no target name exists, and ``mbids``
+# lists every id involved. The functional form allows the ``from`` key.
+NameIdDisagreement = TypedDict(
+    "NameIdDisagreement",
+    {"from": str, "to": str | None, "mbids": list[str], "reason": str},
+)
+
 
 @dataclass(frozen=True, slots=True)
 class ResolveArtistsResult(FieldDict):
@@ -229,7 +237,7 @@ class ResolveArtistsResult(FieldDict):
     already_canonical_values: list[str]
     shrinks_credit_values: list[dict[str, str]]
     needs_review_values: list[dict[str, str]]
-    name_id_disagreement_values: list[dict[str, str]]
+    name_id_disagreement_values: list[NameIdDisagreement]
     error_items: list[dict[str, str]]
     summary: str
 
@@ -259,7 +267,7 @@ class _Tally:
     already_canonical_values: list[str] = field(default_factory=list)
     shrinks_credit_values: list[dict[str, str]] = field(default_factory=list)
     needs_review_values: list[dict[str, str]] = field(default_factory=list)
-    name_id_disagreement_values: list[dict[str, str]] = field(default_factory=list)
+    name_id_disagreement_values: list[NameIdDisagreement] = field(default_factory=list)
     error_items: list[dict[str, str]] = field(default_factory=list)
     # Carriers whose stage raised: no outcome row, so each stays pending for the next call.
     failed_files: set[int] = field(default_factory=set)
@@ -270,6 +278,7 @@ class _Tally:
 # --- public entry --------------------------------------------------------------------
 
 
+@ledger_lock.mutating
 def resolve_artists(  # noqa: PLR0913 - cohesive keyword-only scope + injection params
     settings: Settings,
     *,
@@ -283,13 +292,15 @@ def resolve_artists(  # noqa: PLR0913 - cohesive keyword-only scope + injection 
     """Normalize artist names: look up canonical forms and cascade-stage the changes.
 
     Scope is *file_ids* when given, else every file carrying *value* as ``artist`` or
-    ``albumartist``, else the whole library. The selection is the first *limit* (every one when
-    ``None``) present files in scope that derive ``pending`` on the artist axis. Every distinct
-    ``artist``, ``albumartist`` and ``artists`` element value on them is resolved except the
-    guarded ones (empty / ``feat.`` / compilation sentinels). A value whose files carry its own
-    MBID is looked up by that id on MusicBrainz via *mb_client* first. Every value left over is
-    looked up on Last.fm getCorrection via *client*. Both tiers are cached and paced, and
-    together they build a ``value → correction`` map of the values that actually change.
+    ``albumartist``, else the whole library. The selection is the first *limit* (default
+    ``artist_stage_limit``) present files in scope that derive ``pending`` on the artist axis.
+    ``more`` is true when files settled and pending files in scope lie past the selection, and
+    false on a dry run. Every distinct ``artist``, ``albumartist`` and ``artists`` element value
+    on them is resolved except the guarded ones (empty / ``feat.`` / compilation sentinels). A
+    value whose files carry its own MBID is looked up by that id on MusicBrainz via *mb_client*
+    first. Every value left over is looked up on Last.fm getCorrection via *client*. Both tiers
+    are cached and paced, and together they build a ``value → correction`` map of the values
+    that actually change.
 
     Each correction is then staged as an ``origin='auto'`` change on every in-scope carrier: a
     present file that is not ``manual`` and not multi-value. Each corrected field writes its own
@@ -313,7 +324,10 @@ def resolve_artists(  # noqa: PLR0913 - cohesive keyword-only scope + injection 
     :class:`MusicBrainzClient` is built. Owns its connection, and ``stage_tags`` opens its own.
     """
     check_limit(limit)
+    effective_limit = settings.artist_stage_limit if limit is None else limit
     tally = _Tally()
+    pending_remaining = 0
+    past_selection = 0
 
     connection = db.connect(settings.db_path)
     try:
@@ -330,7 +344,7 @@ def resolve_artists(  # noqa: PLR0913 - cohesive keyword-only scope + injection 
             file_ids=file_ids,
         )
         pending = store.pending_file_ids(connection, axis.ARTIST_AXIS, scoped_ids)
-        selected = pending if limit is None else pending[:limit]
+        selected = pending[:effective_limit]
         if selected:
             carriers = _carriers(connection, scoped_ids)
             values = _distinct_values(connection, selected, tally)
@@ -348,11 +362,18 @@ def resolve_artists(  # noqa: PLR0913 - cohesive keyword-only scope + injection 
                     _resolve_values(settings, connection, unresolved, client, tally)
             _stage_files(settings, connection, carriers, tally, dry_run=dry_run)
             _settle_selected(connection, selected, tally, dry_run=dry_run)
-        pending_remaining = len(store.pending_file_ids(connection, axis.ARTIST_AXIS, scoped_ids))
+        remaining = store.pending_file_ids(connection, axis.ARTIST_AXIS, scoped_ids)
+        pending_remaining = len(remaining)
+        past_selection = len(set(remaining) - set(selected))
     finally:
         connection.close()
 
-    return _build_result(tally, pending_remaining=pending_remaining, dry_run=dry_run)
+    return _build_result(
+        tally,
+        pending_remaining=pending_remaining,
+        past_selection=past_selection,
+        dry_run=dry_run,
+    )
 
 
 # --- carriers ------------------------------------------------------------------------
@@ -469,8 +490,8 @@ def _resolve_by_mbid(  # noqa: PLR0913 - cohesive scope + injection params, mirr
         tally.name_id_disagreement_values.append(
             {
                 "from": value,
-                "to": "",
-                "mbid": ", ".join(sorted(pairing[value])),
+                "to": None,
+                "mbids": sorted(pairing[value]),
                 "reason": "the library pairs this name with more than one MusicBrainz id",
             },
         )
@@ -552,7 +573,7 @@ def _classify_against_mb(value: str, artist: MBArtist, tally: _Tally) -> None:
         {
             "from": value,
             "to": artist.name,
-            "mbid": artist.mbid,
+            "mbids": [artist.mbid],
             "reason": "no name MusicBrainz records for this id",
         },
     )
@@ -773,12 +794,9 @@ def _held_values(tally: _Tally) -> set[str]:
     A value with no correction is included.
     """
     held = set(tally.no_correction_values)
-    for bucket in (
-        tally.needs_review_values,
-        tally.shrinks_credit_values,
-        tally.name_id_disagreement_values,
-    ):
+    for bucket in (tally.needs_review_values, tally.shrinks_credit_values):
         held.update(entry["from"] for entry in bucket)
+    held.update(entry["from"] for entry in tally.name_id_disagreement_values)
     return held
 
 
@@ -841,9 +859,11 @@ def _build_result(
     tally: _Tally,
     *,
     pending_remaining: int,
+    past_selection: int,
     dry_run: bool,
 ) -> ResolveArtistsResult:
     """Freeze the run's tally + counts into the public :class:`ResolveArtistsResult`."""
+    more = not dry_run and tally.settled > 0 and past_selection > 0
     mappings = [
         {
             "from": value,
@@ -866,20 +886,22 @@ def _build_result(
         name_id_disagreement=len(tally.name_id_disagreement_values),
         errors=len(tally.error_items),
         pending_remaining=pending_remaining,
-        more=not dry_run and tally.settled > 0 and pending_remaining > 0,
+        more=more,
         mappings=mappings,
         multi_artist_files=list(tally.multi_artist_files),
         no_correction_values=list(tally.no_correction_values),
         already_canonical_values=list(tally.already_canonical_values),
         shrinks_credit_values=[dict(h) for h in tally.shrinks_credit_values],
         needs_review_values=[dict(h) for h in tally.needs_review_values],
-        name_id_disagreement_values=[dict(d) for d in tally.name_id_disagreement_values],
+        name_id_disagreement_values=[
+            {**d, "mbids": list(d["mbids"])} for d in tally.name_id_disagreement_values
+        ],
         error_items=list(tally.error_items),
-        summary=_summarize(tally, pending_remaining=pending_remaining, dry_run=dry_run),
+        summary=_summarize(tally, pending_remaining=pending_remaining, more=more, dry_run=dry_run),
     )
 
 
-def _summarize(tally: _Tally, *, pending_remaining: int, dry_run: bool) -> str:
+def _summarize(tally: _Tally, *, pending_remaining: int, more: bool, dry_run: bool) -> str:
     """Build a short, plain human summary of what settled and what is left.
 
     A dry run records nothing, so its remainder is not resumable and is worded accordingly.
@@ -900,8 +922,10 @@ def _summarize(tally: _Tally, *, pending_remaining: int, dry_run: bool) -> str:
             f"A dry run records nothing, so {pending_remaining} file(s) in scope stay pending "
             f"and an identical call previews the same files.",
         )
-    elif pending_remaining > 0:
+    elif more:
         parts.append(f"{pending_remaining} file(s) still pending. Call again to continue.")
+    elif pending_remaining > 0:
+        parts.append(f"{pending_remaining} file(s) still pending.")
     if tally.error_items:
         parts.append(
             f"{len(tally.error_items)} item(s) errored and their files stay pending. "

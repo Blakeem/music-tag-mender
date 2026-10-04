@@ -57,9 +57,7 @@ class FakeMBReleaseGroupSource:
 
 
 def _mb(date: str, *, title: str = "Album", rgid: str = "rg-1") -> MBReleaseGroup:
-    return MBReleaseGroup(
-        album_title=title, original_date=date, release_group_mbid=rgid, release_mbid=None
-    )
+    return MBReleaseGroup(album_title=title, original_date=date, release_group_mbid=rgid)
 
 
 def _file_id(settings: Settings, folder: Path, filename: str) -> int:

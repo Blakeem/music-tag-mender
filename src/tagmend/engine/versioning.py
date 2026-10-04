@@ -26,7 +26,7 @@ Transaction ownership mirrors the rest of the engine: :func:`ensure_baseline`,
 :func:`write_and_resync` take an open connection and never commit (building blocks a future
 cascade can batch inside one transaction). :func:`revert_tags` owns its own connection and
 commit, like :func:`tagmend.engine.library.scan_library`, because it pairs a disk write with
-DB writes as one atomic user-facing action.
+DB writes as one user-facing action.
 
 See PLAN.md §7 (versioning/undo semantics) and §11 (safety model).
 """
@@ -39,7 +39,18 @@ from typing import TYPE_CHECKING, Final
 
 import mutagen
 
-from tagmend.engine import acoustid, clock, commits, covers, db, paths, schema, store, trash
+from tagmend.engine import (
+    acoustid,
+    clock,
+    commits,
+    covers,
+    db,
+    ledger_lock,
+    paths,
+    schema,
+    store,
+    trash,
+)
 from tagmend.engine.serialize import FieldDict
 from tagmend.engine.tags import (
     MANAGED_SET_VERSION,
@@ -396,6 +407,18 @@ def _observe_durably(conn: sqlite3.Connection, target: Revision, path: Path) -> 
     return drifted
 
 
+def _signature(path: Path) -> tuple[int, int] | None:
+    """Return *path*'s ``(size, mtime_ns)``, or ``None`` when it cannot be read.
+
+    An atomic tag write replaces the file, so an unchanged signature shows no write landed.
+    """
+    try:
+        stat_result = path.stat()
+    except OSError:
+        return None
+    return stat_result.st_size, stat_result.st_mtime_ns
+
+
 def _revert_file(  # noqa: PLR0913 - cohesive keyword-only per-file revert inputs
     conn: sqlite3.Connection,
     file_id: int,
@@ -478,6 +501,7 @@ class RevertResult(FieldDict):
     dry_run: bool
 
 
+@ledger_lock.mutating
 def revert_tags(
     settings: Settings,
     file_id: int,
@@ -503,13 +527,16 @@ def revert_tags(
     every refusal of the real call, so the preview predicts it.
 
     Raises :class:`ValueError` if the file is unknown, flagged missing, or staged, or the
-    target revision is unknown. Owns its transaction: the commit row, the disk write,
-    and the revision land in ONE transaction, so a crash leaves no partial DB state
-    (re-running the revert is idempotent).
+    target revision is unknown. Owns its transaction. The ``applying`` commit row is durable
+    before the disk write, as in ``commit_tags`` and :func:`revert_commit`. A failure that left
+    the file untouched marks the row ``applied`` with no revision and re-raises. A failure or a
+    crash after the write leaves it ``applying``, so ``check_health`` reports it, and a rerun
+    records the revert.
     """
     new_version: int | None = None
     commit_id: int | None = None
     changed = False
+    before_write: tuple[int, int] | None = None
 
     connection = db.connect(settings.db_path)
     try:
@@ -533,20 +560,29 @@ def revert_tags(
         else:
             # An observed external edit is still overwritten, because its scan revision keeps it.
             _observe_durably(connection, target, path)
+            before_write = _signature(path)
             commit_id = commits.create_commit(
                 connection,
                 origin="revert",
                 message=note,
                 now=clock.utc_now(),
             )
-            new_version, changed = _revert_file(
-                connection,
-                file_id,
-                version,
-                note=note,
-                commit_id=commit_id,
-                droppable_frames=frozenset(settings.id3_droppable_frames),
-            )
+            connection.commit()  # commit row durable before the disk write
+            try:
+                new_version, changed = _revert_file(
+                    connection,
+                    file_id,
+                    version,
+                    note=note,
+                    commit_id=commit_id,
+                    droppable_frames=frozenset(settings.id3_droppable_frames),
+                )
+            except TAG_FILE_ERRORS:
+                connection.rollback()
+                if _signature(path) == before_write:
+                    commits.set_commit_status(connection, commit_id, "applied")
+                    connection.commit()
+                raise
             commits.set_commit_status(connection, commit_id, "applied")
             connection.commit()
     finally:
@@ -701,6 +737,7 @@ def _require_whole_cover_commit(commit_id: int, path: str | os.PathLike[str] | N
         raise ValueError(message)
 
 
+@ledger_lock.mutating
 def revert_commit(
     settings: Settings,
     commit_id: int,

@@ -31,7 +31,18 @@ from urllib.parse import urlsplit
 
 import mutagen
 
-from tagmend.engine import clock, commits, db, mismatch, path_keys, paths, scan, schema, store
+from tagmend.engine import (
+    clock,
+    commits,
+    db,
+    ledger_lock,
+    mismatch,
+    path_keys,
+    paths,
+    scan,
+    schema,
+    store,
+)
 from tagmend.engine.coverart import CoverArtClient, CoverArtError
 from tagmend.engine.detector_core import (
     album_identity,
@@ -417,19 +428,19 @@ def _summarize(albums: int, counts: dict[str, int]) -> str:
 def detect_cover_gaps(
     settings: Settings,
     *,
-    folder: str | None = None,
+    path: str | None = None,
     limit: int | None = None,
 ) -> CoverGapsReport:
     """Report the albums Navidrome shows without a cover. Read-only over the snapshot.
 
-    *folder* keeps the albums with a file at or under it, compared as a path
-    (:func:`tagmend.engine.path_keys.folder_arg_key`). *limit* caps the rows. Raises
-    :class:`ValueError` for a negative *limit*, a *folder* outside ``music_path`` and a missing
+    *path* keeps the albums with a file in this folder or any folder under it, compared as a
+    path (:func:`tagmend.engine.path_keys.folder_arg_key`). *limit* caps the rows. Raises
+    :class:`ValueError` for a negative *limit*, a *path* outside ``music_path`` and a missing
     ``music_path``.
     """
     # Input
     check_limit(limit)
-    folder_key = None if folder is None else path_keys.folder_arg_key(settings, folder)
+    folder_key = None if path is None else path_keys.folder_arg_key(settings, path)
     connection = db.connect(settings.db_path)
     try:
         schema.apply_schema(connection)
@@ -588,7 +599,10 @@ class CoverSkipped(FieldDict):
 
 @dataclass(frozen=True, slots=True)
 class StageCoversResult(FieldDict):
-    """What one :func:`stage_covers` call staged and skipped. ``more`` is true when *limit* cut."""
+    """What one :func:`stage_covers` call staged and skipped.
+
+    ``more`` is true when *limit* left a gap album waiting for an uncached CAA lookup.
+    """
 
     staged: list[CoverStaged]
     skipped: list[CoverSkipped]
@@ -628,11 +642,31 @@ class _Pick:
 
 @dataclass(frozen=True, slots=True)
 class _Selection:
-    """The gap albums a call sources, capped by its limit, and the albums it skips outright."""
+    """The gap albums a call sources and the albums it skips outright."""
 
     work: list[AlbumCover]
     skipped: list[CoverSkipped]
-    more: bool
+
+
+@dataclass(slots=True)
+class _LookupBudget:
+    """The uncached CAA lookups one call may still send, ``None`` for no cap.
+
+    ``deferred`` counts the gap albums left unvisited because no lookup was left for them.
+    """
+
+    left: int | None
+    deferred: int = 0
+
+    def admits(self, *, needs_request: bool) -> bool:
+        """Spend one lookup on an album that needs a request, or defer it when none is left."""
+        if not needs_request or self.left is None:
+            return True
+        if self.left == 0:
+            self.deferred += 1
+            return False
+        self.left -= 1
+        return True
 
 
 def _album_label(album: AlbumCover) -> str:
@@ -678,7 +712,6 @@ def _select(
     staged_folders: set[str],
     *,
     owner: bool,
-    limit: int | None,
 ) -> _Selection:
     """Split *albums* into the gap albums to source and the albums skipped before any lookup.
 
@@ -686,9 +719,7 @@ def _select(
     """
     gaps = [album for album in albums if album.status == STATUS_GAP]
     if owner and len(gaps) != 1:
-        message = (
-            f"folder selects {len(gaps)} album(s) with status gap, and image needs exactly one"
-        )
+        message = f"path selects {len(gaps)} album(s) with status gap, and image needs exactly one"
         raise ValueError(message)
     skipped = [
         _skip_row(music_path, album, _Skip(album.status, None))
@@ -701,8 +732,7 @@ def _select(
             skipped.append(_skip_row(music_path, album, _Skip(SKIP_ALREADY_STAGED, None)))
         else:
             fresh.append(album)
-    cap = len(fresh) if limit is None else limit
-    return _Selection(work=fresh[:cap], skipped=skipped, more=len(fresh) > cap)
+    return _Selection(work=fresh, skipped=skipped)
 
 
 def _local_source(kind: str, ref: str, data: bytes, origin: str) -> _Source | _Skip:
@@ -737,19 +767,35 @@ def _folder_image(album: AlbumCover) -> str | _Skip | None:
     return None
 
 
-def _caa_front(album: AlbumCover, source: CoverArtSource) -> tuple[str, CoverArtFront] | None:
-    """Return the CAA front of the album's release, else of its release group, with its kind."""
+def _caa_lookups(album: AlbumCover) -> list[tuple[str, CoverArtKind, str]]:
+    """Return the CAA listings the album's front is read from, the release's first."""
     lookups: tuple[tuple[str, CoverArtKind, str | None], ...] = (
         (SOURCE_RELEASE, "release", album.release_mbid),
         (SOURCE_RELEASE_GROUP, "release-group", album.release_group_mbid),
     )
-    for kind, caa_kind, mbid in lookups:
-        if mbid is None:
-            continue
+    return [(kind, caa_kind, mbid) for kind, caa_kind, mbid in lookups if mbid is not None]
+
+
+def _caa_front(album: AlbumCover, source: CoverArtSource) -> tuple[str, CoverArtFront] | None:
+    """Return the CAA front of the album's release, else of its release group, with its kind."""
+    for kind, caa_kind, mbid in _caa_lookups(album):
         front = source.front_image(caa_kind, mbid)
         if front is not None:
             return kind, front
     return None
+
+
+def _needs_caa_request(album: AlbumCover, source: CoverArtSource) -> bool:
+    """Whether reading the album's CAA front sends a listing request the cache cannot answer.
+
+    A cached listing answers with no request, so a cached front ends the walk.
+    """
+    for _, caa_kind, mbid in _caa_lookups(album):
+        if not source.has_cached_listing(caa_kind, mbid):
+            return True
+        if source.front_image(caa_kind, mbid) is not None:
+            return False
+    return False
 
 
 def _caa_source(album: AlbumCover, source: CoverArtSource, *, dry_run: bool) -> _Source | _Skip:
@@ -778,15 +824,12 @@ def _caa_source(album: AlbumCover, source: CoverArtSource, *, dry_run: bool) -> 
     )
 
 
-def _pick_source(
+def _local_pick(
     music_path: Path,
     album: AlbumCover,
     owner: tuple[Path, bytes] | None,
-    source: CoverArtSource,
-    *,
-    dry_run: bool,
-) -> _Source | _Skip:
-    """Return the owner's image, else the folder front, else the CAA front.
+) -> _Source | _Skip | None:
+    """Return the owner's image, else the folder front, else ``None`` when only CAA can serve.
 
     A folder front that fails its check ends the chain as a skip.
     """
@@ -804,6 +847,11 @@ def _pick_source(
         except OSError as exc:
             return _Skip(SKIP_INVALID_IMAGE, f"{ref}: {exc}")
         return _local_source(SOURCE_FOLDER_IMAGE, ref, data, _ORIGIN_AUTO)
+    return None
+
+
+def _caa_pick(album: AlbumCover, source: CoverArtSource, *, dry_run: bool) -> _Source | _Skip:
+    """Return the CAA front as a source, or skip the album when the lookup fails."""
     try:
         return _caa_source(album, source, dry_run=dry_run)
     except CoverArtError as exc:
@@ -834,16 +882,8 @@ def _shows_cover(folder: str) -> bool:
     return any(_is_cover_name(name) for name in _direct_images(folder))
 
 
-def _place(
-    music_path: Path,
-    album: AlbumCover,
-    owner: tuple[Path, bytes] | None,
-    source: CoverArtSource,
-    *,
-    dry_run: bool,
-) -> _Pick | _Skip:
-    """Return the cover one gap album takes and where, or why it takes none."""
-    picked = _pick_source(music_path, album, owner, source, dry_run=dry_run)
+def _place(music_path: Path, album: AlbumCover, picked: _Source | _Skip) -> _Pick | _Skip:
+    """Return where the cover *picked* for one gap album goes, or why it takes none."""
     if isinstance(picked, _Skip):
         return picked
     target_folder = album.target_folder or album.folders[0]
@@ -912,22 +952,25 @@ def _staged_view(pick: _Pick) -> CoverStaged:
     )
 
 
-def _stage_summary(*, dry_run: bool, staged: int, skipped: list[CoverSkipped], more: bool) -> str:
+def _stage_summary(
+    *, dry_run: bool, staged: int, skipped: list[CoverSkipped], deferred: int
+) -> str:
     """Build a short, plain human summary of one :func:`stage_covers` call."""
     verb = "Would stage" if dry_run else "Staged"
     reasons = Counter(row.reason for row in skipped)
     counted = ", ".join(f"{count} {reason}" for reason, count in sorted(reasons.items()))
     text = f"{verb} {staged} cover(s). Skipped {len(skipped)} album(s)"
     text += f": {counted}." if counted else "."
-    if more:
-        text += " More gap albums remain past the limit."
+    if deferred:
+        text += f" {deferred} gap album(s) wait for a CAA lookup past the limit."
     return text
 
 
+@ledger_lock.mutating
 def stage_covers(  # noqa: PLR0913 - cohesive keyword-only scope, source and injection params
     settings: Settings,
     *,
-    folder: str | os.PathLike[str] | None = None,
+    path: str | os.PathLike[str] | None = None,
     image: str | os.PathLike[str] | None = None,
     limit: int | None = None,
     dry_run: bool = False,
@@ -944,13 +987,15 @@ def stage_covers(  # noqa: PLR0913 - cohesive keyword-only scope, source and inj
     lookup. A CAA original that is not a JPEG or PNG within the cap gives way to its 1200
     thumbnail, then ``large``. The target is ``cover.jpg`` or ``cover.png`` in the target folder.
 
-    *folder* keeps the albums with a file at or under it. Every album not ``gap`` is skipped
-    with its status as the reason, and a gap album whose folder already holds a staged cover
-    as ``already_staged``. *image* requires a *folder* that selects exactly one gap album, and
+    *path* keeps the albums with a file in this folder or any folder under it. Every album not
+    ``gap`` is skipped with its status as the reason, and a gap album whose folder already holds
+    a staged cover as ``already_staged``. *image* is for the one gap album *path* selects, and
     replaces that album's staged row. A relative *image* resolves against ``music_path``.
-    *limit* caps the gap albums sourced. A dry run downloads no image and writes nothing but
-    lookup cache rows. *note* is stored on each staged row and its eventual write. *client*
-    injects a CAA source, such as a fake in tests.
+    *limit* caps the gap albums whose CAA lookup the cache cannot answer. An album sourced from
+    the owner's image, a folder image or a cached listing never counts, so a re-run with the same
+    *limit* reaches the albums the last run left. A dry run downloads no image and writes
+    nothing but lookup cache rows. *note* is stored on each staged row and its eventual write.
+    *client* injects a CAA source, such as a fake in tests.
 
     A real run is refused while a file or sidecar move is staged, since a staged move plans an
     album's sidecars at stage time. Raises :class:`ValueError` on a refusal, an invalid
@@ -959,13 +1004,14 @@ def stage_covers(  # noqa: PLR0913 - cohesive keyword-only scope, source and inj
     # Input
     check_limit(limit)
     music_path = require_music_path(settings)
-    if image is not None and folder is None:
-        message = "image requires folder, which selects the album it covers"
+    if image is not None and path is None:
+        message = "image requires path, which selects the album it covers"
         raise ValueError(message)
-    folder_key = None if folder is None else path_keys.folder_arg_key(settings, folder)
+    folder_key = None if path is None else path_keys.folder_arg_key(settings, path)
     owner_path = None if image is None else _owner_image(music_path, image)
     owner = None if owner_path is None else (owner_path, _read_image(owner_path))
     picks: list[_Pick] = []
+    budget = _LookupBudget(left=limit)
     connection = db.connect(settings.db_path)
     try:
         schema.apply_schema(connection)
@@ -981,14 +1027,18 @@ def stage_covers(  # noqa: PLR0913 - cohesive keyword-only scope, source and inj
             albums,
             {row.folder_key for row in staged_rows},
             owner=owner is not None,
-            limit=limit,
         )
         skipped = list(selection.skipped)
         with injected_or_owned(
             client, lambda: CoverArtClient.from_settings(settings, connection)
         ) as source:
             for album in selection.work:
-                placed = _place(music_path, album, owner, source, dry_run=dry_run)
+                local = _local_pick(music_path, album, owner)
+                needs_request = local is None and _needs_caa_request(album, source)
+                if not budget.admits(needs_request=needs_request):
+                    continue
+                picked = local if local is not None else _caa_pick(album, source, dry_run=dry_run)
+                placed = _place(music_path, album, picked)
                 if isinstance(placed, _Skip):
                     skipped.append(_skip_row(music_path, album, placed))
                 else:
@@ -1001,19 +1051,19 @@ def stage_covers(  # noqa: PLR0913 - cohesive keyword-only scope, source and inj
 
     # Output
     logger.info(
-        "stage_covers dry_run=%s staged=%d skipped=%d more=%s",
+        "stage_covers dry_run=%s staged=%d skipped=%d deferred=%d",
         dry_run,
         len(picks),
         len(skipped),
-        selection.more,
+        budget.deferred,
     )
     return StageCoversResult(
         staged=[_staged_view(pick) for pick in picks],
         skipped=skipped,
-        more=selection.more,
+        more=budget.deferred > 0,
         dry_run=dry_run,
         summary=_stage_summary(
-            dry_run=dry_run, staged=len(picks), skipped=skipped, more=selection.more
+            dry_run=dry_run, staged=len(picks), skipped=skipped, deferred=budget.deferred
         ),
     )
 
@@ -1095,16 +1145,17 @@ def _refuse_landed(music_path: Path, rows: list[store.StagedCover]) -> None:
     raise ValueError(message)
 
 
-def unstage_covers(settings: Settings, *, folder: str | os.PathLike[str] | None = None) -> int:
-    """Drop the staged covers whose target sits at or under *folder*, else every one.
+@ledger_lock.mutating
+def unstage_covers(settings: Settings, *, path: str | os.PathLike[str] | None = None) -> int:
+    """Drop the staged covers whose target sits in *path* or any folder under it, else every one.
 
-    Returns the count dropped. *folder* is compared as a path
+    Returns the count dropped. *path* is compared as a path
     (:func:`tagmend.engine.path_keys.folder_arg_key`). Raises :class:`ValueError` and drops
     nothing when a matched cover's staged bytes already sit at its target, a write a crash cut
     before its log, since its row is that write's only record until ``commit_covers``.
     """
     music_path = require_music_path(settings)
-    root_key = None if folder is None else path_keys.folder_arg_key(settings, folder)
+    root_key = None if path is None else path_keys.folder_arg_key(settings, path)
     connection = db.connect(settings.db_path)
     try:
         schema.apply_schema(connection)
@@ -1122,10 +1173,10 @@ def unstage_covers(settings: Settings, *, folder: str | os.PathLike[str] | None 
 def diff_covers(
     settings: Settings,
     *,
-    folder: str | os.PathLike[str] | None = None,
+    path: str | os.PathLike[str] | None = None,
     limit: int | None = None,
 ) -> list[CoverDiffView]:
-    """Return every staged cover, or those under *folder*, with its live state. Read-only.
+    """Return every staged cover, or those in *path* and under it, with its live state. Read-only.
 
     ``state`` is the first that holds, as :func:`commit_covers` meets it: ``landed`` (the
     staged bytes already sit at the target, and ``commit_covers`` logs them), ``album_moved``
@@ -1136,7 +1187,7 @@ def diff_covers(
     """
     check_limit(limit)
     music_path = require_music_path(settings)
-    root_key = None if folder is None else path_keys.folder_arg_key(settings, folder)
+    root_key = None if path is None else path_keys.folder_arg_key(settings, path)
     connection = db.connect(settings.db_path)
     try:
         schema.apply_schema(connection)
@@ -1196,11 +1247,17 @@ class CoverCommitError(FieldDict):
 
 @dataclass(frozen=True, slots=True)
 class CommitCoversResult(FieldDict):
-    """What one :func:`commit_covers` call wrote. ``commit_id`` is ``None`` with nothing staged."""
+    """What one :func:`commit_covers` call wrote. ``commit_id`` is ``None`` with nothing staged.
+
+    ``committed`` counts the covers written and logged, and ``written`` lists them. ``errors``
+    counts the failed writes, and ``problems`` lists every cover left staged.
+    """
 
     commit_id: int | None
+    committed: int
+    errors: int
     written: list[CoverWritten]
-    errors: list[CoverCommitError]
+    problems: list[CoverCommitError]
     summary: str
 
 
@@ -1237,7 +1294,7 @@ def _commit_state(
 
 def _unstage_hint(row: store.StagedCover) -> str:
     """Return the ``unstage_covers`` call that drops *row*."""
-    return f"unstage_covers(folder={str(Path(row.target_path).parent)!r})"
+    return f"unstage_covers(path={str(Path(row.target_path).parent)!r})"
 
 
 def _held(row: store.StagedCover, state: str) -> CoverCommitError:
@@ -1353,25 +1410,26 @@ def _commit_cover(
 def _commit_summary(
     commit_id: int | None,
     written: list[CoverWritten],
-    errors: list[CoverCommitError],
+    problems: list[CoverCommitError],
 ) -> str:
     """Build a short, plain human summary of one :func:`commit_covers` call."""
     if commit_id is None:
         return "No cover is staged. No commit was created."
-    reasons = Counter(error.reason for error in errors)
+    reasons = Counter(problem.reason for problem in problems)
     counted = ", ".join(f"{count} {reason}" for reason, count in sorted(reasons.items()))
     text = f"Commit {commit_id} wrote {len(written)} cover(s)."
     if counted:
-        text += f" {len(errors)} stay staged: {counted}."
+        text += f" {len(problems)} stay staged: {counted}."
     return text
 
 
+@ledger_lock.mutating
 def commit_covers(settings: Settings) -> CommitCoversResult:
     """Write every staged cover into its album folder as one commit.
 
     Any commit left ``applying`` is marked ``interrupted`` first, and its leftover rows are
     swept into this one. The rows run in target-key order. A row stays staged, listed under
-    ``errors``, when a stage-time file left the target folder and its disc folders
+    ``problems``, when a stage-time file left the target folder and its disc folders
     (``album_moved``), another file sits at the target (``target_taken``), the folder now
     shows a cover (``covered_since_stage``) or the write fails (``error``). The staged bytes
     already at the target are a write that landed before a crash, logged with no disk action.
@@ -1387,7 +1445,7 @@ def commit_covers(settings: Settings) -> CommitCoversResult:
     # Input
     music_path = require_music_path(settings)
     written: list[CoverWritten] = []
-    errors: list[CoverCommitError] = []
+    problems: list[CoverCommitError] = []
     commit_id: int | None = None
     connection = db.connect(settings.db_path)
     try:
@@ -1417,19 +1475,28 @@ def commit_covers(settings: Settings) -> CommitCoversResult:
                 if isinstance(outcome, CoverWritten):
                     written.append(outcome)
                 else:
-                    errors.append(outcome)
+                    problems.append(outcome)
             commits.set_commit_status(connection, commit_id, "applied")
             connection.commit()
     finally:
         connection.close()
 
     # Output
-    logger.info("cover commit %s: written=%d errors=%d", commit_id, len(written), len(errors))
+    errors = sum(1 for problem in problems if problem.reason == COMMIT_ERROR)
+    logger.info(
+        "cover commit %s: written=%d problems=%d errors=%d",
+        commit_id,
+        len(written),
+        len(problems),
+        errors,
+    )
     return CommitCoversResult(
         commit_id=commit_id,
-        written=written,
+        committed=len(written),
         errors=errors,
-        summary=_commit_summary(commit_id, written, errors),
+        written=written,
+        problems=problems,
+        summary=_commit_summary(commit_id, written, problems),
     )
 
 

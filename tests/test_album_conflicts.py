@@ -14,7 +14,13 @@ import pytest
 
 from conftest import FOLDER_SPELLINGS, make_track, spell_folder
 from tagmend.engine import album_conflicts, detector_core, path_keys
-from tagmend.engine.album_conflicts import _REASON_NO_ALBUMARTIST, _classify, _FileInput
+from tagmend.engine.album_conflicts import (
+    _REASON_EDGE_WHITESPACE,
+    _REASON_MEDIUM,
+    _REASON_NO_ALBUMARTIST,
+    _classify,
+    _FileInput,
+)
 from tagmend.engine.library import scan_library
 
 if TYPE_CHECKING:
@@ -243,7 +249,8 @@ def test_album_names_differing_only_in_case_and_spacing_agree() -> None:
         [_f(1, album="Fiction"), _f(2, filename="b.mp3", album="  FICTION ")],
     )
 
-    assert report.flagged == 0
+    # No split row. Navidrome shows the padded value as written, so only that row remains.
+    assert [(r.file_id, r.reason) for r in report.rows] == [(2, _REASON_EDGE_WHITESPACE)]
 
 
 def test_a_low_single_quote_folds_to_an_ascii_apostrophe() -> None:
@@ -546,6 +553,54 @@ def test_blank_album_files_never_win_the_majority() -> None:
     assert report.groups[0].majority_identity.endswith("Real Album")
 
 
+# --- Navidrome shows an album artist or album title with its edge whitespace ---------
+
+
+def test_a_folder_agreeing_on_a_blank_albumartist_reports_every_file() -> None:
+    report = _classify(
+        [
+            _f(1, filename="a.mp3", albumartist=" ", artist="Dark Tranquillity"),
+            _f(2, filename="b.mp3", albumartist=" ", artist="Dark Tranquillity"),
+        ],
+    )
+
+    assert [(r.file_id, r.tier, r.reason) for r in report.rows] == [
+        (1, "low", _REASON_EDGE_WHITESPACE),
+        (2, "low", _REASON_EDGE_WHITESPACE),
+    ]
+    assert {(r.identity, r.majority_identity) for r in report.rows} == {
+        ("  - Album", "Dark Tranquillity - Album"),
+    }
+    (group,) = _view(report, tier=None, folder_key=None, limit=None, group=True).groups
+    assert (group.flagged, group.file_ids, group.identities, group.majority_files) == (
+        2,
+        [1, 2],
+        1,
+        0,
+    )
+
+
+@pytest.mark.parametrize(
+    ("albumartist", "album", "flagged"),
+    [
+        ("Band ", "Album", True),
+        (" Band", "Album", True),
+        ("Band", "Album ", True),
+        ("Band", " ", True),
+        ("Band", "Album", False),
+        (None, "Album", False),
+    ],
+)
+def test_an_edge_whitespace_value_reports_only_its_own_file(
+    albumartist: str | None, album: str, *, flagged: bool
+) -> None:
+    padded = _f(2, filename="b.mp3", album=album, albumartist=albumartist)
+
+    report = _classify([_f(1), padded])
+
+    assert [r.file_id for r in report.rows] == ([2] if flagged else [])
+
+
 # --- a bonus disc is the same phenomenon as a numbered one ---------------------------
 
 
@@ -799,8 +854,10 @@ def test_a_year_split_with_a_stray_space_is_not_a_disc_suffix() -> None:
         ],
     )
 
-    assert report.medium == 1
-    assert report.low == 0
+    assert [(r.file_id, r.tier, r.reason) for r in report.rows] == [
+        (3, "medium", _REASON_MEDIUM),
+        (1, "low", _REASON_EDGE_WHITESPACE),
+    ]
 
 
 def test_an_albumartist_split_under_differing_disc_suffixes_is_medium() -> None:

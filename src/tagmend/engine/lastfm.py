@@ -100,14 +100,18 @@ class ArtistCorrection:
 class LastfmError(RuntimeError):
     """A Last.fm lookup failed and nothing was cached, so a re-run asks again.
 
-    Raised for a failure that outlasted the retries, an HTTP non-2xx other than 429 or 5xx, an
-    error code other than not found, and a malformed body. A rejected key raises the subclass
-    :class:`LastfmKeyError`.
+    Raised for an HTTP non-2xx other than 429 or 5xx, an error code other than not found, and a
+    malformed body. A failure that outlasted the retries raises the subclass
+    :class:`LastfmUnavailableError`. A rejected key raises the subclass :class:`LastfmKeyError`.
     """
 
 
 class LastfmKeyError(LastfmError):
     """Last.fm rejected the API key, which fails every lookup alike and stops the call."""
+
+
+class LastfmUnavailableError(LastfmError):
+    """Last.fm stayed unreachable, throttled or failing through every retry, as in an outage."""
 
 
 class TagSource(Protocol):
@@ -311,8 +315,9 @@ class LastfmClient:
 
         A transport error, an HTTP 429 or 5xx, or a temporary Last.fm error code is retried
         with a doubling backoff. Any other answer returns at once. A failure that outlasts
-        every attempt, any other HTTP non-2xx and a body that is not a JSON object each raise
-        :class:`LastfmError`. No message carries the request URL, since it holds the API key.
+        every attempt raises :class:`LastfmUnavailableError`. Any other HTTP non-2xx and a body
+        that is not a JSON object each raise :class:`LastfmError`. No message carries the
+        request URL, since it holds the API key.
         """
         params = {"method": method, "api_key": self._api_key, "format": "json", **identity}
 
@@ -320,7 +325,7 @@ class LastfmClient:
         return self._http.send(
             lambda client: client.get(_API_URL, params=params),
             verdict=lambda response: _classify_response(response, method),
-            error=lambda failure, attempts: LastfmError(
+            error=lambda failure, attempts: LastfmUnavailableError(
                 f"Last.fm {method} failed after {attempts} attempt(s): {failure}",
             ),
             label=f"last.fm {method}",

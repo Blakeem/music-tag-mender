@@ -25,7 +25,7 @@ from difflib import SequenceMatcher
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
-from tagmend.engine import axis, axis_status, clock, db, path_keys, schema, store
+from tagmend.engine import axis, axis_status, clock, db, ledger_lock, path_keys, schema, store
 from tagmend.engine.detector_core import (
     MAX_DECIMAL_DIGITS,
     NON_ALBUM_FOLDERS,
@@ -1774,20 +1774,25 @@ def _refuse_uncovered(
     covered: frozenset[str],
     names: Mapping[int, frozenset[str]],
 ) -> None:
-    """Refuse a file flagging a name outside *covered*, naming each ``(file_id, name)``."""
+    """Refuse a file flagging a name outside *covered*, naming each ``(file_id, name)``.
+
+    The hint names the first offending file's own group, since a value scope may span groups.
+    """
+    offending = [item for item in targets if names[item.file.file_id] - covered]
+    if not offending:
+        return
     pairs = [
         (item.file.file_id, name)
-        for item in targets
+        for item in offending
         for name in NAMES
         if name in names[item.file.file_id] - covered
     ]
-    if pairs:
-        message = (
-            f"file(s) flag names outside covers: {pairs}. Read "
-            f"detect_mismatches(folder={targets[0].group_folder!r}) and pass every name it "
-            f"lists, or fix the tags first"
-        )
-        raise ValueError(message)
+    message = (
+        f"file(s) flag names outside covers: {pairs}. Read "
+        f"detect_mismatches(folder={offending[0].group_folder!r}) and pass every name it "
+        f"lists, or fix the tags first"
+    )
+    raise ValueError(message)
 
 
 def _refuse_unflagged_deferral(
@@ -1834,11 +1839,17 @@ def _refuse_unsafe(  # noqa: PLR0913 - one guard pass over the call's entire con
     judged: list[_Judged],
     names: Mapping[int, frozenset[str]],
     stored: Mapping[int, store.MismatchStatusRow],
+    *,
+    by_value: bool,
 ) -> None:
-    """Run every guard that refuses the entire call before anything is written."""
+    """Run every guard that refuses the entire call before anything is written.
+
+    A *by_value* scope may span groups, since its deferral is per file with no group coupling.
+    """
     if not targets:
         return
-    _refuse_spanning_groups(targets)
+    if not by_value:
+        _refuse_spanning_groups(targets)
     _refuse_uncovered(targets, covered, names)
     if status == MISFILED_DEFERRED:
         _refuse_unflagged_deferral(targets, names)
@@ -1864,6 +1875,7 @@ def _decision_row(
     )
 
 
+@ledger_lock.mutating
 def set_mismatch_status(
     settings: Settings,
     *,
@@ -1889,8 +1901,8 @@ def set_mismatch_status(
     *value* scope takes only ``misfiled_deferred`` with ``covers=["top_folder_artist"]``.
 
     Raises :class:`ValueError`, writing nothing, for an unknown *status* or name, a missing music
-    path, an unknown or missing id, a file with a staged path change, a scope spanning two
-    release-folder groups, a file flagging a name outside *covers*, a deferral of a file that
+    path, an unknown or missing id, a file with a staged path change, a *file_ids* scope spanning
+    two release-folder groups, a file flagging a name outside *covers*, a deferral of a file that
     flags nothing, and a keep that would leave a present group member without a keep in force.
     Owns its transaction.
     """
@@ -1932,6 +1944,7 @@ def set_mismatch_status(
             judged,
             names,
             store.load_mismatch_statuses(connection),
+            by_value=by_value,
         )
         rows = {
             item.file.file_id: _decision_row(status, item, names[item.file.file_id], versions)
@@ -1962,6 +1975,7 @@ def set_mismatch_status(
     return result
 
 
+@ledger_lock.mutating
 def reset_mismatch_status(
     settings: Settings,
     *,

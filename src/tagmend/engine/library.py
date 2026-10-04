@@ -26,6 +26,7 @@ from tagmend.engine import (
     axis,
     clock,
     db,
+    ledger_lock,
     mismatch,
     path_keys,
     scan,
@@ -71,7 +72,7 @@ class FileView(FieldDict):
     year_source_artist: str | None = None
     year_source_album: str | None = None
     song_status: str = "pending"
-    song_source_album_mbid: str | None = None  # release ids a done/manual was recorded against
+    song_source_release_mbid: str | None = None  # release ids a done/manual was recorded against
     song_source_release_track_mbid: str | None = None
     mismatch_status: str = "pending"
     mismatch_source_value: dict[str, object] | None = None  # the decision's snapshot
@@ -124,7 +125,9 @@ def _to_view(
     genre_status, genre_artist, genre_album = _axis_view(conn, axis.GENRE_AXIS, row.id)
     artist_status, artist_artist, artist_albumartist = _axis_view(conn, axis.ARTIST_AXIS, row.id)
     year_status, year_artist, year_album = _axis_view(conn, axis.YEAR_AXIS, row.id)
-    song_status, song_album_mbid, song_release_track_mbid = _axis_view(conn, axis.SONG_AXIS, row.id)
+    song_status, song_release_mbid, song_release_track_mbid = _axis_view(
+        conn, axis.SONG_AXIS, row.id
+    )
     mismatch_status, mismatch_source = _mismatch_view(mismatch_state)
     return FileView(
         file_id=row.id,
@@ -143,7 +146,7 @@ def _to_view(
         year_source_artist=year_artist,
         year_source_album=year_album,
         song_status=song_status,
-        song_source_album_mbid=song_album_mbid,
+        song_source_release_mbid=song_release_mbid,
         song_source_release_track_mbid=song_release_track_mbid,
         mismatch_status=mismatch_status,
         mismatch_source_value=mismatch_source,
@@ -466,6 +469,7 @@ class _Counters:
         )
 
 
+@ledger_lock.mutating
 def scan_library(
     settings: Settings,
     *,

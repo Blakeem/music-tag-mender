@@ -1,8 +1,8 @@
-"""Stage, commit and revert across a managed-set widening (set 3 ledgers meeting set 4).
+"""Stage, commit and revert across a managed-set widening (older ledgers meeting the current set).
 
 A revision snapshot covers only the fields its own managed set governed. These tests build a
-file whose revisions a set-3 build wrote, then prove that every write path first observes the
-newer ``artists`` field, so a commit diff is exact and a revert restores the field. Real audio
+file whose revisions an older build wrote, then prove that every write path first observes the
+newer fields, so a commit diff is exact and a revert restores the field. Real audio
 files from ``make_track`` and a temp ledger from ``engine_settings``.
 """
 
@@ -11,13 +11,14 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import pytest
+from mutagen.flac import FLAC
 
 from conftest import make_track
 from tagmend.engine import commits, staging, store, versioning
 from tagmend.engine.db import connect
 from tagmend.engine.library import scan_library
 from tagmend.engine.schema import apply_schema
-from tagmend.engine.tags import MANAGED_SETS, read_tags, write_managed_tags
+from tagmend.engine.tags import MANAGED_SET_VERSION, MANAGED_SETS, read_tags, write_managed_tags
 
 if TYPE_CHECKING:
     import sqlite3
@@ -28,6 +29,7 @@ if TYPE_CHECKING:
 _FORMATS = [".mp3", ".flac", ".m4a", ".ogg"]
 _NOW = "2026-06-02T00:00:00+00:00"
 _LEGACY_SET = 3
+_CURRENT_SET = MANAGED_SET_VERSION
 
 
 class _Crash(BaseException):
@@ -188,8 +190,13 @@ def test_commit_over_an_older_set_records_the_exact_diff_and_reverts(
     assert result.commit_id is not None
     assert _history(engine_settings, file_id) == [
         (0, "scan", 3, {}),
-        (1, "scan", 4, {}),
-        (2, "manual", 4, {"artists": {"from": ["Bryan El", "B"], "to": ["Bryan EL", "B"]}}),
+        (1, "scan", _CURRENT_SET, {}),
+        (
+            2,
+            "manual",
+            _CURRENT_SET,
+            {"artists": {"from": ["Bryan El", "B"], "to": ["Bryan EL", "B"]}},
+        ),
     ]
     reverted = versioning.revert_commit(engine_settings, result.commit_id)
     assert reverted.reverted == 1
@@ -209,7 +216,7 @@ def test_rebaseline_diff_holds_only_drift_on_the_older_set_fields(
 
     assert _history(engine_settings, file_id) == [
         (0, "scan", 3, {}),
-        (1, "scan", 4, {"genre": {"from": ["Rock"], "to": ["Jazz"]}}),
+        (1, "scan", _CURRENT_SET, {"genre": {"from": ["Rock"], "to": ["Jazz"]}}),
     ]
 
 
@@ -223,7 +230,7 @@ def test_batch_stage_rebaselines_an_older_set_file(
 
     staging.stage_tags_batch(engine_settings, entries=[(file_id, {"artists": ["A", "C"]})])
 
-    assert _history(engine_settings, file_id) == [(0, "scan", 3, {}), (1, "scan", 4, {})]
+    assert _history(engine_settings, file_id) == [(0, "scan", 3, {}), (1, "scan", _CURRENT_SET, {})]
 
 
 @pytest.mark.parametrize("suffix", [".mp3", ".flac"])
@@ -243,7 +250,12 @@ def test_crash_reapply_over_an_older_set_keeps_the_change_in_the_commit(
 
     assert result.committed == 1
     history = _history(engine_settings, file_id)
-    assert history[-1] == (2, "manual", 4, {"artists": {"from": ["A", "B"], "to": ["A", "C"]}})
+    assert history[-1] == (
+        2,
+        "manual",
+        _CURRENT_SET,
+        {"artists": {"from": ["A", "B"], "to": ["A", "C"]}},
+    )
     assert [diff for _, origin, _, diff in history if origin == "scan"] == [{}, {}]
 
 
@@ -278,7 +290,7 @@ def test_commit_refuses_a_row_staged_before_the_current_set(
     assert result.errors == 1
     detail = result.outcomes[0].detail
     assert detail is not None
-    assert "staged before managed set 4, unstage and stage it again" in detail
+    assert f"staged before managed set {_CURRENT_SET}, unstage and stage it again" in detail
     assert read_tags(track).tags["artists"] == ["A", "B"]
     assert read_tags(track).tags["genre"] == ["Rock"]
     assert _staged_target(engine_settings, file_id) == {"genre": ["Jazz"]}
@@ -312,7 +324,7 @@ def test_drift_free_rebaseline_does_not_block_revert_commit(
     commit_id = _legacy_commit(engine_settings, monkeypatch, track, {"genre": ["Jazz"]})
     staging.stage_tags(engine_settings, file_id=file_id, tags={"genre": ["Blues"]})
     staging.unstage_tags(engine_settings, file_id=file_id)
-    assert _history(engine_settings, file_id)[-1] == (2, "scan", 4, {})
+    assert _history(engine_settings, file_id)[-1] == (2, "scan", _CURRENT_SET, {})
 
     result = versioning.revert_commit(engine_settings, commit_id)
 
@@ -404,7 +416,10 @@ def test_revert_to_the_latest_stale_set_version_is_a_noop(
 
     assert preview.status == "noop"
     assert result.status == "noop"
-    assert _history(engine_settings, file_id)[2:] == [(2, "scan", 4, {}), (3, "revert", 4, {})]
+    assert _history(engine_settings, file_id)[2:] == [
+        (2, "scan", _CURRENT_SET, {}),
+        (3, "revert", _CURRENT_SET, {}),
+    ]
     assert read_tags(track).tags["artists"] == ["A", "B"]
 
 
@@ -432,8 +447,8 @@ def test_revert_crashed_after_its_write_still_reverts_on_rerun(
 
     assert revert() == "reverted"
     assert _history(engine_settings, file_id)[2:] == [
-        (2, "scan", 4, {}),
-        (3, "revert", 4, {"genre": {"from": ["Jazz"], "to": ["Rock"]}}),
+        (2, "scan", _CURRENT_SET, {}),
+        (3, "revert", _CURRENT_SET, {"genre": {"from": ["Jazz"], "to": ["Rock"]}}),
     ]
 
 
@@ -442,8 +457,9 @@ def test_revert_keeps_the_current_value_when_a_commit_governs_the_field_before_a
     music_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Set 2 never governed releasecountry. A set-3 commit wrote XW, a set-4 re-baseline then
-    # observed that output, and a set-4 commit wrote GB. XW was never the value before v0.
+    # Set 2 never governed releasecountry. A set-3 commit wrote XW, a current-set re-baseline
+    # then observed that output, and a current-set commit wrote GB. XW was never the value
+    # before v0.
     track = make_track(music_dir / "t.flac", {"genre": ["Rock"], "releasecountry": ["US"]})
     file_id = _legacy_baseline(engine_settings, monkeypatch, track, managed_set=2)
     _legacy_commit(engine_settings, monkeypatch, track, {"releasecountry": ["XW"]})
@@ -488,6 +504,40 @@ def test_commit_completes_a_reapply_staged_by_an_older_build(
     assert result.committed == 1
     assert read_tags(track).tags["artists"] == ["A", "B"]
     version, origin, managed_set, diff = _history(engine_settings, file_id)[-1]
-    assert (version, origin, managed_set) == (1, "manual", 4)
+    assert (version, origin, managed_set) == (1, "manual", _CURRENT_SET)
     assert isinstance(diff, dict)
     assert diff["genre"] == {"from": ["Rock"], "to": ["Jazz"]}
+
+
+@pytest.mark.parametrize("entry_point", ["revert_commit", "revert_tags"])
+def test_staging_albumartist_rebaselines_a_set_4_file_so_a_revert_restores_its_alias(
+    engine_settings: Settings,
+    music_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    entry_point: str,
+) -> None:
+    track = make_track(music_dir / "t.flac", {"albumartist": ["Various Artists"]})
+    raw = FLAC(track)
+    raw["ALBUM ARTIST"] = ["Various"]
+    raw.save()
+    file_id = _legacy_baseline(engine_settings, monkeypatch, track, managed_set=4)
+
+    staging.stage_tags(engine_settings, file_id=file_id, tags={"albumartist": ["Various Artists"]})
+    commit_id = staging.commit_tags(engine_settings).commit_id
+    assert commit_id is not None
+    assert _history(engine_settings, file_id) == [
+        (0, "scan", 4, {}),
+        (1, "scan", _CURRENT_SET, {}),
+        (2, "manual", _CURRENT_SET, {"album artist": {"from": ["Various"], "to": []}}),
+    ]
+    assert "album artist" not in read_tags(track).tags
+
+    if entry_point == "revert_commit":
+        assert _outcome_status(versioning.revert_commit(engine_settings, commit_id), file_id) == (
+            "reverted"
+        )
+    else:
+        assert versioning.revert_tags(engine_settings, file_id, 0).status == "reverted"
+
+    assert FLAC(track)["ALBUM ARTIST"] == ["Various"]
+    assert read_tags(track).tags["albumartist"] == ["Various Artists"]

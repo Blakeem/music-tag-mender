@@ -24,7 +24,7 @@ import pytest
 from conftest import make_rvad_mp3, make_track, rejecting_lastfm_client
 from tagmend.engine import axis, axis_status, classify, genres, staging, store, versioning
 from tagmend.engine.db import connect
-from tagmend.engine.lastfm import LastfmError, LastfmKeyError, Tag
+from tagmend.engine.lastfm import LastfmError, LastfmKeyError, LastfmUnavailableError, Tag
 from tagmend.engine.library import ScanMode, list_files, scan_library
 from tagmend.engine.schema import apply_schema
 from tagmend.engine.tags import read_tags, write_managed_tags
@@ -600,16 +600,29 @@ def test_resolve_genres_skips_missing_files(
 
 
 class _FailingTagSource(FakeTagSource):
-    """A :class:`FakeTagSource` whose lookups for the given artists fail like a dropped link."""
+    """A :class:`FakeTagSource` whose lookups for the given artists fail like a dropped link.
 
-    def __init__(self, artists: dict[str, list[Tag] | None], failing: set[str]) -> None:
+    With *malformed* they fail instead on a malformed answer, which recurs on every call.
+    """
+
+    def __init__(
+        self,
+        artists: dict[str, list[Tag] | None],
+        failing: set[str],
+        *,
+        malformed: bool = False,
+    ) -> None:
         super().__init__(artists)
         self._failing = failing
+        self._malformed = malformed
 
     def artist_top_tags(self, name: str) -> list[Tag] | None:
+        if name in self._failing and self._malformed:
+            message = "Last.fm returned a malformed tag entry for artist.gettoptags"
+            raise LastfmError(message)
         if name in self._failing:
             message = "Last.fm artist.gettoptags failed after 3 attempt(s): transport error"
-            raise LastfmError(message)
+            raise LastfmUnavailableError(message)
         return super().artist_top_tags(name)
 
 
@@ -732,6 +745,118 @@ def test_limit_caps_and_reports_pending_then_continues(
     assert second.staged_files == 1
     assert second.pending_remaining == 0
     assert second.more is False
+
+
+def test_refused_files_at_the_front_never_fill_the_window(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    for name in ("a_loud.mp3", "b_loud.mp3"):
+        make_rvad_mp3(music_dir / name, {"artist": ["Daft Punk"], "genre": ["Old"]})
+    for name in ("c.mp3", "d.mp3", "e.mp3"):
+        make_track(music_dir / name, {"artist": ["Justice"], "genre": _EXPECTED_DAFT_PUNK})
+    scan_library(engine_settings)
+    names = ("a_loud.mp3", "b_loud.mp3", "c.mp3", "d.mp3", "e.mp3")
+    ids = [_file_id(engine_settings, music_dir, name) for name in names]
+    assert ids == sorted(ids)
+    fake = FakeTagSource({"Daft Punk": _DAFT_PUNK_TAGS, "Justice": _DAFT_PUNK_TAGS})
+
+    first = genres.resolve_genres(engine_settings, client=fake, limit=2)
+    second = genres.resolve_genres(engine_settings, client=fake, limit=2)
+
+    assert (first.settled, first.more) == (2, True)
+    assert [item["key"] for item in first.error_items] == [f"file_id={i}" for i in ids[:2]]
+    assert "Call again to continue" in first.summary
+    assert (second.settled, second.pending_remaining, second.more) == (1, 2, False)
+    assert _genre_status(engine_settings, ids[4]) is not None
+    assert "fail on every call" in second.summary
+    assert "Call again to continue" not in second.summary
+
+
+def test_an_unavailable_lookup_stops_the_refill(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    make_rvad_mp3(music_dir / "a_loud.mp3", {"artist": ["Daft Punk"], "genre": ["Old"]})
+    make_track(music_dir / "b.mp3", {"artist": ["Justice"], "genre": ["Old"]})
+    make_track(music_dir / "c.mp3", {"artist": ["Air"], "genre": _EXPECTED_DAFT_PUNK})
+    scan_library(engine_settings)
+    ids = [_file_id(engine_settings, music_dir, name) for name in ("a_loud.mp3", "b.mp3", "c.mp3")]
+    assert ids == sorted(ids)
+    fake = _FailingTagSource({"Daft Punk": _DAFT_PUNK_TAGS}, failing={"Justice"})
+
+    result = genres.resolve_genres(engine_settings, client=fake, limit=2)
+
+    assert (result.settled, result.pending_remaining, result.more) == (0, 3, False)
+    assert "Air" not in fake.artist_lookups
+    assert _genre_status(engine_settings, ids[2]) is None
+    assert "Re-run to retry" in result.summary
+    assert "fail on every call" not in result.summary
+
+
+def test_a_lookup_failing_every_call_never_pins_the_window(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    make_rvad_mp3(music_dir / "a_loud.mp3", {"artist": ["Daft Punk"], "genre": ["Old"]})
+    make_track(music_dir / "b.mp3", {"artist": ["Justice"], "genre": ["Old"]})
+    for name in ("c.mp3", "d.mp3", "e.mp3"):
+        make_track(music_dir / name, {"artist": ["Air"], "genre": _EXPECTED_DAFT_PUNK})
+    scan_library(engine_settings)
+    names = ("a_loud.mp3", "b.mp3", "c.mp3", "d.mp3", "e.mp3")
+    ids = [_file_id(engine_settings, music_dir, name) for name in names]
+    assert ids == sorted(ids)
+    fake = _FailingTagSource(
+        {"Daft Punk": _DAFT_PUNK_TAGS, "Air": _DAFT_PUNK_TAGS},
+        failing={"Justice"},
+        malformed=True,
+    )
+
+    first = genres.resolve_genres(engine_settings, client=fake, limit=2)
+    second = genres.resolve_genres(engine_settings, client=fake, limit=2)
+
+    assert (first.settled, first.pending_remaining, first.more) == (2, 3, True)
+    assert [item["key"] for item in first.error_items] == [f"file_id={ids[0]}", "Justice"]
+    assert "Re-run to retry" not in first.summary
+    assert (second.settled, second.pending_remaining, second.more) == (1, 2, False)
+    assert all(_genre_status(engine_settings, fid) is not None for fid in ids[2:])
+    assert "Re-run to retry" not in second.summary
+
+
+def test_a_failing_group_spanning_batches_is_looked_up_once(
+    engine_settings: Settings,
+    music_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    make_rvad_mp3(music_dir / "a_loud.mp3", {"artist": ["Daft Punk"], "genre": ["Old"]})
+    make_track(music_dir / "b.mp3", {"artist": ["Air"], "genre": ["Old"]})
+    for name in ("c.mp3", "d.mp3", "e.mp3"):
+        make_track(music_dir / name, {"artist": ["Justice"], "genre": ["Old"]})
+    scan_library(engine_settings)
+    names = ("a_loud.mp3", "b.mp3", "c.mp3", "d.mp3", "e.mp3")
+    ids = [_file_id(engine_settings, music_dir, name) for name in names]
+    assert ids == sorted(ids)
+    fake = _FailingTagSource(
+        {"Daft Punk": _DAFT_PUNK_TAGS, "Air": _DAFT_PUNK_TAGS},
+        failing={"Justice"},
+        malformed=True,
+    )
+    attempts: list[str] = []
+    lookup = fake.artist_top_tags
+
+    def counting(name: str) -> list[Tag] | None:
+        attempts.append(name)
+        return lookup(name)
+
+    monkeypatch.setattr(fake, "artist_top_tags", counting)
+
+    result = genres.resolve_genres(engine_settings, client=fake, limit=2)
+
+    assert attempts.count("Justice") == 1
+    assert result.settled == 1
+    assert result.errors == 2
+    assert [item["key"] for item in result.error_items] == [f"file_id={ids[0]}", "Justice"]
+    assert all(_genre_status(engine_settings, fid) is None for fid in ids[2:])
 
 
 def test_result_follows_the_resolver_contract(engine_settings: Settings) -> None:

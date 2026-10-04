@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING
 import mutagen
 import pytest
 from mutagen.flac import FLAC
-from mutagen.id3 import ID3, RVAD, TIT2, TYER, MakeID3v1  # type: ignore[attr-defined]
+from mutagen.id3 import ID3, RVAD, TIT2, TXXX, TYER, MakeID3v1  # type: ignore[attr-defined]
 
 from conftest import make_droppable_frames_mp3, make_track
 from tagmend import mcp_server
@@ -1611,6 +1611,107 @@ def test_albumartist_lookalike_survives_commit_and_revert(
     assert reverted["ALBUMARTIST"] == ["Smashing Pumpkins"]
     assert reverted["ARTIST"] == ["Smashing Pumpkins"]
     assert reverted[lookalike] == [""]
+
+
+def _write_album_artist_alias(track: Path, value: str, mp3_desc: str = "ALBUM ARTIST") -> None:
+    """Write each albumartist alias raw on *track*, and one ``TXXX`` under *mp3_desc* on an MP3."""
+    if track.suffix == ".mp3":
+        frames = ID3(track)  # type: ignore[no-untyped-call]
+        frames.add(TXXX(encoding=3, desc=mp3_desc, text=[value]))  # type: ignore[no-untyped-call]
+        frames.save()
+        return
+    raw = FLAC(track)
+    raw["ALBUM ARTIST"] = [value]
+    raw["ALBUM_ARTIST"] = [value]
+    raw.save()
+
+
+def _album_artist_alias_values(track: Path) -> list[str]:
+    """Return the raw values every albumartist alias on *track* holds, in any letter case."""
+    if track.suffix == ".mp3":
+        frames = ID3(track)  # type: ignore[no-untyped-call]
+        items = frames.items()  # type: ignore[no-untyped-call]
+        held = [frame for key, frame in items if key.upper() == "TXXX:ALBUM ARTIST"]
+        return [str(text) for frame in held for text in frame.text]
+    raw = FLAC(track)
+    return [*raw.get("ALBUM ARTIST", []), *raw.get("ALBUM_ARTIST", [])]
+
+
+@pytest.mark.parametrize(
+    ("suffix", "mp3_desc"),
+    [
+        pytest.param(".flac", "ALBUM ARTIST", id="flac"),
+        pytest.param(".mp3", "ALBUM ARTIST", id="mp3"),
+        pytest.param(".mp3", "album artist", id="mp3-lowercase-txxx"),
+    ],
+)
+def test_staging_albumartist_clears_its_aliases_and_revert_commit_restores_them(
+    engine_settings: Settings,
+    music_dir: Path,
+    suffix: str,
+    mp3_desc: str,
+) -> None:
+    # Navidrome shows the union of every albumartist spelling, so this file reads as
+    # "Various Artists • Various" until the alias goes.
+    track = make_track(music_dir / f"t{suffix}", {"albumartist": ["Various Artists"]})
+    _write_album_artist_alias(track, "Various", mp3_desc)
+    held = _album_artist_alias_values(track)
+    scan_library(engine_settings)
+    file_id = _file_id(engine_settings, music_dir, track.name)
+
+    staging.stage_tags(engine_settings, file_id=file_id, tags={"albumartist": ["Various Artists"]})
+    diff = staging.diff_tags(engine_settings)[0].diff
+    result = staging.commit_tags(engine_settings)
+    committed = read_tags(track).tags
+    committed_aliases = _album_artist_alias_values(track)
+    assert result.commit_id is not None
+    versioning.revert_commit(engine_settings, result.commit_id)
+
+    cleared = {alias: {"from": ["Various"], "to": []} for alias in tags.ALBUMARTIST_ALIASES}
+    expected_diff = cleared if suffix == ".flac" else {"album artist": cleared["album artist"]}
+    assert diff == expected_diff
+    assert result.committed == 1
+    assert committed["albumartist"] == ["Various Artists"]
+    assert committed_aliases == []
+    assert _album_artist_alias_values(track) == held
+
+
+def test_staging_an_album_artist_alias_explicitly_writes_it(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    track = make_track(music_dir / "t.flac", {"albumartist": ["Various"]})
+    _write_album_artist_alias(track, "Various")
+    scan_library(engine_settings)
+    file_id = _file_id(engine_settings, music_dir, track.name)
+
+    staging.stage_tags(
+        engine_settings,
+        file_id=file_id,
+        tags={"albumartist": ["Various Artists"], "album artist": ["Various Artists"]},
+    )
+    assert staging.commit_tags(engine_settings).committed == 1
+
+    raw = FLAC(track)
+    assert raw["ALBUMARTIST"] == ["Various Artists"]
+    assert raw["ALBUM ARTIST"] == ["Various Artists"]
+    assert "ALBUM_ARTIST" not in raw
+
+
+def test_a_stage_without_albumartist_keeps_its_aliases(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    track = make_track(music_dir / "t.flac", {"albumartist": ["Various Artists"]})
+    _write_album_artist_alias(track, "Various")
+    scan_library(engine_settings)
+    file_id = _file_id(engine_settings, music_dir, track.name)
+
+    staging.stage_tags(engine_settings, file_id=file_id, tags={"genre": ["Soundtrack"]})
+
+    assert staging.diff_tags(engine_settings)[0].diff == {
+        "genre": {"from": [], "to": ["Soundtrack"]},
+    }
 
 
 @pytest.mark.parametrize(

@@ -11,12 +11,13 @@ import sqlite3
 import zlib
 from typing import TYPE_CHECKING, ClassVar
 
+import httpx
 import pytest
 
 from conftest import make_track
 from tagmend import config, mcp_server
 from tagmend.engine import commits, covers, db, genres, paths, schema, store, trash, versioning
-from tagmend.engine.coverart import CoverArtError, CoverArtFront
+from tagmend.engine.coverart import CoverArtClient, CoverArtError, CoverArtFront
 from tagmend.engine.library import scan_library
 
 if TYPE_CHECKING:
@@ -70,10 +71,15 @@ class _FakeCoverArt:
         self.images = images or {}
         self.listings: list[tuple[str, str]] = []
         self.downloads: list[str] = []
+        self.cached: set[tuple[str, str]] = set()
 
     def front_image(self, kind: CoverArtKind, mbid: str) -> CoverArtFront | None:
         self.listings.append((kind, mbid))
+        self.cached.add((kind, mbid))
         return self.fronts.get((kind, mbid))
+
+    def has_cached_listing(self, kind: CoverArtKind, mbid: str) -> bool:
+        return (kind, mbid) in self.cached
 
     def fetch_image(self, url: str) -> bytes:
         self.downloads.append(url)
@@ -310,9 +316,7 @@ def test_the_owner_image_stages_a_png_and_replaces_the_earlier_row(
     owner_png.write_bytes(_png(900, 900))
 
     again = covers.stage_covers(engine_settings, client=fake)
-    result = covers.stage_covers(
-        engine_settings, folder="Band/Tagged", image=owner_png, client=fake
-    )
+    result = covers.stage_covers(engine_settings, path="Band/Tagged", image=owner_png, client=fake)
 
     assert [skip.reason for skip in again.skipped] == [covers.SKIP_ALREADY_STAGED]
     [staged] = result.staged
@@ -333,13 +337,13 @@ def test_the_owner_image_needs_a_folder_selecting_one_gap_album(
     owner_png = tmp_path / "chosen.png"
     owner_png.write_bytes(_png())
 
-    with pytest.raises(ValueError, match="image requires folder"):
+    with pytest.raises(ValueError, match="image requires path"):
         covers.stage_covers(engine_settings, image=owner_png, client=_FakeCoverArt())
     with pytest.raises(ValueError, match="selects 2 album"):
-        covers.stage_covers(engine_settings, folder="Band", image=owner_png, client=_FakeCoverArt())
+        covers.stage_covers(engine_settings, path="Band", image=owner_png, client=_FakeCoverArt())
     with pytest.raises(ValueError, match="not a regular file"):
         covers.stage_covers(
-            engine_settings, folder="Band/One", image=tmp_path, client=_FakeCoverArt()
+            engine_settings, path="Band/One", image=tmp_path, client=_FakeCoverArt()
         )
 
 
@@ -354,7 +358,7 @@ def test_an_invalid_owner_image_skips_the_album(
     owner_gif.write_bytes(_GIF)
 
     result = covers.stage_covers(
-        engine_settings, folder="Band/One", image=owner_gif, client=_FakeCoverArt()
+        engine_settings, path="Band/One", image=owner_gif, client=_FakeCoverArt()
     )
 
     assert [skip.reason for skip in result.skipped] == [covers.SKIP_INVALID_IMAGE]
@@ -369,21 +373,98 @@ def test_every_other_status_is_skipped_and_the_limit_reports_more(
 ) -> None:
     _album(music_dir / "Band" / "Covered", "Covered")
     (music_dir / "Band" / "Covered" / "folder.jpg").write_bytes(_jpeg())
+    fronts: dict[tuple[str, str], CoverArtFront] = {}
     for name in ("Alpha", "Beta"):
-        _album(music_dir / "Band" / name, name)
-        (music_dir / "Band" / name / "scan.jpg").write_bytes(_jpeg())
+        _album(music_dir / "Band" / name, name, musicbrainz_albumid=f"rel-{name}")
+        fronts["release", f"rel-{name}"] = _front("release", f"rel-{name}")
     scan_library(engine_settings)
+    fake = _FakeCoverArt(fronts, {front.image: _jpeg() for front in fronts.values()})
 
-    result = covers.stage_covers(engine_settings, limit=1, client=_FakeCoverArt())
+    result = covers.stage_covers(engine_settings, limit=1, client=fake)
 
     assert len(result.staged) == 1
     assert result.more is True
     assert [(skip.album, skip.reason) for skip in result.skipped] == [
         ("Band - Covered", covers.STATUS_COVERED_BY_FILE),
     ]
-    assert "More gap albums remain" in result.summary
+    assert "1 gap album(s) wait for a CAA lookup past the limit" in result.summary
     with pytest.raises(ValueError, match="limit must be >= 0"):
         covers.stage_covers(engine_settings, limit=-1, client=_FakeCoverArt())
+
+
+def test_the_limit_counts_only_uncached_lookups_so_paging_advances(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    _album(music_dir / "Band" / "Alpha", "Alpha", musicbrainz_albumid="rel-a")
+    _album(music_dir / "Band" / "Beta", "Beta", musicbrainz_albumid="rel-b")
+    _album(music_dir / "Band" / "Gamma", "Gamma")
+    (music_dir / "Band" / "Gamma" / "Gamma - Front.jpg").write_bytes(_jpeg())
+    scan_library(engine_settings)
+    front = _front("release", "rel-b")
+    fake = _FakeCoverArt({("release", "rel-b"): front}, {front.image: _jpeg()})
+
+    first = covers.stage_covers(engine_settings, limit=1, client=fake)
+    second = covers.stage_covers(engine_settings, limit=1, client=fake)
+    third = covers.stage_covers(engine_settings, limit=1, client=fake)
+
+    assert [row.album for row in first.staged] == ["Band - Gamma"]
+    assert [(row.album, row.reason) for row in first.skipped] == [
+        ("Band - Alpha", covers.SKIP_NO_SOURCE),
+    ]
+    assert first.more is True
+    assert [row.album for row in second.staged] == ["Band - Beta"]
+    assert [(row.album, row.reason) for row in second.skipped] == [
+        ("Band - Gamma", covers.SKIP_ALREADY_STAGED),
+        ("Band - Alpha", covers.SKIP_NO_SOURCE),
+    ]
+    assert second.more is False
+    assert (third.staged, third.more) == ([], False)
+    assert fake.listings.count(("release", "rel-b")) == 1
+    assert len(_staged(engine_settings)) == 2
+
+
+def test_an_id_caa_rejects_as_no_uuid_spends_the_limit_once_so_paging_advances(
+    engine_settings: Settings,
+    music_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    beta_mbid = "22222222-3333-4444-5555-666666666666"
+    image_url = f"http://coverartarchive.org/release/{beta_mbid}/1.jpg"
+    listing = {"images": [{"front": True, "approved": True, "image": image_url}]}
+    requests: list[str] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        requests.append(request.url.path)
+        if request.url.path == "/release/not-a-uuid/":
+            return httpx.Response(400, text="invalid UUID")
+        if request.url.path == f"/release/{beta_mbid}/":
+            return httpx.Response(200, json=listing)
+        if str(request.url) == image_url:
+            return httpx.Response(200, content=_jpeg())
+        return httpx.Response(404)
+
+    def build(_settings: Settings, conn: sqlite3.Connection) -> CoverArtClient:
+        transport = httpx.MockTransport(handle)
+        return CoverArtClient(
+            conn, transport=transport, monotonic=lambda: 0.0, sleep=lambda _seconds: None
+        )
+
+    monkeypatch.setattr(CoverArtClient, "from_settings", build)
+    _album(music_dir / "Band" / "Alpha", "Alpha", musicbrainz_albumid="not-a-uuid")
+    _album(music_dir / "Band" / "Beta", "Beta", musicbrainz_albumid=beta_mbid)
+    scan_library(engine_settings)
+
+    first = covers.stage_covers(engine_settings, limit=1)
+    second = covers.stage_covers(engine_settings, limit=1)
+
+    assert (first.staged, first.more) == ([], True)
+    assert [(row.album, row.reason) for row in first.skipped] == [
+        ("Band - Alpha", covers.SKIP_NO_SOURCE),
+    ]
+    assert [row.album for row in second.staged] == ["Band - Beta"]
+    assert second.more is False
+    assert requests.count("/release/not-a-uuid/") == 1
 
 
 def test_a_file_named_like_the_target_skips_the_album(
@@ -516,7 +597,7 @@ def _stage_one(settings: Settings, music_dir: Path, name: str) -> Path:
     _album(folder, name)
     (folder / f"{name} front.jpg").write_bytes(_jpeg())
     scan_library(settings)
-    covers.stage_covers(settings, folder=f"Band/{name}", client=_FakeCoverArt())
+    covers.stage_covers(settings, path=f"Band/{name}", client=_FakeCoverArt())
     return folder
 
 
@@ -617,9 +698,9 @@ def test_diff_and_unstage_scope_by_folder_and_unstage_clears_the_rows(
     _stage_one(engine_settings, music_dir, "One")
     _stage_one(engine_settings, music_dir, "Two")
 
-    scoped = covers.diff_covers(engine_settings, folder="Band/Two")
+    scoped = covers.diff_covers(engine_settings, path="Band/Two")
     capped = covers.diff_covers(engine_settings, limit=1)
-    removed_one = covers.unstage_covers(engine_settings, folder="Band/One")
+    removed_one = covers.unstage_covers(engine_settings, path="Band/One")
     removed_rest = covers.unstage_covers(engine_settings)
 
     assert [view.album for view in scoped] == ["Band - Two"]
@@ -639,9 +720,9 @@ def test_the_mcp_tools_stage_diff_and_unstage(music_dir: Path) -> None:
     mcp_server.scan_library()
 
     preview = mcp_server.stage_covers(dry_run=True)
-    staged = mcp_server.stage_covers(folder="Band/One")
+    staged = mcp_server.stage_covers(path="Band/One")
     diff = mcp_server.diff_covers()
-    removed = mcp_server.unstage_covers(folder="Band")
+    removed = mcp_server.unstage_covers(path="Band")
     refused = mcp_server.stage_covers(limit=-1)
 
     assert preview["ok"] is True
@@ -709,7 +790,7 @@ def test_commit_covers_writes_two_staged_covers_as_one_commit(
 
     assert result.commit_id is not None
     assert [row.target_path for row in result.written] == targets
-    assert result.errors == []
+    assert (result.committed, result.errors, result.problems) == (2, 0, [])
     assert (one / "cover.jpg").read_bytes() == _jpeg()
     assert (two / "cover.jpg").read_bytes() == _jpeg()
     assert _cover_writes(engine_settings) == [
@@ -731,7 +812,7 @@ def test_a_stage_covers_note_reaches_diff_covers_and_the_cover_write(
     (folder / "One front.jpg").write_bytes(_jpeg())
     scan_library(engine_settings)
     covers.stage_covers(
-        engine_settings, folder="Band/One", note="front from the booklet", client=_FakeCoverArt()
+        engine_settings, path="Band/One", note="front from the booklet", client=_FakeCoverArt()
     )
 
     diffed = covers.diff_covers(engine_settings)
@@ -759,7 +840,7 @@ def test_an_owner_image_among_auto_covers_makes_the_commit_manual(
     owner_png = tmp_path / "owner.png"
     owner_png.write_bytes(_png())
     covers.stage_covers(
-        engine_settings, folder="Band/One", image=str(owner_png), client=_FakeCoverArt()
+        engine_settings, path="Band/One", image=str(owner_png), client=_FakeCoverArt()
     )
     _stage_one(engine_settings, music_dir, "Two")
 
@@ -783,7 +864,8 @@ def test_a_file_placed_at_one_target_keeps_its_row_and_the_other_cover_writes(
 
     result = covers.commit_covers(engine_settings)
 
-    [error] = result.errors
+    [error] = result.problems
+    assert (result.committed, result.errors) == (1, 0)
     assert (error.target_path, error.reason) == (
         _target(music_dir, one),
         covers.STATE_TARGET_TAKEN,
@@ -804,7 +886,7 @@ def test_a_cover_that_appeared_since_staging_keeps_its_row(
 
     result = covers.commit_covers(engine_settings)
 
-    assert [row.reason for row in result.errors] == [covers.STATE_COVERED_SINCE_STAGE]
+    assert [row.reason for row in result.problems] == [covers.STATE_COVERED_SINCE_STAGE]
     assert not (folder / "cover.jpg").exists()
     assert len(_staged(engine_settings)) == 1
 
@@ -819,7 +901,7 @@ def test_a_target_already_holding_the_staged_bytes_is_logged_as_landed(
 
     result = covers.commit_covers(engine_settings)
 
-    assert result.errors == []
+    assert result.problems == []
     assert [row.target_path for row in result.written] == [_target(music_dir, folder)]
     assert (folder / "cover.jpg").stat().st_mtime_ns == landed_at
     assert [row[1] for row in _cover_writes(engine_settings)] == ["create"]
@@ -839,7 +921,7 @@ def test_a_landed_cover_whose_album_moved_is_still_logged(
 
     result = covers.commit_covers(engine_settings)
 
-    assert result.errors == []
+    assert result.problems == []
     assert [row.target_path for row in result.written] == [_target(music_dir, folder)]
     assert [row[1] for row in _cover_writes(engine_settings)] == ["create"]
     assert _staged(engine_settings) == []
@@ -854,7 +936,7 @@ def test_a_leftover_temp_beside_the_target_is_replaced_and_removed(
 
     result = covers.commit_covers(engine_settings)
 
-    assert result.errors == []
+    assert result.problems == []
     assert (folder / "cover.jpg").read_bytes() == _jpeg()
     assert not (folder / "cover.jpg.tagmend.tmp").exists()
 
@@ -871,7 +953,7 @@ def test_an_album_moved_since_staging_writes_nothing(
 
     result = covers.commit_covers(engine_settings)
 
-    assert [row.reason for row in result.errors] == [covers.STATE_ALBUM_MOVED]
+    assert [row.reason for row in result.problems] == [covers.STATE_ALBUM_MOVED]
     assert result.written == []
     assert not (folder / "cover.jpg").exists()
     assert len(_staged(engine_settings)) == 1
@@ -893,7 +975,8 @@ def test_a_failed_write_rolls_back_and_removes_the_temp(
 
     result = covers.commit_covers(engine_settings)
 
-    [error] = result.errors
+    [error] = result.problems
+    assert (result.committed, result.errors) == (0, 1)
     assert (error.reason, error.detail.startswith("disk full")) == (covers.COMMIT_ERROR, True)
     assert not (folder / "cover.jpg").exists()
     assert not (folder / "cover.jpg.tagmend.tmp").exists()
@@ -916,7 +999,8 @@ def test_commit_covers_with_nothing_staged_recovers_and_creates_no_commit(
 
     result = covers.commit_covers(engine_settings)
 
-    assert (result.commit_id, result.written, result.errors) == (None, [], [])
+    assert (result.commit_id, result.written, result.problems) == (None, [], [])
+    assert (result.committed, result.errors) == (0, 0)
     assert [(commit.id, commit.status) for commit in commits.list_commits(engine_settings)] == [
         (stuck, "interrupted")
     ]
@@ -960,14 +1044,14 @@ def test_the_mcp_tool_commits_the_staged_covers(music_dir: Path) -> None:
     _album(folder, "One")
     (folder / "One - Front.jpg").write_bytes(_jpeg())
     mcp_server.scan_library()
-    mcp_server.stage_covers(folder="Band/One")
+    mcp_server.stage_covers(path="Band/One")
 
     committed = mcp_server.commit_covers()
 
     assert committed["ok"] is True
     commit_id = committed["commit_id"]
     assert isinstance(commit_id, int)
-    assert committed["errors"] == []
+    assert (committed["committed"], committed["errors"], committed["problems"]) == (1, 0, [])
     assert mcp_server.get_commit(commit_id)["logs"] == {"cover_writes": 1}
     assert (folder / "cover.jpg").read_bytes() == _jpeg()
 

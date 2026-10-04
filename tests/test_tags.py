@@ -39,13 +39,14 @@ from mutagen.id3 import (  # type: ignore[attr-defined]
 from mutagen.mp4 import MP4, Atoms  # type: ignore[attr-defined]
 from mutagen.oggvorbis import OggVorbis
 
-from conftest import make_droppable_frames_mp3, make_track
+from conftest import make_chunk_id3_track, make_droppable_frames_mp3, make_track
 from tagmend.engine import tags
 from tagmend.engine.scan import TEMP_SUFFIX
 
 # Import tags so its module-load RegisterFreeformKey runs before make_track writes any
 # ``originaldate`` via raw mutagen easy mode (the M4A freeform atom must be registered).
 from tagmend.engine.tags import (
+    ALBUMARTIST_ALIASES,
     MANAGED_SET_VERSION,
     MANAGED_SETS,
     MANAGED_TAGS,
@@ -139,6 +140,8 @@ _EXPECTED_MANAGED = frozenset(
     {
         "genre",
         "albumartist",
+        "album artist",
+        "album_artist",
         "artist",
         "artists",
         "musicbrainz_artistid",
@@ -603,14 +606,116 @@ def test_artists_list_round_trips_in_order_on_its_native_entry(
     assert _raw_artists_entries(track) == _NATIVE_ARTISTS_ENTRY[suffix]
 
 
-def test_managed_set_version_4_registered() -> None:
-    assert MANAGED_SET_VERSION == 4
-    assert MANAGED_SETS[4] == MANAGED_TAGS
+def test_managed_set_version_5_registered() -> None:
+    assert MANAGED_SET_VERSION == 5
+    assert MANAGED_SETS[5] == MANAGED_TAGS
     # Older stamps must stay frozen: stored revisions point at them.
     assert MANAGED_SETS[1] == ORIGINAL_MANAGED_TAGS
     assert len(MANAGED_SETS[2]) == 18
-    assert MANAGED_SETS[3] == MANAGED_TAGS - {"artists"}
-    assert TAG_READER_VERSION == 8
+    assert MANAGED_SETS[3] == MANAGED_SETS[4] - {"artists"}
+    assert MANAGED_SETS[4] == MANAGED_TAGS - ALBUMARTIST_ALIASES
+    assert {"album artist", "album_artist"} == ALBUMARTIST_ALIASES
+    assert TAG_READER_VERSION == 10
+
+
+_ALBUM_ARTIST_ALIAS_ENTRIES = {
+    ".mp3": ["TXXX:ALBUM ARTIST", "TXXX:ALBUM_ARTIST"],
+    ".m4a": ["----:com.apple.iTunes:ALBUM ARTIST", "----:com.apple.iTunes:ALBUM_ARTIST"],
+    ".flac": ["ALBUM ARTIST", "ALBUM_ARTIST"],
+    ".ogg": ["ALBUM ARTIST", "ALBUM_ARTIST"],
+}
+
+
+def _write_raw_album_artist_aliases(track: Path, values: tuple[str, str]) -> None:
+    """Write each albumartist alias under its raw name on *track*'s container, as a tagger would."""
+    pairs = list(zip(_ALBUM_ARTIST_ALIAS_ENTRIES[track.suffix], values, strict=True))
+    if track.suffix == ".mp3":
+        frames = ID3(track)  # type: ignore[no-untyped-call]
+        for entry, value in pairs:
+            desc = entry.removeprefix("TXXX:")
+            frames.add(TXXX(encoding=3, desc=desc, text=[value]))  # type: ignore[no-untyped-call]
+        frames.save()
+    elif track.suffix == ".m4a":
+        atoms = MP4(track)  # type: ignore[no-untyped-call]
+        for entry, value in pairs:
+            atoms[entry] = [value.encode()]
+        atoms.save()  # type: ignore[no-untyped-call]
+    else:
+        audio = mutagen.File(track)  # type: ignore[attr-defined]
+        for entry, value in pairs:
+            audio[entry] = [value]
+        audio.save()
+
+
+def _raw_album_artist_alias_entries(track: Path) -> list[str]:
+    """Return every raw entry name on *track* that spells an albumartist alias."""
+    wanted = set(_ALBUM_ARTIST_ALIAS_ENTRIES[track.suffix])
+    if track.suffix == ".mp3":
+        return sorted(key for key in ID3(track) if key in wanted)  # type: ignore[no-untyped-call]
+    if track.suffix == ".m4a":
+        return sorted(key for key in MP4(track) if key in wanted)  # type: ignore[no-untyped-call]
+    audio = mutagen.File(track)  # type: ignore[attr-defined]
+    return sorted({key.upper() for key, _ in audio.tags if key.upper() in wanted})
+
+
+@pytest.mark.parametrize("suffix", _ALL_FORMATS)
+def test_reads_each_album_artist_alias_beside_albumartist(tmp_path: Path, suffix: str) -> None:
+    track = make_track(tmp_path / f"alias{suffix}", {"albumartist": ["Various Artists"]})
+    _write_raw_album_artist_aliases(track, ("Various", "VA"))
+
+    read = read_tags(track).tags
+
+    assert read["albumartist"] == ["Various Artists"]
+    assert read["album artist"] == ["Various"]
+    assert read["album_artist"] == ["VA"]
+
+
+@pytest.mark.parametrize("suffix", _ALL_FORMATS)
+def test_album_artist_aliases_write_and_clear_on_their_native_entries(
+    tmp_path: Path,
+    suffix: str,
+) -> None:
+    track = make_track(tmp_path / f"alias{suffix}", {"albumartist": ["Various Artists"]})
+
+    write_managed_tags(track, {**_managed(track), "album artist": ["A"], "album_artist": ["B"]})
+    written = read_tags(track).tags
+    entries = _raw_album_artist_alias_entries(track)
+    write_managed_tags(track, {"albumartist": ["Various Artists"]})
+
+    assert (written["album artist"], written["album_artist"]) == (["A"], ["B"])
+    assert entries == _ALBUM_ARTIST_ALIAS_ENTRIES[suffix]
+    assert _raw_album_artist_alias_entries(track) == []
+    assert read_tags(track).tags["albumartist"] == ["Various Artists"]
+
+
+def _album_artist_frames(track: Path) -> dict[str, list[str]]:
+    """Return each ``TXXX`` frame on *track* whose description is ``ALBUM ARTIST`` in any case."""
+    frames = ID3(track)  # type: ignore[no-untyped-call]
+    return {
+        key: [str(text) for text in frame.text]
+        for key, frame in frames.items()  # type: ignore[no-untyped-call]
+        if key.upper() == "TXXX:ALBUM ARTIST"
+    }
+
+
+def test_an_mp3_album_artist_alias_in_any_case_reads_as_one_and_writes_one_frame(
+    tmp_path: Path,
+) -> None:
+    # TagLib upper-cases a TXXX description, so Navidrome reads both frames as the one alias.
+    track = make_track(tmp_path / "alias.mp3", {"albumartist": ["Various Artists"]})
+    frames = ID3(track)  # type: ignore[no-untyped-call]
+    frames.add(TXXX(encoding=3, desc="album artist", text=["Various"]))  # type: ignore[no-untyped-call]
+    frames.add(TXXX(encoding=3, desc="Album Artist", text=["VA"]))  # type: ignore[no-untyped-call]
+    frames.save()
+
+    read = read_tags(track).tags
+    write_managed_tags(track, {**_managed(track), "album artist": ["Various Artists"]})
+    written = _album_artist_frames(track)
+    write_managed_tags(track, {"albumartist": ["Various Artists"]})
+
+    assert sorted(read["album artist"]) == ["VA", "Various"]
+    assert written == {"TXXX:ALBUM ARTIST": ["Various Artists"]}
+    assert _album_artist_frames(track) == {}
 
 
 def test_write_leaves_unchanged_frames_untouched(tmp_path: Path) -> None:
@@ -1315,3 +1420,10 @@ def test_a_wav_suffix_is_not_verifiable(tmp_path: Path) -> None:
         tags.ensure_writable(clip)
 
     assert ".wav" not in tags.VERIFIABLE_SUFFIXES
+
+
+@pytest.mark.parametrize("suffix", [".wav", ".aiff"])
+def test_a_chunk_id3_tag_with_a_cover_reads_under_the_mp3_keys(tmp_path: Path, suffix: str) -> None:
+    track = make_chunk_id3_track(tmp_path / f"clip{suffix}")
+
+    assert read_tags(track).tags == {"title": ["Song"], "artist": ["Band"]}

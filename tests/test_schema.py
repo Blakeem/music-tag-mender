@@ -29,7 +29,7 @@ def test_apply_schema_stamps_current_version(db_conn: sqlite3.Connection) -> Non
     # db_conn already applied the schema; the stamp must match the constant the code ships.
     version = db_conn.execute("PRAGMA user_version").fetchone()[0]
     assert version == SCHEMA_VERSION
-    assert SCHEMA_VERSION == 29
+    assert SCHEMA_VERSION == 30
 
 
 def test_apply_schema_creates_genre_tables(db_conn: sqlite3.Connection) -> None:
@@ -59,9 +59,8 @@ def test_musicbrainz_recording_cache_columns(db_conn: sqlite3.Connection) -> Non
     assert columns["request_key"] == ("TEXT", False, True)
     assert columns["found"] == ("INTEGER", True, False)
     assert columns["album_title"] == ("TEXT", False, False)
-    assert columns["release_group_mbid"] == ("TEXT", False, False)
-    assert columns["recording_mbid"] == ("TEXT", False, False)
     assert columns["fetched_at"] == ("TEXT", True, False)
+    assert set(columns) == {"request_key", "found", "album_title", "fetched_at"}
 
 
 def test_apply_schema_creates_no_voided_auto_table(db_conn: sqlite3.Connection) -> None:
@@ -815,15 +814,16 @@ def test_musicbrainz_cache_is_renamed_in_place() -> None:
 
 def test_release_group_id_columns_are_renamed_in_place() -> None:
     # The previous shape names the release-group cache musicbrainz_cache, and both caches
-    # carry release_group_id.
+    # carry release_group_id. v30 then drops the recording cache's copy, which nothing read.
     conn = sqlite3.connect(":memory:")
     try:
         apply_schema(conn)
         conn.execute("ALTER TABLE musicbrainz_release_group_cache RENAME TO musicbrainz_cache")
+        conn.execute(
+            "ALTER TABLE musicbrainz_cache RENAME COLUMN release_group_mbid TO release_group_id",
+        )
+        conn.execute("ALTER TABLE musicbrainz_recording_cache ADD COLUMN release_group_id TEXT")
         for table in ("musicbrainz_cache", "musicbrainz_recording_cache"):
-            conn.execute(
-                f"ALTER TABLE {table} RENAME COLUMN release_group_mbid TO release_group_id",
-            )
             conn.execute(
                 f"INSERT INTO {table} (request_key, found, release_group_id, fetched_at) "  # noqa: S608
                 "VALUES ('k', 1, 'rg-1', '2026-07-06T00:00:00+00:00')",
@@ -835,8 +835,10 @@ def test_release_group_id_columns_are_renamed_in_place() -> None:
 
         for table in ("musicbrainz_release_group_cache", "musicbrainz_recording_cache"):
             assert "release_group_id" not in _columns(conn, table)
-            kept = conn.execute(f"SELECT release_group_mbid FROM {table}").fetchone()[0]  # noqa: S608
-            assert kept == "rg-1"
+        kept = conn.execute("SELECT release_group_mbid FROM musicbrainz_release_group_cache")
+        assert kept.fetchone()[0] == "rg-1"
+        recording = conn.execute("SELECT request_key FROM musicbrainz_recording_cache")
+        assert recording.fetchall() == [("k",)]
     finally:
         conn.close()
 
@@ -1348,7 +1350,7 @@ def test_fingerprint_cache_cascades_on_file_delete(db_conn: sqlite3.Connection) 
 _SONG_STATUS_COLUMNS = [
     "file_id",
     "status",
-    "source_album_mbid",
+    "source_release_mbid",
     "source_release_track_mbid",
     "source_value",
     "updated_at",
@@ -1827,5 +1829,87 @@ def test_v28_ledger_gains_the_cover_tables_in_place() -> None:
             conn, "trigger"
         )
         assert conn.execute("SELECT id FROM files").fetchall() == [(file_id,)]
+    finally:
+        conn.close()
+
+
+# --- v30: the song release id column and the unread MusicBrainz cache columns ----------
+
+
+def test_v29_ledger_renames_the_song_release_column_in_place() -> None:
+    conn = sqlite3.connect(":memory:")
+    try:
+        apply_schema(conn)
+        file_id = _insert_file(conn)
+        conn.execute(
+            "ALTER TABLE file_song_status RENAME COLUMN source_release_mbid TO source_album_mbid",
+        )
+        conn.execute(
+            """
+            INSERT INTO file_song_status
+              (file_id, status, source_album_mbid, source_release_track_mbid, source_value,
+               updated_at)
+            VALUES (?, 'done', 'rel-1', 'track-1', '{}', '2026-10-03T00:00:00+00:00')
+            """,
+            (file_id,),
+        )
+        conn.execute("PRAGMA user_version = 29")
+        conn.commit()
+
+        apply_schema(conn)  # the in-place upgrade
+        apply_schema(conn)  # idempotent: a current ledger runs nothing
+
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        assert _columns(conn, "file_song_status") == _SONG_STATUS_COLUMNS
+        kept = conn.execute(
+            "SELECT file_id, status, source_release_mbid, source_release_track_mbid "
+            "FROM file_song_status",
+        ).fetchall()
+        assert kept == [(file_id, "done", "rel-1", "track-1")]
+    finally:
+        conn.close()
+
+
+def test_v29_cache_rows_keep_their_other_columns_when_the_unread_ones_drop() -> None:
+    conn = sqlite3.connect(":memory:")
+    try:
+        apply_schema(conn)
+        conn.execute("ALTER TABLE musicbrainz_release_group_cache ADD COLUMN release_mbid TEXT")
+        for column in ("release_group_mbid", "recording_mbid"):
+            conn.execute(f"ALTER TABLE musicbrainz_recording_cache ADD COLUMN {column} TEXT")
+        conn.execute(
+            """
+            INSERT INTO musicbrainz_release_group_cache
+              (request_key, found, album_title, original_date, release_mbid, release_group_mbid,
+               fetched_at)
+            VALUES ('rg-k', 1, 'Paranoid', '1970-09-18', 'rel-1', 'rg-1',
+                    '2026-10-03T00:00:00+00:00')
+            """,
+        )
+        conn.execute(
+            """
+            INSERT INTO musicbrainz_recording_cache
+              (request_key, found, album_title, release_group_mbid, recording_mbid, fetched_at)
+            VALUES ('rec-k', 1, 'Paranoid', 'rg-1', 'rec-1', '2026-10-03T00:00:00+00:00')
+            """,
+        )
+        conn.execute("PRAGMA user_version = 29")
+        conn.commit()
+
+        apply_schema(conn)  # the in-place upgrade
+
+        assert "release_mbid" not in _columns(conn, "musicbrainz_release_group_cache")
+        assert _columns(conn, "musicbrainz_recording_cache") == [
+            "request_key",
+            "found",
+            "album_title",
+            "fetched_at",
+        ]
+        group = conn.execute("SELECT * FROM musicbrainz_release_group_cache").fetchall()
+        assert group == [
+            ("rg-k", 1, "Paranoid", "1970-09-18", "rg-1", "2026-10-03T00:00:00+00:00"),
+        ]
+        recording = conn.execute("SELECT * FROM musicbrainz_recording_cache").fetchall()
+        assert recording == [("rec-k", 1, "Paranoid", "2026-10-03T00:00:00+00:00")]
     finally:
         conn.close()

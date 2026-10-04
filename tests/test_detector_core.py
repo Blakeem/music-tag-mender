@@ -107,7 +107,8 @@ def test_regroup_matches_rows_to_groups_by_the_given_key() -> None:
 @pytest.mark.parametrize(
     ("albumartist", "compilation", "artist", "expected"),
     [
-        (" Band ", "1", "Guest", "Band"),
+        (" Band ", "1", "Guest", " Band "),
+        (" ", "1", "Guest", " "),
         (None, "1", "Guest", "Various Artists"),
         ("", "yes", "Guest", "Guest"),
         (None, None, " ", "[Unknown Artist]"),

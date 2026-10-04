@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from conftest import make_track
+from conftest import make_chunk_id3_track, make_track
 from tagmend.config import Settings
 from tagmend.engine import (
     axis,
@@ -876,6 +876,20 @@ def test_whitespace_only_artist_derives_no_identity(
 
     views = list_files(engine_settings, genre_status="no_identity")
     assert [v.filename for v in views] == ["ws.mp3"]
+
+
+@pytest.mark.parametrize("suffix", [".wav", ".aiff"])
+def test_scan_stores_a_chunk_id3_track_with_a_cover_under_the_mp3_keys(
+    engine_settings: Settings,
+    music_dir: Path,
+    suffix: str,
+) -> None:
+    make_chunk_id3_track(music_dir / "Band" / "Album" / f"01 Song{suffix}")
+
+    scan_library(engine_settings)
+
+    (view,) = list_files(engine_settings)
+    assert view.managed_tags == {"title": ["Song"], "artist": ["Band"]}
 
 
 def test_no_identity_composes_with_other_filters(

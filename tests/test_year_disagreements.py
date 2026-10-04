@@ -55,7 +55,6 @@ def _rg(year: str, title: str = "Paranoid", rgid: str = "rg-1") -> MBReleaseGrou
         album_title=title,
         original_date=year,
         release_group_mbid=rgid,
-        release_mbid=None,
     )
 
 

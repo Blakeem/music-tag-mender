@@ -51,6 +51,7 @@ from tagmend.engine import (
     axis,
     clock,
     db,
+    ledger_lock,
     path_keys,
     release_match,
     schema,
@@ -76,9 +77,9 @@ from tagmend.engine.acoustid import (
     put_fingerprint,
     put_lookup,
 )
-from tagmend.engine.detector_core import parse_total
+from tagmend.engine.detector_core import parse_position, parse_total
 from tagmend.engine.musicbrainz import MusicBrainzClient, MusicBrainzError
-from tagmend.engine.text_keys import alnum_key, display_key, loose_key, title_key
+from tagmend.engine.text_keys import alnum_script_key, display_key, loose_key, title_key
 from tagmend.engine.validation import check_limit, validate_file_pairs
 from tagmend.log import get_logger
 
@@ -373,6 +374,24 @@ class _Convergence:
 
 
 @dataclass(frozen=True, slots=True)
+class _TagTotals:
+    """The disc and track totals a folder's voters agree on, ``None`` where they do not.
+
+    ``disc`` is the medium the voters' disc number names, 1 when every one is blank, and
+    ``None`` when they name two or one does not parse.
+    """
+
+    disc_total: int | None
+    track_total: int | None
+    disc: int | None
+
+    @property
+    def agreed(self) -> bool:
+        """Whether the voters agree on at least one total."""
+        return self.disc_total is not None or self.track_total is not None
+
+
+@dataclass(frozen=True, slots=True)
 class _Ranking:
     """The confirm fetch stage's verdict: the representative and the candidate rows."""
 
@@ -474,6 +493,7 @@ class _Lookups:
 # --- public entry --------------------------------------------------------------------
 
 
+@ledger_lock.mutating
 def resolve_songs(  # noqa: PLR0913 - cohesive keyword-only scope + injection params
     settings: Settings,
     *,
@@ -828,9 +848,9 @@ def _qualifiers(text: str) -> frozenset[str]:
 def _stem_holds(title: str, stem: str) -> bool:
     """Whether the folded filename *stem* contains the qualifier-stripped folded *title*."""
     bare = _QUALIFIER.sub(" ", title)
-    key = alnum_key(bare)
+    key = alnum_script_key(bare)
     if key:
-        return key in alnum_key(stem)
+        return key in alnum_script_key(stem)
     loose = loose_key(bare)
     return bool(loose) and loose in loose_key(stem)
 
@@ -1172,6 +1192,57 @@ def _narrow(family: list[str], refs: dict[str, list[AcoustidReleaseRef]], count:
     return by_medium or family
 
 
+def _one_value(values: set[int | None]) -> int | None:
+    """Return the one value of *values*, else ``None``."""
+    return next(iter(values)) if len(values) == 1 else None
+
+
+def _tag_totals(ballots: list[_Ballot]) -> _TagTotals:
+    """Read the totals and the disc number every voter that carries one agrees on."""
+    disc_values = [ballot.voter.value(_DISC) for ballot in ballots]
+    track_values = [ballot.voter.value(_TRACK) for ballot in ballots]
+    disc_totals = {parse_total(value) for value in disc_values} - {None}
+    track_totals = {parse_total(value) for value in track_values} - {None}
+    discs = {parse_position(value) for value in disc_values if value}
+    return _TagTotals(
+        disc_total=_one_value(disc_totals),
+        track_total=_one_value(track_totals),
+        disc=_one_value(discs) if discs else 1,
+    )
+
+
+def _narrow_by_totals(
+    family: list[str],
+    refs: dict[str, list[AcoustidReleaseRef]],
+    tag_totals: _TagTotals,
+) -> list[str]:
+    """Keep the members holding the voters' disc total, then their track total on their disc.
+
+    A total no member holds is ignored, so a tag the whole family contradicts narrows nothing.
+    """
+    narrowed = family
+    disc_total = tag_totals.disc_total
+    track_total = tag_totals.track_total
+    disc = tag_totals.disc
+
+    if disc_total is not None:
+        by_disc_total = [
+            rid for rid in narrowed if any(ref.medium_count == disc_total for ref in refs[rid])
+        ]
+        narrowed = by_disc_total or narrowed
+    if track_total is not None and disc is not None:
+        by_track_total = [
+            rid
+            for rid in narrowed
+            if any(
+                ref.medium_position == disc and ref.medium_track_count == track_total
+                for ref in refs[rid]
+            )
+        ]
+        narrowed = by_track_total or narrowed
+    return narrowed
+
+
 def _uniform_totals(narrowed: list[str], refs: dict[str, list[AcoustidReleaseRef]]) -> bool:
     """Whether every narrowed member gives each medium one track count and one medium count."""
     members = [ref for rid in narrowed for ref in refs[rid]]
@@ -1182,11 +1253,12 @@ def _uniform_totals(narrowed: list[str], refs: dict[str, list[AcoustidReleaseRef
     return len(medium_counts) == 1 and all(len(counts) == 1 for counts in per_medium.values())
 
 
-def _converge(ballots: list[_Ballot]) -> _Convergence | None:
+def _converge(ballots: list[_Ballot], tag_totals: _TagTotals | None) -> _Convergence | None:
     """Run the folder convergence stage, or return ``None`` when the floor is missed.
 
     The floor applies twice: to the voters the recording gate passes and to the voters the
-    max-coverage family covers.
+    max-coverage family covers. *tag_totals* narrows the family when the voters agree on one.
+    Otherwise, and always for a rebind report, which passes ``None``, the voter count does.
     """
     required = _required_voters(len(ballots))
     gated = [ballot for ballot in ballots if ballot.gate.passed]
@@ -1202,7 +1274,11 @@ def _converge(ballots: list[_Ballot]) -> _Convergence | None:
         rid: [ref for ballot in gated for ref in ballot.gate.refs() if ref.id == rid]
         for rid in family
     }
-    narrowed = _narrow(family, refs, len(ballots))
+    narrowed = (
+        _narrow_by_totals(family, refs, tag_totals)
+        if tag_totals is not None and tag_totals.agreed
+        else _narrow(family, refs, len(ballots))
+    )
     names = {
         ballot.voter.file_id: frozenset(
             (ref.medium_position, ref.track_position)
@@ -1323,11 +1399,18 @@ def _anchored(ballots: list[_Ballot], lookups: _Lookups) -> list[_Outcome]:
 
 
 def _converged(ballots: list[_Ballot], lookups: _Lookups) -> list[_Outcome]:
-    """Settle an id-less folder on the one Official release its voters converge on."""
+    """Settle an id-less folder on the one Official release its voters converge on.
+
+    A voter count below the floor matches a single or an EP as well as a partial album, so a
+    folder that small converges only on the totals its tags carry.
+    """
     targets = [ballot for ballot in ballots if ballot.voter.target]
-    convergence = _converge(ballots)
+    tag_totals = _tag_totals(ballots)
+    convergence = _converge(ballots, tag_totals)
     if convergence is None:
         return [_held_or_ungated(b, "unconverged", "floor_missed", "") for b in targets]
+    if not tag_totals.agreed and len(ballots) < _FLOOR_VOTERS:
+        return [_held_or_ungated(b, "unconverged", "needs_release_mbid", "") for b in targets]
     ranking = _confirm(convergence.narrowed, convergence.refs, _carried(ballots), lookups)
     release = ranking.representative
     if release is None:
@@ -1391,7 +1474,7 @@ def _rebind_report(ballots: list[_Ballot], lookups: _Lookups) -> dict[str, objec
                 "status": _status_of(release),
             },
         )
-    convergence = _converge(ballots)
+    convergence = _converge(ballots, None)
     ranked = (
         []
         if convergence is None

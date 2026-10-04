@@ -42,6 +42,7 @@ KNOWN_KEYS: Final[frozenset[str]] = frozenset(
         "genre_use_album_tags",
         "lastfm_rate_per_sec",
         "genre_stage_limit",
+        "artist_stage_limit",
         "musicbrainz_rate_per_sec",
         "musicbrainz_contact",
         "year_stage_limit",
@@ -74,6 +75,7 @@ _LASTFM_RATE_PER_SEC_DEFAULT: Final = 1.0
 # Last.fm's API terms allow 5 requests per second per IP, averaged over 5 minutes.
 _LASTFM_RATE_PER_SEC_MAX: Final = 5.0
 _GENRE_STAGE_LIMIT_DEFAULT: Final = 300
+_ARTIST_STAGE_LIMIT_DEFAULT: Final = 300
 
 # The public project URL, the contact any User-Agent may carry without naming a person.
 PROJECT_URL: Final = "https://github.com/Blakeem/music-tag-mender"
@@ -97,7 +99,7 @@ _NONE_TOKENS: Final[frozenset[str]] = frozenset({"", "0", "none", "null"})
 # The typed key families whose values check_setting holds to the rules load_settings coerces by.
 _INT_KEYS: Final[frozenset[str]] = frozenset({"genre_min_weight"})
 _NON_NEGATIVE_INT_KEYS: Final[frozenset[str]] = frozenset(
-    {"genre_stage_limit", "year_stage_limit", "song_stage_limit"},
+    {"genre_stage_limit", "artist_stage_limit", "year_stage_limit", "song_stage_limit"},
 )
 _RATE_KEYS: Final[frozenset[str]] = frozenset(
     {"lastfm_rate_per_sec", "musicbrainz_rate_per_sec", "acoustid_rate_per_sec"},
@@ -160,6 +162,7 @@ class Settings:
     genre_use_album_tags: bool = True
     lastfm_rate_per_sec: float = _LASTFM_RATE_PER_SEC_DEFAULT
     genre_stage_limit: int = _GENRE_STAGE_LIMIT_DEFAULT
+    artist_stage_limit: int = _ARTIST_STAGE_LIMIT_DEFAULT
     musicbrainz_rate_per_sec: float = _MUSICBRAINZ_RATE_PER_SEC_DEFAULT
     musicbrainz_contact: str = _MUSICBRAINZ_CONTACT_DEFAULT
     year_stage_limit: int = _YEAR_STAGE_LIMIT_DEFAULT
@@ -221,6 +224,11 @@ def load_settings() -> Settings:
             "genre_stage_limit",
             _resolve_raw("genre_stage_limit", raw),
             _GENRE_STAGE_LIMIT_DEFAULT,
+        ),
+        artist_stage_limit=_coerce_non_negative_int(
+            "artist_stage_limit",
+            _resolve_raw("artist_stage_limit", raw),
+            _ARTIST_STAGE_LIMIT_DEFAULT,
         ),
         musicbrainz_rate_per_sec=_coerce_capped_rate(
             "musicbrainz_rate_per_sec",

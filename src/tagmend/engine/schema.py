@@ -71,7 +71,7 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
-SCHEMA_VERSION: Final = 29
+SCHEMA_VERSION: Final = 30
 
 
 class LedgerSchemaError(RuntimeError):
@@ -369,7 +369,7 @@ _FILE_SONG_STATUS_DDL: Final = """
 CREATE TABLE IF NOT EXISTS file_song_status (
   file_id                   INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
   status                    TEXT NOT NULL,
-  source_album_mbid         TEXT,
+  source_release_mbid       TEXT,
   source_release_track_mbid TEXT,
   source_value              TEXT,
   updated_at                TEXT NOT NULL
@@ -377,14 +377,13 @@ CREATE TABLE IF NOT EXISTS file_song_status (
 """
 
 # ``found = 0`` means no usable Album release group. A found row holds the selected group's
-# ``first-release-date`` and MBIDs. Named ``musicbrainz_cache`` before v20.
+# ``first-release-date`` and MBID. Named ``musicbrainz_cache`` before v20.
 _MUSICBRAINZ_RELEASE_GROUP_CACHE_DDL: Final = """
 CREATE TABLE IF NOT EXISTS musicbrainz_release_group_cache (
   request_key        TEXT PRIMARY KEY,
   found              INTEGER NOT NULL,
   album_title        TEXT,
   original_date      TEXT,
-  release_mbid       TEXT,
   release_group_mbid TEXT,
   fetched_at         TEXT NOT NULL
 )
@@ -419,12 +418,10 @@ CREATE TABLE IF NOT EXISTS musicbrainz_artist_cache (
 # ``found = 0`` means the recording has no usable Album release group.
 _MUSICBRAINZ_RECORDING_CACHE_DDL: Final = """
 CREATE TABLE IF NOT EXISTS musicbrainz_recording_cache (
-  request_key        TEXT PRIMARY KEY,
-  found              INTEGER NOT NULL,
-  album_title        TEXT,
-  release_group_mbid TEXT,
-  recording_mbid     TEXT,
-  fetched_at         TEXT NOT NULL
+  request_key TEXT PRIMARY KEY,
+  found       INTEGER NOT NULL,
+  album_title TEXT,
+  fetched_at  TEXT NOT NULL
 )
 """
 
@@ -1079,6 +1076,45 @@ def _migrate_axis_outcomes(connection: sqlite3.Connection) -> None:
     logger.info("schema v21: replayed %d manual status row(s), dropped voided_auto", replayed)
 
 
+def _migrate_song_release_mbid(connection: sqlite3.Connection) -> None:
+    """v30: rename ``file_song_status.source_album_mbid`` to ``source_release_mbid``, keeping rows.
+
+    The column holds the MusicBrainz release id, which every other part of the engine names
+    ``release_mbid``.
+    """
+    if not _table_exists(connection, "file_song_status"):
+        return
+    if not _column_exists(connection, "file_song_status", "source_album_mbid"):
+        return
+    connection.execute(
+        "ALTER TABLE file_song_status RENAME COLUMN source_album_mbid TO source_release_mbid",
+    )
+    logger.info("schema v30: renamed file_song_status.source_album_mbid to source_release_mbid")
+
+
+# The MusicBrainz cache columns v30 drops, since nothing ever read them back.
+_V30_UNREAD_CACHE_COLUMNS: Final = (
+    ("musicbrainz_release_group_cache", "release_mbid"),
+    ("musicbrainz_recording_cache", "release_group_mbid"),
+    ("musicbrainz_recording_cache", "recording_mbid"),
+)
+
+
+def _migrate_drop_unread_cache_columns(connection: sqlite3.Connection) -> None:
+    """v30: drop the MusicBrainz cache columns nothing read, keeping each row's other columns.
+
+    No index, constraint, view or trigger names them, so ``DROP COLUMN`` applies. Runs after
+    :func:`_migrate_mbid_columns`, which names ``release_group_mbid``.
+    """
+    for table, column in _V30_UNREAD_CACHE_COLUMNS:
+        if not _table_exists(connection, table):
+            continue
+        if not _column_exists(connection, table, column):
+            continue
+        connection.execute(f"ALTER TABLE {table} DROP COLUMN {column}")
+        logger.info("schema v30: dropped %s.%s", table, column)
+
+
 def _apply_migrations(connection: sqlite3.Connection) -> None:
     """Run every in-place migration of :func:`apply_schema`, oldest first."""
     _migrate_v12_year_status(connection)
@@ -1099,6 +1135,8 @@ def _apply_migrations(connection: sqlite3.Connection) -> None:
     _migrate_mismatch_covers(connection)
     _migrate_path_staging(connection)
     _migrate_path_reverted_to_version(connection)
+    _migrate_song_release_mbid(connection)
+    _migrate_drop_unread_cache_columns(connection)
 
 
 def apply_schema(connection: sqlite3.Connection) -> None:

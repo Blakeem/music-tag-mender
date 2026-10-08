@@ -1,12 +1,15 @@
-"""Pure data access for the snapshot, the revision logs, and the staging areas (M1 + M3).
+"""Pure data access for the snapshot, the revision logs, and the staging areas.
 
-Covers the ``files`` / ``file_tags`` snapshot, the append-only ``tag_revisions``,
-``path_revisions``, ``sidecar_moves`` and ``cover_writes`` histories, and the
-``tag_revisions_staged``, ``path_revisions_staged``, ``sidecar_moves_staged`` and
-``cover_writes_staged`` staging areas (git's index). Every function takes an open
+Covers the ``files`` / ``file_tags`` / ``file_pictures`` snapshot, the append-only
+``tag_revisions``, ``path_revisions``, ``sidecar_moves``, ``cover_writes`` and ``picture_writes``
+histories, and the ``tag_revisions_staged``, ``path_revisions_staged``, ``sidecar_moves_staged``,
+``cover_writes_staged`` and ``picture_writes_staged`` staging areas (git's index). It also holds
+the Last.fm, MusicBrainz and Cover Art Archive lookup caches, the tag-axis derived status, the
+``file_mismatch_status`` decisions and the scope selector. Every function takes an open
 :class:`sqlite3.Connection` and does one focused thing, with no scanning, tag reading or commit
 policy. That orchestration lives in :mod:`tagmend.engine.library`,
-:mod:`tagmend.engine.versioning`, :mod:`tagmend.engine.staging` and :mod:`tagmend.engine.paths`.
+:mod:`tagmend.engine.versioning`, :mod:`tagmend.engine.staging`, :mod:`tagmend.engine.paths` and
+:mod:`tagmend.engine.pictures`.
 The ``commits``-table ops and the shared commit loop live in :mod:`tagmend.engine.commits`.
 SQLite hands back ``Any``, so this module casts at the boundary and the rest of the engine stays
 strictly typed.
@@ -22,13 +25,12 @@ from typing import TYPE_CHECKING, Final, cast
 
 from tagmend.engine import axis, db, path_keys
 from tagmend.engine.tags import MANAGED_SET_VERSION, TAG_READER_VERSION
-from tagmend.log import get_logger
 
 if TYPE_CHECKING:
     import sqlite3
-    from collections.abc import Collection
+    from collections.abc import Collection, Sequence
 
-logger = get_logger(__name__)
+    from tagmend.engine.tags import EmbeddedPicture
 
 
 def _dump_json(obj: object) -> str:
@@ -96,11 +98,7 @@ def get_file(conn: sqlite3.Connection, folder: str, filename: str) -> FileRow | 
 
 
 def get_file_by_id(conn: sqlite3.Connection, file_id: int) -> FileRow | None:
-    """Return the file row with the given stable ``id``, or ``None``.
-
-    Used by the revert path, which knows a file by its durable ``file_id`` and needs
-    its current on-disk ``(folder, filename)`` to write tags back.
-    """
+    """Return the file row with the given stable ``id``, or ``None``."""
     cursor = conn.execute(
         f"SELECT {_FILE_COLUMNS} FROM files WHERE id = ?",  # noqa: S608
         (file_id,),
@@ -146,7 +144,7 @@ def insert_file(  # noqa: PLR0913 - keyword-only insert payload, all columns req
         ),
     )
     new_id = cursor.lastrowid
-    if new_id is None:  # pragma: no cover - defensive; INTEGER PK always assigns one
+    if new_id is None:  # pragma: no cover - defensive, since an INTEGER PK always assigns one
         message = "insert_file did not return a row id"
         raise RuntimeError(message)
     return int(new_id)
@@ -253,6 +251,93 @@ def stamp_reader_version(conn: sqlite3.Connection, file_id: int) -> None:
     )
 
 
+@dataclass(frozen=True, slots=True)
+class PictureRow:
+    """One ``file_pictures`` row: an embedded picture of a file, without its bytes."""
+
+    ordinal: int
+    picture_type: int | None
+    mime: str
+    description: str
+    size_bytes: int
+    sha256: str
+
+
+_PICTURE_COLUMNS = "ordinal, picture_type, mime, description, size_bytes, sha256"
+
+
+def _row_to_picture(row: Sequence[object]) -> PictureRow:
+    """Build a typed :class:`PictureRow` from the :data:`_PICTURE_COLUMNS` of a raw sqlite row."""
+    return PictureRow(
+        ordinal=db.as_int(row[0]),
+        picture_type=None if row[1] is None else db.as_int(row[1]),
+        mime=str(row[2]),
+        description=str(row[3]),
+        size_bytes=db.as_int(row[4]),
+        sha256=str(row[5]),
+    )
+
+
+def picture_rows(pictures: Sequence[EmbeddedPicture]) -> list[PictureRow]:
+    """Return the ``file_pictures`` rows of *pictures*, dropping the image bytes."""
+    return [
+        PictureRow(
+            ordinal=picture.ordinal,
+            picture_type=picture.picture_type,
+            mime=picture.mime,
+            description=picture.description,
+            size_bytes=picture.size_bytes,
+            sha256=picture.sha256,
+        )
+        for picture in pictures
+    ]
+
+
+def get_pictures(conn: sqlite3.Connection, file_id: int) -> list[PictureRow]:
+    """Return the stored pictures of *file_id* in ordinal order."""
+    cursor = conn.execute(
+        f"SELECT {_PICTURE_COLUMNS} FROM file_pictures WHERE file_id = ? ORDER BY ordinal",  # noqa: S608
+        (file_id,),
+    )
+    return [_row_to_picture(tuple(row)) for row in cursor.fetchall()]
+
+
+def replace_pictures(
+    conn: sqlite3.Connection,
+    file_id: int,
+    pictures: Sequence[PictureRow],
+) -> None:
+    """Replace every stored picture of *file_id* with *pictures*."""
+    conn.execute("DELETE FROM file_pictures WHERE file_id = ?", (file_id,))
+    conn.executemany(
+        f"INSERT INTO file_pictures (file_id, {_PICTURE_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?)",  # noqa: S608
+        [
+            (
+                file_id,
+                picture.ordinal,
+                picture.picture_type,
+                picture.mime,
+                picture.description,
+                picture.size_bytes,
+                picture.sha256,
+            )
+            for picture in pictures
+        ],
+    )
+
+
+def load_present_pictures(conn: sqlite3.Connection) -> dict[int, list[PictureRow]]:
+    """Return ``{file_id: pictures}`` for every present file holding one, each in ordinal order."""
+    cursor = conn.execute(
+        f"SELECT file_id, {_PICTURE_COLUMNS} FROM file_pictures "  # noqa: S608
+        "WHERE file_id IN (SELECT id FROM files WHERE is_missing = 0) ORDER BY file_id, ordinal",
+    )
+    pictures: dict[int, list[PictureRow]] = {}
+    for row in cursor.fetchall():
+        pictures.setdefault(db.as_int(row[0]), []).append(_row_to_picture(tuple(row)[1:]))
+    return pictures
+
+
 def mark_reader_stale(conn: sqlite3.Connection, file_id: int) -> None:
     """Make the next incremental scan re-read *file_id*, whose new signature had no tag re-read."""
     conn.execute("UPDATE files SET reader_version = 0 WHERE id = ?", (file_id,))
@@ -280,7 +365,7 @@ def list_files(conn: sqlite3.Connection, *, limit: int | None = None) -> list[Fi
 
 
 def compute_stats(conn: sqlite3.Connection) -> dict[str, object]:
-    """Return library-wide counts for the ``stats`` command / MCP tool.
+    """Return library-wide counts for ``get_library_stats``.
 
     The mismatch block needs the path comparator and the settings, so
     :func:`tagmend.engine.library.get_library_stats` adds it.
@@ -305,10 +390,7 @@ def compute_stats(conn: sqlite3.Connection) -> dict[str, object]:
         "unprocessed": unprocessed,
         "total_tag_values": total_tag_values,
         "by_ext": by_ext,
-        "genre": status_counts(conn, axis.GENRE_AXIS),
-        "artist": status_counts(conn, axis.ARTIST_AXIS),
-        "year": status_counts(conn, axis.YEAR_AXIS),
-        "song": status_counts(conn, axis.SONG_AXIS),
+        **{tag_axis.name: status_counts(conn, tag_axis) for tag_axis in axis.TAG_AXES},
     }
 
 
@@ -318,7 +400,7 @@ def _scalar_int(conn: sqlite3.Connection, sql: str) -> int:
     return 0 if row is None else db.as_int(row[0])
 
 
-# --- tag_revisions (append-only history; PLAN.md §7) -------------------------------
+# --- tag_revisions (append-only history, PLAN.md §7) -------------------------------
 
 # Valid ``origin`` values. ``scan`` = an observation of the file on disk (the version-0
 # baseline, or a re-baseline under a newer managed set), ``auto``/``manual`` = normal writes,
@@ -390,7 +472,7 @@ def insert_revision(  # noqa: PLR0913 - cohesive append-only revision payload
     commit_id: int | None = None,
     note: str | None = None,
 ) -> None:
-    """Append one revision row. Append-only — never updates or deletes.
+    """Append one revision row. It never updates or deletes.
 
     Every row is stamped with the CURRENT
     :data:`~tagmend.engine.tags.MANAGED_SET_VERSION`, which is what lets revert read a tag
@@ -449,7 +531,7 @@ def get_revision(conn: sqlite3.Connection, file_id: int, version: int) -> Revisi
 def revisions_for_commit(conn: sqlite3.Connection, commit_id: int) -> list[Revision]:
     """Return every revision row created by *commit_id*, in ``file_id`` order.
 
-    The commit's per-file change set — what :func:`tagmend.engine.versioning.revert_commit`
+    The commit's per-file change set: what :func:`tagmend.engine.versioning.revert_commit`
     classifies and undoes. Baselines (``commit_id`` NULL) never appear here.
     """
     cursor = conn.execute(
@@ -483,8 +565,8 @@ def revisions_after(conn: sqlite3.Connection, file_id: int, version: int) -> lis
 def max_version(conn: sqlite3.Connection, file_id: int) -> int | None:
     """Return *file_id*'s highest revision number, or ``None`` if it has none yet.
 
-    This is the single source of truth for "has this file been versioned?" and for the
-    current revision (the latest row). ``None`` means no baseline has been captured.
+    ``None`` means no baseline has been captured. :func:`latest_revision` reads the current
+    revision.
     """
     row = conn.execute(
         "SELECT MAX(version) FROM tag_revisions WHERE file_id = ?",
@@ -495,14 +577,20 @@ def max_version(conn: sqlite3.Connection, file_id: int) -> int | None:
     return db.as_int(row[0])
 
 
-# --- staged tags (the git "index"; PLAN.md §7) --------------------------------------
+# --- staged tags (the git "index", PLAN.md §7) --------------------------------------
 
-# The ``commits`` table ops and the shared commit loop live in
-# :mod:`tagmend.engine.commits`; staged rows here no longer carry a ``commit_id``.
-_STAGED_TAG_COLUMNS = (
-    "file_id, managed_tags, origin, note, staged_at, base_size_bytes, base_mtime_ns, "
-    "changed_fields, supplied_keys"
+_STAGED_TAG_FIELDS: Final = (
+    "file_id",
+    "managed_tags",
+    "origin",
+    "note",
+    "staged_at",
+    "base_size_bytes",
+    "base_mtime_ns",
+    "changed_fields",
+    "supplied_keys",
 )
+_STAGED_TAG_COLUMNS: Final = ", ".join(_STAGED_TAG_FIELDS)
 
 
 @dataclass(frozen=True, slots=True)
@@ -562,7 +650,7 @@ def upsert_staged_tag(  # noqa: PLR0913 - cohesive keyword-only staging payload
 ) -> None:
     """Insert or replace the single pending change for *file_id*.
 
-    A re-stage overwrites any prior pending change; the ``file_id`` PK keeps exactly one
+    A re-stage overwrites any prior pending change. The ``file_id`` PK keeps exactly one
     pending change per file (the latest staged target wins). *base_size_bytes* and
     *base_mtime_ns* record the file's signature at stage time. A ``None`` pair skips the
     commit's changed-since-stage check. *changed_fields* names the fields the target changes
@@ -570,14 +658,10 @@ def upsert_staged_tag(  # noqa: PLR0913 - cohesive keyword-only staging payload
     """
     changed_json = None if changed_fields is None else _dump_json(sorted(changed_fields))
     supplied_json = None if supplied_keys is None else _dump_json(sorted(supplied_keys))
+    placeholders = ", ".join("?" for _ in _STAGED_TAG_FIELDS)
     conn.execute(
-        """
-        INSERT OR REPLACE INTO tag_revisions_staged (
-            file_id, managed_tags, origin, note, staged_at, base_size_bytes, base_mtime_ns,
-            changed_fields, supplied_keys
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
+        f"INSERT OR REPLACE INTO tag_revisions_staged ({_STAGED_TAG_COLUMNS}) "  # noqa: S608
+        f"VALUES ({placeholders})",
         (
             file_id,
             _dump_json(managed_tags),
@@ -616,23 +700,33 @@ def list_staged_tags_under(conn: sqlite3.Connection, root_key: str) -> list[Stag
     Joins ``files`` on the same key range as :func:`tracked_files_under`, in file_id order.
     """
     low, high = path_keys.subtree_bounds(root_key)
+    columns = ", ".join(f"s.{name}" for name in _STAGED_TAG_FIELDS)
     cursor = conn.execute(
-        """
-        SELECT s.file_id, s.managed_tags, s.origin, s.note, s.staged_at,
-               s.base_size_bytes, s.base_mtime_ns, s.changed_fields, s.supplied_keys
-        FROM tag_revisions_staged s
-        JOIN files f ON f.id = s.file_id
-        WHERE f.path_key >= ? AND f.path_key < ?
-        ORDER BY s.file_id
-        """,
+        f"SELECT {columns} FROM tag_revisions_staged s JOIN files f ON f.id = s.file_id "  # noqa: S608
+        "WHERE f.path_key >= ? AND f.path_key < ? ORDER BY s.file_id",
         (low, high),
     )
     return [_row_to_staged_tag(tuple(row)) for row in cursor.fetchall()]
 
 
-def delete_staged_tag(conn: sqlite3.Connection, file_id: int) -> None:
-    """Remove the pending change for *file_id* (no-op if none)."""
-    conn.execute("DELETE FROM tag_revisions_staged WHERE file_id = ?", (file_id,))
+def delete_staged_tag(
+    conn: sqlite3.Connection,
+    file_id: int,
+    *,
+    staged_at: str | None = None,
+) -> None:
+    """Remove the pending change for *file_id* (no-op if none).
+
+    *staged_at* removes it only while it is still the row staged then, so a row another
+    process staged since survives.
+    """
+    if staged_at is None:
+        conn.execute("DELETE FROM tag_revisions_staged WHERE file_id = ?", (file_id,))
+        return
+    conn.execute(
+        "DELETE FROM tag_revisions_staged WHERE file_id = ? AND staged_at = ?",
+        (file_id, staged_at),
+    )
 
 
 def staged_origins(conn: sqlite3.Connection, file_ids: list[int]) -> set[str]:
@@ -647,7 +741,7 @@ def staged_origins(conn: sqlite3.Connection, file_ids: list[int]) -> set[str]:
     return {str(row[0]) for row in cursor.fetchall()}
 
 
-# --- lastfm_cache (persistent parsed-tag cache; PLAN — Last.fm genre tagging) --------
+# --- lastfm_cache (persistent parsed-tag cache, PLAN.md Last.fm genre tagging) --------
 
 
 def get_cached_tags(
@@ -684,7 +778,7 @@ def put_cached_tags(
     """Insert or replace the cached lookup for *request_key*.
 
     A re-fetch overwrites any prior cached value. ``tags`` is stored as a JSON array of
-    ``[name, weight]`` pairs; pass ``found=False`` with ``tags=[]`` to negative-cache.
+    ``[name, weight]`` pairs. Pass ``found=False`` with ``tags=[]`` to negative-cache.
     """
     payload = [[name, weight] for name, weight in tags]
     conn.execute(
@@ -768,7 +862,6 @@ class MBReleaseGroupRow:
 
     album_title: str | None
     original_date: str | None
-    release_mbid: str | None
     release_group_mbid: str | None
 
 
@@ -784,7 +877,7 @@ def get_cached_mb_release_group(
     """
     cursor = conn.execute(
         """
-        SELECT found, album_title, original_date, release_mbid, release_group_mbid
+        SELECT found, album_title, original_date, release_group_mbid
         FROM musicbrainz_release_group_cache WHERE request_key = ?
         """,
         (request_key,),
@@ -796,8 +889,7 @@ def get_cached_mb_release_group(
     album = MBReleaseGroupRow(
         album_title=None if row[1] is None else str(row[1]),
         original_date=None if row[2] is None else str(row[2]),
-        release_mbid=None if row[3] is None else str(row[3]),
-        release_group_mbid=None if row[4] is None else str(row[4]),
+        release_group_mbid=None if row[3] is None else str(row[3]),
     )
     return (found, album)
 
@@ -809,7 +901,6 @@ def put_cached_mb_release_group(  # noqa: PLR0913 - cohesive keyword-only cache 
     found: bool,
     album_title: str | None,
     original_date: str | None,
-    release_mbid: str | None,
     release_group_mbid: str | None,
     now: str,
 ) -> None:
@@ -821,24 +912,22 @@ def put_cached_mb_release_group(  # noqa: PLR0913 - cohesive keyword-only cache 
     conn.execute(
         """
         INSERT OR REPLACE INTO musicbrainz_release_group_cache (
-            request_key, found, album_title, original_date,
-            release_mbid, release_group_mbid, fetched_at
+            request_key, found, album_title, original_date, release_group_mbid, fetched_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?)
         """,
         (
             request_key,
             1 if found else 0,
             album_title,
             original_date,
-            release_mbid,
             release_group_mbid,
             now,
         ),
     )
 
 
-# --- musicbrainz_recording_cache (persistent recording-search cache; album-gaps tier) ----
+# --- musicbrainz_recording_cache (persistent recording-search cache, album-gaps tier) ----
 
 
 @dataclass(frozen=True, slots=True)
@@ -846,8 +935,6 @@ class MBRecordingRow:
     """One cached MusicBrainz recording-search lookup (a found recording's resolved fields)."""
 
     album_title: str | None
-    release_group_mbid: str | None
-    recording_mbid: str | None
 
 
 def get_cached_mb_recording(
@@ -862,8 +949,7 @@ def get_cached_mb_recording(
     """
     cursor = conn.execute(
         """
-        SELECT found, album_title, release_group_mbid, recording_mbid
-        FROM musicbrainz_recording_cache WHERE request_key = ?
+        SELECT found, album_title FROM musicbrainz_recording_cache WHERE request_key = ?
         """,
         (request_key,),
     )
@@ -871,22 +957,16 @@ def get_cached_mb_recording(
     if row is None:
         return None
     found = bool(row[0])
-    recording = MBRecordingRow(
-        album_title=None if row[1] is None else str(row[1]),
-        release_group_mbid=None if row[2] is None else str(row[2]),
-        recording_mbid=None if row[3] is None else str(row[3]),
-    )
+    recording = MBRecordingRow(album_title=None if row[1] is None else str(row[1]))
     return (found, recording)
 
 
-def put_cached_mb_recording(  # noqa: PLR0913 - cohesive keyword-only cache payload
+def put_cached_mb_recording(
     conn: sqlite3.Connection,
     *,
     request_key: str,
     found: bool,
     album_title: str | None,
-    release_group_mbid: str | None,
-    recording_mbid: str | None,
     now: str,
 ) -> None:
     """Insert or replace the cached recording-search lookup for *request_key*.
@@ -897,18 +977,11 @@ def put_cached_mb_recording(  # noqa: PLR0913 - cohesive keyword-only cache payl
     conn.execute(
         """
         INSERT OR REPLACE INTO musicbrainz_recording_cache (
-            request_key, found, album_title, release_group_mbid, recording_mbid, fetched_at
+            request_key, found, album_title, fetched_at
         )
-        VALUES (?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?)
         """,
-        (
-            request_key,
-            1 if found else 0,
-            album_title,
-            release_group_mbid,
-            recording_mbid,
-            now,
-        ),
+        (request_key, 1 if found else 0, album_title, now),
     )
 
 
@@ -1086,10 +1159,7 @@ def put_cached_coverart(
     )
 
 
-# --- file_<axis>_status: the tag-axis classifier (genre, artist, year) ----------------
-#
-# The row access lives in :mod:`tagmend.engine.axis`. This section derives the user-facing
-# status from a row, the staging area and the current tags of a present file.
+# --- staging-area guards (every staging table) ---------------------------------------
 
 
 def is_staged(conn: sqlite3.Connection, file_id: int) -> bool:
@@ -1102,7 +1172,7 @@ def is_staged(conn: sqlite3.Connection, file_id: int) -> bool:
 
 
 def any_staged(conn: sqlite3.Connection) -> bool:
-    """Return whether ANY tag change, file move, sidecar move or cover is staged.
+    """Return whether ANY tag change, file move, sidecar move, cover or picture removal is staged.
 
     The clean-staging-area guard for commit-level revert and the resolvers: rolling back with
     work still staged would interleave a revert with half-staged intent, so the revert refuses
@@ -1112,7 +1182,8 @@ def any_staged(conn: sqlite3.Connection) -> bool:
         "SELECT EXISTS(SELECT 1 FROM tag_revisions_staged) "
         "OR EXISTS(SELECT 1 FROM path_revisions_staged) "
         "OR EXISTS(SELECT 1 FROM sidecar_moves_staged) "
-        "OR EXISTS(SELECT 1 FROM cover_writes_staged)",
+        "OR EXISTS(SELECT 1 FROM cover_writes_staged) "
+        "OR EXISTS(SELECT 1 FROM picture_writes_staged)",
     ).fetchone()
     return bool(row[0])
 
@@ -1126,6 +1197,12 @@ def any_move_staged(conn: sqlite3.Connection) -> bool:
     return bool(row[0])
 
 
+# --- file_<axis>_status: the tag-axis classifier (genre, artist, year, song) ----------
+#
+# The row access lives in :mod:`tagmend.engine.axis`. This section derives the user-facing
+# status from a row, the staging area and the current tags of a present file.
+
+
 def _staged_alters(
     staged: StagedTag | None,
     current: dict[str, list[str]],
@@ -1137,21 +1214,7 @@ def _staged_alters(
     return any(staged.managed_tags.get(name, []) != current.get(name, []) for name in fields)
 
 
-def has_staged_change_for(
-    conn: sqlite3.Connection,
-    file_id: int,
-    fields: tuple[str, ...],
-) -> bool:
-    """Return whether *file_id*'s pending staged change actually alters any of *fields*.
-
-    Field-aware "staged": a staged row that touches only ``genre`` is not artist-staged, and
-    vice versa. ``None`` (no staged row) is not staged.
-    """
-    return _staged_alters(get_staged_tag(conn, file_id), get_tags(conn, file_id), fields)
-
-
-# The user-facing workflow states of each tag axis. Single source of truth for the
-# ``list_files(<axis>_status=...)`` filters and the stats counts.
+# Re-exports of each tag axis's workflow states for the ``list_files(<axis>_status=...)`` filters.
 GENRE_WORKFLOW_STATUSES: Final = axis.GENRE_AXIS.workflow_statuses
 ARTIST_WORKFLOW_STATUSES: Final = axis.ARTIST_AXIS.workflow_statuses
 YEAR_WORKFLOW_STATUSES: Final = axis.YEAR_AXIS.workflow_statuses
@@ -1451,14 +1514,16 @@ def commit_log_counts(conn: sqlite3.Connection, commit_id: int) -> dict[str, int
         "SELECT (SELECT COUNT(*) FROM tag_revisions WHERE commit_id = ?), "
         "(SELECT COUNT(*) FROM path_revisions WHERE commit_id = ?), "
         "(SELECT COUNT(*) FROM sidecar_moves WHERE commit_id = ?), "
-        "(SELECT COUNT(*) FROM cover_writes WHERE commit_id = ?)",
-        (commit_id, commit_id, commit_id, commit_id),
+        "(SELECT COUNT(*) FROM cover_writes WHERE commit_id = ?), "
+        "(SELECT COUNT(*) FROM picture_writes WHERE commit_id = ?)",
+        (commit_id, commit_id, commit_id, commit_id, commit_id),
     ).fetchone()
     counts = {
         "tag_revisions": db.as_int(row[0]),
         "path_revisions": db.as_int(row[1]),
         "sidecar_moves": db.as_int(row[2]),
         "cover_writes": db.as_int(row[3]),
+        "picture_writes": db.as_int(row[4]),
     }
     return {log: count for log, count in counts.items() if count}
 
@@ -1556,10 +1621,11 @@ def upsert_staged_path(conn: sqlite3.Connection, staged: StagedPath) -> None:
     another file's row holding the same ``to_key``. That conflict raises
     :class:`sqlite3.IntegrityError` instead.
     """
+    placeholders = ", ".join("?" for _ in _STAGED_PATH_FIELDS)
     conn.execute(
         f"""
         INSERT INTO path_revisions_staged ({_STAGED_PATH_COLUMNS})
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES ({placeholders})
         ON CONFLICT(file_id) DO UPDATE SET
           to_path = excluded.to_path, to_key = excluded.to_key, origin = excluded.origin,
           note = excluded.note, staged_at = excluded.staged_at,
@@ -1639,7 +1705,7 @@ def staged_path_file_ids(conn: sqlite3.Connection, file_ids: list[int]) -> list[
     return [db.as_int(row[0]) for row in cursor.fetchall()]
 
 
-# --- sidecar_moves_staged and sidecar_moves (the non-audio files of a moving album) -----
+# --- sidecar_moves_staged (the non-audio files of a moving album) ----------------------
 
 _SIDECAR_STAGED_FIELDS: Final = (
     "from_key",
@@ -1975,6 +2041,270 @@ def cover_write_content(conn: sqlite3.Connection, write_id: int) -> bytes | None
     return None if row is None or row[0] is None else bytes(row[0])
 
 
+# --- picture_writes_staged (one pending picture removal per file and digest) ------------
+
+_STAGED_PICTURE_FIELDS: Final = (
+    "file_id",
+    "sha256",
+    "ordinal",
+    "picture_type",
+    "mime",
+    "description",
+    "size_bytes",
+    "origin",
+    "note",
+    "staged_at",
+)
+_STAGED_PICTURE_COLUMNS: Final = ", ".join(_STAGED_PICTURE_FIELDS)
+
+
+@dataclass(frozen=True, slots=True)
+class StagedPicture:
+    """One pending picture removal, without its bytes or attributes.
+
+    ``ordinal`` is the picture's position in its file at stage time. The removal takes every copy
+    of ``sha256`` the file holds.
+    """
+
+    file_id: int
+    sha256: str
+    ordinal: int
+    picture_type: int | None
+    mime: str
+    description: str
+    size_bytes: int
+    origin: str
+    note: str | None
+    staged_at: str
+
+
+def _row_to_staged_picture(row: tuple[object, ...]) -> StagedPicture:
+    """Build a typed :class:`StagedPicture` from a raw sqlite tuple."""
+    return StagedPicture(
+        file_id=db.as_int(row[0]),
+        sha256=str(row[1]),
+        ordinal=db.as_int(row[2]),
+        picture_type=None if row[3] is None else db.as_int(row[3]),
+        mime=str(row[4]),
+        description=str(row[5]),
+        size_bytes=db.as_int(row[6]),
+        origin=str(row[7]),
+        note=None if row[8] is None else str(row[8]),
+        staged_at=str(row[9]),
+    )
+
+
+def upsert_staged_picture(
+    conn: sqlite3.Connection,
+    staged: StagedPicture,
+    *,
+    attributes: str,
+    content: bytes,
+) -> None:
+    """Stage one picture removal with its *attributes* JSON and its *content*.
+
+    It replaces the row already staged for the same file and digest.
+    """
+    placeholders = ", ".join("?" for _ in (*_STAGED_PICTURE_FIELDS, "attributes", "content"))
+    conn.execute(
+        f"INSERT OR REPLACE INTO picture_writes_staged ({_STAGED_PICTURE_COLUMNS}, attributes, "  # noqa: S608
+        f"content) VALUES ({placeholders})",
+        (
+            staged.file_id,
+            staged.sha256,
+            staged.ordinal,
+            staged.picture_type,
+            staged.mime,
+            staged.description,
+            staged.size_bytes,
+            staged.origin,
+            staged.note,
+            staged.staged_at,
+            attributes,
+            content,
+        ),
+    )
+
+
+def list_staged_pictures(
+    conn: sqlite3.Connection,
+    root_key: str | None = None,
+) -> list[StagedPicture]:
+    """Return the pending picture removals, without bytes, in file id then digest order.
+
+    *root_key* keeps the rows whose file lives in that folder or under it, on the key range of
+    :func:`tracked_files_under`.
+    """
+    columns = ", ".join(f"s.{name}" for name in _STAGED_PICTURE_FIELDS)
+    sql = f"SELECT {columns} FROM picture_writes_staged s JOIN files f ON f.id = s.file_id"  # noqa: S608
+    bounds: tuple[str, ...] = ()
+    if root_key is not None:
+        sql += " WHERE f.path_key >= ? AND f.path_key < ?"
+        bounds = path_keys.subtree_bounds(root_key)
+    cursor = conn.execute(f"{sql} ORDER BY s.file_id, s.sha256", bounds)
+    return [_row_to_staged_picture(tuple(row)) for row in cursor.fetchall()]
+
+
+def staged_pictures_of_file(conn: sqlite3.Connection, file_id: int) -> list[StagedPicture]:
+    """Return the pending picture removals of *file_id*, without bytes, in digest order."""
+    cursor = conn.execute(
+        f"SELECT {_STAGED_PICTURE_COLUMNS} FROM picture_writes_staged "  # noqa: S608
+        "WHERE file_id = ? ORDER BY sha256",
+        (file_id,),
+    )
+    return [_row_to_staged_picture(tuple(row)) for row in cursor.fetchall()]
+
+
+def staged_picture_payload(
+    conn: sqlite3.Connection,
+    file_id: int,
+    sha256: str,
+) -> tuple[str, bytes] | None:
+    """Return the attributes JSON and the bytes of a pending removal, ``None`` if none is staged."""
+    row = conn.execute(
+        "SELECT attributes, content FROM picture_writes_staged WHERE file_id = ? AND sha256 = ?",
+        (file_id, sha256),
+    ).fetchone()
+    return None if row is None else (str(row[0]), bytes(row[1]))
+
+
+def delete_staged_picture(conn: sqlite3.Connection, file_id: int, sha256: str) -> None:
+    """Remove the pending removal of *sha256* from *file_id* (no-op if none)."""
+    conn.execute(
+        "DELETE FROM picture_writes_staged WHERE file_id = ? AND sha256 = ?", (file_id, sha256)
+    )
+
+
+def staged_picture_overlaps(conn: sqlite3.Connection) -> tuple[list[int], list[int]]:
+    """Return the files with a pending picture removal and a staged tag change, then a staged move.
+
+    Each list is in file id order.
+    """
+    tagged = conn.execute(
+        "SELECT DISTINCT p.file_id FROM picture_writes_staged p "
+        "JOIN tag_revisions_staged t ON t.file_id = p.file_id ORDER BY p.file_id"
+    ).fetchall()
+    moved = conn.execute(
+        "SELECT DISTINCT p.file_id FROM picture_writes_staged p "
+        "JOIN path_revisions_staged m ON m.file_id = p.file_id ORDER BY p.file_id"
+    ).fetchall()
+    return [db.as_int(row[0]) for row in tagged], [db.as_int(row[0]) for row in moved]
+
+
+# --- picture_writes (the append-only log of embedded pictures removed or restored) ------
+
+
+@dataclass(frozen=True, slots=True)
+class PictureWrite:
+    """One ``picture_writes`` row to append. ``path`` is the file's absolute path at the write.
+
+    ``attributes`` is the picture's attributes JSON and ``content`` its bytes, which every row
+    keeps.
+    """
+
+    commit_id: int
+    created_at: str
+    origin: str
+    action: str
+    reverted_from: int | None
+    file_id: int
+    version: int
+    path: str
+    sha256: str
+    ordinal: int
+    picture_type: int | None
+    mime: str
+    description: str
+    attributes: str
+    content: bytes
+    size_bytes: int
+    note: str | None
+
+
+def insert_picture_write(conn: sqlite3.Connection, write: PictureWrite) -> None:
+    """Append one ``picture_writes`` row. The append-only triggers refuse rewrites."""
+    conn.execute(
+        """
+        INSERT INTO picture_writes
+          (commit_id, created_at, origin, action, reverted_from, file_id, version, path, sha256,
+           ordinal, picture_type, mime, description, attributes, content, size_bytes, note)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            write.commit_id,
+            write.created_at,
+            write.origin,
+            write.action,
+            write.reverted_from,
+            write.file_id,
+            write.version,
+            write.path,
+            write.sha256,
+            write.ordinal,
+            write.picture_type,
+            write.mime,
+            write.description,
+            write.attributes,
+            write.content,
+            write.size_bytes,
+            write.note,
+        ),
+    )
+
+
+_PICTURE_WRITE_ROW_COLUMNS: Final = "id, action, file_id, version, sha256, ordinal"
+
+
+@dataclass(frozen=True, slots=True)
+class PictureWriteRow:
+    """One logged ``picture_writes`` row, without its bytes or attributes."""
+
+    id: int
+    action: str
+    file_id: int
+    version: int
+    sha256: str
+    ordinal: int
+
+
+def picture_writes_for_commit(conn: sqlite3.Connection, commit_id: int) -> list[PictureWriteRow]:
+    """Return every ``picture_writes`` row *commit_id* appended, in file id then version order."""
+    cursor = conn.execute(
+        f"SELECT {_PICTURE_WRITE_ROW_COLUMNS} FROM picture_writes "  # noqa: S608
+        "WHERE commit_id = ? ORDER BY file_id, version",
+        (commit_id,),
+    )
+    return [
+        PictureWriteRow(
+            id=db.as_int(row[0]),
+            action=str(row[1]),
+            file_id=db.as_int(row[2]),
+            version=db.as_int(row[3]),
+            sha256=str(row[4]),
+            ordinal=db.as_int(row[5]),
+        )
+        for row in cursor.fetchall()
+    ]
+
+
+def picture_write_payload(conn: sqlite3.Connection, write_id: int) -> tuple[str, bytes] | None:
+    """Return the attributes JSON and the bytes the ``picture_writes`` row *write_id* holds."""
+    row = conn.execute(
+        "SELECT attributes, content FROM picture_writes WHERE id = ?", (write_id,)
+    ).fetchone()
+    return None if row is None else (str(row[0]), bytes(row[1]))
+
+
+def latest_picture_version(conn: sqlite3.Connection, file_id: int) -> int:
+    """Return the highest ``picture_writes`` version of *file_id*, 0 when it has none."""
+    row = conn.execute(
+        "SELECT COALESCE(MAX(version), 0) FROM picture_writes WHERE file_id = ?", (file_id,)
+    ).fetchone()
+    return db.as_int(row[0])
+
+
+# --- sidecar_moves (the append-only log of sidecar moves) -------------------------------
+
 _SIDECAR_MOVE_COLUMNS: Final = (
     "id, commit_id, created_at, origin, reverted_from, from_path, to_path, from_key, to_key, "
     "unit_key, size_bytes, mtime_ns, note"
@@ -2079,15 +2409,19 @@ def sidecar_moved_from_after(conn: sqlite3.Connection, commit_id: int, key: str)
     return bool(row[0])
 
 
+# --- files and file_tags readers, and the scope selector --------------------------------
+
+
 def distinct_artists(conn: sqlite3.Connection) -> list[tuple[str, int]]:
-    """Return each distinct ``artist`` tag value with its file count, ordered by value."""
+    """Return each distinct ``artist`` tag value with its present-file count, ordered by value."""
     cursor = conn.execute(
         """
-        SELECT value, COUNT(DISTINCT file_id)
-        FROM file_tags
-        WHERE name = 'artist'
-        GROUP BY value
-        ORDER BY value
+        SELECT t.value, COUNT(DISTINCT t.file_id)
+        FROM file_tags t
+        JOIN files f ON f.id = t.file_id
+        WHERE t.name = 'artist' AND f.is_missing = 0
+        GROUP BY t.value
+        ORDER BY t.value
         """,
     )
     return [(str(row[0]), db.as_int(row[1])) for row in cursor.fetchall()]
@@ -2101,9 +2435,8 @@ def load_tag_values(
 
     One ``SELECT`` over ``file_tags`` filtered to *names* at ``ordinal = 0`` (each tag's
     primary value), so a caller needing a few scalar fields across the whole library avoids
-    the N+1 :func:`get_tags` loop. A file missing every requested tag is simply absent from
-    the result; a file with only some carries only those. Mirrors the read-only, aggregate
-    style of :func:`distinct_artists`.
+    the N+1 :func:`get_tags` loop. A file missing every requested tag is absent from the
+    result. A file with only some carries only those.
     """
     if not names:
         return {}
@@ -2167,8 +2500,8 @@ def files_in_scope(
     a value scope.
     """
     if file_ids is not None:
-        require_known_file_ids(conn, file_ids)
-        return _files_in_scope_by_ids(conn, file_ids)
+        _require_known_file_ids(conn, file_ids)
+        return sorted(set(file_ids))
     if album is not None and value is None:
         message = "album narrows a value scope, so it needs value"
         raise ValueError(message)
@@ -2178,7 +2511,7 @@ def files_in_scope(
     return [db.as_int(row[0]) for row in cursor.fetchall()]
 
 
-def require_known_file_ids(conn: sqlite3.Connection, file_ids: list[int]) -> None:
+def _require_known_file_ids(conn: sqlite3.Connection, file_ids: list[int]) -> None:
     """Raise :class:`ValueError` naming every id in *file_ids* that ``files`` does not hold."""
     if not file_ids:
         return
@@ -2192,18 +2525,6 @@ def require_known_file_ids(conn: sqlite3.Connection, file_ids: list[int]) -> Non
     if unknown:
         message = f"unknown file_id(s): {unknown}"
         raise ValueError(message)
-
-
-def _files_in_scope_by_ids(conn: sqlite3.Connection, file_ids: list[int]) -> list[int]:
-    """Return the subset of *file_ids* that exist in ``files``, in ascending id order."""
-    if not file_ids:
-        return []
-    placeholders = ",".join("?" for _ in file_ids)
-    cursor = conn.execute(
-        f"SELECT id FROM files WHERE id IN ({placeholders}) ORDER BY id",  # noqa: S608
-        tuple(file_ids),
-    )
-    return [db.as_int(row[0]) for row in cursor.fetchall()]
 
 
 def _files_in_scope_by_value(

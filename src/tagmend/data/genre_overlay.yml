@@ -21,8 +21,8 @@
 #   - Fold-key collisions are reported, never silently applied.
 #   - A deny naming a genre the vocabulary lacks is reported and skipped.
 #
-# This is the file the LLM grows from Last.fm tags that match nothing (the "unmatched
-# bucket", §5.1). Keep entries lowercase to match the MusicBrainz canonical style.
+# Add a Last.fm tag that matches no genre here, as a new genre or as an alias of one.
+# Keep entries lowercase to match the MusicBrainz canonical style.
 version: 1
 genres:
   # --- Genres MusicBrainz considers too broad to list, but common in real libraries ---

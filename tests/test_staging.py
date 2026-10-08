@@ -257,7 +257,7 @@ def _staged_ids(settings: Settings) -> list[int]:
 def test_stage_tags_batch_rejects_mcp_shaped_dict_entry(engine_settings: Settings) -> None:
     file_id = _seed_file(engine_settings, "a.mp3")
 
-    with pytest.raises(ValueError, match=r"entry 0: expected a \(file_id, tags\) tuple") as excinfo:
+    with pytest.raises(ValueError, match=r"entry 0: expected a \(file_id, tags\) pair") as excinfo:
         staging.stage_tags_batch(
             engine_settings,
             entries=[{"file_id": file_id, "tags": {"genre": ["Rock"]}}],
@@ -278,7 +278,7 @@ def test_stage_tags_batch_rejects_non_integer_file_id(engine_settings: Settings)
 def test_stage_tags_batch_rejects_wrong_length_tuple(engine_settings: Settings) -> None:
     file_id = _seed_file(engine_settings, "a.mp3")
 
-    with pytest.raises(ValueError, match=r"entry 1: expected a \(file_id, tags\) tuple of 2"):
+    with pytest.raises(ValueError, match=r"entry 1: expected a \(file_id, tags\) pair, got 3"):
         staging.stage_tags_batch(
             engine_settings,
             entries=[(file_id, {"genre": ["Rock"]}), (file_id, {"genre": ["Metal"]}, "extra")],

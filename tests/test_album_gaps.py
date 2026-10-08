@@ -55,7 +55,7 @@ class FakeMBRecordingSource:
 
 
 def _rec(album_title: str) -> MBRecording:
-    return MBRecording(album_title=album_title, release_group_mbid="rg-1", recording_mbid="rec-1")
+    return MBRecording(album_title=album_title)
 
 
 def _mk(  # noqa: PLR0913 - cohesive keyword-only test-input fields
@@ -790,6 +790,28 @@ def test_a_blank_file_the_writer_cannot_verify_is_counted_never_proposed(
     assert (group.blank_count, group.unwritable) == (2, 1)
     assert (report.green, report.stays_blank, report.unwritable) == (1, 0, 1)
     assert "1 file(s) get no proposal" in report.summary
+
+
+def test_a_file_deleted_outside_tagmend_is_no_sibling_witness(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    folder = music_dir / "Band" / "Album"
+    make_track(folder / "a.mp3", {"artist": ["Band"], "title": ["A"]})
+    make_track(folder / "b.mp3", {"artist": ["Band"], "album": ["Paranoid"]})
+    make_track(folder / "c.mp3", {"artist": ["Band"], "album": ["Paranoid"]})
+    scan_library(engine_settings)
+    (folder / "b.mp3").unlink()
+    (folder / "c.mp3").unlink()
+    scan_library(engine_settings)
+
+    report = detect_album_gaps(engine_settings, use_musicbrainz=False)
+
+    assert report.total_files == 1
+    assert report.green == 0
+    group = _group_for(report, folder)
+    assert group is not None
+    assert group.sibling_histogram == {}
 
 
 # --- MCP wiring ----------------------------------------------------------------------

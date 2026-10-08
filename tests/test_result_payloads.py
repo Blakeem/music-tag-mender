@@ -251,7 +251,7 @@ _ARTISTS_RESULT = artists.ResolveArtistsResult(
     already_canonical_values=["Artist"],
     shrinks_credit_values=[{"from": "A & B", "to": "A"}],
     needs_review_values=[{"value": "C", "reason": "casing"}],
-    name_id_disagreement_values=[{"value": "D", "mbid": "m-1"}],
+    name_id_disagreement_values=[{"from": "D", "to": None, "mbids": ["m-1"], "reason": "r"}],
     error_items=_ERROR_ITEMS,
     summary="3 values corrected",
 )
@@ -275,7 +275,7 @@ _ARTISTS_RESULT_DICT: dict[str, object] = {
     "already_canonical_values": ["Artist"],
     "shrinks_credit_values": [{"from": "A & B", "to": "A"}],
     "needs_review_values": [{"value": "C", "reason": "casing"}],
-    "name_id_disagreement_values": [{"value": "D", "mbid": "m-1"}],
+    "name_id_disagreement_values": [{"from": "D", "to": None, "mbids": ["m-1"], "reason": "r"}],
     "error_items": [{"value": "Artist", "error": "timeout"}],
     "summary": "3 values corrected",
 }
@@ -343,10 +343,15 @@ _FILE_VIEW = library.FileView(
     year_source_artist="Year Artist",
     year_source_album="Year Album",
     song_status="done",
-    song_source_album_mbid="rel-1",
+    song_source_release_mbid="rel-1",
     song_source_release_track_mbid="track-1",
     mismatch_status="legit_ignore",
     mismatch_source_value={"covers": ["album"], "inputs": {"album": "Album"}},
+    pictures=(
+        library.PictureView(
+            ordinal=0, picture_type=3, mime="image/jpeg", size_bytes=4, sha256="abc"
+        ),
+    ),
 )
 _FILE_VIEW_DICT: dict[str, object] = {
     "file_id": 1,
@@ -365,10 +370,13 @@ _FILE_VIEW_DICT: dict[str, object] = {
     "year_source_artist": "Year Artist",
     "year_source_album": "Year Album",
     "song_status": "done",
-    "song_source_album_mbid": "rel-1",
+    "song_source_release_mbid": "rel-1",
     "song_source_release_track_mbid": "track-1",
     "mismatch_status": "legit_ignore",
     "mismatch_source_value": {"covers": ["album"], "inputs": {"album": "Album"}},
+    "pictures": [
+        {"ordinal": 0, "picture_type": 3, "mime": "image/jpeg", "size_bytes": 4, "sha256": "abc"},
+    ],
 }
 _ARTIST_ROW = library.ArtistRow(artist="Artist", file_count=3)
 _ARTIST_ROW_DICT: dict[str, object] = {"artist": "Artist", "file_count": 3}
@@ -395,6 +403,7 @@ _SCAN_RESULT = library.ScanResult(
     missing_flagged=6,
     restored=7,
     errors=8,
+    error_items=({"key": "a.mp3", "message": "unreadable"},),
     respelled=9,
     pending_commit=10,
 )
@@ -407,6 +416,7 @@ _SCAN_RESULT_DICT: dict[str, object] = {
     "missing_flagged": 6,
     "restored": 7,
     "errors": 8,
+    "error_items": [{"key": "a.mp3", "message": "unreadable"}],
     "respelled": 9,
     "pending_commit": 10,
 }
@@ -477,7 +487,7 @@ _DEVIATION_GROUP = path_deviations.DeviationGroup(
     destinations=("Artist/Album (2001)", "Artist/Other"),
     kind="move",
     held={"mismatch": 1},
-    example={"from": "Artist/Album/01.flac", "to": None},
+    example={"from_path": "Artist/Album/01.flac", "to_path": None},
 )
 _DEVIATION_GROUP_DICT: dict[str, object] = {
     "folder": "Artist/Album",
@@ -485,7 +495,7 @@ _DEVIATION_GROUP_DICT: dict[str, object] = {
     "destinations": ["Artist/Album (2001)", "Artist/Other"],
     "kind": "move",
     "held": {"mismatch": 1},
-    "example": {"from": "Artist/Album/01.flac", "to": None},
+    "example": {"from_path": "Artist/Album/01.flac", "to_path": None},
 }
 _DEVIATIONS_REPORT = path_deviations.DeviationsReport(
     pattern="{albumartist}/{album}",
@@ -594,8 +604,12 @@ _NAMING_SETTINGS_DICT: dict[str, object] = {
     "container_folders": ["Soundtracks"],
     "settings_path": "C:/settings.json",
 }
-_UNSTAGE_PATHS_RESULT = paths.UnstagePathsResult(removed=3, sidecars_removed=1)
-_UNSTAGE_PATHS_RESULT_DICT: dict[str, object] = {"removed": 3, "sidecars_removed": 1}
+_UNSTAGE_PATHS_RESULT = paths.UnstagePathsResult(removed=3, sidecars_removed=1, sidecars_staged=2)
+_UNSTAGE_PATHS_RESULT_DICT: dict[str, object] = {
+    "removed": 3,
+    "sidecars_removed": 1,
+    "sidecars_staged": 2,
+}
 _PATH_DIFF = paths.PathDiffView(
     file_id=1,
     from_path="Artist/Album/01.flac",
@@ -723,7 +737,6 @@ _RELEASE_GROUP = release_disagreements.ReleaseDisagreementGroup(
     folder="Artist/Album",
     file_count=10,
     flagged=1,
-    folder_context=2,
     tiers={"high": 1},
     file_ids=[1],
     flagged_fields=3,
@@ -735,13 +748,80 @@ _RELEASE_GROUP_DICT: dict[str, object] = {
     "folder": "Artist/Album",
     "file_count": 10,
     "flagged": 1,
-    "folder_context": 2,
     "tiers": {"high": 1},
     "file_ids": [1],
     "flagged_fields": 3,
     "fills": 4,
     "fields": {"title": 1},
     "releases": [{"release_mbid": "rel-1", "release_title": "Album", "file_count": 10}],
+}
+_RELEASE_FILL_ROW = release_disagreements.ReleaseDisagreementRow(
+    file_id=2,
+    folder="Artist/Album",
+    filename="02.flac",
+    release_mbid="rel-1",
+    release_title="Album",
+    field="tracknumber",
+    have="",
+    want="2",
+    tier="medium",
+    reason="",
+)
+_RELEASE_FILL_ROW_DICT: dict[str, object] = {
+    "file_id": 2,
+    "folder": "Artist/Album",
+    "filename": "02.flac",
+    "release_mbid": "rel-1",
+    "release_title": "Album",
+    "field": "tracknumber",
+    "have": "",
+    "want": "2",
+    "tier": "medium",
+    "reason": "",
+}
+_RELEASES_REPORT = release_disagreements.ReleaseDisagreementsReport(
+    rows=[_RELEASE_ROW],
+    total_files=10,
+    flagged=1,
+    flagged_fields=1,
+    high=1,
+    medium=0,
+    low=0,
+    fills=1,
+    fill_rows=[_RELEASE_FILL_ROW],
+    releases_attempted=2,
+    releases_checked=1,
+    releases_remaining=3,
+    more=True,
+    skipped_no_release_mbid=4,
+    unknown_releases=0,
+    unmatched_tracks=5,
+    errors=1,
+    error_items=[{"key": "rel-2", "message": "timeout"}],
+    groups=[_RELEASE_GROUP],
+    summary="1 file disagrees",
+)
+_RELEASES_REPORT_DICT: dict[str, object] = {
+    "rows": [_RELEASE_ROW_DICT],
+    "total_files": 10,
+    "flagged": 1,
+    "flagged_fields": 1,
+    "high": 1,
+    "medium": 0,
+    "low": 0,
+    "fills": 1,
+    "fill_rows": [_RELEASE_FILL_ROW_DICT],
+    "releases_attempted": 2,
+    "releases_checked": 1,
+    "releases_remaining": 3,
+    "more": True,
+    "skipped_no_release_mbid": 4,
+    "unknown_releases": 0,
+    "unmatched_tracks": 5,
+    "errors": 1,
+    "error_items": [{"key": "rel-2", "message": "timeout"}],
+    "groups": [_RELEASE_GROUP_DICT],
+    "summary": "1 file disagrees",
 }
 
 # --- staging ----------------------------------------------------------------------------
@@ -939,6 +1019,46 @@ _YEAR_GROUP_DICT: dict[str, object] = {
     "file_ids": [1, 2],
     "fields": {"originaldate": 2},
 }
+_YEARS_REPORT = year_disagreements.YearDisagreementsReport(
+    rows=[_YEAR_ROW],
+    total_files=9,
+    flagged=1,
+    flagged_fields=1,
+    high=1,
+    medium=0,
+    low=0,
+    folder_context=1,
+    folder_context_rows=[_YEAR_ROW],
+    release_groups_checked=2,
+    release_groups_remaining=3,
+    more=True,
+    unknown_release_groups=4,
+    skipped_no_identity=5,
+    errors=1,
+    error_items=[{"key": "Artist - Album", "message": "timeout"}],
+    groups=[_YEAR_GROUP],
+    summary="1 file carries a contradicting year",
+)
+_YEARS_REPORT_DICT: dict[str, object] = {
+    "rows": [_YEAR_ROW_DICT],
+    "total_files": 9,
+    "flagged": 1,
+    "flagged_fields": 1,
+    "high": 1,
+    "medium": 0,
+    "low": 0,
+    "folder_context": 1,
+    "folder_context_rows": [_YEAR_ROW_DICT],
+    "release_groups_checked": 2,
+    "release_groups_remaining": 3,
+    "more": True,
+    "unknown_release_groups": 4,
+    "skipped_no_identity": 5,
+    "errors": 1,
+    "error_items": [{"key": "Artist - Album", "message": "timeout"}],
+    "groups": [_YEAR_GROUP_DICT],
+    "summary": "1 file carries a contradicting year",
+}
 
 _CASES: list[tuple[_Payload, dict[str, object]]] = [
     (_CONFLICT_ROW, _CONFLICT_ROW_DICT),
@@ -974,6 +1094,7 @@ _CASES: list[tuple[_Payload, dict[str, object]]] = [
     (_PATH_REVERT_RESULT, _PATH_REVERT_RESULT_DICT),
     (_RELEASE_ROW, _RELEASE_ROW_DICT),
     (_RELEASE_GROUP, _RELEASE_GROUP_DICT),
+    (_RELEASES_REPORT, _RELEASES_REPORT_DICT),
     (_TAG_DIFF, _TAG_DIFF_DICT),
     (_TRACK_ROW, _TRACK_ROW_DICT),
     (_TRACK_GROUP, _TRACK_GROUP_DICT),
@@ -981,6 +1102,7 @@ _CASES: list[tuple[_Payload, dict[str, object]]] = [
     (_REVERT_RESULT, _REVERT_RESULT_DICT),
     (_YEAR_ROW, _YEAR_ROW_DICT),
     (_YEAR_GROUP, _YEAR_GROUP_DICT),
+    (_YEARS_REPORT, _YEARS_REPORT_DICT),
 ]
 
 

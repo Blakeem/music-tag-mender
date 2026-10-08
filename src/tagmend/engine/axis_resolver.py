@@ -6,7 +6,8 @@ optional pre-pass differ between the axes, so each resolver supplies an :class:`
 and :func:`run` owns the rest: the connection, the empty-staging precondition, the selection,
 the outcome rows and the counts.
 
-Every count is files. A transient lookup error writes nothing and leaves the group ``pending``.
+Every count is files. A lookup error writes nothing and leaves the group ``pending``. A lookup
+that outlasted every retry also stops the call reading past refused files and failed groups.
 A file staging refuses is itemized under ``file_id=<id>`` and stays ``pending`` while its
 siblings settle. A dry run asks the stage callable whether each file would stage, so its
 ``staged_files`` counts the files the real run would stage.
@@ -14,6 +15,7 @@ siblings settle. A dry run asks the stage callable whether each file would stage
 
 from __future__ import annotations
 
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -47,8 +49,11 @@ class AxisResolver[C, R]:
     lookup: Callable[[C, axis.LookupIdentity], R | None]
     """Looks one group up. ``None`` means nothing usable, which settles the group ``no_match``."""
 
-    transient_error: type[Exception]
-    """The client's retryable failure, which leaves the group ``pending`` instead of aborting."""
+    lookup_error: type[Exception]
+    """The client's lookup failure, which leaves the group ``pending`` instead of aborting."""
+
+    unavailable_error: type[Exception]
+    """The *lookup_error* subclass raised once a lookup outlasted every retry, as in an outage."""
 
     group_key: Callable[[axis.LookupIdentity], str]
     """The ``error_items`` key of a group whose lookup failed."""
@@ -59,6 +64,9 @@ class AxisResolver[C, R]:
 
     settles_without_lookup: Callable[[Mapping[str, list[str]]], bool] | None = None
     """Picks the selected files that settle ``done`` from their own tags with no lookup."""
+
+    fatal_error: tuple[type[Exception], ...] = ()
+    """A failure that fails every lookup alike, such as a rejected key, which stops the call."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,8 +91,11 @@ class _Tally[R]:
     settled: int = 0
     staged_files: int = 0
     no_match: int = 0
+    lookup_failed: bool = False
+    unavailable: bool = False
     error_items: list[dict[str, str]] = field(default_factory=list)
     answers: dict[axis.LookupIdentity, R | None] = field(default_factory=dict)
+    failed_identities: set[axis.LookupIdentity] = field(default_factory=set)
 
 
 def run[C, R](  # noqa: PLR0913 - cohesive keyword-only scope + injection params
@@ -99,7 +110,7 @@ def run[C, R](  # noqa: PLR0913 - cohesive keyword-only scope + injection params
     dry_run: bool,
     client: C | None,
 ) -> ResolverRun[R]:
-    """Settle the first *limit* (else *default_limit*) ``pending`` files in scope on *resolver*.
+    """Settle up to *limit* (else *default_limit*) ``pending`` files in scope on *resolver*.
 
     Scope is *file_ids* when given, else every file carrying *value* in one of the axis's
     ``scope_fields`` (narrowed to *album* when given), else the whole library. *client* is used
@@ -111,6 +122,7 @@ def run[C, R](  # noqa: PLR0913 - cohesive keyword-only scope + injection params
     effective_limit = default_limit if limit is None else limit
     tally: _Tally[R] = _Tally()
     pending_remaining = 0
+    unattempted = 0
 
     connection = db.connect(settings.db_path)
     try:
@@ -129,16 +141,70 @@ def run[C, R](  # noqa: PLR0913 - cohesive keyword-only scope + injection params
             album=album,
             file_ids=file_ids,
         )
-        selected = store.pending_file_ids(connection, resolver.axis_, scoped_ids)[:effective_limit]
-        to_look_up = _settle_without_lookup(connection, resolver, selected, tally, dry_run=dry_run)
-        groups = _group_by_identity(connection, to_look_up)
-        if groups:
-            _process_groups(connection, resolver, groups, client, tally, dry_run=dry_run)
+        pending = store.pending_file_ids(connection, resolver.axis_, scoped_ids)
+        attempted = _settle_pending(
+            connection,
+            resolver,
+            pending,
+            effective_limit,
+            client,
+            tally,
+            dry_run=dry_run,
+        )
+        unattempted = len(pending) - attempted
         pending_remaining = len(store.pending_file_ids(connection, resolver.axis_, scoped_ids))
     finally:
         connection.close()
 
-    return _build_run(tally, pending_remaining=pending_remaining, dry_run=dry_run)
+    return _build_run(
+        tally,
+        pending_remaining=pending_remaining,
+        unattempted=unattempted,
+        dry_run=dry_run,
+    )
+
+
+def _settle_pending[C, R](  # noqa: PLR0913 - cohesive orchestration inputs
+    conn: sqlite3.Connection,
+    resolver: AxisResolver[C, R],
+    pending: list[int],
+    effective_limit: int,
+    client: C | None,
+    tally: _Tally[R],
+    *,
+    dry_run: bool,
+) -> int:
+    """Settle up to *effective_limit* of *pending* in id order. Return how many were attempted.
+
+    A refused file or a failed group settles nothing, so the next pending ids refill the call,
+    else files that fail on every call would fill the front of the id order. Only an unavailable
+    service stops the refill, so an outage does not walk the whole library. The client is built
+    only once a group needs it.
+    """
+    attempted = 0
+    source: C | None = None
+
+    with ExitStack() as stack:
+        while attempted < len(pending) and tally.settled < effective_limit:
+            if tally.unavailable:
+                break
+            batch = pending[attempted : attempted + effective_limit - tally.settled]
+            attempted += len(batch)
+            to_look_up = _settle_without_lookup(conn, resolver, batch, tally, dry_run=dry_run)
+            groups = _group_by_identity(conn, to_look_up)
+            if not groups:
+                continue
+            if source is None:
+                source = stack.enter_context(
+                    lookup_clients.injected_or_owned(client, lambda: resolver.build_client(conn)),
+                )
+            for identity, fids in groups.items():
+                # A failed lookup is never cached, so a group spanning two batches would be
+                # looked up and itemized again. Its files stay pending.
+                if identity in tally.failed_identities:
+                    continue
+                _process_one_group(conn, resolver, source, identity, fids, tally, dry_run=dry_run)
+    return attempted
 
 
 def _settle_without_lookup[C, R](
@@ -187,21 +253,6 @@ def _group_by_identity(
     return groups
 
 
-def _process_groups[C, R](  # noqa: PLR0913 - cohesive orchestration inputs
-    conn: sqlite3.Connection,
-    resolver: AxisResolver[C, R],
-    groups: dict[axis.LookupIdentity, list[int]],
-    client: C | None,
-    tally: _Tally[R],
-    *,
-    dry_run: bool,
-) -> None:
-    """Resolve each group via *client*, built by the resolver when ``None``."""
-    with lookup_clients.injected_or_owned(client, lambda: resolver.build_client(conn)) as source:
-        for identity, fids in groups.items():
-            _process_one_group(conn, resolver, source, identity, fids, tally, dry_run=dry_run)
-
-
 def _process_one_group[C, R](  # noqa: PLR0913 - cohesive per-group inputs
     conn: sqlite3.Connection,
     resolver: AxisResolver[C, R],
@@ -224,9 +275,15 @@ def _process_one_group[C, R](  # noqa: PLR0913 - cohesive per-group inputs
 
     try:
         answer = resolver.lookup(source, identity)
-    except resolver.transient_error as exc:
+    except resolver.fatal_error:
+        raise
+    except resolver.lookup_error as exc:
         logger.warning("%s lookup failed for %r: %s", resolver.axis_.name, key, exc)
         tally.error_items.append({"key": key, "message": str(exc)})
+        tally.lookup_failed = True
+        tally.failed_identities.add(identity)
+        if isinstance(exc, resolver.unavailable_error):
+            tally.unavailable = True
         return
 
     tally.answers[identity] = answer
@@ -279,37 +336,92 @@ def _stage_group[C, R](  # noqa: PLR0913 - cohesive per-group inputs
     return failed
 
 
-def _build_run[R](tally: _Tally[R], *, pending_remaining: int, dry_run: bool) -> ResolverRun[R]:
+def _build_run[R](
+    tally: _Tally[R],
+    *,
+    pending_remaining: int,
+    unattempted: int,
+    dry_run: bool,
+) -> ResolverRun[R]:
     """Freeze the run's tally and counts into a :class:`ResolverRun`."""
+    more = not dry_run and tally.settled > 0 and unattempted > 0
     return ResolverRun(
         settled=tally.settled,
         staged_files=tally.staged_files,
         no_match=tally.no_match,
         pending_remaining=pending_remaining,
-        more=not dry_run and tally.settled > 0 and pending_remaining > 0,
+        more=more,
         errors=len(tally.error_items),
         error_items=list(tally.error_items),
-        summary=_summarize(tally, pending_remaining=pending_remaining, dry_run=dry_run),
+        summary=_summarize(
+            tally,
+            pending_remaining=pending_remaining,
+            all_attempted=unattempted == 0,
+            more=more,
+            dry_run=dry_run,
+        ),
         answers=dict(tally.answers),
     )
 
 
-def _summarize[R](tally: _Tally[R], *, pending_remaining: int, dry_run: bool) -> str:
-    """Build a short, plain human summary of what settled and what is left.
+def _summarize[R](
+    tally: _Tally[R],
+    *,
+    pending_remaining: int,
+    all_attempted: bool,
+    more: bool,
+    dry_run: bool,
+) -> str:
+    """Build a short, plain human summary of what settled and what is left."""
+    settled = (
+        f"Settled {tally.settled} file(s): staged {tally.staged_files}, no_match {tally.no_match}."
+    )
+    remainder = remainder_parts(
+        pending_remaining=pending_remaining,
+        all_attempted=all_attempted,
+        more=more,
+        dry_run=dry_run,
+        lookup_failed=tally.lookup_failed,
+        unavailable=tally.unavailable,
+        errors=len(tally.error_items),
+    )
+    return " ".join([settled, *remainder])
+
+
+def remainder_parts(  # noqa: PLR0913 - the remainder facts every resolver summary words alike
+    *,
+    pending_remaining: int,
+    all_attempted: bool,
+    more: bool,
+    dry_run: bool,
+    lookup_failed: bool,
+    unavailable: bool,
+    errors: int,
+) -> list[str]:
+    """Word what a refilling resolver call left pending, for every resolver summary alike.
 
     A dry run records nothing, so its remainder is not resumable and is worded accordingly.
+    Once every pending file was tried and no lookup failed, each file left is one staging
+    refused, and the next call would refuse it again. Only an unavailable service is worth an
+    immediate retry, since any other lookup error can recur on every call.
     """
-    errors = len(tally.error_items)
-    parts = [
-        f"Settled {tally.settled} file(s): staged {tally.staged_files}, no_match {tally.no_match}.",
-    ]
+    parts: list[str] = []
     if dry_run:
         parts.append(
             f"A dry run records nothing, so {pending_remaining} file(s) in scope stay pending "
             f"and an identical call previews the same files.",
         )
-    elif pending_remaining > 0:
+    elif more:
         parts.append(f"{pending_remaining} file(s) still pending. Call again to continue.")
-    if errors > 0:
+    elif pending_remaining > 0 and all_attempted and not lookup_failed:
+        parts.append(
+            f"{pending_remaining} file(s) still pending fail on every call. Fix each file, set "
+            f"id3_droppable_frames, or scope the call by value or file_ids to skip them.",
+        )
+    elif pending_remaining > 0:
+        parts.append(f"{pending_remaining} file(s) still pending.")
+    if unavailable:
         parts.append(f"{errors} item(s) errored and their files stay pending. Re-run to retry.")
-    return " ".join(parts)
+    elif errors > 0:
+        parts.append(f"{errors} item(s) errored and their files stay pending.")
+    return parts

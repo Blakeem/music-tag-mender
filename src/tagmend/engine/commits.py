@@ -1,22 +1,22 @@
-"""Domain-neutral commit core: ``commits``-table ops + the shared crash-safe loop (M3).
+"""Domain-neutral commit core: ``commits``-table ops + the shared crash-safe loop.
 
 This module owns everything about a *commit* that does not depend on whether the change
 is a tag edit or a file move:
 
 * the ``commits`` table data access (``create_commit`` / ``set_commit_status`` /
-  ``get_commit_in`` / ``get_applying_commits`` / ``list_commits_in`` / ``mark_interrupted``);
+  ``get_commit_in`` / ``get_applying_commits`` / ``list_commits_in`` / ``mark_interrupted``),
 * the immutable result dataclasses a commit or a commit revert returns
-  (:class:`CommitResult`, :class:`RevertCommitResult` and friends);
+  (:class:`CommitResult`, :class:`RevertCommitResult` and friends),
 * the :class:`RevisionDomain` seam plus the one shared :func:`run_commit` loop that
   carries the delicate no-durable-write-before-the-disk-action crash invariant.
 
-It deliberately imports none of :mod:`tagmend.engine.staging`, :mod:`tagmend.engine.paths`
-and :mod:`tagmend.engine.versioning` (which import it back), so there is no import cycle: a
-concrete domain (``staging.TagDomain``, ``paths.PathDomain``) implements the Protocol and is
-passed in.
+It deliberately imports none of :mod:`tagmend.engine.staging`, :mod:`tagmend.engine.paths`,
+:mod:`tagmend.engine.pictures` and :mod:`tagmend.engine.versioning` (which import it back), so
+there is no import cycle. A concrete domain (``staging.TagDomain``, ``paths.PathDomain``,
+``pictures.PictureDomain``) implements the Protocol and is passed in.
 
 Like the rest of the data-access layer, the ``commits``-table functions take an open
-connection and **never commit**; the orchestrator owns the transaction. The one
+connection and **never commit**. The orchestrator owns the transaction. The one
 exception is :func:`run_commit`, which owns the per-file ``conn.commit()`` calls because
 the crash invariant lives in exactly where those commits fall.
 """
@@ -27,6 +27,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final, Protocol
 
 from tagmend.engine import clock, db, schema
+from tagmend.engine.serialize import FieldDict
 from tagmend.engine.validation import check_limit
 from tagmend.log import get_logger
 
@@ -43,7 +44,7 @@ logger = get_logger(__name__)
 
 # A commit is ``applying`` until every file it touched has been turned into a revision
 # and its staged row deleted, then it flips to ``applied``. A lingering ``applying``
-# row is a crash remnant; the next commit flips it to the terminal ``interrupted``.
+# row is a crash remnant. The next commit flips it to the terminal ``interrupted``.
 _COMMIT_STATUSES: Final = frozenset({"applying", "applied", "interrupted"})
 
 _COMMIT_COLUMNS = "id, created_at, origin, message, reverted_from, status"
@@ -101,7 +102,7 @@ def create_commit(
         (now, origin, message, reverted_from),
     )
     new_id = cursor.lastrowid
-    if new_id is None:  # pragma: no cover - defensive; INTEGER PK always assigns one
+    if new_id is None:  # pragma: no cover - defensive, an INTEGER PK always assigns one
         error = "create_commit did not return a row id"
         raise RuntimeError(error)
     return int(new_id)
@@ -141,16 +142,27 @@ def list_commits_in(conn: sqlite3.Connection, *, limit: int | None = None) -> li
 
 
 def mark_interrupted(conn: sqlite3.Connection) -> int:
-    """Flip every lingering ``applying`` commit to ``interrupted``; return the count.
+    """Flip every lingering ``applying`` commit to ``interrupted`` and return the count.
 
-    Single-user model: any commit still ``applying`` at the start of a new commit is a
-    crash remnant. Its already-committed files keep their revisions; its leftover staged
-    rows stay staged and the new commit sweeps them up. Does not commit.
+    Every caller holds :func:`tagmend.engine.ledger_lock.mutation_lock`, which admits one
+    mutating call per ledger, so any commit still ``applying`` here is a crash remnant. Its
+    already-committed files keep their revisions. Its leftover staged rows stay staged and the
+    new commit sweeps them up. Does not commit.
     """
     cursor = conn.execute(
         "UPDATE commits SET status = 'interrupted' WHERE status = 'applying'",
     )
     return cursor.rowcount
+
+
+def has_unfinished_revert(conn: sqlite3.Connection, commit_id: int) -> bool:
+    """Whether a revert of *commit_id* is still ``applying`` or was ``interrupted``."""
+    row = conn.execute(
+        "SELECT EXISTS(SELECT 1 FROM commits WHERE reverted_from = ? "
+        "AND status IN ('applying', 'interrupted'))",
+        (commit_id,),
+    ).fetchone()
+    return bool(row[0])
 
 
 def list_commits(settings: Settings, *, limit: int | None = None) -> list[Commit]:
@@ -204,7 +216,7 @@ class MissingFile:
 
 
 @dataclass(frozen=True, slots=True)
-class CommitResult:
+class CommitResult(FieldDict):
     """Immutable summary of a commit run."""
 
     commit_id: int | None
@@ -215,27 +227,6 @@ class CommitResult:
     errors: int
     outcomes: tuple[FileCommitOutcome, ...]
     missing_files: tuple[MissingFile, ...]
-
-    def to_dict(self) -> dict[str, object]:
-        """JSON-serializable form for the MCP tool."""
-        return {
-            "commit_id": self.commit_id,
-            "committed": self.committed,
-            "noop": self.noop,
-            "missing": self.missing,
-            "changed_since_stage": self.changed_since_stage,
-            "errors": self.errors,
-            "outcomes": [
-                {
-                    "file_id": o.file_id,
-                    "version": o.version,
-                    "status": o.status,
-                    "detail": o.detail,
-                }
-                for o in self.outcomes
-            ],
-            "missing_files": [{"file_id": m.file_id, "path": m.path} for m in self.missing_files],
-        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -270,17 +261,17 @@ class FileRevertOutcome:
     """What happened (or would happen, on a dry run) to one file of the target commit."""
 
     file_id: int
-    target_version: int | None  # version restored (the commit's version - 1); None if not
-    new_version: int | None  # the appended revert revision; None if not reverted
+    target_version: int | None  # version restored (the commit's version - 1), else None
+    new_version: int | None  # the appended revert revision, None if not reverted
     status: str  # 'reverted' | 'noop' | 'skipped_later_changes' | 'missing' | 'error'
     detail: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
-class RevertCommitResult:
+class RevertCommitResult(FieldDict):
     """Immutable summary of a commit-level revert run."""
 
-    commit_id: int | None  # the NEW revert commit; None on dry run / nothing revertable
+    commit_id: int | None  # the NEW revert commit, None on a dry run or with nothing revertable
     reverted_from: int  # the target commit id
     dry_run: bool
     reverted: int
@@ -289,29 +280,6 @@ class RevertCommitResult:
     missing: int
     errors: int
     outcomes: tuple[FileRevertOutcome, ...]
-
-    def to_dict(self) -> dict[str, object]:
-        """JSON-serializable form for the MCP tool."""
-        return {
-            "commit_id": self.commit_id,
-            "reverted_from": self.reverted_from,
-            "dry_run": self.dry_run,
-            "reverted": self.reverted,
-            "noop": self.noop,
-            "skipped": self.skipped,
-            "missing": self.missing,
-            "errors": self.errors,
-            "outcomes": [
-                {
-                    "file_id": o.file_id,
-                    "target_version": o.target_version,
-                    "new_version": o.new_version,
-                    "status": o.status,
-                    "detail": o.detail,
-                }
-                for o in self.outcomes
-            ],
-        }
 
 
 def summarize_revert(
@@ -339,16 +307,16 @@ def summarize_revert(
 
 
 class RevisionDomain(Protocol):
-    """A domain (tags | paths) the shared commit loop drives, one staged file at a time.
+    """A domain (tags | paths | pictures) the shared commit loop drives, one staged file at a time.
 
     Concrete, generics-free, SQL-name-free: a staged item is referenced only by its
-    ``file_id`` and the domain reads its own payload. Not ``@runtime_checkable`` — it is
+    ``file_id`` and the domain reads its own payload. Not ``@runtime_checkable``, since it is
     never ``isinstance``-checked, only structurally satisfied by a concrete dataclass.
     """
 
     @property
-    def name(self) -> str:  # 'tags' | 'paths' (logging only)
-        """A short domain label used only in log messages."""
+    def changed_since_stage_detail(self) -> str:
+        """The ``detail`` of a ``changed_since_stage`` outcome, naming the domain's remedy."""
         ...
 
     @property
@@ -359,21 +327,10 @@ class RevisionDomain(Protocol):
         """
         ...
 
-    def list_staged_file_ids(self, conn: sqlite3.Connection) -> list[int]:
-        """Return every staged file id, in a stable order."""
-        ...
-
-    def list_staged_file_ids_under(self, conn: sqlite3.Connection, root_key: str) -> list[int]:
-        """Return staged file ids whose file lives in the folder keyed *root_key* or under it.
-
-        *root_key* is a :func:`tagmend.engine.path_keys.path_key`.
-        """
-        ...
-
     def plan_order(self, conn: sqlite3.Connection, file_ids: list[int]) -> list[int]:
         """Return the iteration order (possibly reordered/filtered) for *file_ids*.
 
-        Tags = identity; paths = topological move order + collision resolution (§15).
+        Tags keep the given order. Paths keep it too, since staging refuses a shared target.
         """
         ...
 
@@ -412,14 +369,8 @@ class RevisionDomain(Protocol):
         ...
 
     def post_commit_file(self, conn: sqlite3.Connection, file_id: int) -> None:
-        """Per-file follow-up after the commit landed (paths: prune empty dir; tags: no-op)."""
+        """Per-file follow-up after the commit landed (paths prune empty dirs, tags do nothing)."""
         ...
-
-
-_CHANGED_SINCE_STAGE_DETAIL: Final = (
-    "file changed on disk after it was staged. "
-    "Re-stage it (stage_tags replaces the pending row) or unstage it."
-)
 
 
 def run_commit(
@@ -429,7 +380,7 @@ def run_commit(
     commit_id: int,
     file_ids: list[int],
 ) -> list[_Applied]:
-    """Apply each staged change for *file_ids* under *commit_id*; return per-file results.
+    """Apply each staged change for *file_ids* under *commit_id* and return per-file results.
 
     The one place the crash invariant lives. For each file, in ``plan_order``:
 
@@ -485,7 +436,7 @@ def _commit_one(
                 file_id=file_id,
                 version=None,
                 status="changed_since_stage",
-                detail=_CHANGED_SINCE_STAGE_DETAIL,
+                detail=domain.changed_since_stage_detail,
             )
         version = domain.apply_to_disk(
             conn, file_id, path, commit_id=commit_id, now=clock.utc_now()

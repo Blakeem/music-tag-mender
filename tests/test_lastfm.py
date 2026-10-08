@@ -19,6 +19,8 @@ from tagmend.engine.lastfm import (
     ArtistCorrection,
     LastfmClient,
     LastfmError,
+    LastfmKeyError,
+    LastfmUnavailableError,
     Tag,
     _request_key,
 )
@@ -260,7 +262,7 @@ def test_artist_correction_http_500_raises_and_does_not_cache(db_conn: sqlite3.C
     assert get_cached_correction(db_conn, key) is None
 
 
-# --- transient errors are raised and NOT cached --------------------------------------
+# --- a Last.fm error is raised and nothing is cached ---------------------------------
 
 
 def test_non_six_error_raises_and_does_not_cache(db_conn: sqlite3.Connection) -> None:
@@ -279,6 +281,52 @@ def test_http_500_raises_and_does_not_cache(db_conn: sqlite3.Connection) -> None
     with client, pytest.raises(LastfmError):
         client.artist_top_tags("Anybody")
     assert len(calls) == 3
+    key = _request_key("artist.gettoptags", {"artist": "Anybody"})
+    assert get_cached_tags(db_conn, key) is None
+
+
+@pytest.mark.parametrize(
+    ("status", "code"),
+    [(403, 10), (403, 26), (200, 10)],
+    ids=["invalid-key-403", "suspended-key-403", "invalid-key-200"],
+)
+def test_a_rejected_key_raises_lastfm_key_error_and_caches_nothing(
+    db_conn: sqlite3.Connection,
+    status: int,
+    code: int,
+) -> None:
+    body = {"error": code, "message": "Invalid API key - You must be granted a valid key"}
+    client, calls = _client(db_conn, [_json_response(body, status_code=status)])
+    with client, pytest.raises(LastfmKeyError, match="lastfm_api_key"):
+        client.artist_top_tags("Anybody")
+    assert len(calls) == 1
+    key = _request_key("artist.gettoptags", {"artist": "Anybody"})
+    assert get_cached_tags(db_conn, key) is None
+
+
+def test_a_4xx_error_body_is_named_in_the_error_and_never_cached(
+    db_conn: sqlite3.Connection,
+) -> None:
+    # A keyless request answers HTTP 400 with error 6, a missing parameter, not a missing entity.
+    body = {"error": 6, "message": "Invalid parameters - Your request is missing a parameter"}
+    client, calls = _client(db_conn, [_json_response(body, status_code=400)])
+    with client, pytest.raises(LastfmError) as raised:
+        client.artist_correction("Anybody")
+    assert type(raised.value) is LastfmError
+    assert str(raised.value) == (
+        "Last.fm HTTP 400 for artist.getcorrection: error 6: "
+        "Invalid parameters - Your request is missing a parameter"
+    )
+    assert len(calls) == 1
+    key = _request_key("artist.getcorrection", {"artist": "Anybody"})
+    assert get_cached_correction(db_conn, key) is None
+
+
+def test_a_4xx_non_json_body_raises_the_bare_status(db_conn: sqlite3.Connection) -> None:
+    client, _calls = _client(db_conn, [httpx.Response(400, content=b"<html>")])
+    with client, pytest.raises(LastfmError) as raised:
+        client.artist_top_tags("Anybody")
+    assert str(raised.value) == "Last.fm HTTP 400 for artist.gettoptags"
     key = _request_key("artist.gettoptags", {"artist": "Anybody"})
     assert get_cached_tags(db_conn, key) is None
 
@@ -333,7 +381,7 @@ def test_transport_error_exhausts_into_lastfm_error(db_conn: sqlite3.Connection)
         db_conn,
         [httpx.ConnectError("connection dropped")] * 3,
     )
-    with client, pytest.raises(LastfmError) as raised:
+    with client, pytest.raises(LastfmUnavailableError) as raised:
         client.artist_top_tags("Anybody")
     assert isinstance(raised.value.__cause__, httpx.ConnectError)
     assert "api_key" not in str(raised.value)  # the request URL carries the key
@@ -385,33 +433,6 @@ def test_max_attempts_one_does_not_sleep(db_conn: sqlite3.Connection) -> None:
         client.artist_top_tags("Anybody")
     assert len(calls) == 1
     assert sleeps == []
-
-
-# --- argument validation -------------------------------------------------------------
-
-
-def test_artist_top_tags_requires_exactly_one_identity(db_conn: sqlite3.Connection) -> None:
-    client, _calls = _client(db_conn, [])
-    with client:
-        with pytest.raises(ValueError, match="exactly one"):
-            client.artist_top_tags()
-        with pytest.raises(ValueError, match="exactly one"):
-            client.artist_top_tags("name", mbid="abc")
-
-
-def test_artist_by_mbid_uses_mbid_param(db_conn: sqlite3.Connection) -> None:
-    captured: list[httpx.Request] = []
-
-    def handle(request: httpx.Request) -> httpx.Response:
-        captured.append(request)
-        return _json_response(_toptags(("rock", 100)))
-
-    client = LastfmClient("key", db_conn, rate_per_sec=0.0, transport=httpx.MockTransport(handle))
-    with client:
-        result = client.artist_top_tags(mbid="mbid-123")
-    assert result == [Tag("rock", 100)]
-    assert captured[0].url.params["mbid"] == "mbid-123"
-    assert "artist" not in captured[0].url.params
 
 
 # --- pacing --------------------------------------------------------------------------
@@ -469,10 +490,10 @@ def test_request_key_is_order_independent() -> None:
     assert key_a == key_b
 
 
-def test_name_and_mbid_queries_get_different_keys() -> None:
-    by_name = _request_key("artist.gettoptags", {"artist": "Ours"})
-    by_mbid = _request_key("artist.gettoptags", {"mbid": "some-mbid"})
-    assert by_name != by_mbid
+def test_distinct_artist_names_get_different_keys() -> None:
+    first = _request_key("artist.gettoptags", {"artist": "Ours"})
+    second = _request_key("artist.gettoptags", {"artist": "Theirs"})
+    assert first != second
 
 
 def test_request_key_version_one_matches_legacy_bytes() -> None:

@@ -1,19 +1,18 @@
-"""Local config web UI — edit ``settings.json`` from a friendly browser form (stdlib-only).
+"""Local config web UI that edits ``settings.json`` from a browser form.
 
 Two launch paths share this module (see ``cli.py`` and ``mcp_server.py``):
 
-* ``tagmend config`` runs :func:`run_blocking` — a loopback web server that serves until
+* ``tagmend config`` runs :func:`run_blocking`, a loopback web server that serves until
   Ctrl-C.
 * ``tagmend mcp`` calls :func:`launch_background` when settings are incomplete, serving the
   same UI from a daemon thread without blocking the JSON-RPC channel.
 
-Everything is engine-first and dependency-free: pure helpers (:func:`decide_launch`,
-:func:`build_seed`, :func:`validate_and_normalize`, :func:`run_test_ping`,
-:func:`is_loopback`/:func:`host_is_loopback`) carry the logic and are unit-tested directly,
-while a thin :class:`http.server` handler wires them to HTTP. The handler is locked down for
-a single local user: loopback-only source IP, a loopback ``Host`` header, a per-launch CSRF
-token on every POST, an exact-filename static allowlist (no path traversal), and a JSON body
-cap. No real API key is ever sent to the browser. The seed masks each one.
+Module-level helpers (:func:`decide_launch`, :func:`build_seed`, :func:`validate_and_normalize`,
+:func:`run_test_ping`, :func:`is_loopback`/:func:`host_is_loopback`) carry the logic and are
+unit-tested directly, while a thin :class:`http.server` handler wires them to HTTP. The handler
+is locked down for a single local user: loopback-only source IP, a loopback ``Host`` header, a
+per-launch CSRF token on every POST, an exact-filename static allowlist (no path traversal),
+and a JSON body cap. No real API key is ever sent to the browser. The seed masks each one.
 """
 
 from __future__ import annotations
@@ -33,11 +32,14 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Final, cast
 
 from tagmend.config import (
-    _KNOWN_KEYS,
-    _NONE_TOKENS,
+    FOLDER_LIST_DELIMITER,
+    KNOWN_KEYS,
+    NAMING_KEYS,
     SECRET_KEYS,
     Settings,
+    check_setting,
     load_settings,
+    naming_key_refusal,
     set_settings,
 )
 from tagmend.engine.lastfm import LastfmClient, LastfmError
@@ -57,18 +59,10 @@ MASK_PLACEHOLDER: Final = "********"
 
 # The per-launch CSRF token travels in this request header on every POST.
 _CSRF_HEADER: Final = "X-TagMend-CSRF"
-# index.html ships this placeholder; the handler substitutes the live token when serving it.
+# index.html ships this placeholder. The handler substitutes the live token when serving it.
 _CSRF_PLACEHOLDER: Final = "__CSRF_TOKEN__"
 
-# Numeric field families (light save-time validation only; ``load_settings`` still coerces).
-_INT_KEYS: Final[frozenset[str]] = frozenset(
-    {"genre_min_weight", "genre_stage_limit", "year_stage_limit", "song_stage_limit"},
-)
-_FLOAT_KEYS: Final[frozenset[str]] = frozenset(
-    {"lastfm_rate_per_sec", "musicbrainz_rate_per_sec", "acoustid_rate_per_sec"},
-)
-
-# Exact-filename static allowlist — no directory listing, no path traversal.
+# Exact-filename static allowlist: no directory listing, no path traversal.
 _STATIC_ROUTES: Final[dict[str, str]] = {
     "/": "index.html",
     "/index.html": "index.html",
@@ -85,11 +79,11 @@ _CONTENT_TYPES: Final[dict[str, str]] = {
 _MAX_BODY_BYTES: Final = 64 * 1024
 
 
-# --- pure helpers --------------------------------------------------------------------
+# --- helpers -------------------------------------------------------------------------
 
 
 class ValidationError(Exception):
-    """A posted settings payload was rejected; carries the HTTP status to return."""
+    """A posted settings payload was rejected. It carries the HTTP status to return."""
 
     def __init__(self, status: HTTPStatus, message: str) -> None:
         """Store the *status* (4xx) and human-readable *message* for the response."""
@@ -104,11 +98,11 @@ def decide_launch(settings: Settings) -> bool:
 
 
 def build_seed(settings: Settings) -> dict[str, object]:
-    """Build the ``/api/seed`` payload: every key as a string, each API key masked.
+    """Build the ``/api/seed`` payload: every settings key but the naming keys, as strings.
 
-    No real key is ever included. ``lastfm_api_key`` and ``acoustid_api_key`` are the mask
-    placeholder when a key is set (empty otherwise), alongside a ``has_lastfm_api_key``
-    boolean for the UI.
+    ``naming_pattern`` and ``container_folders`` are left out, since only ``set_naming_pattern``
+    writes them. No real key is ever included. ``lastfm_api_key`` and ``acoustid_api_key`` are
+    the mask placeholder when a key is set (empty otherwise).
     """
     values: dict[str, str] = {
         "music_path": str(settings.music_path) if settings.music_path else "",
@@ -120,81 +114,46 @@ def build_seed(settings: Settings) -> dict[str, object]:
         "genre_use_album_tags": "true" if settings.genre_use_album_tags else "false",
         "lastfm_rate_per_sec": str(settings.lastfm_rate_per_sec),
         "genre_stage_limit": str(settings.genre_stage_limit),
+        "artist_stage_limit": str(settings.artist_stage_limit),
         "musicbrainz_rate_per_sec": str(settings.musicbrainz_rate_per_sec),
         "musicbrainz_contact": settings.musicbrainz_contact,
         "year_stage_limit": str(settings.year_stage_limit),
         "fpcalc_path": settings.fpcalc_path or "",
         "acoustid_rate_per_sec": str(settings.acoustid_rate_per_sec),
         "song_stage_limit": str(settings.song_stage_limit),
-        "id3_droppable_frames": ";".join(settings.id3_droppable_frames),
+        "id3_droppable_frames": FOLDER_LIST_DELIMITER.join(settings.id3_droppable_frames),
         "acoustid_api_key": MASK_PLACEHOLDER if settings.acoustid_api_key is not None else "",
+        "lastfm_api_key": MASK_PLACEHOLDER if settings.lastfm_api_key is not None else "",
     }
-    has_key = settings.lastfm_api_key is not None
-    values["lastfm_api_key"] = MASK_PLACEHOLDER if has_key else ""
-    return {"values": values, "has_lastfm_api_key": has_key}
+    return {"values": values}
 
 
 def validate_and_normalize(payload: Mapping[str, object]) -> dict[str, str]:
     """Validate a posted form payload and return the subset of keys to persist.
 
-    Unknown keys raise a 400 ``ValidationError``; numeric/none-token fields that don't parse
-    raise a 422. An unchanged API key (the mask placeholder or an empty field) is dropped so
-    the stored key is preserved. Clearing a key stays a ``config-set`` action.
+    An unknown key or a naming key raises a 400 ``ValidationError``. A value
+    ``load_settings`` would discard raises a 422. An unchanged API key (the mask placeholder or
+    an empty field) is dropped so the stored key is preserved. Clearing a key stays a
+    ``config-set`` action.
     """
     result: dict[str, str] = {}
     for key, raw_value in payload.items():
-        if key not in _KNOWN_KEYS:
+        if key not in KNOWN_KEYS:
             message = f"unknown setting {key!r}"
             raise ValidationError(HTTPStatus.BAD_REQUEST, message)
+        if key in NAMING_KEYS:
+            raise ValidationError(HTTPStatus.BAD_REQUEST, naming_key_refusal(key))
         value = "" if raw_value is None else str(raw_value)
         if key in SECRET_KEYS:
             if value and value != MASK_PLACEHOLDER:
                 result[key] = value
             continue
-        _validate_typed(key, value)
+        try:
+            check_setting(key, value)
+        except ValueError as exc:
+            raise ValidationError(HTTPStatus.UNPROCESSABLE_ENTITY, str(exc)) from exc
         result[key] = value
     return result
-
-
-def _validate_typed(key: str, value: str) -> None:
-    """Raise a 422 ``ValidationError`` when a numeric/none-token field cannot be parsed."""
-    if key in _INT_KEYS:
-        _require_int(key, value)
-    elif key in _FLOAT_KEYS:
-        _require_float(key, value)
-    elif key == "genre_max_count" and value.strip().lower() not in _NONE_TOKENS:
-        _require_int(key, value)
-        if int(value) < 0:
-            message = (
-                f"genre_max_count must be 0 (no cap) or a positive whole number (got {value!r})"
-            )
-            raise ValidationError(HTTPStatus.UNPROCESSABLE_ENTITY, message)
-    # genre_use_album_tags + free-text keys accept any value (load_settings coerces).
-
-
-def _require_int(key: str, value: str) -> None:
-    """Raise a 422 ``ValidationError`` unless *value* parses as an integer."""
-    try:
-        int(value)
-    except ValueError as exc:
-        message = f"{key} must be a whole number (got {value!r})"
-        raise ValidationError(HTTPStatus.UNPROCESSABLE_ENTITY, message) from exc
-
-
-def _require_float(key: str, value: str) -> None:
-    """Raise a 422 ``ValidationError`` unless *value* parses as a number above 0.
-
-    Every float setting is a request rate, and a rate at or below 0 disables pacing.
-    """
-    try:
-        parsed = float(value)
-    except ValueError as exc:
-        message = f"{key} must be a number (got {value!r})"
-        raise ValidationError(HTTPStatus.UNPROCESSABLE_ENTITY, message) from exc
-    # Written as a negation so NaN, which compares false to everything, is rejected too.
-    if not parsed > 0:
-        message = f"{key} must be a number above 0 (got {value!r})"
-        raise ValidationError(HTTPStatus.UNPROCESSABLE_ENTITY, message)
 
 
 def apply_save(payload: Mapping[str, object]) -> Path:
@@ -212,7 +171,7 @@ def run_test_ping(
 
     Returns ``{"ok": True}`` when the key works and ``{"ok": False, "error": ...}`` on a
     :class:`LastfmError`. The cache lives in an in-memory SQLite connection, so the real
-    ledger is never touched; *transport* is injectable so tests fake the network.
+    ledger is never touched. *transport* is injectable so tests fake the network.
     """
     conn = sqlite3.connect(":memory:")
     try:
@@ -311,7 +270,7 @@ class _ConfigHandler(BaseHTTPRequestHandler):
         logger.debug("configui %s", fmt % args if args else fmt)
 
     def do_GET(self) -> None:
-        """Serve a static asset or the JSON seed; everything else is 404."""
+        """Serve a static asset or the JSON seed. Everything else is 404."""
         if not self._guard():
             return
         path = urllib.parse.urlsplit(self.path).path
@@ -483,7 +442,7 @@ def run_blocking(
 ) -> None:
     """Serve the config UI on a loopback port until Ctrl-C, then close the socket cleanly.
 
-    *on_start* (when given) receives the URL before serving begins — the CLI uses it to echo
+    *on_start*, when given, receives the URL before serving begins. The CLI uses it to echo
     the address. The browser open is injectable and honors ``TAGMEND_NO_BROWSER``.
     """
     server = _make_server(_new_csrf_token())

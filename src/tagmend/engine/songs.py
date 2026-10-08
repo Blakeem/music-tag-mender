@@ -20,8 +20,9 @@ its tags. One :func:`resolve_songs` call runs these stages, top to bottom:
    folder on one release its voters share.
 7. Outcome router. A fill stages the blank song fields (``origin='auto'``) and records ``done``.
    A verified file records ``done``. Held, review, ``lookup_empty`` and error outcomes are
-   reported and store nothing. A gated target with no ``artist`` and no ``albumartist`` whose
-   dominant recordings credit one artist also gets a review row naming it, never a stage.
+   reported and store nothing. On the anchored and convergence routes, a gated target with no
+   ``artist`` and no ``albumartist`` whose dominant recordings credit one artist also gets a
+   review row naming it, never a stage.
 
 The manual release path (``release_mbid``) skips the stamp check and the route selector. It
 assigns every file in scope to its track on that release, all or nothing, and stages the whole
@@ -41,7 +42,7 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import datetime
 from fractions import Fraction
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
@@ -50,6 +51,7 @@ from tagmend.engine import (
     axis,
     clock,
     db,
+    ledger_lock,
     path_keys,
     release_match,
     schema,
@@ -57,6 +59,7 @@ from tagmend.engine import (
     store,
 )
 from tagmend.engine.acoustid import (
+    SCORE_FLOOR,
     AcoustidClient,
     AcoustidError,
     AcoustidKeyError,
@@ -74,10 +77,10 @@ from tagmend.engine.acoustid import (
     put_fingerprint,
     put_lookup,
 )
-from tagmend.engine.detector_core import parse_position
+from tagmend.engine.detector_core import parse_position, parse_total
 from tagmend.engine.musicbrainz import MusicBrainzClient, MusicBrainzError
-from tagmend.engine.text_keys import alnum_key, loose_key, title_key
-from tagmend.engine.validation import check_limit
+from tagmend.engine.text_keys import alnum_script_key, display_key, loose_key, title_key
+from tagmend.engine.validation import check_limit, validate_file_pairs
 from tagmend.log import get_logger
 
 if TYPE_CHECKING:
@@ -101,7 +104,6 @@ _ARTIST_ID: Final = "musicbrainz_artistid"
 _ORIGINAL_DATE: Final = "originaldate"
 
 # Recording gate thresholds, as the song-axis decision run measured them.
-_SCORE_FLOOR: Final = 0.9
 _DOMINANT_SHARE: Final = 0.95
 _THIN_SOURCES: Final = 10
 _LENGTH_GUARD_SECONDS: Final = 10
@@ -147,8 +149,6 @@ _KEPT_ON_OWN_RELEASE: Final = (
 )
 # The same rule keyed on the recording, because an ISRC names the recording on every release.
 _KEPT_ON_OWN_RECORDING: Final = ("isrc",)
-
-_ASSIGNMENT_WIDTH: Final = 2
 
 _HELD_KINDS: Final = (
     "disagreement",
@@ -243,7 +243,7 @@ class _Tally:
 
     def add_error(self, file_id: int, message: str) -> None:
         """Record one transient failure. The file stays pending and the next call retries it."""
-        self.error_items.append({"key": str(file_id), "message": message})
+        self.error_items.append({"key": f"file_id={file_id}", "message": message})
 
 
 # --- stage data ----------------------------------------------------------------------
@@ -374,6 +374,24 @@ class _Convergence:
 
 
 @dataclass(frozen=True, slots=True)
+class _TagTotals:
+    """The disc and track totals a folder's voters agree on, ``None`` where they do not.
+
+    ``disc`` is the medium the voters' disc number names, 1 when every one is blank, and
+    ``None`` when they name two or one does not parse.
+    """
+
+    disc_total: int | None
+    track_total: int | None
+    disc: int | None
+
+    @property
+    def agreed(self) -> bool:
+        """Whether the voters agree on at least one total."""
+        return self.disc_total is not None or self.track_total is not None
+
+
+@dataclass(frozen=True, slots=True)
 class _Ranking:
     """The confirm fetch stage's verdict: the representative and the candidate rows."""
 
@@ -475,6 +493,7 @@ class _Lookups:
 # --- public entry --------------------------------------------------------------------
 
 
+@ledger_lock.mutating
 def resolve_songs(  # noqa: PLR0913 - cohesive keyword-only scope + injection params
     settings: Settings,
     *,
@@ -812,7 +831,7 @@ def _titled_recordings(result: AcoustidResult | None) -> tuple[AcoustidRecording
     """Return every titled recording at the score floor, one per id, keeping the most sources."""
     best: dict[str, AcoustidRecording] = {}
     for match in result.results if result is not None else ():
-        if match.score < _SCORE_FLOOR:
+        if match.score < SCORE_FLOOR:
             continue
         for recording in match.recordings:
             kept = best.get(recording.id)
@@ -829,9 +848,9 @@ def _qualifiers(text: str) -> frozenset[str]:
 def _stem_holds(title: str, stem: str) -> bool:
     """Whether the folded filename *stem* contains the qualifier-stripped folded *title*."""
     bare = _QUALIFIER.sub(" ", title)
-    key = alnum_key(bare)
+    key = alnum_script_key(bare)
     if key:
-        return key in alnum_key(stem)
+        return key in alnum_script_key(stem)
     loose = loose_key(bare)
     return bool(loose) and loose in loose_key(stem)
 
@@ -1031,7 +1050,9 @@ def _artist_review(ballot: _Ballot) -> dict[str, object] | None:
     """Return a gated artist-less target's review row naming its one credited artist, else None.
 
     Every dominant recording must credit exactly one artist, the same id on each. The artist
-    axis owns ``artist``, so the song axis proposes it whatever the target's song outcome.
+    axis owns ``artist``, so the song axis only proposes it. A target gets the row when its
+    folder takes the anchored or convergence route, whatever its outcome there. A rebind folder
+    and a folder a MusicBrainz error stops get none.
     """
     voter = ballot.voter
     dominant_credits = [recording.artists for recording in ballot.gate.dominant]
@@ -1078,25 +1099,14 @@ def _is_blank(name: str, value: str) -> bool:
     return not text or (name == _TITLE and _PLACEHOLDER_TITLE.match(text) is not None)
 
 
-def _medium(release: MBRelease, track: MBTrack) -> MBMedium | None:
-    """Return the medium holding *track*, by identity."""
-    return next((m for m in release.media if any(t is track for t in m.tracks)), None)
-
-
 def _track_count(medium: MBMedium | None) -> int:
     """Return how many tracks *medium* holds, 0 when unknown."""
     return 0 if medium is None else medium.track_count or len(medium.tracks)
 
 
-def _total(value: str) -> int | None:
-    """Return the total of an ``n/total`` tag value, or ``None`` when it carries none."""
-    _head, slash, tail = value.partition("/")
-    return parse_position(tail) if slash else None
-
-
 def _want(release: MBRelease, track: MBTrack, *, totals: bool) -> dict[str, str]:
     """Return what the release says each song field should hold."""
-    medium = _medium(release, track)
+    medium = release_match.medium_holding(release, track)
     track_count = _track_count(medium)
     disc = 0 if medium is None else medium.position
     media = len(release.media)
@@ -1109,9 +1119,9 @@ def _want(release: MBRelease, track: MBTrack, *, totals: bool) -> dict[str, str]
 def _agrees(name: str, have: str, release: MBRelease, track: MBTrack, *, totals: bool) -> bool:
     """Whether a non-blank song field agrees with *track* on *release* (the verified rule)."""
     if name == _TITLE:
-        return release_match.text_key(have) == release_match.text_key(track.title)
-    medium = _medium(release, track)
-    total = _total(have)
+        return display_key(have) == display_key(track.title)
+    medium = release_match.medium_holding(release, track)
+    total = parse_total(have)
     if name == _TRACK:
         expected_total = _track_count(medium)
         position_ok = release_match.track_number_agrees(release_match.position(have), track)
@@ -1182,6 +1192,57 @@ def _narrow(family: list[str], refs: dict[str, list[AcoustidReleaseRef]], count:
     return by_medium or family
 
 
+def _one_value(values: set[int | None]) -> int | None:
+    """Return the one value of *values*, else ``None``."""
+    return next(iter(values)) if len(values) == 1 else None
+
+
+def _tag_totals(ballots: list[_Ballot]) -> _TagTotals:
+    """Read the totals and the disc number every voter that carries one agrees on."""
+    disc_values = [ballot.voter.value(_DISC) for ballot in ballots]
+    track_values = [ballot.voter.value(_TRACK) for ballot in ballots]
+    disc_totals = {parse_total(value) for value in disc_values} - {None}
+    track_totals = {parse_total(value) for value in track_values} - {None}
+    discs = {parse_position(value) for value in disc_values if value}
+    return _TagTotals(
+        disc_total=_one_value(disc_totals),
+        track_total=_one_value(track_totals),
+        disc=_one_value(discs) if discs else 1,
+    )
+
+
+def _narrow_by_totals(
+    family: list[str],
+    refs: dict[str, list[AcoustidReleaseRef]],
+    tag_totals: _TagTotals,
+) -> list[str]:
+    """Keep the members holding the voters' disc total, then their track total on their disc.
+
+    A total no member holds is ignored, so a tag the whole family contradicts narrows nothing.
+    """
+    narrowed = family
+    disc_total = tag_totals.disc_total
+    track_total = tag_totals.track_total
+    disc = tag_totals.disc
+
+    if disc_total is not None:
+        by_disc_total = [
+            rid for rid in narrowed if any(ref.medium_count == disc_total for ref in refs[rid])
+        ]
+        narrowed = by_disc_total or narrowed
+    if track_total is not None and disc is not None:
+        by_track_total = [
+            rid
+            for rid in narrowed
+            if any(
+                ref.medium_position == disc and ref.medium_track_count == track_total
+                for ref in refs[rid]
+            )
+        ]
+        narrowed = by_track_total or narrowed
+    return narrowed
+
+
 def _uniform_totals(narrowed: list[str], refs: dict[str, list[AcoustidReleaseRef]]) -> bool:
     """Whether every narrowed member gives each medium one track count and one medium count."""
     members = [ref for rid in narrowed for ref in refs[rid]]
@@ -1192,11 +1253,12 @@ def _uniform_totals(narrowed: list[str], refs: dict[str, list[AcoustidReleaseRef
     return len(medium_counts) == 1 and all(len(counts) == 1 for counts in per_medium.values())
 
 
-def _converge(ballots: list[_Ballot]) -> _Convergence | None:
+def _converge(ballots: list[_Ballot], tag_totals: _TagTotals | None) -> _Convergence | None:
     """Run the folder convergence stage, or return ``None`` when the floor is missed.
 
     The floor applies twice: to the voters the recording gate passes and to the voters the
-    max-coverage family covers.
+    max-coverage family covers. *tag_totals* narrows the family when the voters agree on one.
+    Otherwise, and always for a rebind report, which passes ``None``, the voter count does.
     """
     required = _required_voters(len(ballots))
     gated = [ballot for ballot in ballots if ballot.gate.passed]
@@ -1212,7 +1274,11 @@ def _converge(ballots: list[_Ballot]) -> _Convergence | None:
         rid: [ref for ballot in gated for ref in ballot.gate.refs() if ref.id == rid]
         for rid in family
     }
-    narrowed = _narrow(family, refs, len(ballots))
+    narrowed = (
+        _narrow_by_totals(family, refs, tag_totals)
+        if tag_totals is not None and tag_totals.agreed
+        else _narrow(family, refs, len(ballots))
+    )
     names = {
         ballot.voter.file_id: frozenset(
             (ref.medium_position, ref.track_position)
@@ -1320,7 +1386,7 @@ def _anchored(ballots: list[_Ballot], lookups: _Lookups) -> list[_Outcome]:
         if not slots:
             outcomes.append(_held(ballot, "release_mismatch", "not_on_release", release_mbid))
         elif len(slots) > 1:
-            outcomes.append(_held(ballot, "unconverged", "two_slots", release_mbid))
+            outcomes.append(_held(ballot, "unconverged", "ambiguous_slot", release_mbid))
         elif others := sorted(claims[slots[0].key] - {ballot.voter.file_id}):
             outcomes.append(
                 _held(
@@ -1333,11 +1399,18 @@ def _anchored(ballots: list[_Ballot], lookups: _Lookups) -> list[_Outcome]:
 
 
 def _converged(ballots: list[_Ballot], lookups: _Lookups) -> list[_Outcome]:
-    """Settle an id-less folder on the one Official release its voters converge on."""
+    """Settle an id-less folder on the one Official release its voters converge on.
+
+    A voter count below the floor matches a single or an EP as well as a partial album, so a
+    folder that small converges only on the totals its tags carry.
+    """
     targets = [ballot for ballot in ballots if ballot.voter.target]
-    convergence = _converge(ballots)
+    tag_totals = _tag_totals(ballots)
+    convergence = _converge(ballots, tag_totals)
     if convergence is None:
         return [_held_or_ungated(b, "unconverged", "floor_missed", "") for b in targets]
+    if not tag_totals.agreed and len(ballots) < _FLOOR_VOTERS:
+        return [_held_or_ungated(b, "unconverged", "needs_release_mbid", "") for b in targets]
     ranking = _confirm(convergence.narrowed, convergence.refs, _carried(ballots), lookups)
     release = ranking.representative
     if release is None:
@@ -1401,7 +1474,7 @@ def _rebind_report(ballots: list[_Ballot], lookups: _Lookups) -> dict[str, objec
                 "status": _status_of(release),
             },
         )
-    convergence = _converge(ballots)
+    convergence = _converge(ballots, None)
     ranked = (
         []
         if convergence is None
@@ -1482,7 +1555,7 @@ class _AutoRun:
         self._tally = tally
         self._dry_run = dry_run
         self._scoped = scoped
-        self._now = datetime.now(UTC)
+        self._now = datetime.fromisoformat(clock.utc_now())
 
     def resolve(
         self,
@@ -1617,27 +1690,35 @@ class _AutoRun:
 
     def _stage_fill(self, outcome: _Outcome) -> bool:
         """Stage one fill (``origin='auto'``, blank fields only). Return whether it settles."""
-        if self._dry_run:
-            self._tally.staged_files += 1
-            if self._scoped and outcome.row is not None:
-                self._tally.mappings.append(outcome.row)
-            return True
         try:
-            staged = staging.stage_tags(
-                self._settings,
-                file_id=outcome.file_id,
-                tags=outcome.fill,
-                origin="auto",
-                note=outcome.note,
-                fill_only=outcome.fill_only,
-            )
+            if self._dry_run:
+                staged = staging.would_stage(
+                    self._settings,
+                    self._conn,
+                    file_id=outcome.file_id,
+                    tags=outcome.fill,
+                    fill_only=outcome.fill_only,
+                )
+            else:
+                staged = staging.stage_tags(
+                    self._settings,
+                    file_id=outcome.file_id,
+                    tags=outcome.fill,
+                    origin="auto",
+                    note=outcome.note,
+                    fill_only=outcome.fill_only,
+                )
         except ValueError as exc:
+            logger.warning("song: file_id=%d not staged: %s", outcome.file_id, exc)
             self._tally.add_error(outcome.file_id, str(exc))
             return False
         # Disk gained every value since the scan: nothing staged, and the next rescan re-opens it.
-        if staged:
-            self._tally.staged_files += 1
-        return staged
+        if not staged:
+            return False
+        self._tally.staged_files += 1
+        if self._dry_run and self._scoped and outcome.row is not None:
+            self._tally.mappings.append(outcome.row)
+        return True
 
     def _hold(self, outcome: _Outcome) -> None:
         """Count one held target and keep its row, plus its review row when it has one."""
@@ -1667,7 +1748,8 @@ def _resolve_release(  # noqa: PLR0913 - cohesive keyword-only run inputs
     A file in *assigned* sits on the track the operator named instead of its audio's tracks.
     All or nothing: one unassigned file stages nothing. Returns the release block and the
     unassigned rows. Raises :class:`ValueError` when MusicBrainz holds no such release, a
-    listed file is missing on disk or an assignment is refused.
+    listed file is missing on disk, an assignment is refused or staging refuses a stamp. A dry
+    run runs the same staging refusals.
     """
     # A stamp writes the release's track ids, which MusicBrainz replaces over time, so a real
     # run reads the current tracklist and a dry run keeps reading the cache.
@@ -1678,7 +1760,7 @@ def _resolve_release(  # noqa: PLR0913 - cohesive keyword-only run inputs
     rows = _present_rows(conn, scoped_ids)
     operator_slots = _operator_slots(release, assigned, scoped_ids)
 
-    evidence = _prefetch(conn, rows, lookups, datetime.now(UTC))
+    evidence = _prefetch(conn, rows, lookups, datetime.fromisoformat(clock.utc_now()))
     ballots: list[_Ballot] = []
     for row in rows:
         voter = _Voter(row=row, tags=store.get_tags(conn, row.id), target=True, unsettled=True)
@@ -1711,6 +1793,8 @@ def _resolve_release(  # noqa: PLR0913 - cohesive keyword-only run inputs
         return block, unassigned
     tally.staged_files = len(stamps)
     if dry_run:
+        for voter, stamp, _ in stamps:
+            staging.would_stage(settings, conn, file_id=voter.file_id, tags=stamp)
         tally.mappings = [
             _mapping(voter, release.mbid, stamp, placed_by=placed_by)
             for voter, stamp, placed_by in stamps
@@ -1737,28 +1821,23 @@ def _present_rows(conn: sqlite3.Connection, file_ids: list[int]) -> list[store.F
     return rows
 
 
+def _checked_track_id(track_mbid: object) -> str:
+    """Return one assignment's release track id stripped, or raise :class:`ValueError`."""
+    if not isinstance(track_mbid, str) or not track_mbid.strip():
+        message = "release_track_mbid must be an id"
+        raise ValueError(message)
+    return track_mbid.strip()
+
+
 def _assignment_map(assignments: Sequence[object]) -> dict[int, str]:
     """Narrow *assignments* to ``{file_id: release_track_mbid}``, or raise :class:`ValueError`.
 
     Each entry is a ``(file_id, release_track_mbid)`` tuple, and each file is assigned once.
     """
-    assigned: dict[int, str] = {}
-    for index, entry in enumerate(assignments):
-        if not isinstance(entry, tuple) or len(entry) != _ASSIGNMENT_WIDTH:
-            message = f"assignment {index}: expected a (file_id, release_track_mbid) pair"
-            raise ValueError(message)
-        file_id, track_mbid = entry
-        if not isinstance(file_id, int) or isinstance(file_id, bool):
-            message = f"assignment {index}: file_id must be an integer, got {file_id!r}"
-            raise ValueError(message)  # noqa: TRY004 - every assignment rejection is a ValueError
-        if not isinstance(track_mbid, str) or not track_mbid.strip():
-            message = f"assignment {index} (file_id={file_id}): release_track_mbid must be an id"
-            raise ValueError(message)
-        if file_id in assigned:
-            message = f"file_id={file_id} is assigned more than once"
-            raise ValueError(message)
-        assigned[file_id] = track_mbid.strip()
-    return assigned
+    pairs = validate_file_pairs(
+        assignments, value_name="release_track_mbid", check_value=_checked_track_id
+    )
+    return dict(pairs)
 
 
 def _operator_slots(
@@ -1869,7 +1948,7 @@ def _stamp(release: MBRelease, track: MBTrack, voter: _Voter) -> dict[str, list[
     field of :data:`_KEPT_ON_OWN_RECORDING` on the file's own recording. ``originaldate`` on
     the file's own release is written only when it refines the file's value (:func:`_refines`).
     """
-    medium = _medium(release, track)
+    medium = release_match.medium_holding(release, track)
     track_count = _track_count(medium)
     own_release = voter.value(_ALBUM_ID) == release.mbid
     own_recording = voter.value(_RECORDING_ID) == track.recording_mbid

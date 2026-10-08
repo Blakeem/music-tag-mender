@@ -17,11 +17,18 @@ from typing import TYPE_CHECKING
 import pytest
 
 from conftest import make_track
-from tagmend.engine import commits, store, versioning
+from tagmend.engine import commits, health, resync, store, versioning
 from tagmend.engine.db import connect
 from tagmend.engine.library import scan_library
 from tagmend.engine.schema import apply_append_only_triggers, apply_schema
-from tagmend.engine.tags import MANAGED_TAGS, read_tags, write_managed_tags
+from tagmend.engine.tags import (
+    MANAGED_TAGS,
+    TagWriteError,
+    TagWriteResult,
+    TrackTags,
+    read_tags,
+    write_managed_tags,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -39,6 +46,8 @@ _ALL_MANAGED_TAGS = {
     "artist": ["Artist"],
     "artists": ["Artist", "Guest"],
     "albumartist": ["Album Artist"],
+    "album artist": ["Album Artist"],
+    "album_artist": ["Album Artist"],
     "originaldate": ["1985"],
     "musicbrainz_artistid": ["mb-artist"],
     "title": ["Title"],
@@ -316,7 +325,7 @@ def test_revert_to_empty_baseline_clears_every_managed_tag(
     music_dir: Path,
 ) -> None:
     # The revert-fidelity defect in full: a v0 baseline captured with NO managed tags means
-    # all 26 were empty, so reverting to it must delete all 26. Before the managed-set stamp
+    # all 28 were empty, so reverting to it must delete all 28. Before the managed-set stamp
     # the 13 widened fields were preserved instead and the revert reported success while the
     # file kept them.
     assert set(_ALL_MANAGED_TAGS) == MANAGED_TAGS
@@ -326,7 +335,7 @@ def test_revert_to_empty_baseline_clears_every_managed_tag(
 
     _baseline(engine_settings, file_id, {})
     assert _edit(engine_settings, track, file_id, _ALL_MANAGED_TAGS) == 1
-    assert set(read_tags(track).tags) >= MANAGED_TAGS  # all 26 really landed on disk
+    assert set(read_tags(track).tags) >= MANAGED_TAGS  # all 28 really landed on disk
 
     result = versioning.revert_tags(engine_settings, file_id, 0)
 
@@ -384,6 +393,72 @@ def _committed_track(settings: Settings, music_dir: Path) -> tuple[Path, int]:
     staging.stage_tags(settings, file_id=file_id, tags={"genre": ["Synthwave"]})
     staging.commit_tags(settings)
     return track, file_id
+
+
+def test_revert_refused_before_its_write_leaves_an_applied_commit_and_no_revision(
+    engine_settings: Settings,
+    music_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    track, file_id = _committed_track(engine_settings, music_dir)
+    history_before = len(_revisions(engine_settings, file_id))
+
+    def refuse(
+        path: Path, tags: dict[str, list[str]], *, droppable_frames: frozenset[str] = frozenset()
+    ) -> TagWriteResult:
+        del tags, droppable_frames
+        raise TagWriteError(path, ["refused"])
+
+    monkeypatch.setattr(versioning, "write_managed_tags", refuse)
+    with pytest.raises(TagWriteError, match="refused"):
+        versioning.revert_tags(engine_settings, file_id, 0)
+
+    latest = commits.list_commits(engine_settings, limit=1)[0]
+    assert (latest.origin, latest.status) == ("revert", "applied")
+    assert len(_revisions(engine_settings, file_id)) == history_before
+    assert read_tags(track).tags["genre"] == ["Synthwave"]
+
+
+def test_revert_failing_after_its_write_stays_applying_until_its_rerun_records_it(
+    engine_settings: Settings,
+    music_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    track, file_id = _committed_track(engine_settings, music_dir)
+    written: list[Path] = []
+
+    def write_and_note(
+        path: Path, tags: dict[str, list[str]], *, droppable_frames: frozenset[str] = frozenset()
+    ) -> TagWriteResult:
+        result = write_managed_tags(path, tags, droppable_frames=droppable_frames)
+        written.append(path)
+        return result
+
+    def read_until_written(path: Path) -> TrackTags:
+        if written:
+            message = "share dropped"
+            raise OSError(message)
+        return read_tags(path)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(versioning, "write_managed_tags", write_and_note)
+        patch.setattr(resync, "read_tags", read_until_written)
+        with pytest.raises(OSError, match="share dropped"):
+            versioning.revert_tags(engine_settings, file_id, 0)
+
+    interrupted = commits.list_commits(engine_settings, limit=1)[0]
+    assert (interrupted.origin, interrupted.status) == ("revert", "applying")
+    assert read_tags(track).tags["genre"] == ["Electronic"]
+    report = health._check_interrupted_commits(engine_settings.db_path)
+    assert f"({interrupted.id})" in report.detail
+    assert "revert_tags" in report.detail
+
+    assert versioning.revert_tags(engine_settings, file_id, 0).status == "reverted"
+    latest = _revisions(engine_settings, file_id)[-1]
+    assert (latest.origin, latest.diff) == (
+        "revert",
+        {"genre": {"from": ["Synthwave"], "to": ["Electronic"]}},
+    )
 
 
 def test_revert_dry_run_touches_nothing(engine_settings: Settings, music_dir: Path) -> None:

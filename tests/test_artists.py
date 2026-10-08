@@ -16,18 +16,25 @@ post-lookup correction gate (case-only, credit shrink, no MBID) has its own sect
 
 from __future__ import annotations
 
+import dataclasses
+import unicodedata
 from typing import TYPE_CHECKING, NamedTuple
 
 import mutagen
 import pytest
 
-from conftest import make_track
+from conftest import make_rvad_mp3, make_track, rejecting_lastfm_client
 from tagmend.engine import artists, axis, axis_status, staging, store, versioning
 from tagmend.engine.db import connect
-from tagmend.engine.lastfm import ArtistCorrection, LastfmError
+from tagmend.engine.lastfm import (
+    ArtistCorrection,
+    LastfmError,
+    LastfmKeyError,
+    LastfmUnavailableError,
+)
 from tagmend.engine.library import list_files as library_list
 from tagmend.engine.library import scan_library
-from tagmend.engine.musicbrainz import MBArtist
+from tagmend.engine.musicbrainz import MBArtist, MusicBrainzError, MusicBrainzUnavailableError
 from tagmend.engine.schema import apply_schema
 from tagmend.engine.tags import read_tags
 
@@ -63,6 +70,15 @@ def _file_id(settings: Settings, folder: Path, filename: str) -> int:
         row = store.get_file(conn, str(folder), filename)
         assert row is not None
         return row.id
+    finally:
+        conn.close()
+
+
+def _artist_outcome(settings: Settings, file_id: int) -> axis.OutcomeRow | None:
+    conn = connect(settings.db_path)
+    try:
+        apply_schema(conn)
+        return axis.get_outcome(conn, axis.ARTIST_AXIS, file_id)
     finally:
         conn.close()
 
@@ -235,6 +251,25 @@ def test_file_with_two_artist_values_is_skipped_as_multi_artist(
     assert len(staging.diff_tags(engine_settings)) == 0
 
 
+def test_a_multi_value_file_is_not_staged_through_its_artists_list(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    make_track(music_dir / "a.mp3", {"artist": ["Alpha '84"]})
+    make_track(
+        music_dir / "b.flac",
+        {"artist": ["Alpha '84", "Bravo"], "artists": ["Alpha '84", "Bravo"]},
+    )
+    scan_library(engine_settings)
+    a_id = _file_id(engine_settings, music_dir, "a.mp3")
+    fake = FakeCorrectionSource(_corrections("Alpha"))
+
+    result = artists.resolve_artists(engine_settings, client=fake)
+
+    assert result.staged_files == 1
+    assert [staged.file_id for staged in staging.diff_tags(engine_settings)] == [a_id]
+
+
 # --- (6) already-canonical + idempotent re-run ---------------------------------------
 
 
@@ -312,14 +347,21 @@ def test_no_correction_is_reported_not_an_error(
 class _FailingCorrectionSource(FakeCorrectionSource):
     """A :class:`FakeCorrectionSource` whose lookup for the given values always fails."""
 
-    def __init__(self, table: dict[str, ArtistCorrection | None], failing: set[str]) -> None:
+    def __init__(
+        self,
+        table: dict[str, ArtistCorrection | None],
+        failing: set[str],
+        error: type[LastfmError] = LastfmError,
+    ) -> None:
         super().__init__(table)
         self._failing = failing
+        self._error = error
 
     def artist_correction(self, name: str) -> ArtistCorrection | None:
         if name in self._failing:
+            self.lookups.append(name)
             message = "transport error"
-            raise LastfmError(message)
+            raise self._error(message)
         return super().artist_correction(name)
 
 
@@ -337,6 +379,29 @@ def test_lookup_error_is_counted_and_itemized(
     assert result.error_items == [{"key": "Obscure Band", "message": "transport error"}]
     assert result.to_dict()["error_items"] == result.error_items
     assert result.staged_files == 0
+    # A transient error writes no outcome row, so the file stays pending for a re-run.
+    assert _artist_outcome(engine_settings, _file_id(engine_settings, music_dir, "t.mp3")) is None
+
+
+def test_a_rejected_lastfm_key_stops_the_call(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    make_track(music_dir / "t.mp3", {"artist": ["Obscure Band"]})
+    make_track(music_dir / "u.mp3", {"artist": ["Other Band"]})
+    scan_library(engine_settings)
+
+    conn = connect(engine_settings.db_path)
+    try:
+        with (
+            rejecting_lastfm_client(conn) as client,
+            pytest.raises(LastfmKeyError, match="lastfm_api_key"),
+        ):
+            artists.resolve_artists(engine_settings, client=client)
+    finally:
+        conn.close()
+
+    assert staging.diff_tags(engine_settings) == []
 
 
 def test_result_follows_the_resolver_contract(engine_settings: Settings) -> None:
@@ -421,7 +486,7 @@ def test_normal_correction_still_stages_with_mbid_alongside_placeholder(
     assert read_tags(good).tags["musicbrainz_artistid"] == ["mbid-1"]
 
 
-# --- (7c) the correction gate: only substantive, MusicBrainz-backed names stage ------
+# --- (7c) the correction gate: a substantive name Last.fm pairs with an MBID stages --
 
 
 class _GateCase(NamedTuple):
@@ -435,13 +500,13 @@ class _GateCase(NamedTuple):
 
 
 _GATE_CASES = [
-    # A collapsed multi-artist credit is held whether or not MusicBrainz backs it.
+    # A collapsed multi-artist credit is held whether or not Last.fm pairs it with an MBID.
     _GateCase("Skrillex & The Doors", "Skrillex", "mbid-skrillex", "shrinks_credit", 0),
     _GateCase("The Offspring & Redman", "The Offspring", None, "shrinks_credit", 0),
     # Last.fm casing is not trustworthy, so a case-only difference is already canonical.
     _GateCase("Dååth", "DÅÅTH", "mbid-daath", "already_canonical", 0),
     _GateCase("ChthoniC", "Chthonic", None, "already_canonical", 0),
-    # A rename MusicBrainz does not corroborate is held for review, never silent.
+    # A rename Last.fm pairs with no MBID is held for review, never silent.
     _GateCase("Travis Scott", "Travi$ Scott", None, "needs_review", 0),
     # Diacritics are a spelling fix, not casing — with an MBID it stages.
     _GateCase("Antonio Carlos Jobim", "Antônio Carlos Jobim", "mbid-jobim", "corrected_values", 1),
@@ -597,6 +662,27 @@ def test_dry_run_returns_mappings_but_stages_nothing(
     assert len(staging.diff_tags(engine_settings)) == 0  # nothing actually staged
 
 
+def test_dry_run_itemizes_a_file_the_writer_refuses(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    make_track(music_dir / "plain.mp3", {"artist": ["Miami Nights '84"]})
+    make_rvad_mp3(music_dir / "loud.mp3", {"artist": ["Miami Nights '84"]})
+    scan_library(engine_settings)
+    loud_id = _file_id(engine_settings, music_dir, "loud.mp3")
+    fake = FakeCorrectionSource(
+        {"Miami Nights '84": ArtistCorrection("Miami Nights 1984", "mbid-1")},
+    )
+
+    preview = artists.resolve_artists(engine_settings, client=fake, dry_run=True)
+    real = artists.resolve_artists(engine_settings, client=fake)
+
+    assert preview.staged_files == real.staged_files == 1
+    assert [item["key"] for item in preview.error_items] == [f"file_id={loud_id}"]
+    assert "RVAD" in preview.error_items[0]["message"]
+    assert preview.error_items == real.error_items
+
+
 def test_dry_run_ignores_empty_staging_precondition(
     engine_settings: Settings,
     music_dir: Path,
@@ -671,6 +757,23 @@ def test_limit_caps_files_and_reports_pending(
     assert first.more is True
 
 
+def test_an_omitted_limit_caps_the_selection_at_the_setting(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    for name in ("a.mp3", "b.mp3", "c.mp3"):
+        make_track(music_dir / name, {"artist": [f"{name[0].upper()} '84"]})
+    scan_library(engine_settings)
+    capped = dataclasses.replace(engine_settings, artist_stage_limit=2)
+    fake = FakeCorrectionSource({})
+
+    result = artists.resolve_artists(capped, client=fake)
+
+    assert (result.settled, result.pending_remaining, result.more) == (2, 1, True)
+    assert fake.lookups == ["A '84", "B '84"]
+    assert "Call again to continue" in result.summary
+
+
 def test_two_identical_dry_runs_reprocess_the_same_values(
     engine_settings: Settings,
     music_dir: Path,
@@ -732,6 +835,265 @@ def test_two_capped_runs_with_a_commit_between_advance_the_frontier(
     assert second.pending_remaining == 0
     assert second.more is False
     assert mb.lookups == []
+
+
+def _corrections(*names: str) -> dict[str, ArtistCorrection | None]:
+    """Map each ``X '84`` name to the correction ``X 1984``."""
+    return {
+        f"{name} '84": ArtistCorrection(f"{name} 1984", f"mbid-{name.lower()}") for name in names
+    }
+
+
+def test_refused_files_at_the_front_never_fill_the_window(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    for name in ("a_loud.mp3", "b_loud.mp3"):
+        make_rvad_mp3(music_dir / name, {"artist": ["Alpha '84"]})
+    for name, artist in (("c.mp3", "Charlie"), ("d.mp3", "Delta"), ("e.mp3", "Echo")):
+        make_track(music_dir / name, {"artist": [f"{artist} '84"]})
+    scan_library(engine_settings)
+    names = ("a_loud.mp3", "b_loud.mp3", "c.mp3", "d.mp3", "e.mp3")
+    ids = [_file_id(engine_settings, music_dir, name) for name in names]
+    assert ids == sorted(ids)
+    fake = FakeCorrectionSource(_corrections("Alpha", "Charlie", "Delta", "Echo"))
+
+    first = artists.resolve_artists(engine_settings, client=fake, limit=2)
+    staging.commit_tags(engine_settings)
+    second = artists.resolve_artists(engine_settings, client=fake, limit=2)
+
+    assert (first.settled, first.staged_files, first.more) == (2, 2, True)
+    assert [item["key"] for item in first.error_items] == [f"file_id={i}" for i in ids[:2]]
+    assert "Call again to continue" in first.summary
+    assert (second.settled, second.pending_remaining, second.more) == (1, 2, False)
+    assert _artist_outcome(engine_settings, ids[4]) is not None
+    assert "fail on every call" in second.summary
+    assert "Call again to continue" not in second.summary
+
+
+def test_an_unavailable_lookup_stops_the_refill(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    make_rvad_mp3(music_dir / "a_loud.mp3", {"artist": ["Alpha '84"]})
+    make_track(music_dir / "b.mp3", {"artist": ["Bravo '84"]})
+    make_track(music_dir / "c.mp3", {"artist": ["Charlie '84"]})
+    scan_library(engine_settings)
+    ids = [_file_id(engine_settings, music_dir, name) for name in ("a_loud.mp3", "b.mp3", "c.mp3")]
+    assert ids == sorted(ids)
+    fake = _FailingCorrectionSource(
+        _corrections("Alpha", "Charlie"),
+        failing={"Bravo '84"},
+        error=LastfmUnavailableError,
+    )
+
+    result = artists.resolve_artists(engine_settings, client=fake, limit=2)
+
+    assert (result.settled, result.pending_remaining, result.more) == (0, 3, False)
+    assert "Charlie '84" not in fake.lookups
+    assert _artist_outcome(engine_settings, ids[2]) is None
+    assert "Re-run to retry" in result.summary
+    assert "fail on every call" not in result.summary
+
+
+def test_a_lookup_failing_every_call_never_pins_the_window(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    make_rvad_mp3(music_dir / "a_loud.mp3", {"artist": ["Alpha '84"]})
+    make_track(music_dir / "b.mp3", {"artist": ["Bravo '84"]})
+    for name, artist in (("c.mp3", "Charlie"), ("d.mp3", "Delta"), ("e.mp3", "Echo")):
+        make_track(music_dir / name, {"artist": [f"{artist} '84"]})
+    scan_library(engine_settings)
+    names = ("a_loud.mp3", "b.mp3", "c.mp3", "d.mp3", "e.mp3")
+    ids = [_file_id(engine_settings, music_dir, name) for name in names]
+    assert ids == sorted(ids)
+    fake = _FailingCorrectionSource(
+        _corrections("Alpha", "Charlie", "Delta", "Echo"),
+        failing={"Bravo '84"},
+    )
+
+    result = artists.resolve_artists(engine_settings, client=fake, limit=2)
+
+    assert (result.settled, result.pending_remaining, result.more) == (2, 3, True)
+    assert [item["key"] for item in result.error_items] == ["Bravo '84", f"file_id={ids[0]}"]
+    assert all(_artist_outcome(engine_settings, fid) is not None for fid in ids[2:4])
+    assert "Re-run to retry" not in result.summary
+
+
+def test_a_value_failing_in_one_batch_is_not_asked_again_in_the_next(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    make_rvad_mp3(music_dir / "a_loud.mp3", {"artist": ["Alpha '84"]})
+    for name in ("b.mp3", "c.mp3"):
+        make_track(music_dir / name, {"artist": ["Bravo '84"]})
+    make_track(music_dir / "d.mp3", {"artist": ["Delta '84"]})
+    make_track(music_dir / "e.mp3", {"artist": ["Echo '84"]})
+    scan_library(engine_settings)
+    names = ("a_loud.mp3", "b.mp3", "c.mp3", "d.mp3", "e.mp3")
+    ids = [_file_id(engine_settings, music_dir, name) for name in names]
+    assert ids == sorted(ids)
+    fake = _FailingCorrectionSource(
+        _corrections("Alpha", "Delta", "Echo"),
+        failing={"Bravo '84"},
+    )
+
+    result = artists.resolve_artists(engine_settings, client=fake, limit=2)
+
+    assert fake.lookups.count("Bravo '84") == 1
+    assert result.settled == 2
+    assert _artist_outcome(engine_settings, ids[2]) is None
+    assert all(_artist_outcome(engine_settings, fid) is not None for fid in ids[3:])
+
+
+def test_a_carrier_staged_by_two_batches_holds_both_corrections(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    make_rvad_mp3(music_dir / "a_loud.mp3", {"artist": ["Alpha '84"]})
+    make_track(music_dir / "b.mp3", {"artist": ["Alpha '84"], "albumartist": ["Bravo '84"]})
+    scan_library(engine_settings)
+    b_id = _file_id(engine_settings, music_dir, "b.mp3")
+    fake = FakeCorrectionSource(_corrections("Alpha", "Bravo"))
+
+    a_id = _file_id(engine_settings, music_dir, "a_loud.mp3")
+    assert a_id < b_id
+
+    result = artists.resolve_artists(engine_settings, client=fake, limit=1)
+
+    assert (result.settled, result.staged_files) == (1, 1)
+    assert [item["key"] for item in result.error_items] == [f"file_id={a_id}"]
+    [staged] = staging.diff_tags(engine_settings)
+    assert staged.file_id == b_id
+    assert staged.target["artist"] == ["Alpha 1984"]
+    assert staged.target["albumartist"] == ["Bravo 1984"]
+    staging.commit_tags(engine_settings)
+    conn = connect(engine_settings.db_path)
+    try:
+        assert store.derived_status(conn, axis.ARTIST_AXIS, b_id) == "done"
+    finally:
+        conn.close()
+
+
+def test_a_carrier_refused_once_is_itemized_once(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    make_rvad_mp3(music_dir / "p_loud.mp3", {"artist": ["Alpha '84"]})
+    make_track(music_dir / "q.mp3", {"artist": ["Bravo '84"]})
+    make_rvad_mp3(
+        music_dir / "r_loud.mp3",
+        {"artist": ["Alpha '84"], "albumartist": ["Bravo '84"]},
+    )
+    scan_library(engine_settings)
+    ids = [_file_id(engine_settings, music_dir, n) for n in ("p_loud.mp3", "q.mp3", "r_loud.mp3")]
+    assert ids == sorted(ids)
+    fake = FakeCorrectionSource(_corrections("Alpha", "Bravo"))
+
+    result = artists.resolve_artists(engine_settings, client=fake, limit=1)
+
+    assert [item["key"] for item in result.error_items] == [
+        f"file_id={ids[0]}",
+        f"file_id={ids[2]}",
+    ]
+    assert result.settled == 1
+
+
+def test_a_dry_run_reads_past_refused_files_as_the_real_run_does(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    for name in ("a_loud.mp3", "b_loud.mp3"):
+        make_rvad_mp3(music_dir / name, {"artist": ["Alpha '84"]})
+    for name, artist in (("c.mp3", "Charlie"), ("d.mp3", "Delta"), ("e.mp3", "Echo")):
+        make_track(music_dir / name, {"artist": [f"{artist} '84"]})
+    scan_library(engine_settings)
+    names = ("a_loud.mp3", "b_loud.mp3", "c.mp3", "d.mp3", "e.mp3")
+    ids = [_file_id(engine_settings, music_dir, name) for name in names]
+    assert ids == sorted(ids)
+    fake = FakeCorrectionSource(_corrections("Alpha", "Charlie", "Delta", "Echo"))
+
+    preview = artists.resolve_artists(engine_settings, client=fake, limit=2, dry_run=True)
+    real = artists.resolve_artists(engine_settings, client=fake, limit=2)
+
+    assert (preview.settled, preview.staged_files) == (real.settled, real.staged_files) == (2, 2)
+    assert preview.error_items == real.error_items
+    assert preview.mappings == real.mappings
+
+
+def test_a_musicbrainz_outage_stops_the_refill(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    make_rvad_mp3(music_dir / "a_loud.mp3", {"artist": ["Alpha '84"]})
+    make_track(music_dir / "b.mp3", {"artist": ["BRAVO"], "musicbrainz_artistid": ["mbid-b"]})
+    make_track(music_dir / "c.mp3", {"artist": ["Charlie '84"]})
+    scan_library(engine_settings)
+    lastfm = FakeCorrectionSource(_corrections("Alpha", "Charlie"))
+    mb = _FailingArtistSource({}, error=MusicBrainzUnavailableError)
+
+    result = artists.resolve_artists(engine_settings, client=lastfm, mb_client=mb, limit=2)
+
+    assert (result.settled, result.pending_remaining, result.more) == (0, 3, False)
+    assert mb.lookups == ["mbid-b"]
+    assert "Charlie '84" not in lastfm.lookups
+    assert "Re-run to retry" in result.summary
+
+
+@pytest.mark.parametrize("rejected", [True, False], ids=["rejected_key", "no_key"])
+def test_a_fatal_error_in_a_later_batch_keeps_what_earlier_batches_staged(
+    engine_settings: Settings,
+    music_dir: Path,
+    rejected: bool,  # noqa: FBT001 - pytest parametrize argument
+) -> None:
+    make_rvad_mp3(
+        music_dir / "a_loud.mp3", {"artist": ["ALPHA"], "musicbrainz_artistid": ["mbid-a"]}
+    )
+    make_track(music_dir / "b.mp3", {"artist": ["BRAVO"], "musicbrainz_artistid": ["mbid-b"]})
+    make_track(music_dir / "c.mp3", {"artist": ["Charlie '84"]})
+    scan_library(engine_settings)
+    ids = [_file_id(engine_settings, music_dir, n) for n in ("a_loud.mp3", "b.mp3", "c.mp3")]
+    assert ids == sorted(ids)
+    mb = FakeArtistSource(
+        {"mbid-a": _mb("Alpha", mbid="mbid-a"), "mbid-b": _mb("Bravo", mbid="mbid-b")},
+    )
+    keyless = dataclasses.replace(engine_settings, lastfm_api_key=None)
+    expected: type[Exception] = LastfmKeyError if rejected else ValueError
+    conn = connect(engine_settings.db_path)
+    try:
+        with rejecting_lastfm_client(conn) as rejecting, pytest.raises(expected):
+            artists.resolve_artists(
+                engine_settings if rejected else keyless,
+                client=rejecting if rejected else None,
+                mb_client=mb,
+                limit=2,
+            )
+    finally:
+        conn.close()
+
+    assert [staged.file_id for staged in staging.diff_tags(engine_settings)] == [ids[1]]
+    assert _artist_outcome(engine_settings, ids[1]) is not None
+    assert _artist_outcome(engine_settings, ids[2]) is None
+
+
+def test_a_refused_file_left_after_a_cascade_says_it_fails_on_every_call(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    make_rvad_mp3(music_dir / "a_loud.mp3", {"artist": ["Alpha '84"]})
+    for name in ("b.mp3", "c.mp3"):
+        make_track(music_dir / name, {"artist": ["Bravo '84"]})
+    scan_library(engine_settings)
+    ids = [_file_id(engine_settings, music_dir, n) for n in ("a_loud.mp3", "b.mp3", "c.mp3")]
+    assert ids == sorted(ids)
+    fake = FakeCorrectionSource(_corrections("Alpha", "Bravo"))
+
+    result = artists.resolve_artists(engine_settings, client=fake, limit=1)
+
+    assert (result.settled, result.staged_files, result.pending_remaining) == (1, 2, 1)
+    assert result.more is False
+    assert "fail on every call" in result.summary
 
 
 # --- (11) revert round-trip across all four formats ----------------------------------
@@ -957,6 +1319,47 @@ def test_mb_tier_fixes_casing_that_the_lastfm_tier_would_ignore(
     assert lastfm.lookups == []
 
 
+class _FailingArtistSource(FakeArtistSource):
+    """A :class:`FakeArtistSource` whose every lookup fails transiently."""
+
+    def __init__(
+        self,
+        table: dict[str, MBArtist | None],
+        error: type[MusicBrainzError] = MusicBrainzError,
+    ) -> None:
+        super().__init__(table)
+        self._error = error
+
+    def artist_by_mbid(self, mbid: str) -> MBArtist | None:
+        self.lookups.append(mbid)
+        message = "transport error"
+        raise self._error(message)
+
+
+def test_mb_tier_transient_error_keeps_the_value_from_lastfm(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    make_track(
+        music_dir / "a.mp3",
+        {"artist": ["Solar Feelds"], "musicbrainz_artistid": ["mbid-1"]},
+    )
+    scan_library(engine_settings)
+    file_id = _file_id(engine_settings, music_dir, "a.mp3")
+
+    lastfm = FakeCorrectionSource({"Solar Feelds": ArtistCorrection("Solar Fields", "other-mbid")})
+    mb = _FailingArtistSource({})
+    result = artists.resolve_artists(engine_settings, client=lastfm, mb_client=mb)
+
+    assert mb.lookups == ["mbid-1"]
+    # A Last.fm answer would overwrite the file's own MBID with Last.fm's id.
+    assert lastfm.lookups == []
+    assert result.errors == 1
+    assert result.error_items == [{"key": "Solar Feelds", "message": "transport error"}]
+    assert result.staged_files == 0
+    assert _artist_outcome(engine_settings, file_id) is None
+
+
 def test_mb_tier_merges_a_registered_alias_onto_the_canonical_name(
     engine_settings: Settings,
     music_dir: Path,
@@ -1001,6 +1404,46 @@ def test_mb_tier_matches_an_alias_under_typographic_folding(
     assert result.corrected_values == 1
     assert result.mappings[0]["to"] == "Jean\u2010Michel Jarre"
     assert result.mappings[0]["source"] == "musicbrainz"
+
+
+def test_mb_tier_stages_a_decomposed_spelling_of_the_canonical_name(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    composed = unicodedata.normalize("NFC", "Björk")
+    make_track(
+        music_dir / "a.mp3",
+        {
+            "artist": [unicodedata.normalize("NFD", composed)],
+            "musicbrainz_artistid": ["mbid-1"],
+        },
+    )
+    scan_library(engine_settings)
+
+    result = artists.resolve_artists(
+        engine_settings,
+        client=FakeCorrectionSource({}),
+        mb_client=FakeArtistSource({"mbid-1": _mb(composed)}),
+    )
+
+    assert [(m["to"], m["source"]) for m in result.mappings] == [(composed, "musicbrainz")]
+    assert result.name_id_disagreement_values == []
+
+
+def test_lastfm_tier_reads_a_decomposed_casing_difference_as_canonical(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    decomposed = unicodedata.normalize("NFD", "björk")
+    make_track(music_dir / "a.mp3", {"artist": [decomposed]})
+    scan_library(engine_settings)
+
+    correction = ArtistCorrection(unicodedata.normalize("NFC", "Björk"), "mbid-1")
+    fake = FakeCorrectionSource({decomposed: correction})
+    result = artists.resolve_artists(engine_settings, client=fake)
+
+    assert result.already_canonical_values == [decomposed]
+    assert result.staged_files == 0
 
 
 def test_mb_tier_leaves_an_exactly_canonical_name_alone(
@@ -1075,7 +1518,7 @@ def test_mb_tier_reports_a_name_that_is_no_name_for_its_own_mbid(
         {
             "from": "Tattooed Corpse",
             "to": "Emily Browning",
-            "mbid": "mbid-1",
+            "mbids": ["mbid-1"],
             "reason": "no name MusicBrainz records for this id",
         },
     ]
@@ -1132,6 +1575,14 @@ def test_a_value_carrying_two_different_mbids_is_reported_not_staged(
 
     assert result.staged_files == 0
     assert result.name_id_disagreement == 1
+    assert result.name_id_disagreement_values == [
+        {
+            "from": "Ambiguous",
+            "to": None,
+            "mbids": ["mbid-1", "mbid-2"],
+            "reason": "the library pairs this name with more than one MusicBrainz id",
+        },
+    ]
     # Neither tier may act on a value the library cannot even identify consistently.
     assert mb.lookups == []
     assert lastfm.lookups == []

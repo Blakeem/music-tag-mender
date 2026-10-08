@@ -8,28 +8,14 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Final
 
-from tagmend.engine.detector_core import parse_position
+from tagmend.engine.detector_core import parse_position, position_head
 from tagmend.engine.text_keys import display_key
 
 if TYPE_CHECKING:
-    from tagmend.engine.musicbrainz import MBRelease, MBTrack
-
-_SLASH: Final = "/"
+    from tagmend.engine.musicbrainz import MBMedium, MBRelease, MBTrack
 
 # Picard omits ``discnumber`` on a single-medium release, so only a longer release proposes one.
 _SINGLE_MEDIUM: Final = 1
-
-
-def text_key(value: str) -> str:
-    """Return the comparison key for a free-text tag.
-
-    Shares :func:`tagmend.engine.text_keys.display_key` with the album-conflict detector, so
-    the two agree on what is cosmetic: casing, typographic character choice and whitespace
-    runs. MusicBrainz writes typographic punctuation and taggers write ASCII, and no consumer
-    distinguishes the two, so a curly apostrophe against a straight one is not a finding.
-    Other punctuation stays significant: a colon against a hyphen is a real difference.
-    """
-    return display_key(value)
 
 
 def album_status(release: MBRelease) -> str:
@@ -50,9 +36,7 @@ def position(value: str | None) -> str:
     number = parse_position(value)
     if number is not None:
         return str(number)
-    if not value:
-        return ""
-    return value.split(_SLASH, 1)[0].strip()
+    return position_head(value)
 
 
 def track_number_agrees(have: str, track: MBTrack) -> bool:
@@ -62,22 +46,25 @@ def track_number_agrees(have: str, track: MBTrack) -> bool:
     sequential position, so the two strings differ on every file of such a release without
     anything being wrong. Either spelling is a defensible reading, so either is accepted.
     """
-    return text_key(have) in {
-        text_key(position(track.number)),
-        text_key(position(str(track.position))),
+    return display_key(have) in {
+        display_key(position(track.number)),
+        display_key(position(str(track.position))),
     }
 
 
-def medium_of(release: MBRelease, track: MBTrack) -> int:
-    """Return the 1-based disc position of the medium holding *track*, or 0 if unknown.
+def medium_holding(release: MBRelease, track: MBTrack) -> MBMedium | None:
+    """Return the medium of *release* holding *track*, or None if none holds it.
 
     Identity, not equality: :class:`MBTrack` is a frozen dataclass, so two equal-valued tracks
     on different media would otherwise resolve to whichever medium came first.
     """
-    return next(
-        (m.position for m in release.media if any(t is track for t in m.tracks)),
-        0,
-    )
+    return next((m for m in release.media if any(t is track for t in m.tracks)), None)
+
+
+def medium_of(release: MBRelease, track: MBTrack) -> int:
+    """Return the 1-based disc position of the medium holding *track*, or 0 if unknown."""
+    medium = medium_holding(release, track)
+    return 0 if medium is None else medium.position
 
 
 def disc_expectation(release: MBRelease, track: MBTrack) -> str:

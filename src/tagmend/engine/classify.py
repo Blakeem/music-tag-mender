@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING, Final
 
 import yaml
 
-from tagmend.engine.text_keys import alnum_key
+from tagmend.engine.text_keys import alnum_key, alnum_script_key
 from tagmend.log import get_logger
 
 if TYPE_CHECKING:
@@ -50,7 +50,8 @@ class Vocabulary:
     Built by :func:`load_vocabulary`. ``match`` folds an incoming Last.fm tag name and
     returns the canonical spelling to write, or ``None`` when the tag is not a known genre.
     ``denied_everywhere`` holds the canonical genres denied for every artist.
-    ``denied_for_artists`` maps a canonical genre to the artist fold-keys it is denied for.
+    ``denied_for_artists`` maps a canonical genre to the artist script keys
+    (:func:`tagmend.engine.text_keys.alnum_script_key`) it is denied for.
     """
 
     index: Mapping[str, str]
@@ -65,7 +66,7 @@ class Vocabulary:
         """Return whether the overlay denies canonical *genre* for lookup *artist*."""
         if genre in self.denied_everywhere:
             return True
-        return alnum_key(artist) in self.denied_for_artists.get(genre, frozenset())
+        return alnum_script_key(artist) in self.denied_for_artists.get(genre, frozenset())
 
     def __len__(self) -> int:
         """Return the number of distinct fold-keys (matchable spellings) in the index."""
@@ -126,10 +127,7 @@ def _build_base_index(entries: Iterable[Mapping[str, object]]) -> dict[str, str]
             continue
         _claim_or_raise(index, alnum_key(name), name, label="name")
         for alias in _entry_aliases(entry):
-            key = alnum_key(alias)
-            if key in index and index[key] != name:
-                _claim_or_raise(index, key, name, label="alias", source=alias)
-            index.setdefault(key, name)
+            _claim_or_raise(index, alnum_key(alias), name, label="alias", source=alias)
     return index
 
 
@@ -213,7 +211,7 @@ def _build_deny_rules(
 ) -> tuple[frozenset[str], dict[str, frozenset[str]]]:
     """Resolve the overlay's ``deny:`` entries against the merged index (spec §4.5).
 
-    Returns the genres denied everywhere and, per genre, the artist fold-keys it is denied
+    Returns the genres denied everywhere and, per genre, the artist script keys it is denied
     for. An entry naming no vocabulary genre, or with an unusable ``artists`` value, is logged
     and skipped like an overlay collision. An absent ``artists`` key denies the genre everywhere.
     """
@@ -250,12 +248,12 @@ def _deny_genre(index: Mapping[str, str], entry: Mapping[str, object]) -> str | 
 
 
 def _deny_artist_keys(raw: object, genre: str) -> set[str]:
-    """Return the artist fold-keys of one deny entry, logging every name it cannot use.
+    """Return the artist script keys of one deny entry, logging every name it cannot use.
 
     YAML reads an unquoted name such as ``Yes`` or ``311`` as a boolean or a number, so a
-    non-string name is skipped rather than guessed at. A name folding to an empty key is
-    skipped, since every name without an ASCII letter or digit folds to that same key and the
-    deny would reach unrelated artists.
+    non-string name is skipped rather than guessed at. A name folds to an empty key only when it
+    holds no letter or digit in any script (``!!!``). It is skipped, since every such name shares
+    that key and the deny would reach unrelated artists.
     """
     keys: set[str] = set()
     if not isinstance(raw, list):
@@ -269,7 +267,7 @@ def _deny_artist_keys(raw: object, genre: str) -> set[str]:
                 genre,
             )
             continue
-        key = alnum_key(name)
+        key = alnum_script_key(name)
         if not key:
             logger.warning(
                 "overlay deny artist %r for %r folds to an empty key, skipping artist",
@@ -284,8 +282,17 @@ def _deny_artist_keys(raw: object, genre: str) -> set[str]:
 
 
 def _load_document(path: Path | None, resource: str) -> Mapping[str, object]:
-    """Parse a genre YAML file from *path* or the bundled *resource* into its top mapping."""
-    document = yaml.safe_load(_read_text(path, resource))
+    """Parse a genre YAML file from *path* or the bundled *resource* into its top mapping.
+
+    A syntax error raises :class:`ValueError` naming the file, since the overlay is hand-edited.
+    """
+    text = _read_text(path, resource)
+    try:
+        document = yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        source = str(path) if path is not None else resource
+        message = f"genre YAML {source} does not parse: {exc}"
+        raise ValueError(message) from exc
     if not isinstance(document, dict):
         return {}
     return document

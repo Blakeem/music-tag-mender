@@ -408,12 +408,12 @@ def test_detect_cover_gaps_keeps_the_albums_under_a_folder(
     _report_library(music_dir)
     scan_library(engine_settings)
 
-    report = covers.detect_cover_gaps(engine_settings, folder="Band/Alpha")
+    report = covers.detect_cover_gaps(engine_settings, path="Band/Alpha")
 
     assert report.albums == 1
     assert [row.album for row in report.rows] == ["Alpha"]
     with pytest.raises(ValueError, match="outside music_path"):
-        covers.detect_cover_gaps(engine_settings, folder=str(music_dir.parent))
+        covers.detect_cover_gaps(engine_settings, path=str(music_dir.parent))
 
 
 def test_detect_cover_gaps_reports_a_covered_library(
@@ -439,7 +439,7 @@ def test_the_mcp_tool_returns_the_counts_and_rows_and_honors_folder_and_limit(
 
     payload = mcp_server.detect_cover_gaps()
     capped = mcp_server.detect_cover_gaps(limit=1)
-    narrowed = mcp_server.detect_cover_gaps(folder="Band/Zeta")
+    narrowed = mcp_server.detect_cover_gaps(path="Band/Zeta")
 
     assert payload["ok"] is True
     assert (payload["albums"], payload["gap"], payload["library_root"]) == (4, 2, 1)

@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING
 import httpx
 import pytest
 
-from conftest import make_track
+from conftest import make_rvad_mp3, make_track
 from tagmend.engine import axis, axis_status, library, songs, staging, store, versioning
 from tagmend.engine.acoustid import (
     AcoustidClient,
@@ -134,6 +134,8 @@ class Slot:
     position: int
     track_count: int = 4
     date: int = 2000
+    medium: int = 1
+    medium_count: int = 1
 
 
 def _track_id(release: str, position: int) -> str:
@@ -164,11 +166,11 @@ def _recording(
                 "title": f"{slot.release} title",
                 "country": "US",
                 "date": {"year": slot.date},
-                "medium_count": 1,
-                "track_count": slot.track_count,
+                "medium_count": slot.medium_count,
+                "track_count": slot.track_count * slot.medium_count,
                 "mediums": [
                     {
-                        "position": 1,
+                        "position": slot.medium,
                         "format": "CD",
                         "track_count": slot.track_count,
                         "tracks": [
@@ -358,6 +360,153 @@ def test_convergence_floor_holds_a_folder_too_few_voters_share(
     assert result.held_unconverged == 5
     assert result.staged_files == 0
     assert result.settled == 0
+    assert staging.diff_tags(engine_settings) == []
+
+
+_ALBUM_X = "rel-album-x"
+_SINGLE = "rel-single"
+_SEVEN = "07 Song Seven.flac"
+
+
+def _album_track_kit() -> Kit:
+    """Song Seven sits on the 12-track Album X and on an earlier Official 1-track single."""
+    titles = [f"Song {n}" for n in range(1, 13)]
+    titles[6] = "Song Seven"
+    album = _release(_ALBUM_X, titles)
+    single = _release(_SINGLE, ["Song Seven"], recordings=["rec-7"])
+    slots = (Slot(_ALBUM_X, 7, track_count=12, date=2001), Slot(_SINGLE, 1, 1, date=1999))
+    body = _body(_recording("rec-7", "Song Seven", *slots))
+    return Kit(acoustid=FakeAcoustid({f"fp-{_SEVEN}": body}), releases=FakeReleases(album, single))
+
+
+def _album_track_folder(music_dir: Path, tracknumber: str) -> None:
+    tags = {**_BASE_TAGS, "album": ["Album X"], "title": ["Song Seven"]}
+    make_track(music_dir / "Album X" / _SEVEN, {**tags, "tracknumber": [tracknumber]})
+
+
+def test_a_one_file_folder_converges_on_the_album_its_track_total_names(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    _album_track_folder(music_dir, "7/12")
+    library.scan_library(engine_settings)
+
+    result = _resolve(engine_settings, _album_track_kit())
+
+    assert (result.verified_files, result.held_disagreement) == (1, 0)
+    assert staging.diff_tags(engine_settings) == []
+
+
+def test_a_one_file_folder_without_totals_is_held_for_the_manual_release_path(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    _album_track_folder(music_dir, "7")
+    library.scan_library(engine_settings)
+
+    result = _resolve(engine_settings, _album_track_kit())
+
+    assert (result.held_unconverged, result.staged_files, result.settled) == (1, 0, 0)
+    assert [row["reason"] for row in result.held_values] == ["needs_release_mbid"]
+    assert staging.diff_tags(engine_settings) == []
+
+
+def _two_disc_release(mbid: str, titles: Sequence[str]) -> MBRelease:
+    """Return a release whose first disc plays ``rec-N`` and whose second plays bonus tracks."""
+    release = _release(mbid, titles)
+    first = release.media[0]
+    bonus = tuple(
+        replace(
+            track,
+            recording_mbid=f"rec-bonus-{track.position}",
+            release_track_mbid=f"{mbid}-d2t{track.position}",
+        )
+        for track in first.tracks
+    )
+    return replace(release, media=(first, replace(first, position=2, tracks=bonus)))
+
+
+def test_a_deluxe_disc_folder_converges_on_the_deluxe_its_disc_total_names(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    titles = [f"Song {n}" for n in range(1, 13)]
+    names = [f"{n:02d} Song {n}.flac" for n in range(1, 13)]
+    for n, name in enumerate(names, 1):
+        tags = {"title": [f"Song {n}"], "tracknumber": [str(n)], "discnumber": ["1/2"]}
+        make_track(music_dir / "Deluxe" / "CD1" / name, {**_BASE_TAGS, **tags})
+    library.scan_library(engine_settings)
+    bodies = {
+        f"fp-{name}": _body(
+            _recording(
+                f"rec-{n}",
+                f"Song {n}",
+                Slot("rel-standard", n, 12),
+                Slot("rel-deluxe", n, 12, date=2010, medium_count=2),
+            ),
+        )
+        for n, name in enumerate(names, 1)
+    }
+    releases = FakeReleases(
+        _release("rel-standard", titles), _two_disc_release("rel-deluxe", titles)
+    )
+
+    result = _resolve(engine_settings, Kit(acoustid=FakeAcoustid(bodies), releases=releases))
+
+    assert (result.verified_files, result.held_disagreement) == (12, 0)
+    assert "rel-standard" not in releases.lookups
+
+
+# --- dry-run refusals ----------------------------------------------------------------
+
+_LOUD = "02 Song Two.mp3"
+
+
+def _loud_folder(music_dir: Path) -> Path:
+    """Build the blank-tracknumber LP with its second file an MP3 holding an RVAD frame."""
+    folder = music_dir / "LP"
+    tags = _blank_tracknumbers()
+    _make_folder(folder, [tags[0], *tags[2:]], [_NAMES[0], *_NAMES[2:]])
+    make_rvad_mp3(folder / _LOUD, {**_BASE_TAGS, **tags[1]})
+    return folder
+
+
+def _loud_kit() -> Kit:
+    names = [_NAMES[0], _LOUD, *_NAMES[2:]]
+    return Kit(acoustid=FakeAcoustid(_lp_bodies(names)), releases=FakeReleases(_release(_LP)))
+
+
+def test_convergence_dry_run_itemizes_a_fill_the_writer_refuses(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    _loud_folder(music_dir)
+    library.scan_library(engine_settings)
+    loud_id = _ids(engine_settings)[_LOUD]
+    kit = _loud_kit()
+
+    preview = _resolve(engine_settings, kit, dry_run=True)
+    real = _resolve(engine_settings, kit)
+
+    assert preview.staged_files == real.staged_files == 2
+    assert preview.settled == real.settled == 3
+    assert [item["key"] for item in preview.error_items] == [f"file_id={loud_id}"]
+    assert "RVAD" in preview.error_items[0]["message"]
+    assert preview.error_items == real.error_items
+
+
+def test_manual_release_dry_run_refuses_a_stamp_the_writer_refuses(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    folder = _loud_folder(music_dir)
+    library.scan_library(engine_settings)
+    kit = _loud_kit()
+
+    with pytest.raises(ValueError, match="RVAD"):
+        _resolve(engine_settings, kit, folder=str(folder), release_mbid=_LP, dry_run=True)
+    with pytest.raises(ValueError, match="RVAD"):
+        _resolve(engine_settings, kit, folder=str(folder), release_mbid=_LP)
     assert staging.diff_tags(engine_settings) == []
 
 
@@ -579,7 +728,7 @@ def test_a_rebind_folder_reports_an_ungated_targets_fpcalc_error(
     [rebind] = result.rebind_folders
     assert rebind["flagged_file_ids"] == [ids[name] for name in _NAMES[:3]]
     [item] = result.error_items
-    assert item["key"] == str(ids[_NAMES[3]])
+    assert item["key"] == f"file_id={ids[_NAMES[3]]}"
     assert "exited 2" in item["message"]
     assert result.held_values == []
 
@@ -739,6 +888,133 @@ def test_a_gate_failure_is_held_as_no_contribution_with_its_reason(
     assert held["file_id"] == ids[_NAMES[3]]
     assert held["reason"] == "qualifier_mismatch"
     assert _status(engine_settings, ids[_NAMES[3]]) == "pending"
+
+
+@pytest.mark.parametrize(
+    ("body", "reason"),
+    [
+        pytest.param(
+            _body(_recording("rec-4", "Song Four", Slot(_LP, 4)), score=0.85),
+            "no_titled_recording",
+            id="score-under-the-floor",
+        ),
+        pytest.param(
+            _body(_recording("rec-4", "Unrelated Name", Slot(_LP, 4), sources=5)),
+            "thin_evidence",
+            id="thin-evidence-the-stem-does-not-name",
+        ),
+        pytest.param(
+            _body(_recording("rec-4", "Song Four", Slot(_LP, 4), duration=_DURATION + 30)),
+            "length_mismatch",
+            id="recording-far-from-the-files-length",
+        ),
+    ],
+)
+def test_weak_evidence_is_held_as_no_contribution(
+    engine_settings: Settings,
+    music_dir: Path,
+    body: dict[str, object],
+    reason: str,
+) -> None:
+    _make_folder(music_dir / "LP", _blank_tracknumbers())
+    library.scan_library(engine_settings)
+    ids = _ids(engine_settings)
+    kit = _converging_kit()
+    kit.acoustid.bodies[f"fp-{_NAMES[3]}"] = body
+
+    result = _resolve(engine_settings, kit)
+
+    assert result.held_no_contribution == 1
+    [held] = result.held_values
+    assert (held["file_id"], held["reason"]) == (ids[_NAMES[3]], reason)
+    assert _NAMES[3] not in _diffs(engine_settings)
+    assert _status(engine_settings, ids[_NAMES[3]]) == "pending"
+
+
+@pytest.mark.parametrize(
+    ("title", "stem", "holds"),
+    [
+        pytest.param("Часть 1", "05 Глава 1", False, id="cyrillic-title-sharing-only-a-digit"),
+        pytest.param("Глава 1", "05 Глава 1", True, id="cyrillic-title-the-stem-names"),
+        pytest.param("Cafe", "01 Café", True, id="ascii-title-of-an-accented-stem"),
+        pytest.param("Café", "01 Cafe", True, id="accented-title-of-an-ascii-stem"),
+        pytest.param("!!!", "01 !!!", True, id="punctuation-title-falls-back-to-loose-key"),
+    ],
+)
+def test_stem_check_folds_the_title_and_stem_with_one_script_aware_key(
+    title: str,
+    stem: str,
+    holds: bool,  # noqa: FBT001
+) -> None:
+    assert songs._stem_holds(title, stem) is holds
+
+
+# --- slot collisions -----------------------------------------------------------------
+
+
+def _collision_kit() -> Kit:
+    """Return the LP kit with the fourth file's audio heard as the third track too."""
+    kit = _converging_kit()
+    kit.acoustid.bodies[f"fp-{_NAMES[3]}"] = _body(_recording("rec-3", "Song Three", Slot(_LP, 3)))
+    return kit
+
+
+def _assert_collision_held(settings: Settings, result: songs.ResolveSongsResult) -> None:
+    """Assert the third and fourth files are held as one slot's rivals and nothing is staged."""
+    ids = _ids(settings)
+    third, fourth = ids[_NAMES[2]], ids[_NAMES[3]]
+    held = {row["file_id"]: row for row in result.held_values}
+    diffs = _diffs(settings)
+
+    assert result.held_slot_collision == 2
+    assert (held[third]["reason"], held[third]["other_file_ids"]) == ("slot_collision", [fourth])
+    assert (held[fourth]["reason"], held[fourth]["other_file_ids"]) == ("slot_collision", [third])
+    assert _NAMES[2] not in diffs
+    assert _NAMES[3] not in diffs
+    assert [_status(settings, third), _status(settings, fourth)] == ["pending", "pending"]
+
+
+def test_the_anchored_route_holds_two_files_heard_on_one_track(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    _anchored_lp_folder(music_dir)
+    library.scan_library(engine_settings)
+
+    result = _resolve(engine_settings, _collision_kit())
+
+    _assert_collision_held(engine_settings, result)
+
+
+def test_the_converged_route_holds_two_files_heard_on_one_track(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    _make_folder(music_dir / "LP", _blank_tracknumbers())
+    library.scan_library(engine_settings)
+
+    result = _resolve(engine_settings, _collision_kit())
+
+    _assert_collision_held(engine_settings, result)
+
+
+def test_manual_release_path_refuses_two_files_heard_on_one_track(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    _make_folder(music_dir / "LP", _blank_tracknumbers())
+    library.scan_library(engine_settings)
+    ids = _ids(engine_settings)
+
+    result = _resolve(
+        engine_settings, _collision_kit(), folder=str(music_dir / "LP"), release_mbid=_LP
+    )
+
+    assert result.unassigned == [
+        {"file_id": ids[name], "filename": name, "reason": "slot_collision"} for name in _NAMES[2:]
+    ]
+    assert result.staged_files == 0
+    assert staging.diff_tags(engine_settings) == []
 
 
 def test_manual_release_path_stages_the_whole_stamp_in_one_batch(
@@ -1055,6 +1331,48 @@ def test_manual_release_path_assigns_a_gate_failure_corroborated_by_its_stem(
     assert _diffs(engine_settings)[_NAMES[1]].target["title"] == ["Song Two"]
 
 
+@pytest.mark.parametrize(
+    ("fourth", "body", "reason"),
+    [
+        pytest.param(
+            _NAMES[3],
+            _body(_recording("rec-4", "Song Four", Slot(_LP, 4), duration=_DURATION + 30)),
+            "length_mismatch",
+            id="recording-far-from-the-files-length",
+        ),
+        pytest.param(
+            "04 Mystery.flac",
+            _body(
+                _recording("rec-other", "Other Song", sources=60),
+                _recording("rec-4", "Song Four", Slot(_LP, 4), sources=40),
+            ),
+            "uncorroborated",
+            id="slot-neither-the-gate-nor-the-stem-names",
+        ),
+    ],
+)
+def test_manual_release_path_refuses_a_weakly_placed_file_and_stages_nothing(
+    engine_settings: Settings,
+    music_dir: Path,
+    fourth: str,
+    body: dict[str, object],
+    reason: str,
+) -> None:
+    names = (*_NAMES[:3], fourth)
+    _make_folder(music_dir / "LP", [{}] * 4, names)
+    library.scan_library(engine_settings)
+    ids = _ids(engine_settings)
+    bodies = _lp_bodies(_NAMES[:3])
+    bodies[f"fp-{fourth}"] = body
+    kit = Kit(acoustid=FakeAcoustid(bodies), releases=FakeReleases(_release(_LP)))
+
+    result = _resolve(engine_settings, kit, folder=str(music_dir / "LP"), release_mbid=_LP)
+
+    assert result.unassigned == [{"file_id": ids[fourth], "filename": fourth, "reason": reason}]
+    assert result.staged_files == 0
+    assert staging.diff_tags(engine_settings) == []
+
+
 def test_manual_release_path_reports_a_lookup_error_in_error_items(
     engine_settings: Settings,
     music_dir: Path,
@@ -1070,9 +1388,27 @@ def test_manual_release_path_reports_a_lookup_error_in_error_items(
     assert result.unassigned == [{"file_id": file_id, "filename": _NAMES[3], "reason": "error"}]
     assert result.errors == 1
     [item] = result.error_items
-    assert item["key"] == str(file_id)
+    assert item["key"] == f"file_id={file_id}"
     assert "503" in item["message"]
     assert result.staged_files == 0
+
+
+def test_a_real_run_is_refused_while_anything_is_staged(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    _make_folder(music_dir / "LP", _blank_tracknumbers())
+    library.scan_library(engine_settings)
+    ids = _ids(engine_settings)
+    staging.stage_tags_batch(engine_settings, entries=[(ids[_NAMES[0]], {"genre": ["Rock"]})])
+
+    with pytest.raises(ValueError, match="commit or unstage pending changes first"):
+        _resolve(engine_settings, _converging_kit())
+    _resolve(engine_settings, _converging_kit(), dry_run=True)
+
+    diffs = _diffs(engine_settings)
+    assert list(diffs) == [_NAMES[0]]
+    assert diffs[_NAMES[0]].diff == {"genre": {"from": [], "to": ["Rock"]}}
 
 
 def test_release_mbid_without_a_scope_is_rejected(engine_settings: Settings) -> None:
@@ -1113,6 +1449,22 @@ def _reprise_folder(music_dir: Path) -> Path:
     folder = music_dir / "LP"
     _make_folder(folder, [{} for _ in _NAMES])
     return folder
+
+
+def test_the_anchored_route_holds_a_file_heard_on_two_tracks_as_an_ambiguous_slot(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    _anchored_lp_folder(music_dir)
+    library.scan_library(engine_settings)
+    fourth = _ids(engine_settings)[_NAMES[3]]
+
+    result = _resolve(engine_settings, _reprise_kit())
+
+    held = {row["file_id"]: row for row in result.held_values}
+    assert result.held_unconverged == 1
+    assert held[fourth]["reason"] == "ambiguous_slot"
+    assert _status(engine_settings, fourth) == "pending"
 
 
 def _voter(settings: Settings, file_id: int) -> songs._Voter:
@@ -1266,7 +1618,7 @@ def test_an_assigned_file_with_no_fingerprint_skips_only_the_length_check(
         pytest.param(_LP, [{"file_id": 1}], r"expected a \(file_id", id="not-a-pair"),
         pytest.param(_LP, [("1", "t-1")], "file_id must be an integer", id="file-id-text"),
         pytest.param(_LP, [(1, " ")], "release_track_mbid must be an id", id="blank-track"),
-        pytest.param(_LP, [(1, "t-1"), (1, "t-2")], "assigned more than once", id="file-twice"),
+        pytest.param(_LP, [(1, "t-1"), (1, "t-2")], "duplicate file_id=1", id="file-twice"),
     ],
 )
 def test_malformed_assignments_are_rejected_before_any_lookup(
@@ -1301,7 +1653,7 @@ def test_acoustid_503_leaves_the_file_pending_and_caches_nothing(
 
     assert result.staged_files == 3
     assert result.errors == 1
-    assert result.error_items[0]["key"] == str(ids[_NAMES[3]])
+    assert result.error_items[0]["key"] == f"file_id={ids[_NAMES[3]]}"
     assert "503" in result.error_items[0]["message"]
     assert _status(engine_settings, ids[_NAMES[3]]) == "pending"
     assert _scalar(engine_settings, "SELECT COUNT(*) FROM acoustid_cache") == 3

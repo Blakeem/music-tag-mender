@@ -633,6 +633,45 @@ def test_an_empty_lookup_is_served_at_six_days_and_missed_at_eight(
     assert get_lookup(db_conn, _FP, _NOW + timedelta(days=8)) is None
 
 
+def _recording(title: str) -> AcoustidRecording:
+    return AcoustidRecording(
+        id="rec-9", title=title, duration=None, sources=1, releases=(), artists=()
+    )
+
+
+_FLOOR = acoustid.SCORE_FLOOR
+_BELOW_FLOOR = _FLOOR - 0.01
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        AcoustidResult(results=(AcoustidMatch(score=_FLOOR, recordings=()),)),
+        AcoustidResult(results=(AcoustidMatch(score=_FLOOR, recordings=(_recording("  "),)),)),
+        AcoustidResult(
+            results=(AcoustidMatch(score=_BELOW_FLOOR, recordings=(_recording("Enemy"),)),)
+        ),
+    ],
+)
+def test_a_lookup_with_no_titled_recording_at_the_floor_is_served_at_six_days_and_missed_at_eight(
+    db_conn: sqlite3.Connection,
+    result: AcoustidResult,
+) -> None:
+    # Nothing in it can settle a file, and AcoustID keeps learning new fingerprints.
+    put_lookup(db_conn, _FP, result, _NOW)
+
+    assert get_lookup(db_conn, _FP, _NOW + timedelta(days=6)) == result
+    assert get_lookup(db_conn, _FP, _NOW + timedelta(days=8)) is None
+
+
+def test_a_lookup_with_a_titled_recording_is_still_served_at_eight_days(
+    db_conn: sqlite3.Connection,
+) -> None:
+    put_lookup(db_conn, _FP, _EXPECTED_RESULT, _NOW)
+
+    assert get_lookup(db_conn, _FP, _NOW + timedelta(days=8)) == _EXPECTED_RESULT
+
+
 def test_a_lookup_for_another_fingerprint_or_duration_misses(db_conn: sqlite3.Connection) -> None:
     put_lookup(db_conn, _FP, _EXPECTED_RESULT, _NOW)
 

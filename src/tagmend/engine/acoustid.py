@@ -6,12 +6,12 @@ recordings carry that fingerprint, and two cache helper pairs keep both answers 
 
 * ``fingerprint_cache`` (:func:`get_fingerprint` / :func:`put_fingerprint`) holds one fpcalc
   outcome per file, reused while the files-row signature is unchanged. A failure is stored
-  too, so an undecodable file does not re-run on every call. A timeout is never stored,
-  because the next run may succeed. :func:`rekey_fingerprint` carries a row across a tag write
-  that proved the decoded audio unchanged.
+  too, so an undecodable file does not re-run on every call. A timeout or an unreadable file is
+  never stored, because the next run may succeed. :func:`rekey_fingerprint` carries a row
+  across a tag write that proved the decoded audio unchanged.
 * ``acoustid_cache`` (:func:`get_lookup` / :func:`put_lookup`) holds one lookup per request
-  hash. An empty result is served for 7 days only, because AcoustID keeps learning new
-  fingerprints. An error is never stored.
+  hash. A result with no titled recording on a match at :data:`SCORE_FLOOR` is served for 7 days
+  only, because AcoustID keeps learning new fingerprints. An error is never stored.
 
 The helpers never commit: the caller owns the transaction. The API key travels in a POST body
 over https and never in a URL, and the User-Agent names the project and never a person, so no
@@ -36,7 +36,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Final, Self, cast
 
 from tagmend.config import PROJECT_URL, build_user_agent
-from tagmend.engine.lookup_clients import RETRY_ATTEMPTS, PacedHttp, Retry, decode_object
+from tagmend.engine.lookup_clients import (
+    RETRY_ATTEMPTS,
+    PacedHttp,
+    decode_object,
+    retry_throttle_or_server_error,
+)
 from tagmend.log import get_logger
 
 if TYPE_CHECKING:
@@ -55,14 +60,14 @@ _META: Final = "recordings releases tracks compress sources"
 # Folded into the lookup cache key, so changing what the parser extracts re-fetches every lookup.
 _LOOKUP_VERSION: Final = "2"
 _EMPTY_TTL: Final = timedelta(days=7)
+# The lowest match score the song axis acts on, as its decision run measured it.
+SCORE_FLOOR: Final = 0.9
 _USER_AGENT: Final = build_user_agent(PROJECT_URL)
 _FORM_HEADERS: Final = {
     "Content-Type": "application/x-www-form-urlencoded",
     "Content-Encoding": "gzip",
 }
 
-_HTTP_TOO_MANY_REQUESTS: Final = 429
-_HTTP_SERVER_ERROR: Final = 500
 _ERROR_INVALID_FINGERPRINT: Final = 3
 _ERROR_INVALID_API_KEY: Final = 4
 _KEY_SETTING: Final = "acoustid_api_key"
@@ -167,7 +172,11 @@ class AcoustidResult:
 
 
 class FingerprintError(RuntimeError):
-    """fpcalc failed on one file. The same file fails the same way, so callers may store it."""
+    """fpcalc failed on one file.
+
+    A plain FingerprintError repeats on the same file, so callers may store it. Its transient
+    subclasses are never stored.
+    """
 
     def __init__(self, exit_code: int | None, message: str) -> None:
         """Keep the fpcalc *exit_code* (``None`` when it never exited) beside *message*."""
@@ -413,7 +422,7 @@ class AcoustidClient:
         logger.debug("acoustid lookup duration=%d", fp.duration)
         response = self._http.send(
             lambda client: client.post(_LOOKUP_URL, content=content, headers=_FORM_HEADERS),
-            verdict=_retry_verdict,
+            verdict=retry_throttle_or_server_error,
             error=lambda failure, attempts: AcoustidError(
                 f"AcoustID {failure} after {attempts} attempt(s)",
             ),
@@ -421,14 +430,6 @@ class AcoustidClient:
         )
         body = decode_object(response, AcoustidError, source="AcoustID", what="fingerprint lookup")
         return _interpret(body, response.status_code)
-
-
-def _retry_verdict(response: httpx.Response) -> httpx.Response | Retry:
-    """Retry a throttle or a server fault and hand every other response back."""
-    status = response.status_code
-    if status == _HTTP_TOO_MANY_REQUESTS or status >= _HTTP_SERVER_ERROR:
-        return Retry(f"HTTP {status}")
-    return response
 
 
 def _encode_form(api_key: str, fp: Fingerprint) -> bytes:
@@ -667,7 +668,7 @@ def put_fingerprint(  # noqa: PLR0913 - one keyword per stored column, cohesive 
     """Store *file_id*'s fpcalc outcome at this signature, replacing any older one.
 
     A success carries *fingerprint* with exit 0 or 3. A stored failure passes ``None`` and
-    the failing exit. A timeout has no exit code, so it cannot be stored.
+    the failing exit. A timeout or an unreadable file is transient, so it is never stored.
     """
     conn.execute(
         """
@@ -714,8 +715,8 @@ def rekey_fingerprint(
 def get_lookup(conn: sqlite3.Connection, fp: Fingerprint, now: datetime) -> AcoustidResult | None:
     """Return the cached lookup for *fp*, or ``None`` on a miss.
 
-    An empty result is served only while younger than 7 days. An unreadable row is a miss,
-    so the next lookup overwrites it.
+    A result with no titled recording on a match at :data:`SCORE_FLOOR` is served only while
+    younger than 7 days. An unreadable row is a miss, so the next lookup overwrites it.
     """
     row = conn.execute(
         "SELECT found, payload, fetched_at FROM acoustid_cache WHERE request_key = ?",
@@ -724,14 +725,27 @@ def get_lookup(conn: sqlite3.Connection, fp: Fingerprint, now: datetime) -> Acou
     if row is None:
         return None
     found, payload, fetched_at = row
+    age = now - datetime.fromisoformat(str(fetched_at))
     if not found:
-        age = now - datetime.fromisoformat(str(fetched_at))
         return AcoustidResult() if age < _EMPTY_TTL else None
     try:
-        return _result_from_payload(bytes(payload))
+        result = _result_from_payload(bytes(payload))
     except (zlib.error, ValueError, AcoustidError) as exc:
         logger.warning("unreadable acoustid_cache row, treating it as a miss: %s", exc)
         return None
+    if age >= _EMPTY_TTL and not _has_titled_recording(result):
+        return None
+    return result
+
+
+def _has_titled_recording(result: AcoustidResult) -> bool:
+    """Return whether a match of *result* at :data:`SCORE_FLOOR` links a recording with a title."""
+    return any(
+        recording.title.strip()
+        for match in result.results
+        if match.score >= SCORE_FLOOR
+        for recording in match.recordings
+    )
 
 
 def put_lookup(

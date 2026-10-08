@@ -41,7 +41,6 @@ Usage::
 from __future__ import annotations
 
 import argparse
-import re
 import sys
 import tarfile
 from dataclasses import dataclass, field
@@ -50,6 +49,8 @@ from typing import IO, TYPE_CHECKING
 
 import httpx
 import yaml
+
+from tagmend.engine.text_keys import alnum_key
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Iterator
@@ -68,7 +69,6 @@ GENRE_ALIAS_COL_GENRE_ID = 1
 GENRE_ALIAS_COL_NAME = 2
 
 _PROGRESS_STEP = 50 * 1024 * 1024  # log every ~50 MB streamed
-_FOLD_RE = re.compile(r"[^a-z0-9]+")
 
 
 # ── Domain types ─────────────────────────────────────────────────────────────────────
@@ -90,15 +90,6 @@ class VocabularyEntry:
 
 
 # ── Pure helpers (Process) ───────────────────────────────────────────────────────────
-def fold(value: str) -> str:
-    """Reduce a genre string to its match-key: lowercase, drop all non-alphanumerics.
-
-    ``"Synth-Pop"``, ``"synth pop"`` and ``"synthpop"`` all fold to ``"synthpop"``.
-    See ``docs/genre-tagging-spec.md`` §3.
-    """
-    return _FOLD_RE.sub("", value.lower())
-
-
 def _unescape(field_value: str) -> str | None:
     r"""Decode one Postgres COPY field: ``\N`` -> None, plus the standard escapes."""
     if field_value == r"\N":
@@ -171,7 +162,7 @@ def _collect_aliases(
     kept: list[str] = []
     for source_id in ids:
         for alias in aliases.get(source_id, []):
-            alias_key = fold(alias)
+            alias_key = alnum_key(alias)
             if not alias_key:
                 continue
             owner = owner_of_fold.get(alias_key)
@@ -206,7 +197,7 @@ def build_vocabulary(
     # Group genre ids by their name's fold-key so duplicate spellings collapse together.
     groups: dict[str, list[str]] = {}
     for genre_id, genre in genres.items():
-        groups.setdefault(fold(genre.name), []).append(genre_id)
+        groups.setdefault(alnum_key(genre.name), []).append(genre_id)
 
     # Names claim their fold-keys first (names always win over aliases).
     warnings: list[str] = []

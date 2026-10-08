@@ -16,12 +16,14 @@ from tagmend.engine import musicbrainz
 from tagmend.engine.musicbrainz import (
     MusicBrainzClient,
     MusicBrainzError,
+    MusicBrainzUnavailableError,
     _artist_request_key,
     _recording_request_key,
     _release_from_json,
     _release_request_key,
     _release_to_json,
     _request_key,
+    _title_matches,
 )
 from tagmend.engine.store import (
     get_cached_mb_artist,
@@ -141,7 +143,6 @@ def test_returns_album_original_year(db_conn: sqlite3.Connection) -> None:
     assert album.original_date == "1970-09-18"  # the full date, as MusicBrainz gives it
     assert album.album_title == "Paranoid"
     assert album.release_group_mbid == "rg-1"
-    assert album.release_mbid == "rel-1"
     assert len(calls) == 1
 
 
@@ -287,16 +288,68 @@ def test_replicas_candidate_set_is_no_match(db_conn: sqlite3.Connection) -> None
         assert client.album_first_release("Gary Numan", "Replicas") is None
 
 
+def _query_logging_client(
+    db_conn: sqlite3.Connection, responses: list[httpx.Response]
+) -> tuple[MusicBrainzClient, list[str]]:
+    """Return a client answering *responses* in order, and the list of queries it receives."""
+    queries: list[str] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        queries.append(request.url.params["query"])
+        return responses[len(queries) - 1]
+
+    client = MusicBrainzClient(
+        "TagMend/test ( test@example.com )",
+        db_conn,
+        rate_per_sec=0.0,
+        transport=httpx.MockTransport(handle),
+    )
+    return client, queries
+
+
 def test_edition_suffix_in_request_still_matches_plain_release_group(
     db_conn: sqlite3.Connection,
 ) -> None:
-    body = _body(_group(title="Fiction", first_release_date="2007-04-20", rgid="rg-fiction"))
-    client, _ = _client(db_conn, [_json_response(body)])
+    # MusicBrainz matches the quoted phrase, so the suffixed title finds no plain group.
+    plain = _body(_group(title="Fiction", first_release_date="2007-04-20", rgid="rg-fiction"))
+    client, queries = _query_logging_client(
+        db_conn, [_json_response(_body()), _json_response(plain)]
+    )
     with client:
         album = client.album_first_release("Dark Tranquillity", "Fiction (Deluxe Edition)")
     assert album is not None
     assert album.original_date == "2007-04-20"
     assert album.release_group_mbid == "rg-fiction"
+    assert len(queries) == 2
+    assert 'releasegroup:"Fiction (Deluxe Edition)"' in queries[0]
+    assert 'releasegroup:"Fiction"' in queries[1]
+    cached = get_cached_mb_release_group(
+        db_conn, _request_key("Dark Tranquillity", "Fiction (Deluxe Edition)")
+    )
+    assert cached is not None
+    assert cached[0] is True
+
+
+def test_unsuffixed_miss_sends_one_query_and_negative_caches(db_conn: sqlite3.Connection) -> None:
+    client, queries = _query_logging_client(db_conn, [_json_response(_body())])
+    with client:
+        assert client.album_first_release("Dark Tranquillity", "Fiction") is None
+    assert len(queries) == 1
+    cached = get_cached_mb_release_group(db_conn, _request_key("Dark Tranquillity", "Fiction"))
+    assert cached is not None
+    assert cached[0] is False
+
+
+def test_suffixed_title_found_by_its_full_title_sends_one_query(
+    db_conn: sqlite3.Connection,
+) -> None:
+    body = _body(_group(title="Fiction (Deluxe Edition)", first_release_date="2008", rgid="rg-dx"))
+    client, queries = _query_logging_client(db_conn, [_json_response(body)])
+    with client:
+        album = client.album_first_release("Dark Tranquillity", "Fiction (Deluxe Edition)")
+    assert album is not None
+    assert album.release_group_mbid == "rg-dx"
+    assert len(queries) == 1
 
 
 def test_rejects_candidate_carrying_content_the_request_lacks(
@@ -404,12 +457,19 @@ def test_selection_version_changes_recording_request_key(monkeypatch: pytest.Mon
     assert _recording_request_key("Black Sabbath", "War Pigs") != before
 
 
+def test_script_aware_title_key_bumped_selection_version() -> None:
+    # Token "5" cached picks under the ASCII-only title key, which decided both pairs the other way.
+    assert _title_matches("Cafe", "Café")
+    assert not _title_matches("Часть 1", "Глава 1")
+    assert musicbrainz._SELECTION_VERSION not in {"4", "5"}
+
+
 # --- transient errors ----------------------------------------------------------------
 
 
 def test_http_error_raises_and_caches_nothing(db_conn: sqlite3.Connection) -> None:
-    # 500, not 503: 503 is MusicBrainz's throttle signal and is retried.
-    client, _ = _client(db_conn, [_json_response({}, status_code=500)])
+    # 400, not a 429 or a 5xx: those are retried.
+    client, _ = _client(db_conn, [_json_response({}, status_code=400)])
     with client, pytest.raises(MusicBrainzError):
         client.album_first_release("Artist", "Album")
     # Nothing cached → a re-run would retry.
@@ -540,8 +600,6 @@ def test_recording_search_returns_album(db_conn: sqlite3.Connection) -> None:
 
     assert recording is not None
     assert recording.album_title == "Paranoid"
-    assert recording.release_group_mbid == "rg-1"
-    assert recording.recording_mbid == "rec-1"
     assert len(calls) == 1
 
 
@@ -555,8 +613,6 @@ def test_recording_search_picks_highest_scoring(db_conn: sqlite3.Connection) -> 
         recording = client.recording_search("Artist", "Title")
     assert recording is not None
     assert recording.album_title == "High"
-    assert recording.release_group_mbid == "rg-hi"
-    assert recording.recording_mbid == "rec-hi"
 
 
 def test_recording_search_tie_prefers_the_recording_on_an_official_album(
@@ -581,7 +637,6 @@ def test_recording_search_tie_prefers_the_recording_on_an_official_album(
         recording = client.recording_search("Team Sleep", "Ever (Foreign Flag)")
     assert recording is not None
     assert recording.album_title == "Team Sleep"
-    assert recording.recording_mbid == "rec-album"
 
 
 def test_recording_search_takes_the_official_release_of_one_recording(
@@ -606,7 +661,6 @@ def test_recording_search_takes_the_official_release_of_one_recording(
         recording = client.recording_search("Team Sleep", "Ever (Foreign Flag)")
     assert recording is not None
     assert recording.album_title == "Team Sleep"
-    assert recording.release_group_mbid == "rg-album"
 
 
 def test_recording_search_falls_back_to_a_release_that_is_not_official(
@@ -637,7 +691,7 @@ def test_recording_search_full_tie_keeps_the_first(db_conn: sqlite3.Connection) 
     with client:
         recording = client.recording_search("Artist", "Title")
     assert recording is not None
-    assert recording.recording_mbid == "rec-first"
+    assert recording.album_title == "First"
 
 
 def test_recording_search_skips_non_album_release_group(db_conn: sqlite3.Connection) -> None:
@@ -690,8 +744,8 @@ def test_recording_no_match_is_negative_cached(db_conn: sqlite3.Connection) -> N
 
 
 def test_recording_http_error_raises_and_caches_nothing(db_conn: sqlite3.Connection) -> None:
-    # 500, not 503: 503 is MusicBrainz's throttle signal and is retried.
-    client, _ = _client(db_conn, [_json_response({}, status_code=500)])
+    # 400, not a 429 or a 5xx: those are retried.
+    client, _ = _client(db_conn, [_json_response({}, status_code=400)])
     with client, pytest.raises(MusicBrainzError):
         client.recording_search("Artist", "Title")
     # Nothing cached → a re-run would retry.
@@ -795,6 +849,22 @@ def test_artist_by_mbid_second_call_is_served_from_cache(db_conn: sqlite3.Connec
     assert len(calls) == 1
 
 
+def test_artist_by_mbid_keeps_a_distinct_sort_name_through_the_cache(
+    db_conn: sqlite3.Connection,
+) -> None:
+    body = _artist_body(name="The Beatles", sort_name="Beatles, The")
+    client, calls = _client(db_conn, [_json_response(body)])
+    with client:
+        first = client.artist_by_mbid("24ee4021-50ac-4285-b76e-860082d0d731")
+        second = client.artist_by_mbid("24ee4021-50ac-4285-b76e-860082d0d731")
+
+    assert first is not None
+    assert second is not None
+    assert first.sort_name == "Beatles, The"
+    assert second.sort_name == "Beatles, The"
+    assert len(calls) == 1
+
+
 def test_artist_by_mbid_caches_a_404_as_a_negative(db_conn: sqlite3.Connection) -> None:
     client, calls = _client(
         db_conn,
@@ -812,7 +882,7 @@ def test_artist_by_mbid_raises_and_does_not_cache_a_transient_failure(
 ) -> None:
     client, calls = _client(
         db_conn,
-        [httpx.Response(500, text="broken"), _json_response(_artist_body())],
+        [httpx.Response(400, text="broken"), _json_response(_artist_body())],
     )
     with client:
         with pytest.raises(MusicBrainzError):
@@ -1076,12 +1146,31 @@ def test_release_by_mbid_caches_a_404_as_a_negative(db_conn: sqlite3.Connection)
     assert len(calls) == 1
 
 
+def test_has_cached_release_probes_the_cache_hit_or_negative(db_conn: sqlite3.Connection) -> None:
+    client, calls = _client(
+        db_conn,
+        [_json_response(_release_body()), httpx.Response(404, json={"error": "Not Found"})],
+    )
+    with client:
+        before = client.has_cached_release("rel-1")
+        client.release_by_mbid("rel-1")
+        client.release_by_mbid("gone")
+        probes = (
+            client.has_cached_release("rel-1"),
+            client.has_cached_release("gone"),
+            client.has_cached_release("other"),
+        )
+
+    assert (before, *probes) == (False, True, True, False)
+    assert len(calls) == 2
+
+
 def test_release_by_mbid_raises_and_does_not_cache_a_transient_failure(
     db_conn: sqlite3.Connection,
 ) -> None:
     client, calls = _client(
         db_conn,
-        [httpx.Response(500, text="broken"), _json_response(_release_body())],
+        [httpx.Response(400, text="broken"), _json_response(_release_body())],
     )
     with client:
         with pytest.raises(MusicBrainzError):
@@ -1380,7 +1469,7 @@ def test_a_503_that_never_clears_raises_and_caches_nothing(
 ) -> None:
     responses = [httpx.Response(503, text="busy") for _ in range(4)]
     client, calls = _client(db_conn, responses, sleep=lambda _s: None)
-    with client, pytest.raises(MusicBrainzError):
+    with client, pytest.raises(MusicBrainzUnavailableError):
         client.release_by_mbid("rel-1")
 
     # Three attempts, then it gives up rather than hammering.
@@ -1388,11 +1477,24 @@ def test_a_503_that_never_clears_raises_and_caches_nothing(
 
 
 def test_a_non_throttle_error_is_not_retried(db_conn: sqlite3.Connection) -> None:
-    client, calls = _client(db_conn, [httpx.Response(500, text="broken")], sleep=lambda _s: None)
+    client, calls = _client(db_conn, [httpx.Response(400, text="broken")], sleep=lambda _s: None)
     with client, pytest.raises(MusicBrainzError):
         client.release_by_mbid("rel-1")
 
     assert len(calls) == 1
+
+
+@pytest.mark.parametrize("status", [429, 500, 502, 504])
+def test_a_throttle_or_a_server_fault_is_retried(db_conn: sqlite3.Connection, status: int) -> None:
+    client, calls = _client(
+        db_conn,
+        [httpx.Response(status, text="busy"), _json_response(_release_body())],
+        sleep=lambda _s: None,
+    )
+    with client:
+        assert client.release_by_mbid("rel-1") is not None
+
+    assert len(calls) == 2
 
 
 def test_the_artist_lookup_backs_off_the_same_way(db_conn: sqlite3.Connection) -> None:

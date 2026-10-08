@@ -13,22 +13,28 @@ rather than the dummy byte file ``temp_library`` produces.
 
 from __future__ import annotations
 
+import base64
 import logging
 import os
 import shutil
 import sqlite3
+import struct
 import sys
+import wave
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import httpx
 import mutagen
 import pytest
 import send2trash
-from mutagen.id3 import ID3, RVAD, TIT2  # type: ignore[attr-defined]
+from mutagen.flac import Picture
+from mutagen.id3 import APIC, ID3, RVAD, TIT2, TPE1  # type: ignore[attr-defined]
+from mutagen.mp4 import MP4Cover
 
 from tagmend import config
 from tagmend.config import Settings
+from tagmend.engine.lastfm import LastfmClient
 from tagmend.engine.schema import apply_schema
 
 if TYPE_CHECKING:
@@ -95,6 +101,90 @@ def make_droppable_frames_mp3(dest: Path) -> Path:
     return track
 
 
+def make_rvad_mp3(dest: Path, tags: Mapping[str, Sequence[str]]) -> Path:
+    """Write an ID3v2.3 MP3 holding *tags* and an ``RVAD`` frame, which a v2.4 save drops."""
+    track = make_track(dest, tags)
+    frames = ID3(track)  # type: ignore[no-untyped-call]
+    frames.add(RVAD(adjustments=[1, 1], peaks=[1, 1]))  # type: ignore[no-untyped-call]
+    frames.save(track, v2_version=3)
+    return track
+
+
+# 8000 Hz as the 80-bit extended float an AIFF COMM chunk holds. The stdlib aifc is deprecated.
+_AIFF_8000_HZ = b"\x40\x0b\xfa\x00\x00\x00\x00\x00\x00\x00"
+
+
+def _iff_chunk(chunk_id: bytes, data: bytes) -> bytes:
+    return chunk_id + struct.pack(">L", len(data)) + data
+
+
+def make_chunk_id3_track(dest: Path) -> Path:
+    """Write a silent WAV or AIFF, by *dest*'s suffix, titled ``Song`` by ``Band`` with a cover.
+
+    Both keep their ID3 tag in a chunk, and mutagen has no easy class for either.
+    """
+    frames = 800
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.suffix.lower() == ".wav":
+        with wave.open(str(dest), "wb") as stream:
+            stream.setnchannels(1)
+            stream.setsampwidth(2)
+            stream.setframerate(8000)
+            stream.writeframes(bytes(frames * 2))
+    else:
+        comm = struct.pack(">hLh", 1, frames, 16) + _AIFF_8000_HZ
+        ssnd = struct.pack(">LL", 0, 0) + bytes(frames * 2)
+        form = b"AIFF" + _iff_chunk(b"COMM", comm) + _iff_chunk(b"SSND", ssnd)
+        dest.write_bytes(_iff_chunk(b"FORM", form))
+    audio = mutagen.File(dest)  # type: ignore[attr-defined]
+    audio.add_tags()
+    audio.tags.add(TIT2(encoding=3, text=["Song"]))  # type: ignore[no-untyped-call]
+    audio.tags.add(TPE1(encoding=3, text=["Band"]))  # type: ignore[no-untyped-call]
+    cover = APIC(  # type: ignore[no-untyped-call]
+        encoding=3, mime="image/png", type=3, desc="", data=b"\x89PNG"
+    )
+    audio.tags.add(cover)
+    audio.save()
+    return dest
+
+
+# (picture type, mime, description, image bytes)
+type PictureImage = tuple[int, str, str, bytes]
+
+
+def _flac_picture(image: PictureImage) -> Any:
+    picture: Any = Picture()  # type: ignore[no-untyped-call]
+    picture.type, picture.mime, picture.desc, picture.data = image
+    return picture
+
+
+def vorbis_picture_value(image: PictureImage) -> str:
+    """Return *image* as an Ogg ``metadata_block_picture`` value."""
+    return base64.b64encode(_flac_picture(image).write()).decode("ascii")
+
+
+def embed_pictures(path: Path, images: Sequence[PictureImage]) -> None:
+    """Replace the pictures embedded in *path* with *images*, as its container stores each."""
+    audio: Any = mutagen.File(path)  # type: ignore[attr-defined]
+    if audio.tags is None:
+        audio.add_tags()
+    suffix = path.suffix.lower()
+    if suffix == ".mp3":
+        audio.tags.delall("APIC")
+        for kind, mime, desc, data in images:
+            audio.tags.add(APIC(encoding=3, mime=mime, type=kind, desc=desc, data=data))  # type: ignore[no-untyped-call]
+    elif suffix == ".flac":
+        audio.clear_pictures()
+        for image in images:
+            audio.add_picture(_flac_picture(image))
+    elif suffix == ".m4a":
+        formats = {"image/jpeg": MP4Cover.FORMAT_JPEG, "image/png": MP4Cover.FORMAT_PNG}
+        audio["covr"] = [MP4Cover(data, imageformat=formats[mime]) for _, mime, _, data in images]  # type: ignore[no-untyped-call]
+    else:
+        audio["metadata_block_picture"] = [vorbis_picture_value(image) for image in images]
+    audio.save()
+
+
 # The ways a user can type one folder. Upper case names the same folder only where the
 # filesystem ignores case, so that spelling runs on Windows alone.
 FOLDER_SPELLINGS = (
@@ -115,6 +205,13 @@ def spell_folder(folder: Path, spelling: str) -> str:
     if spelling == "slash":
         return text.replace(os.sep, "/")
     return text
+
+
+def rejecting_lastfm_client(conn: sqlite3.Connection) -> LastfmClient:
+    """Return a real :class:`LastfmClient` whose transport answers Last.fm's invalid-key 403."""
+    body = {"error": 10, "message": "Invalid API key - You must be granted a valid key by last.fm"}
+    transport = httpx.MockTransport(lambda _request: httpx.Response(403, json=body))
+    return LastfmClient("rejected-key", conn, rate_per_sec=0.0, transport=transport)
 
 
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
@@ -162,15 +259,7 @@ def _isolate_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """Redirect config/data dirs into a temp location and clear env overrides."""
     monkeypatch.setattr(config, "config_dir", lambda: tmp_path / "config")
     monkeypatch.setattr(config, "data_dir", lambda: tmp_path / "data")
-    for var in (
-        "TAGMEND_MUSIC_PATH",
-        "TAGMEND_LASTFM_API_KEY",
-        "TAGMEND_ACOUSTID_API_KEY",
-        "TAGMEND_FPCALC_PATH",
-        "TAGMEND_DB_PATH",
-        "TAGMEND_NO_BROWSER",
-        "TAGMEND_NO_CONFIG_UI",
-    ):
+    for var in [name for name in os.environ if name.startswith("TAGMEND_")]:
         monkeypatch.delenv(var, raising=False)
 
 

@@ -217,6 +217,45 @@ def test_a_404_is_cached_as_not_found_for_seven_days(
         assert len(seen) == 2
 
 
+def test_a_400_for_an_id_that_is_no_uuid_is_cached_as_not_found(
+    db_conn: sqlite3.Connection,
+    wall_clock: _Clock,
+) -> None:
+    client, seen = _client(db_conn, [httpx.Response(400, text="invalid UUID")])
+
+    with client:
+        first = client.front_image("release", "not-a-uuid")
+        cached = client.has_cached_listing("release", "not-a-uuid")
+        second = client.front_image("release", "not-a-uuid")
+
+    assert (first, cached, second) == (None, True, None)
+    assert len(seen) == 1
+    assert _cache_rows(db_conn) == [(0, None, _START.isoformat())]
+
+
+def test_has_cached_listing_probes_the_cache_found_or_not_without_a_request(
+    db_conn: sqlite3.Connection,
+    wall_clock: _Clock,
+) -> None:
+    client, seen = _client(
+        db_conn,
+        [httpx.Response(404), httpx.Response(200, json=_listing(_entry()))],
+    )
+
+    with client:
+        before = client.has_cached_listing("release", _MBID)
+        client.front_image("release", _MBID)
+        missing = client.has_cached_listing("release", _MBID)
+        other_kind = client.has_cached_listing("release-group", _MBID)
+        wall_clock.now = _START + timedelta(days=7)
+        expired = client.has_cached_listing("release", _MBID)
+        client.front_image("release", _MBID)
+        found = client.has_cached_listing("release", _MBID)
+
+    assert (before, missing, other_kind, expired, found) == (False, True, False, False, True)
+    assert len(seen) == 2
+
+
 def test_a_found_listing_is_served_from_the_cache(
     db_conn: sqlite3.Connection,
     wall_clock: _Clock,
@@ -316,9 +355,9 @@ def test_another_error_status_raises_at_once_and_caches_nothing(
     db_conn: sqlite3.Connection,
     wall_clock: _Clock,
 ) -> None:
-    client, seen = _client(db_conn, [httpx.Response(400, text="invalid UUID")])
+    client, seen = _client(db_conn, [httpx.Response(403, text="forbidden")])
 
-    with client, pytest.raises(CoverArtError, match="HTTP 400"):
+    with client, pytest.raises(CoverArtError, match="HTTP 403"):
         client.front_image("release", _MBID)
 
     assert len(seen) == 1

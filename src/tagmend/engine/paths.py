@@ -94,6 +94,7 @@ from tagmend.engine import (
     clock,
     commits,
     db,
+    ledger_lock,
     mismatch,
     naming,
     path_keys,
@@ -104,6 +105,7 @@ from tagmend.engine import (
 from tagmend.engine.detector_core import parse_position
 from tagmend.engine.path_text import part_problems
 from tagmend.engine.serialize import FieldDict
+from tagmend.engine.validation import require_music_path, validate_file_pairs
 from tagmend.log import get_logger
 
 if TYPE_CHECKING:
@@ -138,9 +140,9 @@ _FORWARD_ORIGINS: Final = frozenset({"auto", "manual"})
 _REVERT: Final = "revert"
 _BASELINE_ORIGIN: Final = "scan"
 
-# Windows limits: NTFS caps one name at 255 UTF-16 units, and MAX_PATH leaves 259 characters.
+# Windows limits: NTFS caps one name at 255 UTF-16 units, and MAX_PATH leaves 259 UTF-16 units.
 _MAX_PART_UNITS: Final = 255
-_MAX_PATH_CHARS: Final = 259
+_MAX_PATH_UNITS: Final = 259
 
 _PLAYLIST_SUFFIXES: Final = frozenset({".cue", ".m3u", ".m3u8"})
 _CUE_FILE_LINE: Final = re.compile(r'^\s*FILE\s+(?:"([^"]+)"|(\S+))\s+\S+\s*$', re.IGNORECASE)
@@ -149,8 +151,6 @@ STAGING_NOT_EMPTY: Final = (
     "staging area is not empty - commit or unstage pending changes before reverting. "
     "Run commit_paths to finish an interrupted path revert"
 )
-
-_BATCH_ENTRY_WIDTH: Final = 2
 
 
 # --- the path component rules (pure) --------------------------------------------------
@@ -189,9 +189,9 @@ def check_length(music_path: Path, relative_path: str) -> list[str]:
         for part in Path(relative_path).parts
         if _utf16_units(part) > _MAX_PART_UNITS
     ]
-    full_length = len(str(music_path / relative_path))
-    if full_length > _MAX_PATH_CHARS:
-        problems.append(f"the full path is {full_length} characters, over {_MAX_PATH_CHARS}")
+    full_length = _utf16_units(str(music_path / relative_path))
+    if full_length > _MAX_PATH_UNITS:
+        problems.append(f"the full path is {full_length} UTF-16 units, over {_MAX_PATH_UNITS}")
     return problems
 
 
@@ -306,14 +306,29 @@ def respell_folders(music_path: Path, relative_path: str) -> str:
     return _Speller(music_path).respell(relative_path)
 
 
+def _first_lettered_entry(folder: Path) -> os.DirEntry[str] | None:
+    """Return *folder*'s first entry, in name order, whose name changes case, else ``None``."""
+    try:
+        with os.scandir(folder) as entries:
+            listing = sorted(entries, key=lambda e: e.name)
+    except OSError:
+        return None
+    return next((e for e in listing if e.name.swapcase() != e.name), None)
+
+
 def _case_blind_volume(music_path: Path) -> bool:
     """Whether *music_path*'s volume ignores case while path keys keep it. Stats, writes nothing.
 
     Path keys fold case only on Windows, so a case-insensitive POSIX mount would let the mover
-    write into ``Abba`` while the ledger records ``ABBA``.
+    write into ``Abba`` while the ledger records ``ABBA``. The probe tests a name inside
+    *music_path*, because a mount point's own name is resolved by its parent volume.
     """
     if path_keys.path_key("A") != "A":
         return False
+    entry = _first_lettered_entry(music_path)
+    if entry is not None:
+        probe = music_path / entry.name.swapcase()
+        return probe.exists() and Path(entry.path).samefile(probe)
     parts = Path(os.path.normpath(music_path)).parts
     for index in range(len(parts) - 1, 0, -1):
         swapped = parts[index].swapcase()
@@ -333,14 +348,6 @@ def volume_refusal(music_path: Path) -> str | None:
         f"{music_path} sits on a volume that ignores case while TagMend's path keys keep it, so "
         "a move could split one folder into two spellings. The path tools refuse this volume"
     )
-
-
-def _require_music_path(settings: Settings) -> Path:
-    """Return ``music_path``, or raise :class:`ValueError` when it is not configured."""
-    if settings.music_path is None:
-        message = "music_path not configured. Run `tagmend config-set music_path <dir>`"
-        raise ValueError(message)
-    return settings.music_path
 
 
 def _require_volume(music_path: Path) -> None:
@@ -431,6 +438,62 @@ def _locate_at(source: Path, target: Path, base: tuple[int | None, int | None]) 
     return LANDED_CHANGED
 
 
+# --- destination holds ---------------------------------------------------------------
+
+
+def _tracked_at_detail(holder: int, target: str | Path) -> str:
+    """Return the detail of a target another tracked file holds."""
+    return f"file_id={holder} is tracked at {target}"
+
+
+def _taken_on_disk_detail(target: str | Path) -> str:
+    """Return the detail of a target an untracked folder entry holds."""
+    return f"{target} is taken on disk"
+
+
+def _landed_hold(to_path: str) -> tuple[str, str]:
+    """Return the ``landed_move`` hold of a file whose staged move to *to_path* already landed."""
+    detail = f"its staged move to {to_path} already landed on disk. Run commit_paths first"
+    return LANDED_MOVE, detail
+
+
+def _destination_reasons(  # noqa: PLR0913 - cohesive keyword-only target-safety inputs
+    *,
+    file_id: int,
+    source: Path,
+    target: Path,
+    to_path: str,
+    holder: int | None,
+    claimant: int | None,
+    probe_disk: bool,
+    holds_key: Callable[[Path], bool],
+    cue_sheets: Callable[[Path], list[str]],
+) -> list[tuple[str, str]]:
+    """Return the ``occupied``, ``shared_target`` and ``cue_reference`` reasons of one target.
+
+    *holder* is the file tracked at the target and *claimant* the file staged to it. The file's
+    own current key never occupies its target, so a case-only rename is not held by its own
+    folder entry. *holds_key* probes the disk only when *probe_disk* holds and no other file is
+    tracked there.
+    """
+    reasons: list[tuple[str, str]] = []
+    if holder is not None and holder != file_id:
+        reasons.append((OCCUPIED, _tracked_at_detail(holder, to_path)))
+    elif (
+        probe_disk
+        and path_keys.path_key(target) != path_keys.path_key(source)
+        and holds_key(target)
+    ):
+        reasons.append((OCCUPIED, _taken_on_disk_detail(to_path)))
+    if claimant is not None and claimant != file_id:
+        reasons.append((SHARED_TARGET, f"file_id={claimant} is already staged to {to_path}"))
+    sheets = cue_sheets(source)
+    if sheets:
+        detail = f"{', '.join(sheets)} in its folder names it. Edit or move the sheet first"
+        reasons.append((CUE_REFERENCE, detail))
+    return reasons
+
+
 # --- the disk mover and the pruner ----------------------------------------------------
 
 
@@ -457,7 +520,8 @@ def _prune(music_path: Path, folder: Path) -> list[Path]:
     """Remove *folder* and each parent it empties, below ``music_path``, until one is refused.
 
     ``rmdir`` refuses a folder holding anything, a hidden file included, so only empty folders
-    go and nothing is deleted.
+    go and nothing is deleted. The walk stops at a junction or symlink and never removes it,
+    since Windows ``rmdir`` removes a link whatever its target holds.
     """
     root_key = path_keys.path_key(music_path)
     removed: list[Path] = []
@@ -465,6 +529,8 @@ def _prune(music_path: Path, folder: Path) -> list[Path]:
     while True:
         key = path_keys.path_key(current)
         if key == root_key or not path_keys.is_within(key, root_key):
+            return removed
+        if current.is_junction() or current.is_symlink():
             return removed
         try:
             current.rmdir()
@@ -510,21 +576,17 @@ class PathDomain:
     """
 
     music_path: Path
-    name: str = "paths"
     pruned: list[Path] = field(default_factory=list, compare=False)
+
+    @property
+    def changed_since_stage_detail(self) -> str:
+        """Re-staging to the same target confirms a move that already landed."""
+        return _PROBLEM_DETAILS["changed_since_stage"]
 
     @property
     def per_file_errors(self) -> tuple[type[Exception], ...]:
         """A refused move, a vanished source or a tracked target fails one file alone."""
         return (OSError, ValueError, sqlite3.IntegrityError)
-
-    def list_staged_file_ids(self, conn: sqlite3.Connection) -> list[int]:
-        """Return every staged file id, in file_id order."""
-        return [staged.file_id for staged in store.list_staged_paths(conn)]
-
-    def list_staged_file_ids_under(self, conn: sqlite3.Connection, root_key: str) -> list[int]:
-        """Return staged file ids whose file's recorded source is under *root_key*."""
-        return [staged.file_id for staged in store.list_staged_paths_under(conn, root_key)]
 
     def plan_order(self, conn: sqlite3.Connection, file_ids: list[int]) -> list[int]:  # noqa: ARG002
         """Return *file_ids* unchanged: staging refuses a target another tracked file holds."""
@@ -853,7 +915,7 @@ def _disc_members(
     A release folder holds no audio directly and never did, and every folder under it holding
     audio is a disc folder (:func:`tagmend.engine.mismatch.layout_of`) directly below it.
     """
-    music_path = _require_music_path(settings)
+    music_path = require_music_path(settings)
     root_key = path_keys.path_key(music_path / key)
     low, high = path_keys.subtree_bounds(root_key)
     discs: list[list[store.FileRow]] = []
@@ -875,7 +937,7 @@ def _disc_folder_keys(settings: Settings, folder: str) -> set[str]:
 
     A disc folder whose audio already left still counts, so a file it held back stays in it.
     """
-    music_path = _require_music_path(settings)
+    music_path = require_music_path(settings)
     keys: set[str] = set()
     try:
         with os.scandir(music_path / folder) as listing:
@@ -902,7 +964,7 @@ def _release_unit(
     Its destination, origin and lowest file id come from its disc units, so it ties with the
     disc unit holding that file.
     """
-    music_path = _require_music_path(settings)
+    music_path = require_music_path(settings)
     units = [_moving_unit(music_path, members, targets) for members in discs]
     moving = [unit for unit in units if unit is not None]
     destinations = {path_keys.path_key(unit.destination) for unit in moving}
@@ -942,7 +1004,7 @@ def _sidecar_hold(
         return f"{claimant} is already staged to {to_path}"
     # The sidecar's own entry never takes its target, only another entry with the key does.
     if to_key != from_key and _listing_holds_key(music_path / to_path):
-        return f"{to_path} is taken on disk"
+        return _taken_on_disk_detail(to_path)
     return None
 
 
@@ -960,7 +1022,7 @@ def _units_to_recompute(
     wins a shared target whatever order the calls came in. The release folder above each
     recomputed folder is recomputed too, so its rows drop once its discs part ways.
     """
-    music_path = _require_music_path(settings)
+    music_path = require_music_path(settings)
     units: dict[str, _Unit | None] = {}
 
     def add(key: str) -> None:
@@ -1063,7 +1125,7 @@ def _plan_sidecars(
     a commit may log that move, and one that changed there is confirmed at its signature now.
     A revert row is never dropped, but it is confirmed like any other, or nothing would clear it.
     """
-    music_path = _require_music_path(settings)
+    music_path = require_music_path(settings)
     existing = store.list_staged_sidecars(conn)
     audio = _audio_folders(conn, music_path)
     units = _units_to_recompute(settings, unit_keys, targets, audio, existing)
@@ -1316,28 +1378,17 @@ def _vacated_by(conn: sqlite3.Connection, music_path: Path, commit_id: int) -> s
 # --- staging --------------------------------------------------------------------------
 
 
+def _checked_to_path(to_path: object) -> str:
+    """Return one batch entry's *to_path*, or raise :class:`ValueError` when it is no string."""
+    if not isinstance(to_path, str):
+        message = "to_path must be a string"
+        raise ValueError(message)  # noqa: TRY004 - batch rejections are uniformly ValueError
+    return to_path
+
+
 def _validate_batch_entries(entries: Sequence[object]) -> list[tuple[int, str]]:
     """Narrow an untyped *entries* sequence to ``(file_id, to_path)`` pairs, or raise."""
-    validated: list[tuple[int, str]] = []
-    for index, entry in enumerate(entries):
-        if not isinstance(entry, tuple) or len(entry) != _BATCH_ENTRY_WIDTH:
-            message = f"entry {index}: expected a (file_id, to_path) pair"
-            raise ValueError(message)
-        file_id, to_path = entry
-        if not isinstance(file_id, int) or isinstance(file_id, bool):
-            message = f"entry {index}: file_id must be an integer, got {type(file_id).__name__}"
-            raise ValueError(message)  # noqa: TRY004 - batch rejections are uniformly ValueError
-        if not isinstance(to_path, str):
-            message = f"entry {index} (file_id={file_id}): to_path must be a string"
-            raise ValueError(message)  # noqa: TRY004 - batch rejections are uniformly ValueError
-        validated.append((file_id, to_path))
-    seen: set[int] = set()
-    for file_id, _ in validated:
-        if file_id in seen:
-            message = f"duplicate file_id={file_id} in batch"
-            raise ValueError(message)
-        seen.add(file_id)
-    return validated
+    return validate_file_pairs(entries, value_name="to_path", check_value=_checked_to_path)
 
 
 def _batch_relative(music_path: Path, to_path: str) -> str | None:
@@ -1440,8 +1491,7 @@ def _landed_conflict(
         return False, None
     if existing.to_path == to_path:
         return True, None
-    detail = f"its staged move to {existing.to_path} already landed on disk. Run commit_paths first"
-    return False, (LANDED_MOVE, detail)
+    return False, _landed_hold(existing.to_path)
 
 
 def _target_reasons(  # noqa: PLR0913 - cohesive keyword-only target-safety inputs
@@ -1454,26 +1504,21 @@ def _target_reasons(  # noqa: PLR0913 - cohesive keyword-only target-safety inpu
     to_key: str,
     confirming: bool,
 ) -> list[tuple[str, str]]:
-    """Return the ``occupied``, ``shared_target`` and ``cue_reference`` reasons of one entry.
+    """Return the destination reasons of one batch entry, read from the ledger and the disk.
 
-    The file's own current key never occupies its target, so a case-only rename is not held by
-    its own folder entry.
+    A confirmation decides no new path, so its target is never probed on disk.
     """
-    reasons: list[tuple[str, str]] = []
-    target_key = path_keys.path_key(target)
-    holder = store.file_id_at_key(conn, target_key)
-    if holder is not None and holder != file_id:
-        reasons.append((OCCUPIED, f"file_id={holder} is tracked at {to_path}"))
-    elif not confirming and target_key != path_keys.path_key(source) and _listing_holds_key(target):
-        reasons.append((OCCUPIED, f"{to_path} is taken on disk"))
-    claimant = store.staged_file_id_at_target(conn, to_key)
-    if claimant is not None and claimant != file_id:
-        reasons.append((SHARED_TARGET, f"file_id={claimant} is already staged to {to_path}"))
-    sheets = _cue_references(source)
-    if sheets:
-        detail = f"{', '.join(sheets)} in its folder names it. Edit or move the sheet first"
-        reasons.append((CUE_REFERENCE, detail))
-    return reasons
+    return _destination_reasons(
+        file_id=file_id,
+        source=source,
+        target=target,
+        to_path=to_path,
+        holder=store.file_id_at_key(conn, path_keys.path_key(target)),
+        claimant=store.staged_file_id_at_target(conn, to_key),
+        probe_disk=not confirming,
+        holds_key=_listing_holds_key,
+        cue_sheets=_cue_references,
+    )
 
 
 def _plan_entry(
@@ -1481,8 +1526,13 @@ def _plan_entry(
     music_path: Path,
     index: int,
     entry: tuple[int, str],
+    *,
+    speller: _Speller,
 ) -> _EntryPlan:
-    """Validate one batch entry against every destination-safety hold."""
+    """Validate one batch entry against every destination-safety hold.
+
+    *speller* spans the whole call, so two entries never stage two spellings of one new folder.
+    """
     file_id, raw_to_path = entry
     inputs = _entry_inputs(conn, music_path, file_id, raw_to_path)
     if isinstance(inputs, tuple):
@@ -1497,7 +1547,7 @@ def _plan_entry(
     if any(reason in {INVALID_PATH, TOO_LONG} for reason, _ in reasons):
         return _EntryPlan(index, file_id, None, tuple(reasons), None)
 
-    to_path = respell_folders(music_path, inputs.relative)
+    to_path = speller.respell(inputs.relative)
     to_key = path_keys.path_key(to_path)
     target = music_path / to_path
     # A key match passes only as a filename case change, since another folder spelling names
@@ -1595,6 +1645,7 @@ class StagePathsBatchResult:
         }
 
 
+@ledger_lock.mutating
 def stage_paths_batch(
     settings: Settings,
     *,
@@ -1617,15 +1668,16 @@ def stage_paths_batch(
     Raises :class:`ValueError` on any refusal, and nothing is staged.
     """
     validated = _validate_batch_entries(entries)
-    music_path = _require_music_path(settings)
+    music_path = require_music_path(settings)
     _require_volume(music_path)
 
+    speller = _Speller(music_path)
     connection = db.connect(settings.db_path)
     try:
         schema.apply_schema(connection)
         plans = _shared_in_call(
             [
-                _plan_entry(connection, music_path, index, entry)
+                _plan_entry(connection, music_path, index, entry, speller=speller)
                 for index, entry in enumerate(validated)
             ],
         )
@@ -1970,8 +2022,7 @@ def _replaceable(
     if staged is None or staged.origin != _AUTO:
         return False, None
     if _locate(work.source, music_path / staged.to_path, staged) in _AT_TARGET:
-        detail = f"its staged move to {staged.to_path} already landed on disk. Run commit_paths"
-        return False, (LANDED_MOVE, detail)
+        return False, _landed_hold(staged.to_path)
     in_scope = scope_key is None or path_keys.is_within(work.folder_key, scope_key)
     return in_scope, None
 
@@ -1998,19 +2049,19 @@ def _target_holds(  # noqa: PLR0913 - cohesive keyword-only target-safety inputs
         work.hold(TOO_LONG, "; ".join(too_long))
         return
     target = music_path / work.to_path
-    target_key = path_keys.path_key(target)
-    holder = tracked.get(target_key)
-    if holder is not None and holder != work.row.id:
-        work.hold(OCCUPIED, f"file_id={holder} is tracked at {work.to_path}")
-    elif target_key != path_keys.path_key(work.source) and speller.holds_key(target):
-        work.hold(OCCUPIED, f"{work.to_path} is taken on disk")
-    claimant = claims.get(path_keys.path_key(work.to_path))
-    if claimant is not None and claimant != work.row.id:
-        work.hold(SHARED_TARGET, f"file_id={claimant} is already staged to {work.to_path}")
-    sheets = speller.cue_sheets(work.source)
-    if sheets:
-        detail = f"{', '.join(sheets)} in its folder names it. Edit or move the sheet first"
-        work.hold(CUE_REFERENCE, detail)
+    reasons = _destination_reasons(
+        file_id=work.row.id,
+        source=work.source,
+        target=target,
+        to_path=work.to_path,
+        holder=tracked.get(path_keys.path_key(target)),
+        claimant=claims.get(path_keys.path_key(work.to_path)),
+        probe_disk=True,
+        holds_key=speller.holds_key,
+        cue_sheets=speller.cue_sheets,
+    )
+    for reason, detail in reasons:
+        work.hold(reason, detail)
 
 
 def _hold_unsafe(
@@ -2136,7 +2187,7 @@ def plan_library(
     more than one folder with shared disc numbers holds ``merge``. Those two repeat until no
     hold is added. *scope_key* marks the ``auto`` rows a stage of that folder replaces.
     """
-    music_path = _require_music_path(settings)
+    music_path = require_music_path(settings)
     works, speller = _rendered_works(conn, settings, music_path, pattern)
     _hold_shared_renders(works)
     _hold_unsafe(conn, works, music_path=music_path, speller=speller, scope_key=scope_key)
@@ -2152,7 +2203,7 @@ def render_targets(
     pattern: naming.Pattern,
 ) -> dict[int, str | None]:
     """Return each present file's rendered target, respelled on disk, ``None`` when blank."""
-    works, _ = _rendered_works(conn, settings, _require_music_path(settings), pattern)
+    works, _ = _rendered_works(conn, settings, require_music_path(settings), pattern)
     return {work.row.id: work.to_path for work in works}
 
 
@@ -2267,6 +2318,7 @@ def _write_plan(
         )
 
 
+@ledger_lock.mutating
 def stage_paths(
     settings: Settings,
     *,
@@ -2299,7 +2351,7 @@ def stage_paths(
     file sits now (:func:`tagmend.engine.path_keys.folder_arg_key`). Raises
     :class:`ValueError` on a refusal, an invalid persisted pattern or a missing ``music_path``.
     """
-    music_path = _require_music_path(settings)
+    music_path = require_music_path(settings)
     pattern = naming.effective_pattern(settings)
     root_key = None if path is None else path_keys.folder_arg_key(settings, path)
     if not dry_run:
@@ -2375,6 +2427,7 @@ class NamingSettings(FieldDict):
     settings_path: str
 
 
+@ledger_lock.mutating
 def set_naming_pattern(
     settings: Settings,
     *,
@@ -2439,10 +2492,15 @@ def _staged_in_scope(
 
 @dataclass(frozen=True, slots=True)
 class UnstagePathsResult(FieldDict):
-    """What one :func:`unstage_paths` call dropped: audio moves and sidecar moves."""
+    """What one :func:`unstage_paths` call dropped: audio moves and sidecar moves.
+
+    A sidecar row the call drops and stages again counts in neither total. ``sidecars_staged``
+    counts the sidecar moves the call stages for the first time, such as one a dropped unit held.
+    """
 
     removed: int
     sidecars_removed: int
+    sidecars_staged: int
 
 
 def _refuse_landed(
@@ -2472,6 +2530,7 @@ def _refuse_landed(
     raise ValueError(message)
 
 
+@ledger_lock.mutating
 def unstage_paths(
     settings: Settings,
     *,
@@ -2489,7 +2548,7 @@ def unstage_paths(
     if (file_id is None) == (path is None):
         message = "pass exactly one of file_id and path"
         raise ValueError(message)
-    music_path = _require_music_path(settings)
+    music_path = require_music_path(settings)
     root_key = None if path is None else path_keys.folder_arg_key(settings, path)
 
     connection = db.connect(settings.db_path)
@@ -2525,7 +2584,13 @@ def unstage_paths(
         connection.commit()
     finally:
         connection.close()
-    return UnstagePathsResult(removed=len(rows), sidecars_removed=len(sidecars) + len(units.drops))
+    removed_keys = {sidecar.from_key for sidecar in sidecars} | set(units.drops)
+    reinserted_keys = {sidecar.from_key for sidecar in units.inserts}
+    return UnstagePathsResult(
+        removed=len(rows),
+        sidecars_removed=len(removed_keys - reinserted_keys),
+        sidecars_staged=len(reinserted_keys - removed_keys),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -2557,7 +2622,7 @@ def diff_paths(
     is ``stale`` when the persisted naming settings render the file elsewhere now. The commit
     still applies the staged target, so stage again to follow the new render.
     """
-    music_path = _require_music_path(settings)
+    music_path = require_music_path(settings)
     root_key = None if path is None else path_keys.folder_arg_key(settings, path)
 
     connection = db.connect(settings.db_path)
@@ -2613,7 +2678,7 @@ def diff_sidecars(
     its album's audio commits, and it keeps the staging area non-empty until a commit or an
     unstage clears it.
     """
-    music_path = _require_music_path(settings)
+    music_path = require_music_path(settings)
     root_key = None if path is None else path_keys.folder_arg_key(settings, path)
 
     connection = db.connect(settings.db_path)
@@ -2782,6 +2847,7 @@ def _pattern_message(settings: Settings) -> str:
     return f"naming pattern {naming.pattern_text(settings)}"
 
 
+@ledger_lock.mutating
 def commit_paths(
     settings: Settings,
     *,
@@ -2804,7 +2870,7 @@ def commit_paths(
     *message* the commit records the naming pattern in force. Raises :class:`ValueError` when
     ``music_path`` is unset or the volume check refuses it.
     """
-    music_path = _require_music_path(settings)
+    music_path = require_music_path(settings)
     _require_volume(music_path)
     root_key = None if path is None else path_keys.folder_arg_key(settings, path)
     domain = PathDomain(music_path=music_path)
@@ -2903,9 +2969,9 @@ def _target_problem(
     destination_key = path_keys.path_key(destination)
     holder = store.file_id_at_key(conn, destination_key)
     if holder is not None and holder != file_id:
-        return f"file_id={holder} is tracked at {destination}"
+        return _tracked_at_detail(holder, destination)
     if destination_key != path_keys.path_key(source) and _listing_holds_key(destination):
-        return f"{destination} is taken on disk"
+        return _taken_on_disk_detail(destination)
     return None
 
 
@@ -2982,6 +3048,7 @@ def _require_revert_source(
     return source
 
 
+@ledger_lock.mutating
 def revert_paths(
     settings: Settings,
     file_id: int,
@@ -2993,12 +3060,13 @@ def revert_paths(
     """Move one file back to the location of its path *version*, under its own revert commit.
 
     The move is staged as an ``origin='revert'`` row and run through the commit loop, so a crash
-    leaves a row :func:`commit_paths` finishes. Refused while any tag or path change is staged,
-    for a missing file, a file moved outside TagMend, an unknown *version*, and a target that is
-    on disk or tracked. The mismatch gate does not apply. *dry_run* keeps every refusal and
+    leaves a row :func:`commit_paths` finishes. Refused while any tag change, file or sidecar
+    move, or cover is staged, since the whole staging area must be empty. Also refused for a
+    missing file, a file moved outside TagMend, an unknown *version*, and a target that is on
+    disk or tracked. The mismatch gate does not apply. *dry_run* keeps every refusal and
     changes nothing.
     """
-    music_path = _require_music_path(settings)
+    music_path = require_music_path(settings)
     _require_volume(music_path)
 
     connection = db.connect(settings.db_path)
@@ -3128,8 +3196,10 @@ class PathRevertCommitResult(commits.RevertCommitResult):
     def to_dict(self) -> dict[str, object]:
         """JSON-serializable form for the MCP tool."""
         # A slots dataclass is rebuilt as a new class, which zero-argument super() cannot see.
+        base = commits.RevertCommitResult.to_dict(self)
+        base.pop("sidecars")
         return {
-            **commits.RevertCommitResult.to_dict(self),
+            **base,
             "sidecars_reverted": sum(1 for o in self.sidecars if o.status == "reverted"),
             "sidecars": [outcome.to_dict() for outcome in self.sidecars],
         }
@@ -3162,7 +3232,7 @@ def _audio_staying(
     a later commit may have moved it away from those sidecars. A file gone from disk leaves no
     audio for a sidecar to stay with.
     """
-    music_path = _require_music_path(settings)
+    music_path = require_music_path(settings)
     left = {path_keys.path_key(Path(revision.from_path).parent) for revision, *_ in planned}
     staying: dict[tuple[str, str], list[tuple[str, int]]] = {}
     row: store.FileRow | None = None
@@ -3206,7 +3276,7 @@ def _classify_sidecar_revert(
     if not _present(music_path / move.to_path):
         return MISSING, None
     if _listing_holds_key(music_path / move.from_path):
-        return "error", f"{move.from_path} is taken on disk"
+        return "error", _taken_on_disk_detail(move.from_path)
     album_key = path_keys.path_key(
         music_path / _unit_folder_of(move.to_path, _unit_depth(move.from_key, move.unit_key))
     )
@@ -3289,7 +3359,7 @@ def revert_commit_moves(  # noqa: PLR0913 - the revert_commit surface plus its o
     loop, then the sidecar step, so a crash leaves rows :func:`commit_paths` finishes.
     *dry_run* returns the classification only.
     """
-    music_path = _require_music_path(settings)
+    music_path = require_music_path(settings)
     _require_volume(music_path)
     root_key = None if path is None else path_keys.folder_arg_key(settings, path)
     latest_versions = store.path_versions(conn)

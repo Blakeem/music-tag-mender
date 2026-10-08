@@ -207,6 +207,14 @@ def test_distinct_artists_counts_files(db_conn: sqlite3.Connection) -> None:
     assert store.distinct_artists(db_conn) == [("A", 2), ("B", 1)]
 
 
+def test_distinct_artists_skips_missing_files(db_conn: sqlite3.Connection) -> None:
+    ids = _seed_library(db_conn)
+    store.flag_missing(db_conn, ids["a1"], _LATER)
+    assert store.distinct_artists(db_conn) == [("A", 1), ("B", 1)]
+    store.flag_missing(db_conn, ids["b1"], _LATER)
+    assert store.distinct_artists(db_conn) == [("A", 1)]
+
+
 def test_files_in_scope_all(db_conn: sqlite3.Connection) -> None:
     ids = _seed_library(db_conn)
     assert store.files_in_scope(db_conn) == sorted(ids.values())
@@ -400,13 +408,6 @@ def test_manual_and_staged_beat_no_identity(db_conn: sqlite3.Connection) -> None
     assert _status(db_conn, staged) == "staged"
 
 
-def test_has_staged_change_for_is_field_specific(db_conn: sqlite3.Connection) -> None:
-    file_id = _insert(db_conn)
-    _stage_field(db_conn, file_id, "artist")
-    assert store.has_staged_change_for(db_conn, file_id, ("artist", "albumartist")) is True
-    assert store.has_staged_change_for(db_conn, file_id, ("genre",)) is False
-
-
 def test_field_aware_split_staged(db_conn: sqlite3.Connection) -> None:
     """A genre-only staged change reads as genre-staged but artist-pending, and vice versa."""
     genre_file = _insert(db_conn, filename="g.mp3")
@@ -543,7 +544,6 @@ def test_mb_cache_negative_round_trip(db_conn: sqlite3.Connection) -> None:
         found=False,
         album_title=None,
         original_date=None,
-        release_mbid=None,
         release_group_mbid=None,
         now=_NOW,
     )
@@ -561,7 +561,6 @@ def test_mb_cache_found_round_trip(db_conn: sqlite3.Connection) -> None:
         found=True,
         album_title="Paranoid",
         original_date="1970",
-        release_mbid="rel-1",
         release_group_mbid="rg-1",
         now=_NOW,
     )
@@ -571,5 +570,4 @@ def test_mb_cache_found_round_trip(db_conn: sqlite3.Connection) -> None:
     assert found is True
     assert row.album_title == "Paranoid"
     assert row.original_date == "1970"
-    assert row.release_mbid == "rel-1"
     assert row.release_group_mbid == "rg-1"

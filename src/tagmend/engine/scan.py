@@ -1,7 +1,7 @@
-"""Library discovery: walk a root folder and yield audio files.
+"""Library discovery.
 
-This is the foundation of the read path (M1). For M0 it powers the health check's
-"music folder reachable" probe and gives a quick file count.
+It holds the audio extension set, the temp-file suffix discovery skips, and the walk that
+yields audio files under a root.
 """
 
 from __future__ import annotations

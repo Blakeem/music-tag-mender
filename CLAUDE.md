@@ -21,7 +21,8 @@ Each entry names a subsystem, its MCP tools and its modules under `src/tagmend/e
   name, id, sort or stamp field.
 - Commit ledger: `list_commits`, `get_commit`, `revert_commit`. `commits.py` holds the `commits`
   table, the `RevisionDomain` seam and the crash-safe, resume-free `run_commit` loop.
-  `versioning.revert_commit` undoes a tag, path or cover commit as one new `revert` commit.
+  `versioning.revert_commit` undoes a tag, path, cover or picture commit as one new `revert`
+  commit.
 - Path staging: `stage_paths_batch`, `unstage_paths`, `diff_paths`, `commit_paths`,
   `history_paths`, `revert_paths`. Module `paths.py` (`PathDomain`). A file keeps one `files.id`
   across every move. The next `commit_paths` finishes a move that landed before a crash.
@@ -50,6 +51,18 @@ Each entry names a subsystem, its MCP tools and its modules under `src/tagmend/e
   staged row holds the image bytes, and `commit_covers` writes them with no overwrite.
   `cover_writes` logs each write with its bytes. `revert_commit` sends a written cover to the OS
   trash through `trash.py`, and a revert of that revert writes it again.
+- Embedded pictures: `detect_picture_duplicates`, `stage_pictures`, `unstage_pictures`,
+  `diff_pictures`, `commit_pictures`. Modules `picture_duplicates.py`, `pictures.py` and
+  `resync.py`. The scan records each file's embedded pictures in `file_pictures` by SHA-256, with
+  no bytes. `detect_picture_duplicates` groups albums as `detect_cover_gaps` does and reports a
+  picture that the albums of two or more album artists hold, since an old art fetcher matched
+  albums by title alone. It lists each zero-byte picture under `empty_pictures`.
+  `stage_pictures(path, sha256)` stages the removal of a picture from the files under `path`,
+  bytes included. `commit_pictures` removes them through `commits.run_commit` and logs each removed
+  copy with its bytes in `picture_writes`. It is refused while a file it writes has a staged tag
+  change or move. `revert_commit` writes each removed picture back at its position. Navidrome then
+  shows the album cover for each song, and an album left with no cover shows in
+  `detect_cover_gaps` as a gap for `stage_covers`.
 - Tag axes (genre, artist, year, song): `resolve_<axis>s`, `set_<axis>_status` and
   `reset_<axis>_status`, 12 tools. `axis.py` defines each `Axis`, `MISMATCH_AXIS` included.
   `axis_status.py` is the one set and reset implementation. `axis_resolver.py` runs the group
@@ -70,7 +83,9 @@ Each entry names a subsystem, its MCP tools and its modules under `src/tagmend/e
   - Song: `songs.py` and `release_match.py`. Every file of a folder holding a `pending` file
     votes by AcoustID fingerprint. A folder whose files all carry `musicbrainz_albumid` is
     checked against those releases. A folder without ids converges on the one Official release
-    most of its files share and fills blank `title`, `tracknumber` and `discnumber` as `auto`.
+    its files share whose disc and track totals match the totals its files agree on, and fills
+    blank `title`, `tracknumber` and `discnumber` as `auto`. A folder of fewer than three files
+    whose tags carry no total is held `unconverged` (`needs_release_mbid`).
     A folder holding a pending file whose audio is off its tagged release is reported in
     `rebind_folders` with ranked candidates. The first five candidates are placed as the manual
     release path would place the folder. A settled file (`done`, `manual` or staged) off its
@@ -102,11 +117,13 @@ Each entry names a subsystem, its MCP tools and its modules under `src/tagmend/e
 
 ## Invariants
 
-- `tag_revisions`, `path_revisions`, `sidecar_moves` and `cover_writes` are append-only. Triggers
+- `tag_revisions`, `path_revisions`, `sidecar_moves`, `cover_writes` and `picture_writes` are
+  append-only. Triggers
   abort every `UPDATE` or `DELETE` on them, the cascade from `files` included.
 - `schema.apply_schema` upgrades an older ledger in place and refuses a newer one.
-- Every forward change to a music file, its path or a cover is staged, reviewed with `diff_tags`,
-  `diff_paths` or `diff_covers`, and written by `commit_tags`, `commit_paths` or `commit_covers`.
+- Every forward change to a music file, its path, a cover or an embedded picture is staged,
+  reviewed with `diff_tags`, `diff_paths`, `diff_covers` or `diff_pictures`, and written by
+  `commit_tags`, `commit_paths`, `commit_covers` or `commit_pictures`.
   A resolver or `stage_*` tool only stages. `revert_tags`, `revert_paths` and `revert_commit`
   write their restore directly, each as its own `revert` commit.
 - Every commit is revertible. A resolver's real run and `revert_commit` are refused while
@@ -141,7 +158,7 @@ Each entry names a subsystem, its MCP tools and its modules under `src/tagmend/e
 - Two tag names are collapsed only after measuring that they never disagree in the wild.
   `organization` and `label` stay unmapped and unmanaged, since 245 real FLACs hold a different
   label in each.
-- `MANAGED_TAGS` holds 26 fields (managed set 4). `MANAGED_SETS` keeps every older set frozen,
+- `MANAGED_TAGS` holds 28 fields (managed set 5). `MANAGED_SETS` keeps every older set frozen,
   since stored revisions point at them. A widening adds a new entry and bumps
   `MANAGED_SET_VERSION`. Staging and revert first append a `scan` re-baseline
   (`versioning.observe_widened_fields`) to a file whose latest revision predates the current set.
@@ -151,6 +168,12 @@ Each entry names a subsystem, its MCP tools and its modules under `src/tagmend/e
   re-baseline. Otherwise it keeps the current value.
 - `artists` is the Picard ARTISTS list Navidrome links artists from. It is `TXXX:ARTISTS` on
   ID3, the `ARTISTS` freeform atom on MP4 and `ARTISTS` on Vorbis.
+- `album artist` and `album_artist` are managed keys of their own, since Navidrome shows the
+  union of every album artist spelling. A stage that sets `albumartist` clears each of them the
+  file holds unless the stage sets it too.
+- Every mutating engine entry point and `scan_library` hold the ledger mutation lock
+  (`ledger_lock.py`), an OS lock on `<db_path>.lock`. A second mutating call on the same ledger
+  raises `LedgerBusyError`. A dry run and a read-only tool take no lock.
 - Any change to what `read_tags` produces bumps `TAG_READER_VERSION` in the same commit, so that
   the next incremental scan re-reads each stale row once.
 - Every write verifies its temp copy before the atomic swap and raises `TagWriteError` on any
@@ -197,11 +220,11 @@ Each entry names a subsystem, its MCP tools and its modules under `src/tagmend/e
   `tagmend/engine/*`, then gets a thin CLI subcommand and/or MCP tool.
 - **Settings live on disk, not in env.** The MCP server can't see the CLI's shell.
   Read config via `tagmend.config.load_settings()`. Never read env/JSON directly.
-- **`music/` is the live-testing sandbox.** It is a full **copy** of Blake's real 135 GB,
-  11,233-file library. The original is `E:\Music`, which stays untouched and can be re-copied
-  anytime. Live scans, resolver runs, fix runs and problem discovery run against this copy, so
-  that everything is proven before the mended copy replaces the real library (ROADMAP B3). The
-  folder is gitignored and copyrighted.
+- **`music/` is the live-testing sandbox.** It is a full **copy** of Blake's real library, and
+  ROADMAP.md holds the current file count. Live scans, resolver runs, fix runs and problem
+  discovery run against this copy, so that everything is proven before it replaces the real
+  library at `E:\Music` (ROADMAP B3). It now holds the mended library, so it is never re-copied
+  without the owner's go-ahead. The folder is gitignored and copyrighted.
 
 ## Tool naming
 
@@ -230,7 +253,7 @@ A new verb requires an operation no existing verb covers.
 | readiness / ingest | `check_health` · `scan_library` |
 | enumerate / fetch | `list_<plural>` · `get_<singular>` · `get_library_stats` |
 | read-only findings | `detect_[<field>_]<plural finding noun>` |
-| stage→commit cycle | `stage_/unstage_/diff_/commit_/history_/revert_<domain>` (domains `tags`, `paths`, `covers`. `covers` reverts only through `revert_commit`) |
+| stage→commit cycle | `stage_/unstage_/diff_/commit_/history_/revert_<domain>` (domains `tags`, `paths`, `covers`, `pictures`. `covers` and `pictures` revert only through `revert_commit`) |
 | atomic multi-target | `<stage-verb>_<domain>_batch` (`_batch` reserved, reusable) |
 | commit ledger | `list_commits` · `get_commit` · `revert_commit` (bare: one `commits` table, no domain column) |
 | lookup → stage | `resolve_<axis>s` |
@@ -264,7 +287,8 @@ Rules, in order:
 Glossary (the comparison behind each finding noun): `mismatch` = tags ↔ path (folders and
 filename) · `gap` = tag or cover ↔ absent · `disagreement` = tag ↔ external source (MusicBrainz) ·
 `conflict` = tag ↔ sibling tags in the same folder (coined) · `deviation` = current path ↔
-canonical path generated from tags by the naming pattern (coined).
+canonical path generated from tags by the naming pattern (coined) · `duplicate` = embedded
+picture ↔ the embedded pictures of other albums (coined).
 
 ## Quality gates: all four must pass before anything is "done"
 
@@ -319,9 +343,14 @@ npx -y @modelcontextprotocol/inspector $tag mcp
 
 ## End-user install
 
+The three PyPI commands work once TagMend is published to PyPI (ROADMAP.md section 4).
+
 - CLI: `uv tool install tagmend` → `tagmend …`
 - MCP (in a client config): run `uvx tagmend mcp` (or the installed `tagmend mcp`)
 - Fallback: `pipx install tagmend`
+
+Until then, install from a repo checkout with `pip install -e .` and point an MCP client at the
+installed `tagmend mcp`.
 
 ## Layout
 
@@ -331,17 +360,18 @@ src/tagmend/
   config.py         settings.json (platformdirs) + typed Settings
   cli.py            Typer CLI (thin)
   configui.py       loopback config web UI that edits settings.json
-  mcp_server.py     FastMCP server (thin), 51 tools
+  mcp_server.py     FastMCP server (thin), 56 tools
   data/             genre_vocabulary.yml, genre_overlay.yml, web/ (the config UI page)
   engine/
     db.py           SQLite connection (WAL)
-    schema.py       all DDL + PRAGMA user_version (v29)
+    schema.py       all DDL + PRAGMA user_version (v33)
+    ledger_lock.py  the ledger mutation lock every mutating entry point holds
     path_keys.py    path identity keys, subtree key ranges, the folder-argument normalizer
     text_keys.py    the shared text fold keys (alnum, display, artist name, loose, title)
     clock.py        the engine's one source of the current time
     validation.py   argument checks shared by the engine entry points
     serialize.py
-    scan.py         filesystem discovery + signatures
+    scan.py         the audio extension set and the library walk
     health.py       check_health / readiness + interrupted-commit report
     store.py        pure data access: files/file_tags + tag_revisions[_staged] + tag-axis derived status + mismatch status
     library.py      scan orchestration (3 modes) + stats + list_files/get_file
@@ -375,6 +405,9 @@ src/tagmend/
     path_deviations.py  detect_path_deviations: current path vs the rendered path, plus the discovery header
     paths.py
     covers.py       detect_cover_gaps and the cover stage, commit and revert
+    picture_duplicates.py  detect_picture_duplicates: one picture held by two album artists' albums
+    pictures.py     the embedded picture stage, commit and revert
+    resync.py       re-syncs the snapshot to a file after a tag or picture write
     coverart.py     the Cover Art Archive client
     trash.py        sends a file to the OS trash, refusing a volume without one
 tests/              pytest; conftest isolates config + builds temp libraries (make_track)

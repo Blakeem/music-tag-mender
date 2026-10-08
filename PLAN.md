@@ -15,8 +15,8 @@ TagMend is a CLI + MCP tool that cleans up the metadata and file layout of a per
 library, using **Last.fm**, **MusicBrainz** and **AcoustID**. An **append-only revision history
 per file** keeps every change revertible.
 
-Designed so the boring 95% runs deterministically and unattended (via the CLI). An
-LLM (via the MCP subcommand) is pulled in only to resolve the ambiguous cases.
+Designed so the resolvers run the boring 95% deterministically. The MCP server is the primary
+surface for every operation, and an LLM reviews the cases the resolvers hold.
 
 ---
 
@@ -55,8 +55,9 @@ don't collapse into single entities.
 
 ## 3. Non-goals (v1)
 
-- Editing embedded album art.
-- A GUI. The MCP client *is* the UI. A CLI covers batch runs.
+- Embedding album art. TagMend only removes an embedded picture that belongs to another album, and
+  an album's cover goes in its folder.
+- A GUI. The MCP client *is* the UI.
 - Streaming-service or DRM'd files.
 
 ---
@@ -149,8 +150,8 @@ The valuable, risky work is deterministic and must not live inside an LLM. Build
 
 - **MCP server** = primary interface for AI-in-the-loop review. Universal standard.
   Clients configure it per-folder trivially.
-- **CLI** = nearly free once the engine exists. The better UX for the unattended
-  bulk pass.
+- **CLI** = the four commands worth running by hand plus the config and program commands
+  (§12).
 - A **Skill** is explicitly *out of scope for v1*. If wanted later it's just a
   playbook teaching Claude how to drive the MCP, reusing everything below.
 
@@ -458,7 +459,8 @@ Every tag axis (genre, artist, year, song) runs one workflow. Its state is the a
 ## 11. Safety model
 
 - **Stage before write.** A resolver or `stage_*` tool only stages, and every resolver takes
-  `dry_run`. Nothing reaches disk until an explicit `commit_tags`, `commit_paths` or revert call.
+  `dry_run`. Nothing reaches disk until an explicit `commit_tags`, `commit_paths`,
+  `commit_covers`, `commit_pictures` or revert call.
 - **Version 0 baseline** captured before the first write → always revertible.
 - **Surgical writes.** Only the narrow managed-tag set. `ALBUMARTIST` is the merge
   key for collapsing duplicate artists. Per-track `ARTIST` is touched cautiously. The artist
@@ -470,6 +472,10 @@ Every tag axis (genre, artist, year, song) runs one workflow. Its state is the a
   `stage_paths`/`stage_paths_batch` and `commit_paths`. Each move runs atomically per item
   and is recorded in the append-only `path_revisions` log, so any rename/move is
   individually revertible.
+- **Cover writes never overwrite.** `commit_covers` creates each cover as a new file and logs it
+  in the append-only `cover_writes` table. `revert_commit` sends a written cover to the OS trash.
+- **Removed pictures are kept.** `commit_pictures` logs each embedded picture it removes, bytes
+  included, in the append-only `picture_writes` table. `revert_commit` writes it back.
 
 ---
 
@@ -478,7 +484,9 @@ Every tag axis (genre, artist, year, song) runs one workflow. Its state is the a
 The tags side organizes into a **symmetric family** mirroring git, so the paths
 side (§18) reads identically: `stage_/unstage_/diff_/commit_/history_/revert_` × the
 domain (`tags` | `paths`), plus domain-neutral discovery (`list_files`, `get_file`) and
-commit inspection (`list_commits`, `get_commit`).
+commit inspection (`list_commits`, `get_commit`). `covers` and `pictures` are the third and
+fourth domains of the stage and commit family. Neither has a `history_` or `revert_` tool, and
+each reverts only through `revert_commit`.
 
 The tool contract is the `@mcp.tool()` docstrings in `src/tagmend/mcp_server.py`. The naming
 grammar and call shapes are in CLAUDE.md "Tool naming". Both domains run through the same
@@ -609,8 +617,8 @@ so there is one install, one command, and the MCP server is just one of its mode
 - ~~Signature: `size+mtime` vs content hash?~~ **RESOLVED (M1):** `size_bytes` +
   `mtime_ns` (`st_mtime_ns`), fast and NAS-friendly.
 - ~~Should `revert` be exposed in the CLI bulk path or MCP-only?~~ **RESOLVED (M3):**
-  shipped as the MCP `revert_tags(file_id, version)`. Per-file and deliberate. The CLI
-  surface (which MCP tools become subcommands) is deferred until the MCP set proves out.
+  shipped as the MCP `revert_tags(file_id, version)`. Per-file and deliberate. §12 names the
+  CLI surface.
 - ~~Tag storage: raw JSON vs normalized?~~ **RESOLVED (M1):** normalized EAV linked
   table (`file_tags`), one row per value, no raw JSON.
 - ~~Stable `file_id` scheme?~~ **RESOLVED (M1):** DB-assigned integer surrogate
@@ -800,8 +808,8 @@ Exact commands live in `CLAUDE.md` so any fresh context can run the gate immedia
 
 ## 22. Database naming conventions
 
-Applied consistently across every table the engine creates, so the schema reads
-predictably as it grows milestone by milestone:
+The conventions the engine's tables follow, so the schema reads predictably as it grows
+milestone by milestone:
 
 - **Tables:** plural `snake_case` (`files`, `file_tags`, `lastfm_cache`).
 - **Surrogate primary key:** a bare `id` (`INTEGER PRIMARY KEY`) where a table needs a
@@ -826,6 +834,9 @@ predictably as it grows milestone by milestone:
   staged rows carry **no `commit_id`**: there is no claiming. This is the *only* place
   rows are mutated/deleted: committing moves a row into the append-only log and clears
   it. A crash just leaves the row staged for the next commit to sweep up.
+- **Logs keyed by `id`:** `sidecar_moves` and `cover_writes` are append-only logs keyed by `id`
+  with a `commit_id`, staged in `sidecar_moves_staged` (PK `from_key`) and
+  `cover_writes_staged` (PK `target_key`).
 - **SQL safety:** all values bound via `?` placeholders (never string-formatted:
   bandit S608). Identifier-only interpolation (column lists) is the sole exception and
   carries a `# noqa: S608` with no untrusted input.

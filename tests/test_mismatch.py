@@ -293,9 +293,24 @@ def test_filename_track_reads_each_numbering_shape() -> None:
         _mk(9, "311/Album", "311 - Album - 04 - Amber.mp3", albumartist="311", tracknumber="4"),
         # A blank track tag gives no signal.
         _mk(10, "H/Album", "09 Song.mp3", albumartist="H"),
+        _mk(
+            11,
+            "I/Album",
+            "I - Album - 2-05 - Song.mp3",
+            albumartist="I",
+            album="Album",
+            tracknumber="5",
+            discnumber="1",
+        ),
+        _mk(12, "J/Album", "205 Song.mp3", albumartist="J", tracknumber="5", discnumber="1"),
     ]
 
-    assert _flags(files) == {2: {FILENAME_TRACK}, 5: {FILENAME_TRACK}}
+    assert _flags(files) == {
+        2: {FILENAME_TRACK},
+        5: {FILENAME_TRACK},
+        11: {FILENAME_TRACK},
+        12: {FILENAME_TRACK},
+    }
 
 
 def test_filename_track_accepts_a_continuous_count_only_across_discs() -> None:
@@ -449,6 +464,13 @@ def test_a_blank_tag_never_flags() -> None:
 
     assert report.rows == []
     assert report.exception_rows == []
+
+
+def test_a_number_too_long_for_int_stays_a_word() -> None:
+    word = "9" * 5000
+
+    assert mismatch._map_token(word) == word
+    assert mismatch._map_token("007") == "7"
 
 
 def test_a_path_rendered_from_the_tags_never_flags() -> None:
@@ -1262,6 +1284,38 @@ def test_set_by_value_defers_only_the_carriers_that_flag(
     assert (result.affected, result.skipped_unflagged) == (1, 1)
     assert [decided.folder for decided in result.files] == ["rendered"]
     assert set(_stored(engine_settings)) == {jem_id}
+
+
+def test_set_by_value_defers_carriers_across_release_folders(
+    engine_settings: Settings,
+    music_dir: Path,
+) -> None:
+    ozzy = _make_mislabeled_library(music_dir)
+    live = music_dir / "Ozzy Osbourne" / "(2002) Ozzy Osbourne - Live"
+    make_track(live / "01 Paranoid.mp3", {"albumartist": ["Jem"], "artist": ["Ozzy Osbourne"]})
+    make_track(live / "02 Crazy Train.mp3", {"albumartist": ["Ozzy Osbourne"], "artist": ["Ozzy"]})
+    scan_library(engine_settings)
+    jem_ids = [
+        _ozzy_ids(engine_settings, ozzy)[0],
+        _file_id(engine_settings, live, "01 Paranoid.mp3"),
+    ]
+
+    with pytest.raises(ValueError, match="these files span 2"):
+        mismatch.set_mismatch_status(
+            engine_settings,
+            status=MISFILED_DEFERRED,
+            covers=[TOP_FOLDER_ARTIST],
+            file_ids=jem_ids,
+        )
+    result = mismatch.set_mismatch_status(
+        engine_settings,
+        status=MISFILED_DEFERRED,
+        covers=[TOP_FOLDER_ARTIST],
+        value="Jem",
+    )
+
+    assert (result.affected, result.skipped_unflagged) == (2, 0)
+    assert set(_stored(engine_settings)) == set(jem_ids)
 
 
 def _guard_library(settings: Settings, music_dir: Path) -> dict[str, int]:

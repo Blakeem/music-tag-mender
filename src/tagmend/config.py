@@ -32,7 +32,7 @@ if TYPE_CHECKING:
 _APP_NAME: Final = "tagmend"
 _SETTINGS_FILENAME: Final = "settings.json"
 _DB_FILENAME: Final = "tagmend.sqlite3"
-_KNOWN_KEYS: Final[frozenset[str]] = frozenset(
+KNOWN_KEYS: Final[frozenset[str]] = frozenset(
     {
         "music_path",
         "lastfm_api_key",
@@ -42,6 +42,7 @@ _KNOWN_KEYS: Final[frozenset[str]] = frozenset(
         "genre_use_album_tags",
         "lastfm_rate_per_sec",
         "genre_stage_limit",
+        "artist_stage_limit",
         "musicbrainz_rate_per_sec",
         "musicbrainz_contact",
         "year_stage_limit",
@@ -58,27 +59,29 @@ _KNOWN_KEYS: Final[frozenset[str]] = frozenset(
 # The API keys. The config UI masks them and ``config-set`` prompts for them without echoing.
 SECRET_KEYS: Final[frozenset[str]] = frozenset({"lastfm_api_key", "acoustid_api_key"})
 
+# Only paths.set_naming_pattern writes these, since it validates them and refuses while a path
+# move is staged.
+NAMING_KEYS: Final[frozenset[str]] = frozenset({"naming_pattern", "container_folders"})
+
 # A settings file written before the album axis became the year axis still carries the old key.
 _LEGACY_KEYS: Final[Mapping[str, str]] = {"album_stage_limit": "year_stage_limit"}
 
 _ID3_FRAME_ID: Final = re.compile(r"[A-Za-z0-9]{4}")
 
-# Defaults for the M2 genre-tagging settings (used by the coercion helpers below).
+# Defaults for the genre-tagging settings.
 _GENRE_MIN_WEIGHT_DEFAULT: Final = 2
 _GENRE_MAX_COUNT_DEFAULT: Final = 4
 _LASTFM_RATE_PER_SEC_DEFAULT: Final = 1.0
 # Last.fm's API terms allow 5 requests per second per IP, averaged over 5 minutes.
 _LASTFM_RATE_PER_SEC_MAX: Final = 5.0
 _GENRE_STAGE_LIMIT_DEFAULT: Final = 300
+_ARTIST_STAGE_LIMIT_DEFAULT: Final = 300
 
 # The public project URL, the contact any User-Agent may carry without naming a person.
 PROJECT_URL: Final = "https://github.com/Blakeem/music-tag-mender"
 
-# Defaults for the year-axis MusicBrainz settings. MusicBrainz's published rate limit is
-# ~1 request/second and it REQUIRES a descriptive User-Agent identifying the application
-# plus a contact (an email or URL). We compose ``TagMend/<live-version> ( <contact> )`` at
-# request time so the version never drifts; only the contact is user-configurable, and it
-# defaults to the public project URL rather than a personal address.
+# MusicBrainz allows about 1 request per second and requires a User-Agent naming the app and a
+# contact.
 _MUSICBRAINZ_RATE_PER_SEC_DEFAULT: Final = 1.0
 _MUSICBRAINZ_RATE_PER_SEC_MAX: Final = 1.0
 _MUSICBRAINZ_CONTACT_DEFAULT: Final = PROJECT_URL
@@ -93,12 +96,22 @@ _SONG_STAGE_LIMIT_DEFAULT: Final = 150
 # Tokens (case-insensitive) that mean "no limit" for ``genre_max_count``.
 _NONE_TOKENS: Final[frozenset[str]] = frozenset({"", "0", "none", "null"})
 
+# The typed key families whose values check_setting holds to the rules load_settings coerces by.
+_INT_KEYS: Final[frozenset[str]] = frozenset({"genre_min_weight"})
+_NON_NEGATIVE_INT_KEYS: Final[frozenset[str]] = frozenset(
+    {"genre_stage_limit", "artist_stage_limit", "year_stage_limit", "song_stage_limit"},
+)
+_RATE_KEYS: Final[frozenset[str]] = frozenset(
+    {"lastfm_rate_per_sec", "musicbrainz_rate_per_sec", "acoustid_rate_per_sec"},
+)
+
 # Tokens (case-insensitive) that mean ``False`` for a boolean setting.
 _FALSE_TOKENS: Final[frozenset[str]] = frozenset({"false", "0", "no", "off"})
 
 logger = get_logger(__name__)
 
-# Serializes concurrent writers (the CLI, the config web UI) so a merge never loses data.
+# Serializes writers inside one process, such as the config UI's handler threads and
+# set_naming_pattern. Separate processes are not serialized, and the later rename wins.
 _WRITE_LOCK: Final = threading.Lock()
 
 
@@ -129,7 +142,7 @@ def default_db_path() -> Path:
 def build_user_agent(contact: str) -> str:
     """Compose the MusicBrainz ``User-Agent`` from the live app version + *contact*.
 
-    MusicBrainz requires ``App/Version ( contact )``; *contact* is an email or URL.
+    MusicBrainz requires ``App/Version ( contact )``. *contact* is an email or URL.
     """
     return f"TagMend/{__version__} ( {contact} )"
 
@@ -142,15 +155,14 @@ class Settings:
     # Both API keys stay out of the repr so a logged Settings never leaks them.
     lastfm_api_key: str | None = field(repr=False)
     db_path: Path
-    # M2 genre/Last.fm settings carry defaults so direct construction (tests, fixtures)
-    # needn't restate them; ``load_settings`` always passes the coerced values.
+    # Fields from here on carry defaults so tests can build Settings directly. load_settings
+    # always passes the coerced values.
     genre_min_weight: int = _GENRE_MIN_WEIGHT_DEFAULT
     genre_max_count: int | None = _GENRE_MAX_COUNT_DEFAULT
     genre_use_album_tags: bool = True
     lastfm_rate_per_sec: float = _LASTFM_RATE_PER_SEC_DEFAULT
     genre_stage_limit: int = _GENRE_STAGE_LIMIT_DEFAULT
-    # Year-axis MusicBrainz settings carry defaults so direct construction (tests,
-    # fixtures) needn't restate them; ``load_settings`` always passes the coerced values.
+    artist_stage_limit: int = _ARTIST_STAGE_LIMIT_DEFAULT
     musicbrainz_rate_per_sec: float = _MUSICBRAINZ_RATE_PER_SEC_DEFAULT
     musicbrainz_contact: str = _MUSICBRAINZ_CONTACT_DEFAULT
     year_stage_limit: int = _YEAR_STAGE_LIMIT_DEFAULT
@@ -159,7 +171,6 @@ class Settings:
     container_folders: tuple[str, ...] = ()
     # The path naming pattern. Empty means the built-in default the naming module defines.
     naming_pattern: str = ""
-    # Song-axis settings.
     acoustid_api_key: str | None = field(default=None, repr=False)
     fpcalc_path: str | None = None
     acoustid_rate_per_sec: float = _ACOUSTID_RATE_PER_SEC_DEFAULT
@@ -172,7 +183,7 @@ class Settings:
         """The MusicBrainz ``User-Agent`` header: app name + live version + contact.
 
         Composed at read time so the version tracks ``tagmend.__version__`` and never
-        drifts the way a stored string would; only the contact half is configurable.
+        drifts the way a stored string would. Only the contact half is configurable.
         """
         return build_user_agent(self.musicbrainz_contact)
 
@@ -180,9 +191,8 @@ class Settings:
 def load_settings() -> Settings:
     """Load settings, applying env overrides over the on-disk file over defaults.
 
-    The on-disk store and env overrides are string-only, so the typed genre/Last.fm
-    settings are coerced here; a malformed value logs a lazy ``%``-warning and falls back
-    to the built-in default rather than raising.
+    The on-disk store and env overrides hold strings, so every typed setting is coerced here. A
+    malformed value logs a warning and falls back to the built-in default.
     """
     raw = _read_raw_settings()
 
@@ -214,6 +224,11 @@ def load_settings() -> Settings:
             "genre_stage_limit",
             _resolve_raw("genre_stage_limit", raw),
             _GENRE_STAGE_LIMIT_DEFAULT,
+        ),
+        artist_stage_limit=_coerce_non_negative_int(
+            "artist_stage_limit",
+            _resolve_raw("artist_stage_limit", raw),
+            _ARTIST_STAGE_LIMIT_DEFAULT,
         ),
         musicbrainz_rate_per_sec=_coerce_capped_rate(
             "musicbrainz_rate_per_sec",
@@ -253,7 +268,7 @@ def _resolve_raw(key: str, raw: dict[str, str]) -> str | None:
 
 
 def _coerce_int(key: str, value: str | None, default: int) -> int:
-    """Parse *value* as an ``int``; warn and use *default* when missing or malformed."""
+    """Parse *value* as an ``int``. Warn and use *default* when missing or malformed."""
     if value is None:
         return default
     try:
@@ -276,7 +291,7 @@ def _coerce_non_negative_int(key: str, value: str | None, default: int) -> int:
 
 
 def _coerce_float(key: str, value: str | None, default: float) -> float:
-    """Parse *value* as a ``float``; warn and use *default* when missing or malformed."""
+    """Parse *value* as a ``float``. Warn and use *default* when missing or malformed."""
     if value is None:
         return default
     try:
@@ -292,8 +307,7 @@ def _coerce_capped_rate(key: str, value: str | None, default: float, cap: float)
     A rate at or below zero would disable pacing entirely, so it falls back to *default*.
     """
     parsed = _coerce_float(key, value, default)
-    # Written as a negation so NaN, which compares false to everything, is rejected too.
-    if not parsed > 0:
+    if not _is_positive(parsed):
         logger.warning("invalid %s=%r; using default %s", key, value, default)
         return default
     if parsed > cap:
@@ -302,11 +316,17 @@ def _coerce_capped_rate(key: str, value: str | None, default: float, cap: float)
     return parsed
 
 
+def _is_positive(value: float | None) -> bool:
+    """Return whether *value* is a number above 0."""
+    # NaN compares false to everything, so ``> 0`` rejects it where ``<= 0`` would accept it.
+    return value is not None and value > 0
+
+
 def _coerce_max_count(value: str | None) -> int | None:
-    """Parse ``genre_max_count``: unset → default cap; a sentinel → ``None`` (unlimited).
+    """Parse ``genre_max_count``: unset → default cap, a sentinel → ``None`` (unlimited).
 
     Unset (not configured) yields the default cap of ``_GENRE_MAX_COUNT_DEFAULT``. The
-    sentinel tokens (empty string, ``0``, ``none``, ``null``; case-insensitive) explicitly
+    sentinel tokens (empty string, ``0``, ``none``, ``null``, in any case) explicitly
     mean "no cap" (``None``). Any other value is parsed as ``int``. A malformed or negative
     one warns and falls back to the default cap, since the cap is a slice bound where a
     negative value means "all but the last N". Any spelling that parses to 0 (``00``,
@@ -332,21 +352,26 @@ def _coerce_max_count(value: str | None) -> int | None:
 
 
 def _coerce_bool(value: str | None, *, default: bool) -> bool:
-    """Parse *value* as a bool; ``false``/``0``/``no``/``off`` (any case) → ``False``."""
+    """Parse *value* as a bool. ``false``/``0``/``no``/``off`` (any case) → ``False``."""
     if value is None:
         return default
     return value.strip().lower() not in _FALSE_TOKENS
 
 
+FOLDER_LIST_DELIMITER: Final = ";"
+
+
 def _coerce_folder_list(value: str | None) -> tuple[str, ...]:
-    """Parse a semicolon-delimited folder list into a tuple; strip entries, drop empties.
+    """Parse a semicolon-delimited folder list into a tuple of stripped, non-empty entries.
 
     Unset (``None``) or all-empty yields ``()``. Each segment is stripped and blank segments
     (from leading/trailing/repeated ``;``) are dropped, so ``" a ; ;b; "`` → ``("a", "b")``.
     """
     if value is None:
         return ()
-    return tuple(stripped for part in value.split(";") if (stripped := part.strip()))
+    return tuple(
+        stripped for part in value.split(FOLDER_LIST_DELIMITER) if (stripped := part.strip())
+    )
 
 
 def _coerce_frame_ids(value: str | None) -> tuple[str, ...]:
@@ -364,6 +389,61 @@ def _coerce_frame_ids(value: str | None) -> tuple[str, ...]:
     return tuple(frame_ids)
 
 
+def check_setting(key: str, value: str) -> None:
+    """Raise ``ValueError`` naming *key* and *value* when ``load_settings`` would discard it.
+
+    A key with no typed rule accepts any value.
+    """
+    requirement = _broken_requirement(key, value)
+    if requirement is None:
+        return
+    message = f"{key} must be {requirement} (got {value!r})"
+    raise ValueError(message)
+
+
+def _broken_requirement(key: str, value: str) -> str | None:
+    """Return the rule *value* breaks for *key*, or ``None`` when ``load_settings`` keeps it."""
+    parsed_int = _parse_int(value)
+    is_count = parsed_int is not None and parsed_int >= 0
+    if key in _INT_KEYS and parsed_int is None:
+        return "a whole number"
+    if key in _NON_NEGATIVE_INT_KEYS and not is_count:
+        return "a whole number of 0 or more"
+    if key in _RATE_KEYS and not _is_positive(_parse_float(value)):
+        return "a number above 0"
+    if key == "genre_max_count" and value.strip().lower() not in _NONE_TOKENS and not is_count:
+        return "0 (no cap) or a positive whole number"
+    if key == "id3_droppable_frames" and not all(
+        _ID3_FRAME_ID.fullmatch(entry) for entry in _coerce_folder_list(value)
+    ):
+        return "a semicolon-separated list of four-character ID3 frame ids"
+    return None
+
+
+def _parse_int(value: str) -> int | None:
+    """Return *value* as an ``int``, or ``None`` when it does not parse."""
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
+
+def _parse_float(value: str) -> float | None:
+    """Return *value* as a ``float``, or ``None`` when it does not parse."""
+    try:
+        return float(value)
+    except ValueError:
+        return None
+
+
+def naming_key_refusal(key: str) -> str:
+    """Return the refusal a settings writer other than ``set_naming_pattern`` gives *key*."""
+    return (
+        f"config-set does not write {key}. Use the set_naming_pattern MCP tool, which validates "
+        "it and refuses while a path move is staged. Nothing was saved"
+    )
+
+
 def set_setting(key: str, value: str) -> Path:
     """Persist a single key into ``settings.json`` and return the file path.
 
@@ -376,23 +456,21 @@ def set_setting(key: str, value: str) -> Path:
 def set_settings(mapping: dict[str, str]) -> Path:
     """Merge a batch of keys into ``settings.json`` atomically and return the file path.
 
-    Every key must be in ``_KNOWN_KEYS`` (a ``ValueError`` lists any unknowns). The given
-    *mapping* is **merged** over the current on-disk values — never a wholesale replace, so
-    keys absent from *mapping* are preserved. A file that exists but cannot be read or parsed
+    Every key must be in ``KNOWN_KEYS`` (a ``ValueError`` lists any unknowns). *mapping* is
+    merged over the current on-disk values, never a wholesale replace, so keys absent from
+    *mapping* are preserved. A file that exists but cannot be read or parsed
     raises ``ValueError`` before anything is written. The write is serialized by a module-level
     lock and is atomic (temp file, fsync, restrict permissions, then rename) so a concurrent
     writer or a mid-write crash can never leave a partial file.
     """
-    # Input: reject unknown keys before touching disk.
-    unknown = sorted(key for key in mapping if key not in _KNOWN_KEYS)
+    unknown = sorted(key for key in mapping if key not in KNOWN_KEYS)
     if unknown:
-        known = ", ".join(sorted(_KNOWN_KEYS))
+        known = ", ".join(sorted(KNOWN_KEYS))
         message = f"unknown setting {', '.join(unknown)}; known keys: {known}"
         raise ValueError(message)
 
     path = settings_path()
 
-    # Process + Output: merge under the lock, then write atomically.
     with _WRITE_LOCK:
         path.parent.mkdir(parents=True, exist_ok=True)
         current = _parse_settings_file(path)
@@ -433,7 +511,7 @@ def _env_override(key: str) -> str | None:
 
 
 def _read_raw_settings() -> dict[str, str]:
-    """Read ``settings.json`` into a flat string map; tolerate a missing/invalid file."""
+    """Read ``settings.json`` into a flat string map. A missing or invalid file reads empty."""
     path = settings_path()
     if not path.exists():
         logger.debug("no settings file at %s; using defaults", path)
@@ -490,5 +568,5 @@ def _restrict_permissions(path: Path) -> None:
     """Best-effort: make the settings file user-readable/writable only (holds a key)."""
     try:
         path.chmod(stat.S_IRUSR | stat.S_IWUSR)
-    except OSError as exc:  # Windows ACLs differ; non-fatal
+    except OSError as exc:  # Windows ACLs differ, so a failure is non-fatal.
         logger.debug("could not restrict permissions on %s: %s", path, exc)

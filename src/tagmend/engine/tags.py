@@ -1,28 +1,36 @@
-"""Read and surgically write the normalized tag set via mutagen (M1 read + M3 write).
+"""Read and surgically write the normalized tag set via mutagen.
 
 Tags are read in mutagen's "easy" mode and normalized into a single canonical,
 lowercase namespace so the rest of the engine never has to care about format-specific
 key spellings (ID3 vs Vorbis vs MP4). A Vorbis spelling map collapses the Picard names
 mutagen leaves raw. Everything else passes through lowercased unchanged.
 
-The write path (:func:`write_managed_tags`, M3) touches only the narrow
+The write path (:func:`write_managed_tags`) touches only the narrow
 :data:`MANAGED_TAGS` set and writes atomically (temp copy + ``os.replace``) so a
-dropped NAS connection mid-write cannot corrupt the original (PLAN.md §7 and §11).
+dropped NAS connection mid-write cannot corrupt the original.
 Before the swap it verifies the temp copy, and refuses with :class:`TagWriteError` when the
 save changed anything outside the target. A container the verifier cannot check is refused
 before any copy, and :func:`ensure_writable` lets staging refuse it before a change is queued.
 An ID3 frame the caller names in ``droppable_frames`` is the one entry a save may drop.
+
+:func:`read_pictures` lists a file's embedded pictures, each with its bytes and their SHA-256.
+:func:`read_picture_data` lists them with every attribute their container stores, and
+:func:`write_pictures` sets that list through the same verified temp copy.
 """
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import hashlib
 import io
+import json
 import os
 import re
 import shutil
-from dataclasses import dataclass
+import stat
+from collections import Counter
+from dataclasses import dataclass, field, fields, replace
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, BinaryIO, Final, Protocol
 
@@ -34,8 +42,9 @@ import mutagen
 from mutagen._vorbis import VCommentDict
 from mutagen.easyid3 import EasyID3
 from mutagen.easymp4 import EasyMP4, EasyMP4Tags
-from mutagen.flac import FLAC
+from mutagen.flac import FLAC, Picture
 from mutagen.id3 import (  # type: ignore[attr-defined]
+    APIC,
     ID3,
     ID3FileType,
     ID3NoHeaderError,
@@ -43,27 +52,22 @@ from mutagen.id3 import (  # type: ignore[attr-defined]
     MakeID3v1,
     ParseID3v1,
 )
-from mutagen.mp4 import MP4, MP4Tags
+from mutagen.mp4 import MP4, MP4Cover, MP4Tags
 from mutagen.ogg import OggFileType
 
 from tagmend.engine.scan import TEMP_SUFFIX
 from tagmend.log import get_logger
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Mapping, Sequence
+    from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
     from pathlib import Path
 
     from mutagen._file import FileType
 
 logger = get_logger(__name__)
 
-# ``originaldate`` (the original/first-release year) is native on ID3 (``TDOR``) and Vorbis
-# (``ORIGINALDATE``) via mutagen's easy mode, but MP4 has no built-in easy mapping. Register
-# it ONCE at module load so read and write agree on the iTunes freeform atom — never ``©day``
-# (that is ``date``, the reissue year). The atom name is matched CASE-SENSITIVELY and Picard
-# writes it lowercase, so an uppercase registration reads nothing on a Picard-tagged file and
-# writes a second, contradicting atom beside it. Registration is idempotent; importing this
-# module is the single place it happens.
+# EasyMP4 has no ``originaldate`` mapping, and ``©day`` is ``date``, the reissue year. Picard
+# writes the freeform atom lowercase, and an atom name matches case-sensitively.
 EasyMP4Tags.RegisterFreeformKey("originaldate", "originaldate")  # type: ignore[no-untyped-call]
 
 # EasyID3 maps ``albumartistsort`` to ``TXXX:ALBUMARTISTSORT``, a frame Picard does not write:
@@ -78,8 +82,68 @@ EasyID3.RegisterTextKey("albumartistsort", "TSO2")  # type: ignore[no-untyped-ca
 EasyID3.RegisterTXXXKey("artists", "ARTISTS")  # type: ignore[no-untyped-call]
 EasyMP4Tags.RegisterFreeformKey("artists", "ARTISTS")  # type: ignore[no-untyped-call]
 
+# Navidrome shows the union of ``ALBUMARTIST`` and these two aliases, so each alias is managed
+# and a stage can leave one spelling. ID3 holds each in a ``TXXX`` frame, MP4 in a freeform atom.
+_ALBUMARTIST_ALIAS_FIELDS: Final[Mapping[str, str]] = {
+    "album artist": "ALBUM ARTIST",
+    "album_artist": "ALBUM_ARTIST",
+}
+_ALBUMARTIST_ALIAS_FRAMES: Final[frozenset[str]] = frozenset(
+    f"TXXX:{field}" for field in _ALBUMARTIST_ALIAS_FIELDS.values()
+)
+
+
+def _alias_frame_of(frame_key: str) -> str | None:
+    """Return the albumartist alias ``TXXX`` frame *frame_key* names in any ASCII case, or ``None``.
+
+    TagLib upper-cases the ASCII letters of a ``TXXX`` description, so Navidrome reads
+    ``TXXX:album artist`` as the ``album artist`` alias.
+    """
+    folded = frame_key.upper() if frame_key.isascii() else None
+    return folded if folded in _ALBUMARTIST_ALIAS_FRAMES else None
+
+
+def _register_alias_txxx_key(key: str, desc: str) -> None:
+    """Register *key* on every ``TXXX`` frame whose description is *desc* in any ASCII case.
+
+    A read joins every case variant, as TagLib does, and a write or a clear removes each one, so
+    the file keeps one spelling.
+    """
+    frame_key = f"TXXX:{desc}"
+    EasyID3.RegisterTXXXKey(key, desc)  # type: ignore[no-untyped-call]
+    add_frame = EasyID3.Set[key]
+
+    def variants(id3: ID3) -> list[str]:
+        held = list(id3.keys())  # type: ignore[no-untyped-call]
+        return [name for name in held if _alias_frame_of(name) == frame_key]
+
+    def getter(id3: ID3, _key: str) -> list[str]:
+        held = variants(id3)
+        if not held:
+            raise KeyError(frame_key)
+        return [str(text) for variant in held for text in id3[variant]]
+
+    def deleter(id3: ID3, _key: str) -> None:
+        held = variants(id3)
+        if not held:
+            raise KeyError(frame_key)
+        for variant in held:
+            del id3[variant]  # type: ignore[no-untyped-call]
+
+    def setter(id3: ID3, key: str, value: list[str]) -> None:
+        for variant in variants(id3):
+            del id3[variant]  # type: ignore[no-untyped-call]
+        add_frame(id3, key, value)
+
+    EasyID3.RegisterKey(key, getter, setter, deleter)  # type: ignore[no-untyped-call]
+
+
+for _alias, _field in _ALBUMARTIST_ALIAS_FIELDS.items():
+    _register_alias_txxx_key(_alias, _field)
+    EasyMP4Tags.RegisterFreeformKey(_alias, _field)  # type: ignore[no-untyped-call]
+
 # The two MusicBrainz ids in :data:`MANAGED_TAGS` that EasyMP4 has no built-in mapping for
-# (the other four — album/albumartist/artist/track ids + album type — are native). Register
+# (the album, albumartist, artist and track ids and the album type are native). Register
 # them here on the SAME iTunes freeform atom names Picard writes (verified against a real
 # Picard-tagged ``.m4a``: ``----:com.apple.iTunes:MusicBrainz Release Group Id`` /
 # ``MusicBrainz Release Track Id``), so read and write agree. EasyID3/Vorbis carry both
@@ -93,14 +157,8 @@ EasyMP4Tags.RegisterFreeformKey(  # type: ignore[no-untyped-call]
     "MusicBrainz Release Track Id",
 )
 
-# The release-stamp fields MP4 needs mapped. ``organization`` is registered for READING only
-# (it is not in the managed set — see the note beside _VORBIS_SPELLINGS), which costs nothing
-# and beats leaving the atom invisible. All but ``releasecountry`` simply have no built-in
-# EasyMP4 entry; ``releasecountry`` HAS one and it points at the wrong atom — mutagen says
-# ``MusicBrainz Release Country`` while Picard writes ``MusicBrainz Album Release Country``, one
-# word apart and invisible without this override. Every name here was read off a real
-# Picard-tagged ``.m4a`` in the library except ``CATALOGNUMBER``, which no sample carried and
-# which follows the uppercase convention the other five share.
+# EasyMP4 lacks these atoms, and its own ``releasecountry`` atom is a word off from Picard's.
+# Each name is Picard's (no sample held CATALOGNUMBER). ``organization`` is read, never managed.
 for _key, _atom in (
     ("organization", "LABEL"),
     ("media", "MEDIA"),
@@ -112,24 +170,16 @@ for _key, _atom in (
 ):
     EasyMP4Tags.RegisterFreeformKey(_key, _atom)  # type: ignore[no-untyped-call]
 
-# Canonical key -> the name Picard uses for the same concept in a Vorbis comment. mutagen has
-# no "easy" layer for Vorbis (``mutagen.File(path, easy=True)`` hands back a plain ``FLAC`` /
-# ``OggVorbis``), so unlike ID3 and MP4 these names are NOT normalized for us and every one
-# that differs from the canonical key has to be mapped here, in both directions. An entry is
-# needed ONLY where the two names differ.
+# Canonical key -> Picard's Vorbis name, only where the two differ. Vorbis has no easy layer, so
+# mutagen leaves these names raw in both directions.
 _VORBIS_SPELLINGS: Final[Mapping[str, str]] = {
     "musicbrainz_albumtype": "releasetype",
     "musicbrainz_albumstatus": "releasestatus",
 }
 
-# NOT here, deliberately: ``organization`` <-> ``label``. Measured on this library, 479 FLACs
-# carry BOTH Vorbis names and on 245 of them the values DIFFER (an original label in
-# ORGANIZATION, the reissue label in LABEL). Collapsing them would pick one and let a later
-# write delete the other, with the baseline holding only the survivor — irreversible. The two
-# above have zero such overlap, so collapsing them is lossless. Until the label pair has a
-# decided rule, both names stay unmapped and unmanaged.
-# The same holds for ``BAND`` and ``ALBUM ARTIST`` against ``ALBUMARTIST``: library FLACs carry a
-# different value in each, and none carries either without ``ALBUMARTIST``.
+# Left unmapped: 245 of 479 library FLACs holding both ``organization`` and ``label`` differ,
+# and ``BAND`` can differ from ``ALBUMARTIST``. Collapsing either pair loses data. ``BAND`` stays
+# unmanaged, since Navidrome does not read it as an album artist.
 
 # Derived, never hand-written twice: a second literal could drift out of step with the map above.
 _VORBIS_TO_CANONICAL: Final[Mapping[str, str]] = {v: k for k, v in _VORBIS_SPELLINGS.items()}
@@ -153,11 +203,8 @@ ORIGINAL_MANAGED_TAGS: Final[frozenset[str]] = frozenset(
     },
 )
 
-# The 13 identity/MusicBrainz fields the mismatch-fix flow adds: the full wrong-release
-# "stamp" a tagger (Picard) leaves when it matches a track against the wrong MusicBrainz
-# release — identity (``title``/``album``/``date``/``tracknumber``/``discnumber``/the two
-# sort names) plus the album type and the five remaining MB ids. EasyID3/Vorbis carry them
-# natively; EasyMP4 needs the two freeform registrations above.
+# The 13 identity and MusicBrainz fields of a wrong-release stamp. Vorbis spells the album type
+# ``releasetype``, ID3 needs the ``TSO2`` override and MP4 the two freeform registrations above.
 _WIDENED_MANAGED_TAGS: Final[frozenset[str]] = frozenset(
     {
         "title",
@@ -176,11 +223,8 @@ _WIDENED_MANAGED_TAGS: Final[frozenset[str]] = frozenset(
     },
 )
 
-# The release/recording provenance stamp: WHICH PRESSING a file's tags came from. An identity
-# fix rewrites artist/album/title but leaves this block behind, so a rebound file reads
-# "Alice in Chains - Greatest Hits" while its albumstatus still says "bootleg" and its country
-# "RU" — from the Russian bootleg it was wrongly matched to. Managed so the fix flow can clear
-# or replace it in the same commit, and so revert governs it like everything else.
+# The provenance stamp of a file's release, which an identity fix would otherwise leave behind
+# (a bootleg status, a foreign country). Managed so the fix clears it in the same commit.
 RELEASE_STAMP_TAGS: Final[frozenset[str]] = frozenset(
     {
         "musicbrainz_albumstatus",
@@ -197,31 +241,35 @@ RELEASE_STAMP_TAGS: Final[frozenset[str]] = frozenset(
 # it, ``artist`` then being only the display credit. Managed so an artist-name fix renames both.
 _ARTIST_LIST_TAGS: Final[frozenset[str]] = frozenset({"artists"})
 
-# The set of tags TagMend is allowed to write/revert (26 = 5 original + 13 identity + 7 release
-# stamp + the artists list). A CLOSED set: anything outside it (``comment``/``composer``/art…)
-# is never read, written, or deleted, and every key here MUST be provably writable on all four
-# formats. The mismatch-fix flow can repair a poisoned release in one commit, and revert restores
-# every field the target revision's own managed set governed (see
-# :func:`tagmend.engine.versioning._revert_target_tags`).
-# ``date`` (reissue year, MP4 ``©day``) and ``originaldate`` (original year, MP4 freeform) are
-# BOTH managed and kept distinct.
+# The albumartist aliases, each its own key so that staging can clear the ones a change leaves.
+ALBUMARTIST_ALIASES: Final[frozenset[str]] = frozenset(_ALBUMARTIST_ALIAS_FIELDS)
+
+# The 28 tags TagMend writes and reverts, each writable on all four formats. A key outside the
+# set is never written or deleted. :func:`read_tags` reports every key the file holds, and
+# ``versioning.managed_subset`` narrows a read to this set.
 MANAGED_TAGS: Final[frozenset[str]] = (
-    ORIGINAL_MANAGED_TAGS | _WIDENED_MANAGED_TAGS | RELEASE_STAMP_TAGS | _ARTIST_LIST_TAGS
+    ORIGINAL_MANAGED_TAGS
+    | _WIDENED_MANAGED_TAGS
+    | RELEASE_STAMP_TAGS
+    | _ARTIST_LIST_TAGS
+    | ALBUMARTIST_ALIASES
 )
 
 # Which managed set governed a given revision, so revert can tell "this tag was empty then"
 # from "this tag was not tracked then". Version 1 is the pre-widening five-tag set, version 2
 # adds the thirteen identity fields, version 3 the seven release-stamp fields, version 4 the
-# ``artists`` list. Every new revision is stamped with :data:`MANAGED_SET_VERSION`, and
-# :func:`governed_tags` looks a stamp up here. Widening the set again means a new entry and a
-# bump, never editing an existing entry, since stored revisions point at it.
-MANAGED_SET_VERSION: Final = 4
+# ``artists`` list, version 5 the two albumartist aliases. Every new revision is stamped with
+# :data:`MANAGED_SET_VERSION`, and :func:`governed_tags` looks a stamp up here. Widening the set
+# again means a new entry and a bump, never editing an existing entry, since stored revisions
+# point at it.
+MANAGED_SET_VERSION: Final = 5
 
 MANAGED_SETS: Final[Mapping[int, frozenset[str]]] = {
     1: ORIGINAL_MANAGED_TAGS,
     2: ORIGINAL_MANAGED_TAGS | _WIDENED_MANAGED_TAGS,
     3: ORIGINAL_MANAGED_TAGS | _WIDENED_MANAGED_TAGS | RELEASE_STAMP_TAGS,
-    4: MANAGED_TAGS,
+    4: ORIGINAL_MANAGED_TAGS | _WIDENED_MANAGED_TAGS | RELEASE_STAMP_TAGS | _ARTIST_LIST_TAGS,
+    5: MANAGED_TAGS,
 }
 
 
@@ -236,9 +284,11 @@ def governed_tags(managed_set: int) -> frozenset[str]:
 
 # Which reader produced a snapshot row, so an incremental scan can spot rows left behind by
 # an older one and re-read them exactly once. BUMP THIS IN THE SAME COMMIT as any change to
-# what :func:`read_tags` produces (the managed set, a Vorbis spelling, a format registration), or
+# what :func:`read_tags` produces (a Vorbis spelling, a format registration), or
 # every already-scanned file keeps serving the old reader's output to every detector.
-TAG_READER_VERSION: Final = 8
+# The scan stores each file's ``file_pictures`` on the same read, so version 11 re-reads every
+# file once to fill them.
+TAG_READER_VERSION: Final = 11
 
 
 @dataclass(frozen=True, slots=True)
@@ -362,6 +412,22 @@ def _taglib_view(path: Path, tags: _EasyTags | None) -> _EasyTags:
     return id3v2_only
 
 
+def _easy_id3_view(frames: ID3) -> dict[str, list[str]]:
+    """Read a raw ID3 tag through the getters the easy MP3 layer registers, in its key order.
+
+    mutagen has no easy class for WAV or AIFF and hands back raw frames, so without this an MP3
+    and a WAV holding one frame would read under two keys.
+    """
+    view: dict[str, list[str]] = {}
+    for pattern, getter in EasyID3.Get.items():
+        lister = EasyID3.List.get(pattern)
+        keys = [pattern] if lister is None else lister(frames, pattern)
+        for key in keys:
+            with contextlib.suppress(KeyError):
+                view[key] = getter(frames, key)
+    return view
+
+
 def read_tags(path: Path) -> TrackTags:
     """Read and normalize the tags on *path*.
 
@@ -370,6 +436,8 @@ def read_tags(path: Path) -> TrackTags:
     decide how to record a read failure. An ID3v2.3 ``TYER`` that starts with a full
     ``YYYY-MM-DD`` date mutagen cannot convert reads as that ``date`` when no other date exists.
     An MP3 reads ID3v2 alone when it holds a frame, else ID3v1, as TagLib reads it apart from APEv2.
+    A WAV or AIFF ID3 tag reads under the MP3 keys. Any other value that is not a list of
+    strings, such as a WMA attribute, is skipped.
     """
     return _normalized_tags(path, mutagen.File(path, easy=True))  # type: ignore[attr-defined]
 
@@ -381,14 +449,19 @@ def _normalized_tags(path: Path, audio: FileType | None) -> TrackTags:
     weighs the file name when it sniffs and the temp name carries no audio extension.
     """
     # Input
-    tags: Any = {} if audio is None else _taglib_view(path, audio.tags)
+    raw_tags: Any = None if audio is None else audio.tags
+    tags: Any = (
+        _easy_id3_view(raw_tags) if isinstance(raw_tags, ID3) else _taglib_view(path, raw_tags)
+    )
 
-    # Process — a file can carry both spellings of one concept (a tagger wrote the Vorbis name,
+    # Process: a file can carry both spellings of one concept (a tagger wrote the Vorbis name,
     # an older TagMend wrote the canonical one). The Vorbis name is what every other reader
     # looks at, so it wins regardless of iteration order.
     normalized: dict[str, list[str]] = {}
     from_vorbis_spelling: set[str] = set()
     for raw_key, raw_values in tags.items():
+        if not isinstance(raw_values, list) or not all(isinstance(v, str) for v in raw_values):
+            continue
         lowered = str(raw_key).lower()
         key = _VORBIS_TO_CANONICAL.get(lowered, lowered)
         native = lowered in _VORBIS_TO_CANONICAL
@@ -406,26 +479,192 @@ def _normalized_tags(path: Path, audio: FileType | None) -> TrackTags:
     return TrackTags(normalized)
 
 
+_MP4_COVER_MIMES: Final = {MP4Cover.FORMAT_JPEG: "image/jpeg", MP4Cover.FORMAT_PNG: "image/png"}
+
+# The Vorbis comment an Ogg stream embeds each picture in, as a base64 FLAC picture block.
+_VORBIS_PICTURE_FIELD: Final = "METADATA_BLOCK_PICTURE"
+
+_PICTURE_DECODE_ERRORS: Final = (ValueError, mutagen.MutagenError)  # type: ignore[attr-defined]
+
+
+@dataclass(frozen=True, slots=True)
+class EmbeddedPicture:
+    """One picture embedded in an audio file.
+
+    ``ordinal`` is its position in the container's picture list. ``picture_type`` is the ID3 or
+    FLAC picture type, ``None`` for an MP4 ``covr`` item, which has none.
+    """
+
+    ordinal: int
+    picture_type: int | None
+    mime: str
+    description: str
+    size_bytes: int
+    sha256: str
+    data: bytes = field(repr=False)
+
+
+@dataclass(frozen=True, slots=True)
+class PictureData:
+    """One embedded picture with every attribute its container stores, so a restore writes it equal.
+
+    ``picture_type`` is the ID3 or FLAC picture type, ``None`` for an MP4 ``covr`` item. An MP4
+    item stores only ``image_format``, which its ``mime`` is read from. ``encoding`` is the ID3
+    text encoding of the description. ``width``, ``height``, ``depth`` and ``colors`` belong to
+    the FLAC picture block, which Ogg also embeds. A field the container does not store holds
+    ``None`` or 0.
+    """
+
+    picture_type: int | None
+    mime: str
+    description: str
+    data: bytes = field(repr=False)
+    encoding: int | None = None
+    width: int = 0
+    height: int = 0
+    depth: int = 0
+    colors: int = 0
+    image_format: int | None = None
+
+    def to_json(self) -> str:
+        """Return every attribute but the image bytes as a JSON object, keys sorted."""
+        attributes = {name: getattr(self, name) for name in _PICTURE_ATTRIBUTES}
+        return json.dumps(attributes, sort_keys=True)
+
+    @classmethod
+    def from_json(cls, attributes: str, data: bytes) -> PictureData:
+        """Rebuild a picture from its :meth:`to_json` *attributes* and its image *data*.
+
+        Raises :class:`ValueError` when *attributes* is not a JSON object naming exactly the
+        attributes :meth:`to_json` writes.
+        """
+        values = json.loads(attributes)
+        if not isinstance(values, dict) or set(values) != set(_PICTURE_ATTRIBUTES):
+            message = f"picture attributes must name exactly {sorted(_PICTURE_ATTRIBUTES)}"
+            raise ValueError(message)
+        return cls(data=bytes(data), **values)
+
+
+_PICTURE_ATTRIBUTES: Final = tuple(item.name for item in fields(PictureData) if item.name != "data")
+
+
+def _block_picture(block: Picture) -> PictureData:
+    """Return the :class:`PictureData` of a FLAC picture block."""
+    return PictureData(
+        picture_type=int(block.type),
+        mime=block.mime,
+        description=block.desc,
+        data=bytes(block.data),
+        width=block.width,
+        height=block.height,
+        depth=block.depth,
+        colors=block.colors,
+    )
+
+
+def _decode_vorbis_picture(value: str) -> Picture:
+    """Decode one Ogg ``metadata_block_picture`` value as a FLAC picture block."""
+    return Picture(base64.b64decode(value))  # type: ignore[no-untyped-call]
+
+
+def _vorbis_picture_data(path: Path, values: Sequence[str]) -> list[tuple[int, PictureData]]:
+    """Decode each Ogg ``metadata_block_picture`` value of *path*, with its container position.
+
+    A value that does not decode is skipped, and the next keeps its own container position.
+    """
+    pictures: list[tuple[int, PictureData]] = []
+    for ordinal, value in enumerate(values):
+        try:
+            block = _decode_vorbis_picture(value)
+        except _PICTURE_DECODE_ERRORS as exc:
+            logger.warning("skipped undecodable picture %d of %s: %s", ordinal, path, exc)
+            continue
+        pictures.append((ordinal, _block_picture(block)))
+    return pictures
+
+
+def _indexed_picture_data(path: Path, audio: FileType | None) -> list[tuple[int, PictureData]]:
+    """Return each picture *audio*, opened from *path*, embeds, with its container position."""
+    if audio is None:
+        return []
+    if isinstance(audio, FLAC):
+        return list(enumerate(_block_picture(block) for block in audio.pictures))
+    tags: Any = audio.tags
+    if isinstance(tags, ID3):
+        frames: Any = tags.getall("APIC")  # type: ignore[no-untyped-call]
+        return [
+            (
+                ordinal,
+                PictureData(
+                    picture_type=int(frame.type),
+                    mime=frame.mime,
+                    description=frame.desc,
+                    data=bytes(frame.data),
+                    encoding=int(frame.encoding),
+                ),
+            )
+            for ordinal, frame in enumerate(frames)
+        ]
+    if isinstance(tags, MP4Tags):
+        items: Any = tags.get("covr") or []  # type: ignore[no-untyped-call]
+        return [
+            (
+                ordinal,
+                PictureData(
+                    picture_type=None,
+                    mime=_MP4_COVER_MIMES.get(item.imageformat, ""),
+                    description="",
+                    data=bytes(item),
+                    image_format=int(item.imageformat),
+                ),
+            )
+            for ordinal, item in enumerate(items)
+        ]
+    if isinstance(tags, VCommentDict):
+        values: Any = tags.get(_VORBIS_PICTURE_FIELD, [])  # type: ignore[no-untyped-call]
+        return _vorbis_picture_data(path, values)
+    return []
+
+
+def read_picture_data(path: Path) -> list[PictureData]:
+    """Return the pictures embedded in *path* with every attribute their container stores.
+
+    The list holds the pictures :func:`read_pictures` reports, in the same order. Raises as
+    :func:`read_tags` does for an unreadable file.
+    """
+    audio: FileType | None = mutagen.File(path)  # type: ignore[attr-defined]
+    return [picture for _, picture in _indexed_picture_data(path, audio)]
+
+
+def read_pictures(path: Path) -> list[EmbeddedPicture]:
+    """Return the pictures embedded in *path*, in its container's order.
+
+    They are the ID3v2 ``APIC`` frames, the FLAC picture blocks, the MP4 ``covr`` items or the
+    Ogg ``metadata_block_picture`` comments. mutagen loads an ID3v2.2 ``PIC`` frame as ``APIC``.
+    A file mutagen cannot identify holds none. Raises as :func:`read_tags` does for an
+    unreadable file.
+    """
+    audio: FileType | None = mutagen.File(path)  # type: ignore[attr-defined]
+    return [
+        EmbeddedPicture(
+            ordinal=ordinal,
+            picture_type=picture.picture_type,
+            mime=picture.mime,
+            description=picture.description,
+            size_bytes=len(picture.data),
+            sha256=hashlib.sha256(picture.data).hexdigest(),
+            data=picture.data,
+        )
+        for ordinal, picture in _indexed_picture_data(path, audio)
+    ]
+
+
 def has_embedded_picture(path: Path) -> bool:
     """Whether *path* holds a picture Navidrome can show as its album's cover.
 
-    That is an ID3v2 ``APIC`` frame, a FLAC picture block, an MP4 ``covr`` atom or an Ogg
-    ``metadata_block_picture`` comment. mutagen loads an ID3v2.2 ``PIC`` frame as ``APIC``.
     Raises as :func:`read_tags` does for an unreadable file.
     """
-    audio: Any = mutagen.File(path)  # type: ignore[attr-defined]
-    if audio is None:
-        return False
-    if isinstance(audio, FLAC):
-        return bool(audio.pictures)
-    tags = audio.tags
-    if isinstance(tags, ID3):
-        return bool(tags.getall("APIC"))  # type: ignore[no-untyped-call]
-    if isinstance(tags, MP4Tags):
-        return bool(tags.get("covr"))  # type: ignore[no-untyped-call]
-    if isinstance(tags, VCommentDict):
-        return "metadata_block_picture" in tags
-    return False
+    return bool(read_pictures(path))
 
 
 class TagWriteError(ValueError):
@@ -463,7 +702,7 @@ _PAYLOAD_DECIDES_AUDIO: Final = frozenset({_Container.ID3, _Container.FLAC})
 
 @dataclass(frozen=True, slots=True)
 class TagWriteResult:
-    """What :func:`write_managed_tags` did to the file.
+    """What :func:`write_managed_tags` or :func:`write_pictures` did to the file.
 
     ``audio_proven`` holds after a write whose verified payload hash decides the decoded audio,
     so a fingerprint taken before the write still describes the file. ``dropped_frames`` holds
@@ -719,9 +958,28 @@ def _id3_entries(source: Path | BinaryIO) -> dict[str, list[str]]:
             entries.setdefault(frame_id, []).append(_digest(repr(frame)))
     managed = frozenset(_ID3_FRAMES.values())
     for key, frame in frames.items():
-        if key not in managed:
+        if key not in managed and _alias_frame_of(key) is None:
             entries.setdefault(key, []).append(_digest(repr(frame)))
     return entries
+
+
+# The unmanaged entry each container keeps the pictures :func:`write_pictures` sets under. ID3
+# keys each ``APIC`` frame by its description, so its entry is a key prefix.
+_ID3_PICTURE_PREFIX: Final = "APIC:"
+_FLAC_PICTURE_ENTRY: Final = "FLAC picture block"
+_PICTURE_ENTRIES: Final[Mapping[_Container, str]] = {
+    _Container.FLAC: _FLAC_PICTURE_ENTRY,
+    _Container.MP4: "covr",
+    _Container.OGG: _VORBIS_PICTURE_FIELD,
+}
+
+
+def _raw_kind(kind: type[FileType]) -> type[FileType]:
+    """Return the class that opens a non-ID3 file with the entries of the easy class *kind* raw.
+
+    MP4 swaps in the raw class, because the easy layer renames the atoms.
+    """
+    return MP4 if issubclass(kind, EasyMP4) else kind
 
 
 def _mutagen_entries(
@@ -731,12 +989,10 @@ def _mutagen_entries(
 ) -> dict[str, list[str]]:
     """Return the unmanaged Vorbis comments or MP4 atoms (plus FLAC pictures) of *path*.
 
-    *kind* is the easy class the original opened as. MP4 swaps in the raw class, because the
-    easy layer renames the atoms.
+    *kind* is the easy class the original opened as.
     """
     entries: dict[str, list[str]] = {}
-    raw_kind = MP4 if issubclass(kind, EasyMP4) else kind
-    audio: Any = raw_kind(path)
+    audio: Any = _raw_kind(kind)(path)
     is_mp4 = container is _Container.MP4
     if audio.tags is not None:
         pairs = audio.tags.items() if is_mp4 else audio.tags
@@ -748,7 +1004,7 @@ def _mutagen_entries(
                 entries.setdefault(key, []).append(_digest(repr(value)))
     if container is _Container.FLAC:
         for picture in audio.pictures:
-            entries.setdefault("FLAC picture block", []).append(_digest(picture.write()))
+            entries.setdefault(_FLAC_PICTURE_ENTRY, []).append(_digest(picture.write()))
     return entries
 
 
@@ -814,6 +1070,7 @@ def _snapshot_violations(
 
 def _readback_violations(
     path: Path,
+    container: _Container,
     kind: type[FileType],
     managed: Mapping[str, list[str]],
 ) -> list[str]:
@@ -825,6 +1082,8 @@ def _readback_violations(
         got = read_back.get(key, [])
         if got != wanted:
             violations.append(f"{key} reads back {got!r}, wanted {wanted!r}")
+    if violations and container is _Container.ID3 and not _id3v2_holds_frames(path):
+        violations.append("emptying ID3v2 exposes the values only ID3v1 holds")
     return violations
 
 
@@ -897,29 +1156,40 @@ def _rewrite_id3v1(path: Path, original: Mapping[str, object], touched: frozense
         handle.write(block)
 
 
-def _apply_id3(path: Path, changes: list[tuple[str, list[str] | None]]) -> None:
-    """Apply *changes* to the ID3v2 tag of *path*, writing only the planned keys.
+@contextlib.contextmanager
+def _edited_id3v2(path: Path, touched: frozenset[str]) -> Iterator[Any]:
+    """Yield the ID3v2 tag of *path* loaded alone, then save it and rebuild ID3v1 around *touched*.
 
     mutagen's easy MP3 loader merges ID3v1 into the ID3v2 frames it holds, and a save then
-    writes those truncated values into ID3v2. Loading ID3v2 alone and setting keys through
-    the easy layer's own setters keeps the ID3v2 footprint to the planned keys.
+    writes those truncated values into ID3v2. *touched* names the frames whose old ID3v1 value
+    the rebuild must not keep.
     """
     original_v1 = _read_id3v1(path)
     try:
         frames: Any = ID3(path, load_v1=False)  # type: ignore[no-untyped-call]
     except ID3NoHeaderError:
         frames = ID3()  # type: ignore[no-untyped-call]
-    for written, values in changes:
-        if values is None:
-            # A value that lived only in ID3v1 has no ID3v2 frame to delete.
-            with contextlib.suppress(KeyError):
-                EasyID3.Delete[written](frames, written)
-        else:
-            EasyID3.Set[written](frames, written, values)
+    yield frames
     frames.save(path)
     if original_v1 is not None:
-        touched = frozenset(_ID3_FRAMES[written] for written, _ in changes)
         _rewrite_id3v1(path, original_v1, touched)
+
+
+def _apply_id3(path: Path, changes: list[tuple[str, list[str] | None]]) -> None:
+    """Apply *changes* to the ID3v2 tag of *path*, writing only the planned keys.
+
+    Setting keys through the easy layer's own setters on the ID3v2 tag alone keeps the ID3v2
+    footprint to the planned keys.
+    """
+    touched = frozenset(_ID3_FRAMES[written] for written, _ in changes)
+    with _edited_id3v2(path, touched) as frames:
+        for written, values in changes:
+            if values is None:
+                # A value that lived only in ID3v1 has no ID3v2 frame to delete.
+                with contextlib.suppress(KeyError):
+                    EasyID3.Delete[written](frames, written)
+            else:
+                EasyID3.Set[written](frames, written, values)
 
 
 def _apply_changes(
@@ -939,6 +1209,19 @@ def _apply_changes(
         else:
             audio[written] = values
     audio.save()
+
+
+def _discard_temp(tmp: Path) -> None:
+    """Remove a write's temp copy, logging a failure so the caller's own exception propagates.
+
+    Windows refuses to unlink a read-only file, and ``shutil.copy2`` copies that bit.
+    """
+    try:
+        with contextlib.suppress(FileNotFoundError):
+            tmp.chmod(tmp.stat().st_mode | stat.S_IWRITE)
+            tmp.unlink()
+    except OSError as exc:
+        logger.warning("could not remove temp copy %s: %s", tmp, exc)
 
 
 def _require_verifiable(path: Path, audio: FileType) -> _Container:
@@ -987,18 +1270,152 @@ def _id3_entries_snapshot(source: Path | BinaryIO) -> _ContainerSnapshot:
     return _ContainerSnapshot(audio_digest=None, entries=entries, has_id3v1=False, has_apev2=False)
 
 
+def _open_for_writing(path: Path) -> FileType:
+    """Open *path* in easy mode, raising :class:`ValueError` when mutagen cannot identify it."""
+    audio: FileType | None = mutagen.File(path, easy=True)  # type: ignore[attr-defined]
+    if audio is None:
+        message = f"mutagen could not identify {path} for writing"
+        raise ValueError(message)
+    return audio
+
+
+def _writable_audio(path: Path, *, droppable_frames: frozenset[str]) -> FileType:
+    """Open *path*, raising where every write of it would be refused whatever its changes."""
+    audio = _open_for_writing(path)
+    if _require_verifiable(path, audio) is _Container.ID3:
+        _require_lossless_id3_save(path, droppable_frames=droppable_frames)
+    return audio
+
+
+def _require_decodable_pictures(path: Path, audio: FileType) -> None:
+    """Raise :class:`TagWriteError` when an Ogg picture of *path* does not decode.
+
+    A picture write rebuilds every ``metadata_block_picture`` value from the decoded pictures,
+    so it would drop the one that does not decode.
+    """
+    tags: Any = audio.tags
+    if _container_of(audio) is not _Container.OGG or tags is None:
+        return
+    violations: list[str] = []
+    for ordinal, value in enumerate(tags.get(_VORBIS_PICTURE_FIELD, [])):
+        try:
+            _decode_vorbis_picture(value)
+        except _PICTURE_DECODE_ERRORS:
+            violations.append(f"picture {ordinal} does not decode, and a picture write drops it")
+    if violations:
+        raise TagWriteError(path, violations)
+
+
 def ensure_writable(path: Path, *, droppable_frames: frozenset[str] = frozenset()) -> None:
     """Raise when :func:`write_managed_tags` would refuse *path* before reading its changes.
 
     Staging calls this so a change on a file that can never be written is refused up front
     rather than failing on every commit. *droppable_frames* is the set the write is given.
     """
+    _writable_audio(path, droppable_frames=droppable_frames)
+
+
+def ensure_pictures_writable(
+    path: Path,
+    *,
+    droppable_frames: frozenset[str] = frozenset(),
+) -> None:
+    """Raise when :func:`write_pictures` would refuse *path* before reading its pictures.
+
+    It refuses what :func:`ensure_writable` refuses, and an Ogg picture that does not decode.
+    *droppable_frames* is the set the write is given.
+    """
+    audio = _writable_audio(path, droppable_frames=droppable_frames)
+    _require_decodable_pictures(path, audio)
+
+
+def check_round_trip(path: Path, managed: Mapping[str, list[str]]) -> None:
+    """Raise :class:`ValueError` for a value in *managed* the container of *path* alters.
+
+    The ID3 and MP4 easy layers parse what they store, such as a timestamp or a track pair, and
+    :func:`read_tags` reads it back reformatted, so the write verifier would refuse every commit.
+    The values pass through the same easy setters and getters the writer and the reader use.
+    """
     audio = mutagen.File(path, easy=True)  # type: ignore[attr-defined]
-    if audio is None:
-        message = f"mutagen could not identify {path} for writing"
-        raise ValueError(message)
-    if _require_verifiable(path, audio) is _Container.ID3:
-        _require_lossless_id3_save(path, droppable_frames=droppable_frames)
+    container = None if audio is None else _container_of(audio)
+    probe: Any
+    easy: Any
+    if container is _Container.ID3:
+        probe, easy = ID3(), EasyID3  # type: ignore[no-untyped-call]
+    elif container is _Container.MP4:
+        probe, easy = MP4Tags(), EasyMP4Tags  # type: ignore[no-untyped-call]
+    else:
+        return
+    for key, values in sorted(managed.items()):
+        if not values:
+            continue
+        try:
+            easy.Set[key](probe, key, list(values))
+            stored = [str(value) for value in easy.Get[key](probe, key)]
+        except ValueError as exc:
+            message = f"{key}={values!r} cannot be stored in {container} tags: {exc}"
+            raise ValueError(message) from exc
+        if stored != list(values):
+            message = f"{key}={values!r} reads back from {container} tags as {stored!r}"
+            raise ValueError(message)
+
+
+def _write_verified_copy(  # noqa: PLR0913 - the steps each writer supplies, keyword-only
+    path: Path,
+    container: _Container,
+    *,
+    snapshot: Callable[[Path], _ContainerSnapshot],
+    apply: Callable[[Path], None],
+    verify: Callable[[Path], list[str]],
+    droppable_frames: frozenset[str],
+) -> TagWriteResult:
+    """Apply a change to a sibling temp copy of *path*, verify it, then flush and swap it in.
+
+    *apply* changes the copy. *snapshot* captures what the change must leave alone, and *verify*
+    lists what else the copy got wrong. A difference raises :class:`TagWriteError` and leaves the
+    original untouched. An ID3 frame whose id *droppable_frames* names may be dropped. It is
+    listed in ``dropped_frames`` and a warning names it, since no revert restores it.
+    """
+    # Input: a Vorbis field or an MP4 atom can share its name with an ID3 frame id.
+    droppable = droppable_frames if container is _Container.ID3 else frozenset()
+    before = snapshot(path)
+    tmp = path.with_name(path.name + TEMP_SUFFIX)
+    dropped_frames: tuple[str, ...] = ()
+    replaced = False
+
+    # Process
+    _discard_temp(tmp)
+    try:
+        shutil.copy2(path, tmp)
+        tmp.chmod(tmp.stat().st_mode | stat.S_IWRITE)
+        apply(tmp)
+        after = snapshot(tmp)
+        violations = _snapshot_violations(before, after, droppable_frames=droppable) + verify(tmp)
+        if violations:
+            raise TagWriteError(path, violations)
+        dropped_frames = tuple(sorted({_frame_id(key) for key in _dropped_keys(before, after)}))
+        # The swap frees the original's data at once, so the new bytes must be on disk first.
+        # Windows flushes only a handle opened for writing.
+        with tmp.open("r+b") as handle:
+            os.fsync(handle.fileno())
+        tmp.replace(path)
+        replaced = True
+    finally:
+        if not replaced:
+            _discard_temp(tmp)
+
+    # Output
+    if dropped_frames:
+        logger.warning(
+            "dropped ID3 frame(s) %s from %s, and no revert can restore them",
+            ", ".join(dropped_frames),
+            path,
+        )
+    return TagWriteResult(
+        written=True,
+        audio_proven=container in _PAYLOAD_DECIDES_AUDIO,
+        dropped_frames=dropped_frames,
+    )
 
 
 def write_managed_tags(
@@ -1009,41 +1426,30 @@ def write_managed_tags(
 ) -> TagWriteResult:
     """Surgically write the managed-tag set on *path*, leaving all other tags intact.
 
-    For each key in :data:`MANAGED_TAGS`: a non-empty value list in *managed* is written
-    (replacing any existing values); a key absent from *managed* (or mapped to an empty
-    list) is deleted from the file, so reverting to a baseline that lacked a tag removes
-    a later-added one. Keys outside :data:`MANAGED_TAGS` are never read, written, or
-    removed. Passing one raises :class:`ValueError` (a caller bug). Only the keys whose
-    values differ from what :func:`read_tags` reports are touched, so an unchanged frame keeps
-    its encoding. On an MP3, a write that creates the first ID3v2 frame writes every value of
-    *managed* into ID3v2, since TagLib then stops reading ID3v1.
+    For each key in :data:`MANAGED_TAGS`, a non-empty value list in *managed* is written, and a
+    key absent from *managed* or mapped to an empty list is deleted. Keys outside
+    :data:`MANAGED_TAGS` are never written or removed, and passing one raises
+    :class:`ValueError`. Only keys whose values differ from what :func:`read_tags` reports are
+    touched, so an unchanged frame keeps its encoding. On an MP3, a write that creates the first
+    ID3v2 frame writes every value of *managed* into ID3v2, since TagLib then stops reading ID3v1.
 
-    Returns ``written=False`` without touching the file when nothing differs. After a write it
-    returns ``written=True``, and ``audio_proven`` for an ID3 or FLAC file. The write is
-    atomic: tags are applied to a sibling temp copy which then atomically replaces the
-    original via :meth:`Path.replace`, so an interrupted write leaves the original file
-    untouched (PLAN.md §11). Lets :class:`mutagen.MutagenError` / ``OSError``
-    propagate, mirroring :func:`read_tags`.
+    The tags go to a sibling temp copy that is verified, flushed and swapped in with
+    :meth:`Path.replace`, so an interrupted write leaves the original untouched. A container the
+    verifier has no layout for, or a non-Ogg file whose audio payload cannot be located, is
+    refused before the copy. A verification difference raises :class:`TagWriteError`. An ID3
+    frame whose id *droppable_frames* names may be dropped. It is listed in ``dropped_frames``
+    and a warning names it, since no revert restores it. :class:`mutagen.MutagenError` and
+    ``OSError`` propagate.
 
-    The temp copy is verified before the swap: the audio payload hash (not for Ogg, whose
-    pages a save renumbers), every unmanaged tag entry, the presence of ID3v1 and APEv2 blocks,
-    and a re-read of every managed key against *managed*. Any difference deletes the temp copy
-    and raises :class:`TagWriteError` listing each one. A container the verifier has no layout
-    for, or a non-Ogg file whose audio payload cannot be located, is refused before the copy.
-    On an ID3 file, an unmanaged frame whose id *droppable_frames* names may be dropped. The
-    result lists it in ``dropped_frames`` and a warning names it, since no revert restores it.
-    Measured on a 10 MB MP3 on a local SSD, the verification costs about 18 ms of a 34 ms write
-    (two SHA-256 passes and two tag parses).
+    Returns ``written=False`` without touching the file when nothing differs, else
+    ``written=True`` with ``audio_proven`` set for an ID3 or FLAC file.
     """
     # Input / validation
     unknown = set(managed) - MANAGED_TAGS
     if unknown:
         message = f"refusing to write non-managed tags: {sorted(unknown)}"
         raise ValueError(message)
-    original = mutagen.File(path, easy=True)  # type: ignore[attr-defined]
-    if original is None:
-        message = f"mutagen could not identify {path} for writing"
-        raise ValueError(message)
+    original = _open_for_writing(path)
 
     # Process: plan against what read_tags reports, so a no-op never copies or rewrites the file.
     container = _container_of(original)
@@ -1057,39 +1463,210 @@ def write_managed_tags(
         return TagWriteResult(written=False, audio_proven=False)
     _require_verifiable(path, original)
     kind = type(original)
-    # A Vorbis field or an MP4 atom can share its name with an ID3 frame id.
-    droppable = droppable_frames if container is _Container.ID3 else frozenset()
-    before = _snapshot(path, container, kind)
-    dropped_frames: tuple[str, ...] = ()
 
-    # Output: apply the plan to a temp copy, verify it, then atomically swap it in.
-    tmp = path.with_name(path.name + TEMP_SUFFIX)
-    shutil.copy2(path, tmp)
-    replaced = False
-    try:
-        _apply_changes(tmp, container, kind, changes)
-        after = _snapshot(tmp, container, kind)
-        violations = _snapshot_violations(before, after, droppable_frames=droppable)
-        readback = _readback_violations(tmp, kind, managed)
-        if readback and container is _Container.ID3 and not _id3v2_holds_frames(tmp):
-            readback.append("emptying ID3v2 exposes the values only ID3v1 holds")
-        violations += readback
-        if violations:
-            raise TagWriteError(path, violations)
-        dropped_frames = tuple(sorted({_frame_id(key) for key in _dropped_keys(before, after)}))
-        tmp.replace(path)
-        replaced = True
-    finally:
-        if not replaced:
-            tmp.unlink(missing_ok=True)
-    if dropped_frames:
-        logger.warning(
-            "dropped ID3 frame(s) %s from %s, and no revert can restore them",
-            ", ".join(dropped_frames),
-            path,
-        )
-    return TagWriteResult(
-        written=True,
-        audio_proven=container in _PAYLOAD_DECIDES_AUDIO,
-        dropped_frames=dropped_frames,
+    # Output
+    return _write_verified_copy(
+        path,
+        container,
+        snapshot=lambda source: _snapshot(source, container, kind),
+        apply=lambda tmp: _apply_changes(tmp, container, kind, changes),
+        verify=lambda tmp: _readback_violations(tmp, container, kind, managed),
+        droppable_frames=droppable_frames,
+    )
+
+
+def _is_picture_entry(container: _Container, key: str) -> bool:
+    """Whether the unmanaged entry *key* of *container* holds the pictures of a picture write."""
+    if container is _Container.ID3:
+        return key.startswith(_ID3_PICTURE_PREFIX)
+    return key == _PICTURE_ENTRIES.get(container)
+
+
+def _without_pictures(snapshot: _ContainerSnapshot, container: _Container) -> _ContainerSnapshot:
+    """Return *snapshot* without the unmanaged entries holding the pictures of *container*."""
+    entries = {
+        key: values
+        for key, values in snapshot.entries.items()
+        if not _is_picture_entry(container, key)
+    }
+    return replace(snapshot, entries=entries)
+
+
+def _unfit_pictures(container: _Container, pictures: Sequence[PictureData]) -> list[int]:
+    """Return the positions of *pictures* lacking an attribute *container* stores per picture."""
+    unfit: list[int] = []
+    for position, picture in enumerate(pictures):
+        if container is _Container.ID3:
+            fits = picture.encoding is not None and picture.picture_type is not None
+        elif container is _Container.MP4:
+            fits = picture.image_format is not None
+        else:
+            fits = picture.picture_type is not None
+        if not fits:
+            unfit.append(position)
+    return unfit
+
+
+def _picture_view(path: Path, container: _Container, kind: type[FileType]) -> FileType:
+    """Open *path*, identified as the easy class *kind*, with its pictures reachable.
+
+    The easy ID3 tag hides ``APIC`` frames, so an ID3 file loads its raw tag class instead.
+    """
+    if container is _Container.ID3:
+        return kind(path, ID3=ID3)
+    return _raw_kind(kind)(path)
+
+
+def _view_pictures(path: Path, container: _Container, kind: type[FileType]) -> list[PictureData]:
+    """Return the pictures of *path*, opened as :func:`_picture_view` opens it."""
+    audio = _picture_view(path, container, kind)
+    return [picture for _, picture in _indexed_picture_data(path, audio)]
+
+
+def _same_pictures(
+    container: _Container,
+    left: Sequence[PictureData],
+    right: Sequence[PictureData],
+) -> bool:
+    """Whether *left* and *right* are one picture list of *container*.
+
+    ID3 compares them as a multiset, since an ID3 save orders its frames by size and key.
+    """
+    if container is _Container.ID3:
+        return Counter(left) == Counter(right)
+    return list(left) == list(right)
+
+
+def _picture_labels(pictures: Sequence[PictureData]) -> str:
+    """Label each picture by its attributes and the SHA-256 of its bytes."""
+    labels = [f"{picture.to_json()} sha256 {_digest(picture.data)}" for picture in pictures]
+    return f"[{', '.join(labels)}]"
+
+
+def _picture_violations(
+    path: Path,
+    container: _Container,
+    kind: type[FileType],
+    wanted: Sequence[PictureData],
+) -> list[str]:
+    """Describe how the pictures of *path*, opened as *kind*, differ from *wanted*."""
+    got = _view_pictures(path, container, kind)
+    if _same_pictures(container, got, wanted):
+        return []
+    return [f"pictures read back as {_picture_labels(got)}, wanted {_picture_labels(wanted)}"]
+
+
+def _picture_block(picture: PictureData) -> Picture:
+    """Build the FLAC picture block that stores *picture*."""
+    block: Any = Picture()  # type: ignore[no-untyped-call]
+    block.type = picture.picture_type
+    block.mime = picture.mime
+    block.desc = picture.description
+    block.width = picture.width
+    block.height = picture.height
+    block.depth = picture.depth
+    block.colors = picture.colors
+    block.data = picture.data
+    return block  # type: ignore[no-any-return]
+
+
+def _entry_values(container: _Container, pictures: Sequence[PictureData]) -> list[object]:
+    """Return the MP4 ``covr`` items or the Ogg comment values that store *pictures*."""
+    if container is _Container.MP4:
+        return [
+            MP4Cover(picture.data, imageformat=picture.image_format)  # type: ignore[no-untyped-call]
+            for picture in pictures
+        ]
+    blocks = [_picture_block(picture).write() for picture in pictures]  # type: ignore[no-untyped-call]
+    return [base64.b64encode(block).decode("ascii") for block in blocks]
+
+
+def _apply_pictures(
+    path: Path,
+    container: _Container,
+    kind: type[FileType],
+    pictures: Sequence[PictureData],
+) -> None:
+    """Set the picture list of *path*, identified as the easy class *kind*, and save it."""
+    if container is _Container.ID3:
+        # read_tags reports the date of a v2.3 TYER the v2.4 save discards, so it lands as TDRC.
+        tyer_date = _unconverted_tyer_date(path)
+        with _edited_id3v2(path, frozenset()) as frames:
+            if tyer_date and not frames.getall("TDRC"):
+                EasyID3.Set["date"](frames, "date", tyer_date)
+            frames.delall("APIC")
+            for picture in pictures:
+                frames.add(
+                    APIC(  # type: ignore[no-untyped-call]
+                        encoding=picture.encoding,
+                        mime=picture.mime,
+                        type=picture.picture_type,
+                        desc=picture.description,
+                        data=picture.data,
+                    ),
+                )
+        return
+    audio: Any = _picture_view(path, container, kind)
+    if container is _Container.FLAC:
+        audio.clear_pictures()
+        for picture in pictures:
+            audio.add_picture(_picture_block(picture))
+    elif pictures:
+        if audio.tags is None:
+            audio.add_tags()
+        audio.tags[_PICTURE_ENTRIES[container]] = _entry_values(container, pictures)
+    elif audio.tags is not None:
+        with contextlib.suppress(KeyError):
+            del audio.tags[_PICTURE_ENTRIES[container]]
+    audio.save()
+
+
+def write_pictures(
+    path: Path,
+    pictures: Sequence[PictureData],
+    *,
+    droppable_frames: frozenset[str] = frozenset(),
+) -> TagWriteResult:
+    """Set the pictures embedded in *path* to exactly *pictures*, in order, leaving all else intact.
+
+    The pictures are the entries :func:`read_picture_data` reads. An ID3 save orders its
+    ``APIC`` frames by size and key, so on ID3 only the multiset of *pictures* is set. A picture
+    lacking an attribute the container stores per picture raises :class:`ValueError`.
+
+    The write runs through the verified temp copy :func:`write_managed_tags` uses, and refuses
+    what it refuses. The verifier compares every unmanaged entry but the pictures, reads the
+    managed tags back unchanged and reads the pictures back as *pictures*. It also refuses an Ogg
+    file holding a picture that does not decode, since the rewrite would drop it.
+
+    Returns ``written=False`` without touching the file when the list already equals
+    *pictures*, else ``written=True`` with ``audio_proven`` set for an ID3 or FLAC file.
+    """
+    # Input / validation
+    original = _open_for_writing(path)
+    container = _container_of(original)
+    kind = type(original)
+    target = list(pictures)
+    unfit = _unfit_pictures(container, target)
+    if unfit:
+        message = f"pictures {unfit} lack an attribute the {container} container stores"
+        raise ValueError(message)
+
+    # Process: compare with the current list, so a no-op never copies or rewrites the file.
+    if _same_pictures(container, _view_pictures(path, container, kind), target):
+        return TagWriteResult(written=False, audio_proven=False)
+    _require_verifiable(path, original)
+    _require_decodable_pictures(path, original)
+    managed = _normalized_tags(path, original).tags
+
+    # Output
+    return _write_verified_copy(
+        path,
+        container,
+        snapshot=lambda source: _without_pictures(_snapshot(source, container, kind), container),
+        apply=lambda tmp: _apply_pictures(tmp, container, kind, target),
+        verify=lambda tmp: (
+            _readback_violations(tmp, container, kind, managed)
+            + _picture_violations(tmp, container, kind, target)
+        ),
+        droppable_frames=droppable_frames,
     )

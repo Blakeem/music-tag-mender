@@ -7,7 +7,7 @@ the release its own ``musicbrainz_albumid`` names. This compares a file's ``orig
 ``resolve_years`` uses to fill a blank ``originaldate``, so a library ``resolve_years`` has
 already swept costs no request.
 
-The cached lookup keeps only the first-release YEAR, so both tiers compare years alone:
+Both tiers compare years alone:
 
 * ``high``: ``originaldate`` names a different year than the first release.
 * ``medium``: ``date`` is earlier than the first release, which no release of the group can be.
@@ -51,6 +51,9 @@ logger = get_logger(__name__)
 
 _ORIGINALDATE: Final = "originaldate"
 _DATE: Final = "date"
+
+# The lookup identity's fields and the two years compared, read for the whole library at once.
+_LOAD_FIELDS: Final = ("albumartist", "artist", "album", _ORIGINALDATE, _DATE)
 
 # How many uncached release groups one call looks up when the caller names no limit. At the one
 # request per second MusicBrainz asks for, this is about three minutes of wall clock.
@@ -153,7 +156,7 @@ class YearDisagreementGroup(FieldDict):
 
 
 @dataclass(frozen=True, slots=True)
-class YearDisagreementsReport:
+class YearDisagreementsReport(FieldDict):
     """Immutable summary of one :func:`detect_year_disagreements` run, JSON-ready for the tool.
 
     ``flagged`` counts files with at least one contradicting year and ``flagged_fields`` counts
@@ -169,40 +172,18 @@ class YearDisagreementsReport:
     high: int
     medium: int
     low: int
+    folder_context: int
+    folder_context_rows: list[YearDisagreementRow]
     release_groups_checked: int
     release_groups_remaining: int
     more: bool
     unknown_release_groups: int
     skipped_no_identity: int
     errors: int
-    summary: str
-    folder_context: int = 0
-    folder_context_rows: list[YearDisagreementRow] = field(default_factory=list)
     error_items: list[dict[str, str]] = field(default_factory=list)
     groups: list[YearDisagreementGroup] = field(default_factory=list)
-
-    def to_dict(self) -> dict[str, object]:
-        """JSON-serializable form for the MCP tool."""
-        return {
-            "rows": [r.to_dict() for r in self.rows],
-            "total_files": self.total_files,
-            "flagged": self.flagged,
-            "flagged_fields": self.flagged_fields,
-            "high": self.high,
-            "medium": self.medium,
-            "low": self.low,
-            "folder_context": self.folder_context,
-            "folder_context_rows": [r.to_dict() for r in self.folder_context_rows],
-            "release_groups_checked": self.release_groups_checked,
-            "release_groups_remaining": self.release_groups_remaining,
-            "more": self.more,
-            "unknown_release_groups": self.unknown_release_groups,
-            "skipped_no_identity": self.skipped_no_identity,
-            "errors": self.errors,
-            "error_items": [dict(e) for e in self.error_items],
-            "groups": [g.to_dict() for g in self.groups],
-            "summary": self.summary,
-        }
+    # Last, so the payload ends with it. Keyword-only keeps it required after the defaults.
+    summary: str = field(kw_only=True)
 
 
 # --- comparison ----------------------------------------------------------------------
@@ -292,7 +273,7 @@ def _look_up(
     return lookups
 
 
-# --- pure classifier -----------------------------------------------------------------
+# --- classifier ----------------------------------------------------------------------
 
 
 def _classify(
@@ -451,11 +432,12 @@ def _load_inputs(connection: sqlite3.Connection) -> list[_FileInput]:
     The identity is :func:`tagmend.engine.axis.lookup_identity`, the one ``resolve_years`` looks
     up, so both share the lookup's cache rows.
     """
+    tag_lists = store.load_tag_lists(connection, _LOAD_FIELDS)
     inputs: list[_FileInput] = []
     for row in store.list_files(connection):
         if row.is_missing:
             continue
-        tags = store.get_tags(connection, row.id)
+        tags = tag_lists.get(row.id, {})
         identity = axis.lookup_identity(tags)
         originaldate = axis.first_nonblank(tags.get(_ORIGINALDATE))
         date = axis.first_nonblank(tags.get(_DATE))

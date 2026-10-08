@@ -22,6 +22,8 @@ logger = get_logger(__name__)
 RETRY_ATTEMPTS: Final = 3
 _RETRY_BACKOFF_SECONDS: Final = 1.0
 _TIMEOUT_SECONDS: Final = 30.0
+_HTTP_TOO_MANY_REQUESTS: Final = 429
+_HTTP_SERVER_ERROR: Final = 500
 
 
 @contextmanager
@@ -45,6 +47,14 @@ class Retry:
     """A temporary answer: the request is sent again after a backoff, and *reason* names it."""
 
     reason: str
+
+
+def retry_throttle_or_server_error(response: httpx.Response) -> httpx.Response | Retry:
+    """Retry a throttle (HTTP 429) or a server fault (HTTP 5xx), else hand the response back."""
+    status = response.status_code
+    if status == _HTTP_TOO_MANY_REQUESTS or status >= _HTTP_SERVER_ERROR:
+        return Retry(f"HTTP {status}")
+    return response
 
 
 class PacedHttp:

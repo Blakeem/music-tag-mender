@@ -2,19 +2,20 @@
 
 A thin Typer frontend over :mod:`tagmend.engine`. Subcommands:
 
-* ``tagmend check-health``      — readiness check (settings, music folder, ledger).
-* ``tagmend scan-library``      — scan the library into the snapshot (read-only).
-* ``tagmend get-library-stats`` — show library-wide snapshot counts.
-* ``tagmend detect-mismatches`` — list files whose tags disagree with their path (read-only).
-* ``tagmend config``            — launch the local config web UI.
-* ``tagmend config-set``        — write a value into ``settings.json``.
-* ``tagmend config-path``       — print the settings file location.
-* ``tagmend mcp``               — run the MCP server over stdio.
-* ``tagmend version``           — print the version.
+* ``tagmend check-health``: readiness check (music folder, ledger, API keys, fpcalc, live
+  Last.fm, MusicBrainz and AcoustID requests).
+* ``tagmend scan-library``: scan the library into the snapshot (read-only).
+* ``tagmend get-library-stats``: show library-wide snapshot counts.
+* ``tagmend detect-mismatches``: list files whose tags disagree with their path (read-only).
+* ``tagmend config``: launch the local config web UI.
+* ``tagmend config-set``: write a value into ``settings.json``.
+* ``tagmend config-path``: print the settings file location.
+* ``tagmend mcp``: run the MCP server over stdio.
+* ``tagmend version``: print the version.
 """
 
-# NOTE: deliberately no `from __future__ import annotations` here — Typer evaluates
-# parameter annotations at runtime, so types like `Path` must be real runtime imports.
+# Typer evaluates parameter annotations at runtime, so this module omits
+# `from __future__ import annotations` and imports types like Path for real.
 from dataclasses import replace
 from pathlib import Path
 from typing import Annotated
@@ -30,7 +31,7 @@ logger = get_logger(__name__)
 
 app = typer.Typer(
     name="tagmend",
-    help="TagMend — mend your music tags.",
+    help="TagMend: mend your music tags.",
     no_args_is_help=True,
     add_completion=True,
 )
@@ -56,7 +57,10 @@ def check_health(
         typer.Option(help="Override the configured music folder for this check."),
     ] = None,
 ) -> None:
-    """Check that settings load and the music folder + ledger are reachable."""
+    """Check the music folder, the ledger, both API keys, fpcalc and the live services.
+
+    The live services are Last.fm, MusicBrainz and AcoustID.
+    """
     settings = config.load_settings()
     if music_path is not None:
         settings = replace(settings, music_path=music_path)
@@ -67,9 +71,9 @@ def check_health(
         typer.echo(f"[{mark}] {check.name}: {check.detail}")
 
     if not report.ready:
-        typer.echo("Not ready — fix the failures above.")
+        typer.echo("Not ready. Fix the failures above.")
         raise typer.Exit(code=1)
-    typer.echo("All checks passed — ready to go.")
+    typer.echo("All checks passed. Ready to go.")
 
 
 @app.command(name="scan-library")
@@ -204,6 +208,9 @@ def config_set(
     An API key may be omitted from the command line, which shell history and the process list
     would otherwise hold in plain text. It is then read from a prompt that does not echo.
     """
+    if key in config.NAMING_KEYS:
+        typer.echo(config.naming_key_refusal(key))
+        raise typer.Exit(code=1)
     if value is None and key not in config.SECRET_KEYS:
         typer.echo(f"config-set needs a value for {key}")
         raise typer.Exit(code=1)

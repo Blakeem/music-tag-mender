@@ -1,8 +1,8 @@
-"""TagMend — mend your music tags.
+"""TagMend mends the tags and paths of a music library.
 
-Genre & artist-name cleanup from Last.fm community tags, with full revertible
-history. This package is the importable core (``tagmend``); the CLI and MCP server
-are thin frontends over :mod:`tagmend.engine`.
+It mends genres, artist names, original dates, songs, paths and covers, with revertible
+history. This package is the importable core (``tagmend``). The CLI and MCP server are
+thin frontends over :mod:`tagmend.engine`.
 """
 
 from __future__ import annotations

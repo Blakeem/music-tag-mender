@@ -6,14 +6,15 @@ The tables, by role:
   revision, staging and status tables reference. Its ``path_key`` is the path's identity key
   from :mod:`tagmend.engine.path_keys`. The UNIQUE index ``idx_files_path_key`` keeps one row per
   key. The column is nullable. A NULL key never collides, so every engine insert sets it.
-  ``file_tags`` holds the file's tag values, one row per value.
+  ``file_tags`` holds the file's tag values, one row per value. ``file_pictures`` holds the
+  file's embedded pictures, one row per picture with the image's SHA-256 and size but no bytes.
 * Change tracking, modelled on git: ``commits`` holds one row per commit with its status. The
   statuses are documented beside ``_COMMIT_STATUSES`` in :mod:`tagmend.engine.commits`.
   ``tag_revisions`` and ``path_revisions`` are the per-file histories, keyed
   ``(file_id, version)``. Version 0 is the baseline. ``reverted_to_version``, on
   ``tag_revisions``, ``path_revisions`` and ``path_revisions_staged``, holds the version a revert
-  restores. ``reverted_from``, on ``commits`` and on both sidecar tables, holds the row a revert
-  undid.
+  restores. ``reverted_from``, on ``commits``, ``cover_writes``, ``picture_writes`` and both sidecar
+  tables, holds the row a revert undid.
 * Staging, git's index: ``tag_revisions_staged`` and ``path_revisions_staged`` hold one pending
   target per file. Each row keeps the file's signature at stage time, which the commit checks.
 * Sidecars: ``sidecar_moves`` logs each non-audio file that moved with its album folder. Its rows
@@ -22,6 +23,10 @@ The tables, by role:
   by depth. ``sidecar_moves_staged`` holds the pending sidecar moves.
 * Covers: ``cover_writes_staged`` holds one pending cover image per album folder, bytes
   included. ``cover_writes`` logs each cover file a commit created or removed.
+* Pictures: ``picture_writes_staged`` holds one pending removal per file and embedded picture
+  SHA-256, the picture's bytes and attributes included. ``picture_writes`` logs each embedded
+  picture a commit removed or restored, with its bytes. Its ``version`` is a per-file sequence and
+  its ``path`` the file's absolute path at the write.
 * Axis status: ``file_genre_status``, ``file_artist_status``, ``file_year_status`` and
   ``file_song_status`` each hold at most one outcome row per file (:mod:`tagmend.engine.axis`).
   Each axis names its own two identity columns. ``file_mismatch_status`` holds one path decision
@@ -37,7 +42,8 @@ Every path in ``path_revisions``, ``path_revisions_staged``, ``sidecar_moves``,
 ``sidecar_moves_staged``, ``cover_writes`` and ``cover_writes_staged`` is relative to
 ``music_path``.
 
-``tag_revisions``, ``path_revisions``, ``sidecar_moves`` and ``cover_writes`` are append-only.
+``tag_revisions``, ``path_revisions``, ``sidecar_moves``, ``cover_writes`` and ``picture_writes``
+are append-only.
 :func:`apply_append_only_triggers` creates the triggers that abort an ``UPDATE`` or ``DELETE`` on
 them. It also creates one that aborts a ``tag_revisions`` insert with no ``managed_set``.
 
@@ -46,15 +52,19 @@ them. It also creates one that aborts a ``tag_revisions`` insert with no ``manag
 ``CREATE TABLE IF NOT EXISTS`` never alters an existing table. A new table or a new plain index
 needs only its DDL. Every other change needs an idempotent ``_migrate_*`` step: a renamed table,
 a column added, renamed or dropped, a row rewrite, or a UNIQUE index that existing rows could
-break. The steps run before the DDL. The triggers persist in a ledger. A migration that updates
-or deletes rows of an append-only log first drops that log's triggers. :func:`apply_schema`
-recreates them after the DDL. A column rename fires no trigger.
+break. The steps run before the DDL. A step guards on ``_table_exists`` first, since a fresh
+ledger has no tables when the steps run. A step whose writes share one guard makes them in one
+:func:`_migration_transaction`, so a failure never leaves its guard column behind. A step that
+loops over tables guards each table on its own. The triggers persist in a ledger. A migration
+that updates or deletes rows of an append-only log first drops that log's triggers.
+:func:`apply_schema` recreates them after the DDL. A column rename fires no trigger.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, Final, cast
 
 from tagmend.engine import axis, path_keys
@@ -63,10 +73,16 @@ from tagmend.log import get_logger
 
 if TYPE_CHECKING:
     import sqlite3
+    from collections.abc import Iterator
 
 logger = get_logger(__name__)
 
-SCHEMA_VERSION: Final = 29
+SCHEMA_VERSION: Final = 33
+
+
+class LedgerSchemaError(RuntimeError):
+    """This build cannot open the ledger until the owner acts on the message."""
+
 
 _FILES_DDL: Final = """
 CREATE TABLE IF NOT EXISTS files (
@@ -104,11 +120,23 @@ _FILE_TAGS_INDEX_DDL: Final = (
     "CREATE INDEX IF NOT EXISTS idx_file_tags_name_value ON file_tags(name, value)"
 )
 
-# One row per commit: a group of individual changes applied together (git's commit).
-# ``id`` is the ``commit_id`` the revision rows reference. ``status`` is the crash
-# marker: a row stuck in 'applying' is an interrupted commit (the next commit flips it
-# to 'interrupted' and sweeps any leftover staged rows into a new commit).
-# ``reverted_from`` (origin='revert') points at the commit this one undoes. See PLAN.md §7.
+_FILE_PICTURES_DDL: Final = """
+CREATE TABLE IF NOT EXISTS file_pictures (
+  file_id      INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+  ordinal      INTEGER NOT NULL,
+  picture_type INTEGER,
+  mime         TEXT NOT NULL,
+  description  TEXT NOT NULL,
+  size_bytes   INTEGER NOT NULL,
+  sha256       TEXT NOT NULL,
+  PRIMARY KEY (file_id, ordinal)
+)
+"""
+
+_FILE_PICTURES_INDEX_DDL: Final = (
+    "CREATE INDEX IF NOT EXISTS idx_file_pictures_sha256 ON file_pictures(sha256)"
+)
+
 _COMMITS_DDL: Final = """
 CREATE TABLE IF NOT EXISTS commits (
   id            INTEGER PRIMARY KEY,
@@ -120,16 +148,8 @@ CREATE TABLE IF NOT EXISTS commits (
 )
 """
 
-# Append-only managed-tag content history. One row per file per change. The
-# :func:`apply_append_only_triggers` triggers abort any UPDATE or DELETE, the cascade from
-# ``files`` included. ``version`` (0 = baseline) is both the ordering key and the restore
-# handle. ``created_at`` is display-only. ``commit_id`` groups the change with the
-# other files in the same commit (NULL for the version-0 baseline, which precedes any
-# commit). ``managed_tags`` is a FULL JSON snapshot, so any version is restorable
-# without replaying the chain. ``managed_set`` records WHICH managed-tag set that
-# snapshot governed (:data:`tagmend.engine.tags.MANAGED_SETS`), so revert knows whether an
-# omitted tag means "empty then" (delete it) or "not tracked then" (keep it).
-# See PLAN.md §7 / §22.
+# ``managed_tags`` is a full snapshot, so any version restores without replaying the chain.
+# ``managed_set`` tells a revert whether a tag the snapshot omits was empty or untracked then.
 _TAG_REVISIONS_DDL: Final = """
 CREATE TABLE IF NOT EXISTS tag_revisions (
   file_id       INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
@@ -146,10 +166,7 @@ CREATE TABLE IF NOT EXISTS tag_revisions (
 )
 """
 
-# Append-only location history (file/folder renames + moves), enforced by the same
-# :func:`apply_append_only_triggers` triggers as ``tag_revisions``. ``reverted_to_version`` holds
-# the version whose location a revert restored.
-# No ``kind`` column: rename and move are derivable from ``from_path``/``to_path``.
+# No ``kind`` column, since ``from_path`` and ``to_path`` already tell a rename from a move.
 _PATH_REVISIONS_DDL: Final = """
 CREATE TABLE IF NOT EXISTS path_revisions (
   file_id       INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
@@ -165,14 +182,8 @@ CREATE TABLE IF NOT EXISTS path_revisions (
 )
 """
 
-# Staging area (git's index): one pending change per file, holding the desired TARGET
-# state. There is no ``commit_id`` (no claiming): a staged row stays staged until a
-# commit turns it into a real revision row and deletes it. A crash leaves leftover rows
-# staged, which the next commit sweeps into a new commit. See PLAN.md §7.
-# ``base_size_bytes``/``base_mtime_ns`` are the file's signature at stage time, so a commit can
-# refuse a file edited since. ``changed_fields`` keeps the stage's own change because a re-applied
-# commit finds disk already equal to the target. ``supplied_keys`` tells a value the caller
-# confirmed from one the merge kept. Migrations append these, so they sit last.
+# The base signature lets a commit refuse a file edited since staging. ``changed_fields`` keeps
+# the stage's own change, since a re-applied commit finds disk already at the target.
 _TAG_REVISIONS_STAGED_DDL: Final = """
 CREATE TABLE IF NOT EXISTS tag_revisions_staged (
   file_id         INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
@@ -188,9 +199,8 @@ CREATE TABLE IF NOT EXISTS tag_revisions_staged (
 )
 """
 
-# ``to_path`` and ``to_key`` are relative to ``music_path``, so a staged move survives the
-# library being promoted to another folder. A migration appends the last four columns, so they
-# stay nullable.
+# Relative paths let a staged move survive the library's promotion to another folder. A
+# migration appended the last four columns, so they stay nullable.
 _PATH_REVISIONS_STAGED_DDL: Final = """
 CREATE TABLE IF NOT EXISTS path_revisions_staged (
   file_id         INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
@@ -317,12 +327,61 @@ _COVER_DDL: Final = (
     "CREATE INDEX IF NOT EXISTS idx_cover_writes_path_key ON cover_writes(path_key)",
 )
 
-# Persistent cache of parsed Last.fm top-tag lists only, keyed by a request hash (so it
-# survives MCP restarts and inspector re-launches). ``found`` is the negative-cache sentinel
-# (0 = artist/album genuinely absent from Last.fm; 1 = found), distinct from ``found=1``
-# with an empty ``tags`` array. ``tags`` is a JSON array of ``[name, weight]`` pairs
-# (``[]`` when found-but-empty, or when not found). See PLAN, Last.fm genre tagging,
-# "Caching & pacing".
+# The row keeps the picture's bytes and container attributes, since after a crash between the
+# write and its log it is the only copy of the removed picture.
+_PICTURE_WRITES_STAGED_DDL: Final = """
+CREATE TABLE IF NOT EXISTS picture_writes_staged (
+  file_id      INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+  sha256       TEXT NOT NULL,
+  ordinal      INTEGER NOT NULL,
+  picture_type INTEGER,
+  mime         TEXT NOT NULL,
+  description  TEXT NOT NULL,
+  attributes   TEXT NOT NULL,
+  content      BLOB NOT NULL,
+  size_bytes   INTEGER NOT NULL,
+  origin       TEXT NOT NULL,
+  note         TEXT,
+  staged_at    TEXT NOT NULL,
+  PRIMARY KEY (file_id, sha256)
+)
+"""
+
+# Every row keeps its picture's bytes and attributes, so a revert can write a removed picture back.
+_PICTURE_WRITES_DDL: Final = """
+CREATE TABLE IF NOT EXISTS picture_writes (
+  id            INTEGER PRIMARY KEY,
+  commit_id     INTEGER NOT NULL REFERENCES commits(id),
+  created_at    TEXT NOT NULL,
+  origin        TEXT NOT NULL,
+  action        TEXT NOT NULL CHECK (action IN ('remove', 'restore')),
+  reverted_from INTEGER REFERENCES picture_writes(id),
+  file_id       INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+  version       INTEGER NOT NULL,
+  path          TEXT NOT NULL,
+  sha256        TEXT NOT NULL,
+  ordinal       INTEGER NOT NULL,
+  picture_type  INTEGER,
+  mime          TEXT NOT NULL,
+  description   TEXT NOT NULL,
+  attributes    TEXT NOT NULL,
+  content       BLOB NOT NULL,
+  size_bytes    INTEGER NOT NULL,
+  note          TEXT
+)
+"""
+
+# Each table precedes its indexes. The unique index also serves the lookups by file.
+_PICTURE_DDL: Final = (
+    _PICTURE_WRITES_STAGED_DDL,
+    _PICTURE_WRITES_DDL,
+    "CREATE INDEX IF NOT EXISTS idx_picture_writes_commit_id ON picture_writes(commit_id)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_picture_writes_file_id_version "
+    "ON picture_writes(file_id, version)",
+)
+
+# ``found = 0`` means Last.fm lacks the artist or album, unlike a found row with no tags.
+# ``tags`` holds JSON ``[name, weight]`` pairs, ``[]`` when there are none. See PLAN.md §8.
 _LASTFM_CACHE_DDL: Final = """
 CREATE TABLE IF NOT EXISTS lastfm_cache (
   request_key TEXT PRIMARY KEY,
@@ -332,9 +391,8 @@ CREATE TABLE IF NOT EXISTS lastfm_cache (
 )
 """
 
-# Persistent cache of ``artist.getCorrection`` answers, keyed like ``lastfm_cache``. ``found``
-# is the negative-cache sentinel (0 = no correction). A found row carries the canonical
-# ``name`` and the ``mbid`` when Last.fm gives one.
+# ``artist.getCorrection`` answers. ``found = 0`` means no correction. A found row holds the
+# canonical ``name`` and the ``mbid`` when Last.fm gives one.
 _LASTFM_CORRECTION_CACHE_DDL: Final = """
 CREATE TABLE IF NOT EXISTS lastfm_correction_cache (
   request_key TEXT PRIMARY KEY,
@@ -345,11 +403,8 @@ CREATE TABLE IF NOT EXISTS lastfm_correction_cache (
 )
 """
 
-# The four tag-axis status tables share one shape (:mod:`tagmend.engine.axis`). Each row is
-# one outcome (``done``/``no_match``/``manual``), the identity it was decided against in the
-# two ``source_*`` columns, and ``source_value``: the JSON of the axis fields' values it
-# describes, NULL on a row written before v21. A ``done``/``no_match`` row counts only while
-# both snapshots match the file, so no writer is needed to re-open one.
+# ``source_value`` is the JSON of the axis field values a row settled. A row written before v21
+# holds NULL there, so the column stays nullable.
 _FILE_GENRE_STATUS_DDL: Final = """
 CREATE TABLE IF NOT EXISTS file_genre_status (
   file_id       INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
@@ -390,36 +445,28 @@ _FILE_SONG_STATUS_DDL: Final = """
 CREATE TABLE IF NOT EXISTS file_song_status (
   file_id                   INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
   status                    TEXT NOT NULL,
-  source_album_mbid         TEXT,
+  source_release_mbid       TEXT,
   source_release_track_mbid TEXT,
   source_value              TEXT,
   updated_at                TEXT NOT NULL
 )
 """
 
-# Persistent cache of MusicBrainz release-group lookups, keyed by a request hash (so it
-# survives MCP restarts), mirroring ``lastfm_cache``. ``found`` is the negative-cache
-# sentinel (0 = no usable Album release group; 1 = found). The found columns hold the
-# selected release group's original ``first-release-date`` and MBIDs. Named
-# ``musicbrainz_cache`` before v20. See PLAN, year axis.
+# ``found = 0`` means no usable Album release group. A found row holds the selected group's
+# ``first-release-date`` and MBID. Named ``musicbrainz_cache`` before v20.
 _MUSICBRAINZ_RELEASE_GROUP_CACHE_DDL: Final = """
 CREATE TABLE IF NOT EXISTS musicbrainz_release_group_cache (
   request_key        TEXT PRIMARY KEY,
   found              INTEGER NOT NULL,
   album_title        TEXT,
   original_date      TEXT,
-  release_mbid       TEXT,
   release_group_mbid TEXT,
   fetched_at         TEXT NOT NULL
 )
 """
 
-# Persistent cache of MusicBrainz release lookups by release MBID, keyed by a request hash
-# carrying its own parse-rule version. ``found`` is the negative-cache sentinel (0 = no
-# release under that id; 1 = found). A release is a nested document (media, each with
-# tracks), so the parsed form is one JSON ``payload`` rather than three shredded tables:
-# nothing queries inside it, since the key is always the MBID and the caller wants the whole
-# tracklist. Feeds ``detect_release_disagreements``.
+# ``found = 0`` means no release under that MBID. ``payload`` is one JSON document, since each
+# caller reads a whole tracklist. Feeds ``detect_release_disagreements`` and ``resolve_songs``.
 _MUSICBRAINZ_RELEASE_CACHE_DDL: Final = """
 CREATE TABLE IF NOT EXISTS musicbrainz_release_cache (
   request_key TEXT PRIMARY KEY,
@@ -429,11 +476,8 @@ CREATE TABLE IF NOT EXISTS musicbrainz_release_cache (
 )
 """
 
-# Persistent cache of MusicBrainz artist lookups by artist MBID, keyed by a request hash
-# carrying its own parse-rule version. ``found`` is the negative-cache sentinel (0 = no
-# artist under that id; 1 = found). The found columns hold the canonical name, the sort name
-# and the alias set, which is what tells a name worth merging from a per-track credit.
-# Feeds ``resolve_artists``' MusicBrainz tier.
+# ``found = 0`` means no artist under that MBID. The alias set tells a name worth merging from a
+# per-track credit in ``resolve_artists``' MusicBrainz tier.
 _MUSICBRAINZ_ARTIST_CACHE_DDL: Final = """
 CREATE TABLE IF NOT EXISTS musicbrainz_artist_cache (
   request_key    TEXT PRIMARY KEY,
@@ -446,27 +490,19 @@ CREATE TABLE IF NOT EXISTS musicbrainz_artist_cache (
 )
 """
 
-# Persistent cache of MusicBrainz recording-search lookups, keyed by a request hash (so it
-# survives MCP restarts), mirroring ``musicbrainz_release_group_cache`` for the
-# ``(artist, title)`` axis.
-# ``found`` is the negative-cache sentinel (0 = no usable Album release group for the
-# recording; 1 = found). The found columns hold the selected recording's release-group
-# title/id + the recording MBID. Feeds ``detect_album_gaps``' review-only tier. See PLAN —
-# album-gaps recording tier.
+# ``(artist, title)`` recording searches for ``detect_album_gaps``' review-only tier.
+# ``found = 0`` means the recording has no usable Album release group.
 _MUSICBRAINZ_RECORDING_CACHE_DDL: Final = """
 CREATE TABLE IF NOT EXISTS musicbrainz_recording_cache (
-  request_key        TEXT PRIMARY KEY,
-  found              INTEGER NOT NULL,
-  album_title        TEXT,
-  release_group_mbid TEXT,
-  recording_mbid     TEXT,
-  fetched_at         TEXT NOT NULL
+  request_key TEXT PRIMARY KEY,
+  found       INTEGER NOT NULL,
+  album_title TEXT,
+  fetched_at  TEXT NOT NULL
 )
 """
 
-# One fpcalc outcome per file, reused while ``size_bytes`` and ``mtime_ns`` equal the files row.
-# The raw fingerprint is kept so an expired or failed lookup re-queries without re-running fpcalc,
-# and a stored failure (NULL fingerprint and duration) keeps an undecodable file from re-running.
+# The fingerprint lets an expired or failed lookup re-query without fpcalc. A NULL fingerprint
+# and duration store a failure, so an undecodable file does not re-run fpcalc.
 _FINGERPRINT_CACHE_DDL: Final = """
 CREATE TABLE IF NOT EXISTS fingerprint_cache (
   file_id          INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
@@ -479,9 +515,8 @@ CREATE TABLE IF NOT EXISTS fingerprint_cache (
 )
 """
 
-# Persistent cache of AcoustID lookups, keyed by a hash of the fingerprint, the duration, the
-# requested meta and a parse version. ``found`` is the negative-cache sentinel (0 = no match),
-# served only while young because AcoustID learns new fingerprints over time.
+# ``found = 0`` means no match, served only while young since AcoustID learns new fingerprints.
+# ``payload`` holds the parsed result as zlib-compressed JSON.
 _ACOUSTID_CACHE_DDL: Final = """
 CREATE TABLE IF NOT EXISTS acoustid_cache (
   request_key TEXT PRIMARY KEY,
@@ -491,9 +526,8 @@ CREATE TABLE IF NOT EXISTS acoustid_cache (
 )
 """
 
-# Persistent cache of Cover Art Archive listings, keyed by a hash of the kind, a parse version
-# and the MBID. ``found`` is the negative-cache sentinel (0 = no approved front), served only
-# while young because CAA gains art over time. ``payload`` holds the front's URLs as JSON.
+# ``found = 0`` means no approved front, served only while young since CAA gains art over time.
+# ``payload`` holds the front's URLs as JSON.
 _COVERART_CACHE_DDL: Final = """
 CREATE TABLE IF NOT EXISTS coverart_cache (
   request_key TEXT PRIMARY KEY,
@@ -503,11 +537,8 @@ CREATE TABLE IF NOT EXISTS coverart_cache (
 )
 """
 
-# One path decision per file. ``legit_ignore`` keeps the file's folder, and
-# ``misfiled_deferred`` lets the tags render the entire path. ``source_value`` is the JSON
-# snapshot that binds the decision to its tags and location
-# (:class:`tagmend.engine.store.MismatchStatusRow`). It stays nullable because the v24 upgrade
-# drops a column in place and cannot add NOT NULL.
+# ``source_value`` stays nullable, since the v24 upgrade drops a column in place and cannot add
+# NOT NULL.
 _FILE_MISMATCH_STATUS_DDL: Final = """
 CREATE TABLE IF NOT EXISTS file_mismatch_status (
   file_id       INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
@@ -523,7 +554,13 @@ _REVISIONS_COMMIT_INDEX_DDL: Final = (
     "CREATE INDEX IF NOT EXISTS idx_path_revisions_commit_id ON path_revisions(commit_id)",
 )
 
-_APPEND_ONLY_LOGS: Final = ("tag_revisions", "path_revisions", "sidecar_moves", "cover_writes")
+_APPEND_ONLY_LOGS: Final = (
+    "tag_revisions",
+    "path_revisions",
+    "sidecar_moves",
+    "cover_writes",
+    "picture_writes",
+)
 
 # Revert reads an omitted tag by the revision's managed set, so a NULL would silently change
 # what a revert deletes. SQLite cannot add NOT NULL to an existing column, so a trigger does.
@@ -580,15 +617,24 @@ def _column_exists(connection: sqlite3.Connection, table: str, column: str) -> b
     return any(str(row[1]) == column for row in cursor.fetchall())
 
 
-def _migrate_v12_year_status(connection: sqlite3.Connection) -> None:
-    """v12: rename ``file_album_status`` → ``file_year_status``, preserving every row.
+@contextmanager
+def _migration_transaction(connection: sqlite3.Connection) -> Iterator[None]:
+    """Commit a step's writes together, or roll every one back and re-raise.
 
-    Runs BEFORE the DDL so the ``CREATE TABLE IF NOT EXISTS`` below finds the renamed table
-    and does not create an empty second one. The rename is SQLite-native (``ALTER TABLE ...
-    RENAME TO``), so all stored ``'no_match'``/``'manual'`` dispositions survive. Idempotent:
-    it fires only when the old table exists and the new one does not (a fresh ledger has
-    neither, a v12+ ledger has only the new one).
+    ``db.connect`` keeps sqlite3's legacy transaction control, which opens no transaction for
+    DDL, so each ``ALTER`` outside this block commits alone.
     """
+    connection.execute("BEGIN")
+    try:
+        yield
+    except BaseException:
+        connection.rollback()
+        raise
+    connection.commit()
+
+
+def _migrate_v12_year_status(connection: sqlite3.Connection) -> None:
+    """v12: rename ``file_album_status`` to ``file_year_status``, keeping every row."""
     if not _table_exists(connection, "file_album_status"):
         return
     if _table_exists(connection, "file_year_status"):
@@ -597,55 +643,39 @@ def _migrate_v12_year_status(connection: sqlite3.Connection) -> None:
     logger.info("schema v12: renamed file_album_status to file_year_status")
 
 
-# The date the managed set widened from 5 tags to 18 (managed-set version 1 -> 2 in
-# :data:`tagmend.engine.tags.MANAGED_SETS`). Frozen history: a later widening adds a new
-# version and never restamps rows through this constant.
+# The date the managed set widened from 5 tags to 18 (managed-set version 1 to 2). A later
+# widening adds a new version and never restamps rows through this constant.
 _MANAGED_SET_WIDENING_DATE: Final = "2026-07-04"
 
 
 def _migrate_v13_managed_set(connection: sqlite3.Connection) -> None:
     """v13: add ``tag_revisions.managed_set`` and stamp existing rows by capture date.
 
-    Runs BEFORE the DDL, so the guard leads with ``_table_exists``: on a fresh ledger
-    ``tag_revisions`` does not exist yet and a bare ``ALTER TABLE`` would raise "no such
-    table" on every first run. A fresh ledger skips this and takes the column from
-    :data:`_TAG_REVISIONS_DDL` instead. Idempotent: the ``_column_exists`` half stops a
-    second application.
-
     Capture date is the only evidence a v12 row carries about which set governed it, and
-    ``created_at`` is an ISO-8601 UTC string, so the comparison is lexicographic. Commits
-    itself, since a read-only caller would otherwise discard the stamp (see below).
+    ``created_at`` is an ISO-8601 UTC string, so the comparison is lexicographic. The column and
+    the stamp land in one transaction the step commits itself, since a read-only caller never
+    commits.
     """
     if not _table_exists(connection, "tag_revisions"):
         return
     if _column_exists(connection, "tag_revisions", "managed_set"):
         return
-    connection.execute("ALTER TABLE tag_revisions ADD COLUMN managed_set INTEGER")
-    # Test ledgers are built by downgrading a fresh schema that already carries the trigger.
-    connection.execute("DROP TRIGGER IF EXISTS tag_revisions_no_update")
-    connection.execute(
-        "UPDATE tag_revisions SET managed_set = CASE WHEN created_at >= ? THEN 2 ELSE 1 END",
-        (_MANAGED_SET_WIDENING_DATE,),
-    )
-    # The stamp is DML, so sqlite3 opens an implicit transaction for it. Every caller runs
-    # apply_schema straight after db.connect and many never commit (read-only paths), which
-    # would roll the stamp back while the autocommitted ADD COLUMN survives — leaving the
-    # column present but NULL, so the migration could never run again. Commit it here.
-    connection.commit()
+    with _migration_transaction(connection):
+        connection.execute("ALTER TABLE tag_revisions ADD COLUMN managed_set INTEGER")
+        # Test ledgers are built by downgrading a fresh schema that already carries the trigger.
+        connection.execute("DROP TRIGGER IF EXISTS tag_revisions_no_update")
+        connection.execute(
+            "UPDATE tag_revisions SET managed_set = CASE WHEN created_at >= ? THEN 2 ELSE 1 END",
+            (_MANAGED_SET_WIDENING_DATE,),
+        )
     logger.info("schema v13: stamped tag_revisions.managed_set on pre-existing rows")
 
 
 def _migrate_v14_reader_version(connection: sqlite3.Connection) -> None:
     """v14: add ``files.reader_version``, defaulting pre-existing rows below any reader.
 
-    Runs BEFORE the DDL, so the guard leads with ``_table_exists``: on a fresh ledger
-    ``files`` does not exist yet and a bare ``ALTER TABLE`` would raise "no such table" on
-    every first run. A fresh ledger skips this and takes the column from :data:`_FILES_DDL`
-    instead. Idempotent: the ``_column_exists`` half stops a second application.
-
-    The ``DEFAULT 0`` backfills every existing row below :data:`TAG_READER_VERSION`, which is
-    the point — those rows were read by an unknown older reader, so the next incremental scan
-    must re-read each of them once. No DML follows, so unlike v13 there is no stamp to commit.
+    The ``DEFAULT 0`` puts every existing row below :data:`TAG_READER_VERSION`. An unknown older
+    reader read those rows, so the next incremental scan re-reads each of them once.
     """
     if not _table_exists(connection, "files"):
         return
@@ -658,27 +688,21 @@ def _migrate_v14_reader_version(connection: sqlite3.Connection) -> None:
 def _migrate_staged_base_signature(connection: sqlite3.Connection) -> None:
     """v17: add ``tag_revisions_staged.base_size_bytes`` / ``base_mtime_ns`` as NULL.
 
-    Runs BEFORE the DDL, so the guard leads with ``_table_exists``: on a fresh ledger the table
-    does not exist yet and takes both columns from :data:`_TAG_REVISIONS_STAGED_DDL` instead.
-    Idempotent: the ``_column_exists`` half stops a second application. A NULL pair marks a row
-    staged before the signature existed, and the commit skips the changed-since-stage check
-    for it.
+    A NULL pair marks a row staged before the signature existed, and the commit skips the
+    changed-since-stage check for it.
     """
     if not _table_exists(connection, "tag_revisions_staged"):
         return
     if _column_exists(connection, "tag_revisions_staged", "base_size_bytes"):
         return
-    connection.execute("ALTER TABLE tag_revisions_staged ADD COLUMN base_size_bytes INTEGER")
-    connection.execute("ALTER TABLE tag_revisions_staged ADD COLUMN base_mtime_ns INTEGER")
+    with _migration_transaction(connection):
+        connection.execute("ALTER TABLE tag_revisions_staged ADD COLUMN base_size_bytes INTEGER")
+        connection.execute("ALTER TABLE tag_revisions_staged ADD COLUMN base_mtime_ns INTEGER")
     logger.info("schema v17: added tag_revisions_staged base signature columns")
 
 
 def _migrate_staged_changed_fields(connection: sqlite3.Connection) -> None:
-    """v21: add ``tag_revisions_staged.changed_fields`` as NULL.
-
-    Runs BEFORE the DDL, so a fresh ledger takes the column from
-    :data:`_TAG_REVISIONS_STAGED_DDL` instead. Idempotent through ``_column_exists``.
-    """
+    """v21: add ``tag_revisions_staged.changed_fields`` as NULL."""
     if not _table_exists(connection, "tag_revisions_staged"):
         return
     if _column_exists(connection, "tag_revisions_staged", "changed_fields"):
@@ -690,10 +714,8 @@ def _migrate_staged_changed_fields(connection: sqlite3.Connection) -> None:
 def _migrate_staged_supplied_keys(connection: sqlite3.Connection) -> None:
     """v23: add ``tag_revisions_staged.supplied_keys`` as NULL.
 
-    Runs BEFORE the DDL, so a fresh ledger takes the column from
-    :data:`_TAG_REVISIONS_STAGED_DDL` instead. Idempotent through ``_column_exists``. A NULL
-    marks a row staged before the column existed, which the stale-identity report reads as
-    "no key confirmed".
+    A NULL marks a row staged before the column existed, which the stale-identity report reads
+    as "no key confirmed".
     """
     if not _table_exists(connection, "tag_revisions_staged"):
         return
@@ -706,27 +728,25 @@ def _migrate_staged_supplied_keys(connection: sqlite3.Connection) -> None:
 def _migrate_path_staging(connection: sqlite3.Connection) -> None:
     """v25: add the path staging columns ``to_key``, the base signature and ``reverted_from``.
 
-    Runs BEFORE the DDL, so a fresh ledger takes the columns from
-    :data:`_PATH_REVISIONS_STAGED_DDL` instead. Idempotent through ``_column_exists``. The DDL
-    phase adds the unique ``to_key`` index, which several NULL keys do not violate.
+    The DDL phase adds the unique ``to_key`` index, which several NULL keys do not violate.
     """
     if not _table_exists(connection, "path_revisions_staged"):
         return
     if _column_exists(connection, "path_revisions_staged", "to_key"):
         return
-    connection.execute("ALTER TABLE path_revisions_staged ADD COLUMN to_key TEXT")
-    connection.execute("ALTER TABLE path_revisions_staged ADD COLUMN base_size_bytes INTEGER")
-    connection.execute("ALTER TABLE path_revisions_staged ADD COLUMN base_mtime_ns INTEGER")
-    connection.execute("ALTER TABLE path_revisions_staged ADD COLUMN reverted_from INTEGER")
+    with _migration_transaction(connection):
+        connection.execute("ALTER TABLE path_revisions_staged ADD COLUMN to_key TEXT")
+        connection.execute("ALTER TABLE path_revisions_staged ADD COLUMN base_size_bytes INTEGER")
+        connection.execute("ALTER TABLE path_revisions_staged ADD COLUMN base_mtime_ns INTEGER")
+        connection.execute("ALTER TABLE path_revisions_staged ADD COLUMN reverted_from INTEGER")
     logger.info("schema v25: added the path staging columns")
 
 
 def _migrate_path_reverted_to_version(connection: sqlite3.Connection) -> None:
     """v27: rename ``reverted_from`` to ``reverted_to_version`` on both path tables, keeping rows.
 
-    Runs BEFORE the DDL and after :func:`_migrate_path_staging`, which adds the old name to a
-    pre-v25 staging table. Idempotent per table: it fires only while the old column exists and
-    the new one does not. A rename fires no UPDATE trigger, so the append-only triggers stay.
+    Runs after :func:`_migrate_path_staging`, which adds the old name to a pre-v25 staging
+    table.
     """
     for table in ("path_revisions", "path_revisions_staged"):
         if not _table_exists(connection, table):
@@ -776,19 +796,13 @@ def _legacy_mismatch_snapshot(
 
 
 def _migrate_mismatch_covers(connection: sqlite3.Connection) -> None:
-    """v24: rewrite each mismatch row as a JSON snapshot and drop ``source_field``.
-
-    Runs BEFORE the DDL, so a fresh ledger takes the v24 shape from
-    :data:`_FILE_MISMATCH_STATUS_DDL`. Idempotent: it fires only while ``source_field`` exists.
-    The rewrite and the drop land in one transaction.
-    """
+    """v24: rewrite each mismatch row as a JSON snapshot and drop ``source_field``."""
     if not _table_exists(connection, "file_mismatch_status"):
         return
     if not _column_exists(connection, "file_mismatch_status", "source_field"):
         return
 
-    connection.execute("BEGIN")
-    try:
+    with _migration_transaction(connection):
         cursor = connection.execute(
             """
             SELECT m.file_id, m.status, m.source_field, m.source_value, f.folder
@@ -812,10 +826,6 @@ def _migrate_mismatch_covers(connection: sqlite3.Connection) -> None:
             ],
         )
         connection.execute("ALTER TABLE file_mismatch_status DROP COLUMN source_field")
-    except BaseException:
-        connection.rollback()
-        raise
-    connection.commit()
     logger.info("schema v24: rewrote %d mismatch row(s) as covers snapshots", len(rows))
 
 
@@ -831,7 +841,7 @@ def _keyed_file_rows(connection: sqlite3.Connection) -> list[tuple[int, str, str
 
 
 def _refuse_path_key_collisions(rows: list[tuple[int, str, str, str]]) -> None:
-    """Raise :class:`RuntimeError` naming every path key two or more *rows* share."""
+    """Raise :class:`LedgerSchemaError` naming every path key two or more *rows* share."""
     by_key: dict[str, list[str]] = {}
     for file_id, folder, filename, key in rows:
         by_key.setdefault(key, []).append(f"id={file_id} ({folder!r}, {filename!r})")
@@ -843,25 +853,22 @@ def _refuse_path_key_collisions(rows: list[tuple[int, str, str, str]]) -> None:
         f"schema v18: {len(collisions)} path key(s) are held by more than one file row, so one "
         f"file is tracked twice. Keep one row per key, then restart: {details}"
     )
-    raise RuntimeError(message)
+    raise LedgerSchemaError(message)
 
 
 def _migrate_files_path_key(connection: sqlite3.Connection) -> None:
     """v18: add ``files.path_key``, backfill it and create its UNIQUE index, all or nothing.
 
-    Runs BEFORE the DDL, so the guard leads with ``_table_exists``: a fresh ledger takes the
-    column from :data:`_FILES_DDL`. Idempotent: the ``_column_exists`` half stops a second
-    application. Two rows sharing a key are one file recorded twice, and only the owner can say
-    which row keeps the history, so the upgrade rolls back (the ADD COLUMN included, SQLite DDL
-    being transactional) and raises :class:`RuntimeError` naming each collision.
+    Two rows sharing a key are one file recorded twice, and only the owner can say which row
+    keeps the history. The upgrade then rolls back, the ADD COLUMN included, and raises
+    :class:`LedgerSchemaError` naming each collision.
     """
     if not _table_exists(connection, "files"):
         return
     if _column_exists(connection, "files", "path_key"):
         return
 
-    connection.execute("BEGIN")
-    try:
+    with _migration_transaction(connection):
         connection.execute("ALTER TABLE files ADD COLUMN path_key TEXT")
         rows = _keyed_file_rows(connection)
         _refuse_path_key_collisions(rows)
@@ -870,20 +877,14 @@ def _migrate_files_path_key(connection: sqlite3.Connection) -> None:
             [(key, file_id) for file_id, _, _, key in rows],
         )
         connection.execute(_FILES_PATH_KEY_INDEX_DDL)
-    except BaseException:
-        connection.rollback()
-        raise
-    connection.commit()
     logger.info("schema v18: backfilled files.path_key on %d row(s)", len(rows))
 
 
 def _migrate_commit_origin(connection: sqlite3.Connection) -> None:
     """v19: restamp ``auto`` on every ``manual`` commit whose revisions are all ``auto``.
 
-    Runs BEFORE the DDL, so the guard leads with ``_table_exists``: a fresh ledger has no
-    commits to restamp. Idempotent: a second run finds no ``manual`` commit left to match. It
-    updates ``commits`` only, which carries no append-only trigger. Commits itself like v13,
-    since a read-only caller would otherwise roll the restamp back.
+    It updates ``commits`` only, which carries no append-only trigger. Commits itself, since a
+    read-only caller would otherwise roll the restamp back.
     """
     if not _table_exists(connection, "commits"):
         return
@@ -905,12 +906,7 @@ def _migrate_commit_origin(connection: sqlite3.Connection) -> None:
 
 
 def _migrate_reverted_to_version(connection: sqlite3.Connection) -> None:
-    """v20: rename ``tag_revisions.reverted_from`` to ``reverted_to_version``, keeping every row.
-
-    Runs BEFORE the DDL, so a fresh ledger skips this and takes the column from
-    :data:`_TAG_REVISIONS_DDL`. Idempotent: it fires only while the old column exists and the
-    new one does not. A rename fires no UPDATE trigger, so the append-only triggers stay.
-    """
+    """v20: rename ``tag_revisions.reverted_from`` to ``reverted_to_version``, keeping every row."""
     if not _table_exists(connection, "tag_revisions"):
         return
     if _column_exists(connection, "tag_revisions", "reverted_to_version"):
@@ -932,7 +928,7 @@ def _migrate_managed_set_required(connection: sqlite3.Connection) -> None:
 
     Runs after :func:`_migrate_v13_managed_set`, so a pre-v13 row is already stamped. A NULL
     here means that stamp was lost, and only the owner can say which set governed the row, so
-    the upgrade raises :class:`RuntimeError` naming the count and the first few rows.
+    the upgrade raises :class:`LedgerSchemaError` naming the count and the first few rows.
     """
     if not _table_exists(connection, "tag_revisions"):
         return
@@ -958,16 +954,13 @@ def _migrate_managed_set_required(connection: sqlite3.Connection) -> None:
         f"tell which tags they governed. Stamp each one, then restart. "
         f"First (file_id, version) pairs: {pairs}"
     )
-    raise RuntimeError(message)
+    raise LedgerSchemaError(message)
 
 
 def _migrate_release_group_cache_name(connection: sqlite3.Connection) -> None:
     """v20: rename ``musicbrainz_cache`` to ``musicbrainz_release_group_cache``, keeping rows.
 
-    Runs BEFORE the DDL so the ``CREATE TABLE IF NOT EXISTS`` finds the renamed table and does
-    not create an empty second one. Idempotent: it fires only when the old table exists and
-    the new one does not. Every request key already starts with ``release-group``, so no
-    cached row is invalidated.
+    Every request key already starts with ``release-group``, so no cached row is invalidated.
     """
     if not _table_exists(connection, "musicbrainz_cache"):
         return
@@ -988,8 +981,7 @@ _RELEASE_GROUP_ID_TABLES: Final = (
 def _migrate_mbid_columns(connection: sqlite3.Connection) -> None:
     """v20: rename ``release_group_id`` to ``release_group_mbid`` in each cache, keeping rows.
 
-    Runs after :func:`_migrate_release_group_cache_name`. Idempotent: each table renames only
-    while it has the old column and lacks the new one.
+    Runs after :func:`_migrate_release_group_cache_name`.
     """
     for table in _RELEASE_GROUP_ID_TABLES:
         if not _table_exists(connection, table):
@@ -1007,9 +999,7 @@ def _migrate_mbid_columns(connection: sqlite3.Connection) -> None:
 def _migrate_drop_files_status(connection: sqlite3.Connection) -> None:
     """v20: drop ``files.status``, which only its DEFAULT ever wrote and nothing read.
 
-    Runs BEFORE the DDL, so a fresh ledger skips this and its DDL has no such column.
-    Idempotent: it fires only while the column exists. No index, constraint, view or trigger
-    names the column, so ``DROP COLUMN`` applies.
+    No index, constraint, view or trigger names the column, so ``DROP COLUMN`` applies.
     """
     if not _table_exists(connection, "files"):
         return
@@ -1070,25 +1060,17 @@ def _move_correction_rows(connection: sqlite3.Connection) -> int:
 def _migrate_lastfm_correction_cache(connection: sqlite3.Connection) -> None:
     """v20: create ``lastfm_correction_cache`` and move the library's correction rows into it.
 
-    Runs BEFORE the DDL. A fresh ledger has no ``lastfm_cache`` and takes the table from
-    :data:`_LASTFM_CORRECTION_CACHE_DDL`. Idempotent: an existing ``lastfm_correction_cache``
-    stops a second run. The CREATE and the row moves land in one transaction. A correction
-    row for a value the library no longer carries stays behind unreachable, which costs only
-    a re-fetch if that value returns.
+    A correction row for a value the library no longer carries stays behind unreachable, which
+    costs only a re-fetch if that value returns.
     """
     if not _table_exists(connection, "lastfm_cache"):
         return
     if _table_exists(connection, "lastfm_correction_cache"):
         return
 
-    connection.execute("BEGIN")
-    try:
+    with _migration_transaction(connection):
         connection.execute(_LASTFM_CORRECTION_CACHE_DDL)
         moved = _move_correction_rows(connection)
-    except BaseException:
-        connection.rollback()
-        raise
-    connection.commit()
     logger.info("schema v20: moved %d correction row(s) to lastfm_correction_cache", moved)
 
 
@@ -1155,33 +1137,64 @@ def _replay_manual_revisions(connection: sqlite3.Connection) -> int:
 def _migrate_axis_outcomes(connection: sqlite3.Connection) -> None:
     """v21: snapshot tag-axis status values, replay manual revisions, drop ``voided_auto``.
 
-    Runs BEFORE the DDL, so a fresh ledger (no ``tag_revisions``) skips this and takes every
-    table from its DDL. In one transaction it creates any tag-axis status table an older
-    ledger never had, adds ``source_value`` where it is missing (existing rows keep NULL, which
-    the classifier treats as matching), writes ``manual`` from the manual revisions
-    (:func:`_replay_manual_revisions`) and drops ``voided_auto``, whose watermarks the
-    snapshots replace. It writes no ``done`` row, so a file an auto revision settled reads
-    ``pending`` until a resolver re-derives it from cache. Idempotent: it fires only while
-    ``voided_auto`` exists or a status table lacks ``source_value``.
+    It creates any tag-axis status table an older ledger never had, adds ``source_value`` where
+    it is missing (existing rows keep NULL, which the classifier treats as matching), writes
+    ``manual`` from the manual revisions (:func:`_replay_manual_revisions`) and drops
+    ``voided_auto``, whose watermarks the snapshots replace. It writes no ``done`` row, so a
+    file an auto revision settled reads ``pending`` until a resolver re-derives it from cache.
     """
     if not _table_exists(connection, "tag_revisions"):
         return
     if _axis_outcomes_migrated(connection):
         return
 
-    connection.execute("BEGIN")
-    try:
+    with _migration_transaction(connection):
         for table, ddl in _AXIS_STATUS_TABLES:
             connection.execute(ddl)
             if not _column_exists(connection, table, "source_value"):
                 connection.execute(f"ALTER TABLE {table} ADD COLUMN source_value TEXT")
         replayed = _replay_manual_revisions(connection)
         connection.execute("DROP TABLE IF EXISTS voided_auto")
-    except BaseException:
-        connection.rollback()
-        raise
-    connection.commit()
     logger.info("schema v21: replayed %d manual status row(s), dropped voided_auto", replayed)
+
+
+def _migrate_song_release_mbid(connection: sqlite3.Connection) -> None:
+    """v30: rename ``file_song_status.source_album_mbid`` to ``source_release_mbid``, keeping rows.
+
+    The column holds the MusicBrainz release id, which every other part of the engine names
+    ``release_mbid``.
+    """
+    if not _table_exists(connection, "file_song_status"):
+        return
+    if not _column_exists(connection, "file_song_status", "source_album_mbid"):
+        return
+    connection.execute(
+        "ALTER TABLE file_song_status RENAME COLUMN source_album_mbid TO source_release_mbid",
+    )
+    logger.info("schema v30: renamed file_song_status.source_album_mbid to source_release_mbid")
+
+
+# The MusicBrainz cache columns v30 drops, since nothing ever read them back.
+_V30_UNREAD_CACHE_COLUMNS: Final = (
+    ("musicbrainz_release_group_cache", "release_mbid"),
+    ("musicbrainz_recording_cache", "release_group_mbid"),
+    ("musicbrainz_recording_cache", "recording_mbid"),
+)
+
+
+def _migrate_drop_unread_cache_columns(connection: sqlite3.Connection) -> None:
+    """v30: drop the MusicBrainz cache columns nothing read, keeping each row's other columns.
+
+    No index, constraint, view or trigger names them, so ``DROP COLUMN`` applies. Runs after
+    :func:`_migrate_mbid_columns`, which names ``release_group_mbid``.
+    """
+    for table, column in _V30_UNREAD_CACHE_COLUMNS:
+        if not _table_exists(connection, table):
+            continue
+        if not _column_exists(connection, table, column):
+            continue
+        connection.execute(f"ALTER TABLE {table} DROP COLUMN {column}")
+        logger.info("schema v30: dropped %s.%s", table, column)
 
 
 def _apply_migrations(connection: sqlite3.Connection) -> None:
@@ -1204,6 +1217,8 @@ def _apply_migrations(connection: sqlite3.Connection) -> None:
     _migrate_mismatch_covers(connection)
     _migrate_path_staging(connection)
     _migrate_path_reverted_to_version(connection)
+    _migrate_song_release_mbid(connection)
+    _migrate_drop_unread_cache_columns(connection)
 
 
 def apply_schema(connection: sqlite3.Connection) -> None:
@@ -1211,14 +1226,15 @@ def apply_schema(connection: sqlite3.Connection) -> None:
 
     A current ledger costs one ``PRAGMA user_version`` read and no write, so a read-only caller
     never waits on the write lock a running scan holds. A ledger stamped newer than this build
-    raises :class:`RuntimeError` rather than being stamped down.
+    raises :class:`LedgerSchemaError` rather than being stamped down.
 
     An older ledger, or a fresh one stamped 0, runs the in-place migrations first
     (:func:`_apply_migrations`). It then runs every ``CREATE ... IF NOT EXISTS``, then the
     append-only triggers, then the stamp. A migration keeps the ledger's rows unless its own
-    docstring says otherwise. Two migrations refuse an older ledger with :class:`RuntimeError`.
-    :func:`_migrate_files_path_key` refuses one where two file rows share a path key.
-    :func:`_migrate_managed_set_required` refuses one holding a revision with no managed set.
+    docstring says otherwise. Two migrations refuse an older ledger with
+    :class:`LedgerSchemaError`. :func:`_migrate_files_path_key` refuses one where two file rows
+    share a path key. :func:`_migrate_managed_set_required` refuses one holding a revision with
+    no managed set.
 
     ``commits`` is created before every table that references it.
     """
@@ -1227,10 +1243,10 @@ def apply_schema(connection: sqlite3.Connection) -> None:
         return
     if current > SCHEMA_VERSION:
         message = (
-            f"ledger schema v{current} is newer than this tagmend (v{SCHEMA_VERSION}); "
-            "upgrade tagmend"
+            f"ledger schema v{current} is newer than this tagmend (v{SCHEMA_VERSION}). "
+            "Upgrade tagmend."
         )
-        raise RuntimeError(message)
+        raise LedgerSchemaError(message)
 
     _log_schema_change(connection, current)
     _apply_migrations(connection)
@@ -1238,6 +1254,8 @@ def apply_schema(connection: sqlite3.Connection) -> None:
     connection.execute(_FILES_PATH_KEY_INDEX_DDL)
     connection.execute(_FILE_TAGS_DDL)
     connection.execute(_FILE_TAGS_INDEX_DDL)
+    connection.execute(_FILE_PICTURES_DDL)
+    connection.execute(_FILE_PICTURES_INDEX_DDL)
     connection.execute(_COMMITS_DDL)
     connection.execute(_TAG_REVISIONS_DDL)
     connection.execute(_PATH_REVISIONS_DDL)
@@ -1258,7 +1276,7 @@ def apply_schema(connection: sqlite3.Connection) -> None:
     connection.execute(_FINGERPRINT_CACHE_DDL)
     connection.execute(_ACOUSTID_CACHE_DDL)
     connection.execute(_COVERART_CACHE_DDL)
-    for ddl in (*_SIDECAR_DDL, *_COVER_DDL, *_REVISIONS_COMMIT_INDEX_DDL):
+    for ddl in (*_SIDECAR_DDL, *_COVER_DDL, *_REVISIONS_COMMIT_INDEX_DDL, *_PICTURE_DDL):
         connection.execute(ddl)
     apply_append_only_triggers(connection)
     connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")

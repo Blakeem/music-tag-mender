@@ -29,7 +29,7 @@ def test_apply_schema_stamps_current_version(db_conn: sqlite3.Connection) -> Non
     # db_conn already applied the schema; the stamp must match the constant the code ships.
     version = db_conn.execute("PRAGMA user_version").fetchone()[0]
     assert version == SCHEMA_VERSION
-    assert SCHEMA_VERSION == 29
+    assert SCHEMA_VERSION == 33
 
 
 def test_apply_schema_creates_genre_tables(db_conn: sqlite3.Connection) -> None:
@@ -59,9 +59,8 @@ def test_musicbrainz_recording_cache_columns(db_conn: sqlite3.Connection) -> Non
     assert columns["request_key"] == ("TEXT", False, True)
     assert columns["found"] == ("INTEGER", True, False)
     assert columns["album_title"] == ("TEXT", False, False)
-    assert columns["release_group_mbid"] == ("TEXT", False, False)
-    assert columns["recording_mbid"] == ("TEXT", False, False)
     assert columns["fetched_at"] == ("TEXT", True, False)
+    assert set(columns) == {"request_key", "found", "album_title", "fetched_at"}
 
 
 def test_apply_schema_creates_no_voided_auto_table(db_conn: sqlite3.Connection) -> None:
@@ -358,6 +357,29 @@ def test_v13_migration_does_not_restamp_on_reapply() -> None:
         conn.close()
 
 
+def test_a_failed_v13_stamp_leaves_no_managed_set_column() -> None:
+    # A column left behind by a failed stamp satisfies the guard, so the stamp never runs again.
+    conn = sqlite3.connect(":memory:")
+    try:
+        apply_schema(conn)
+        file_id = _insert_file(conn)
+        _downgrade_to_v12(conn)
+        _insert_revision_row(conn, file_id, 0, "2026-01-01T00:00:00+00:00")
+        conn.execute(
+            "CREATE TRIGGER tag_revisions_frozen BEFORE UPDATE ON tag_revisions "
+            "BEGIN SELECT RAISE(ABORT, 'frozen'); END",
+        )
+        conn.commit()
+
+        with pytest.raises(sqlite3.IntegrityError, match="frozen"):
+            apply_schema(conn)
+
+        assert "managed_set" not in _columns(conn, "tag_revisions")
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 12
+    finally:
+        conn.close()
+
+
 def _downgrade_to_v13(conn: sqlite3.Connection) -> None:
     """Turn a freshly-applied ledger back into a v13 one (no ``reader_version`` column)."""
     conn.execute("PRAGMA user_version = 13")
@@ -571,6 +593,25 @@ def test_v16_ledger_gains_the_staged_base_signature_in_place() -> None:
         conn.close()
 
 
+def test_a_failed_v17_step_leaves_no_base_signature_column() -> None:
+    # The second ALTER fails on a column the table already holds. The first must roll back with
+    # it, or the guard column stays and the upgrade never adds the second.
+    conn = sqlite3.connect(":memory:")
+    try:
+        apply_schema(conn)
+        conn.execute("ALTER TABLE tag_revisions_staged DROP COLUMN base_size_bytes")
+        conn.execute("PRAGMA user_version = 16")
+        conn.commit()
+
+        with pytest.raises(sqlite3.OperationalError, match="duplicate column"):
+            apply_schema(conn)
+
+        assert "base_size_bytes" not in _staged_columns(conn)
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 16
+    finally:
+        conn.close()
+
+
 def _downgrade_to_v17(conn: sqlite3.Connection) -> None:
     """Turn a freshly-applied ledger back into a v17 one (no ``path_key`` or its index)."""
     conn.execute("DROP INDEX idx_files_path_key")
@@ -773,15 +814,16 @@ def test_musicbrainz_cache_is_renamed_in_place() -> None:
 
 def test_release_group_id_columns_are_renamed_in_place() -> None:
     # The previous shape names the release-group cache musicbrainz_cache, and both caches
-    # carry release_group_id.
+    # carry release_group_id. v30 then drops the recording cache's copy, which nothing read.
     conn = sqlite3.connect(":memory:")
     try:
         apply_schema(conn)
         conn.execute("ALTER TABLE musicbrainz_release_group_cache RENAME TO musicbrainz_cache")
+        conn.execute(
+            "ALTER TABLE musicbrainz_cache RENAME COLUMN release_group_mbid TO release_group_id",
+        )
+        conn.execute("ALTER TABLE musicbrainz_recording_cache ADD COLUMN release_group_id TEXT")
         for table in ("musicbrainz_cache", "musicbrainz_recording_cache"):
-            conn.execute(
-                f"ALTER TABLE {table} RENAME COLUMN release_group_mbid TO release_group_id",
-            )
             conn.execute(
                 f"INSERT INTO {table} (request_key, found, release_group_id, fetched_at) "  # noqa: S608
                 "VALUES ('k', 1, 'rg-1', '2026-07-06T00:00:00+00:00')",
@@ -793,8 +835,10 @@ def test_release_group_id_columns_are_renamed_in_place() -> None:
 
         for table in ("musicbrainz_release_group_cache", "musicbrainz_recording_cache"):
             assert "release_group_id" not in _columns(conn, table)
-            kept = conn.execute(f"SELECT release_group_mbid FROM {table}").fetchone()[0]  # noqa: S608
-            assert kept == "rg-1"
+        kept = conn.execute("SELECT release_group_mbid FROM musicbrainz_release_group_cache")
+        assert kept.fetchone()[0] == "rg-1"
+        recording = conn.execute("SELECT request_key FROM musicbrainz_recording_cache")
+        assert recording.fetchall() == [("k",)]
     finally:
         conn.close()
 
@@ -1306,7 +1350,7 @@ def test_fingerprint_cache_cascades_on_file_delete(db_conn: sqlite3.Connection) 
 _SONG_STATUS_COLUMNS = [
     "file_id",
     "status",
-    "source_album_mbid",
+    "source_release_mbid",
     "source_release_track_mbid",
     "source_value",
     "updated_at",
@@ -1548,6 +1592,28 @@ def test_v24_ledger_gains_the_path_staging_columns_in_place() -> None:
         conn.close()
 
 
+def test_a_failed_v25_step_leaves_no_path_staging_column() -> None:
+    # The last ALTER fails on a column the table already holds. Every earlier one must roll back
+    # with it, or the guard column stays and the upgrade never adds the rest.
+    conn = sqlite3.connect(":memory:")
+    try:
+        apply_schema(conn)
+        conn.execute("DROP INDEX idx_path_revisions_staged_to_key")
+        for column in _PATH_STAGING_COLUMNS:
+            conn.execute(f"ALTER TABLE path_revisions_staged DROP COLUMN {column}")
+        conn.execute("ALTER TABLE path_revisions_staged ADD COLUMN reverted_from INTEGER")
+        conn.execute("PRAGMA user_version = 24")
+        conn.commit()
+
+        with pytest.raises(sqlite3.OperationalError, match="duplicate column"):
+            apply_schema(conn)
+
+        assert "to_key" not in _path_staged_columns(conn)
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 24
+    finally:
+        conn.close()
+
+
 # --- v26: the sidecar tables -------------------------------------------------------------
 
 _SIDECAR_TABLES = ("sidecar_moves", "sidecar_moves_staged")
@@ -1763,5 +1829,215 @@ def test_v28_ledger_gains_the_cover_tables_in_place() -> None:
             conn, "trigger"
         )
         assert conn.execute("SELECT id FROM files").fetchall() == [(file_id,)]
+    finally:
+        conn.close()
+
+
+# --- v30: the song release id column and the unread MusicBrainz cache columns ----------
+
+
+def test_v29_ledger_renames_the_song_release_column_in_place() -> None:
+    conn = sqlite3.connect(":memory:")
+    try:
+        apply_schema(conn)
+        file_id = _insert_file(conn)
+        conn.execute(
+            "ALTER TABLE file_song_status RENAME COLUMN source_release_mbid TO source_album_mbid",
+        )
+        conn.execute(
+            """
+            INSERT INTO file_song_status
+              (file_id, status, source_album_mbid, source_release_track_mbid, source_value,
+               updated_at)
+            VALUES (?, 'done', 'rel-1', 'track-1', '{}', '2026-10-03T00:00:00+00:00')
+            """,
+            (file_id,),
+        )
+        conn.execute("PRAGMA user_version = 29")
+        conn.commit()
+
+        apply_schema(conn)  # the in-place upgrade
+        apply_schema(conn)  # idempotent: a current ledger runs nothing
+
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        assert _columns(conn, "file_song_status") == _SONG_STATUS_COLUMNS
+        kept = conn.execute(
+            "SELECT file_id, status, source_release_mbid, source_release_track_mbid "
+            "FROM file_song_status",
+        ).fetchall()
+        assert kept == [(file_id, "done", "rel-1", "track-1")]
+    finally:
+        conn.close()
+
+
+def test_v29_cache_rows_keep_their_other_columns_when_the_unread_ones_drop() -> None:
+    conn = sqlite3.connect(":memory:")
+    try:
+        apply_schema(conn)
+        conn.execute("ALTER TABLE musicbrainz_release_group_cache ADD COLUMN release_mbid TEXT")
+        for column in ("release_group_mbid", "recording_mbid"):
+            conn.execute(f"ALTER TABLE musicbrainz_recording_cache ADD COLUMN {column} TEXT")
+        conn.execute(
+            """
+            INSERT INTO musicbrainz_release_group_cache
+              (request_key, found, album_title, original_date, release_mbid, release_group_mbid,
+               fetched_at)
+            VALUES ('rg-k', 1, 'Paranoid', '1970-09-18', 'rel-1', 'rg-1',
+                    '2026-10-03T00:00:00+00:00')
+            """,
+        )
+        conn.execute(
+            """
+            INSERT INTO musicbrainz_recording_cache
+              (request_key, found, album_title, release_group_mbid, recording_mbid, fetched_at)
+            VALUES ('rec-k', 1, 'Paranoid', 'rg-1', 'rec-1', '2026-10-03T00:00:00+00:00')
+            """,
+        )
+        conn.execute("PRAGMA user_version = 29")
+        conn.commit()
+
+        apply_schema(conn)  # the in-place upgrade
+
+        assert "release_mbid" not in _columns(conn, "musicbrainz_release_group_cache")
+        assert _columns(conn, "musicbrainz_recording_cache") == [
+            "request_key",
+            "found",
+            "album_title",
+            "fetched_at",
+        ]
+        group = conn.execute("SELECT * FROM musicbrainz_release_group_cache").fetchall()
+        assert group == [
+            ("rg-k", 1, "Paranoid", "1970-09-18", "rg-1", "2026-10-03T00:00:00+00:00"),
+        ]
+        recording = conn.execute("SELECT * FROM musicbrainz_recording_cache").fetchall()
+        assert recording == [("rec-k", 1, "Paranoid", "2026-10-03T00:00:00+00:00")]
+    finally:
+        conn.close()
+
+
+def test_v30_ledger_gains_file_pictures_keeping_its_files() -> None:
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.execute("PRAGMA foreign_keys=ON")
+        apply_schema(conn)
+        file_id = _insert_file(conn)
+        conn.execute("DROP INDEX idx_file_pictures_sha256")
+        conn.execute("DROP TABLE file_pictures")
+        conn.execute("PRAGMA user_version = 30")
+        conn.commit()
+
+        apply_schema(conn)  # the in-place upgrade
+
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        assert _columns(conn, "file_pictures") == [
+            "file_id",
+            "ordinal",
+            "picture_type",
+            "mime",
+            "description",
+            "size_bytes",
+            "sha256",
+        ]
+        indexes = {str(row[1]) for row in conn.execute("PRAGMA index_list(file_pictures)")}
+        assert "idx_file_pictures_sha256" in indexes
+        assert conn.execute("SELECT id FROM files").fetchall() == [(file_id,)]
+        conn.execute(
+            "INSERT INTO file_pictures VALUES (?, 0, 3, 'image/jpeg', '', 4, 'abc')",
+            (file_id,),
+        )
+        conn.execute("DELETE FROM files WHERE id = ?", (file_id,))
+        assert conn.execute("SELECT COUNT(*) FROM file_pictures").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_v31_ledger_gains_picture_writes_staged_keeping_its_files() -> None:
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.execute("PRAGMA foreign_keys=ON")
+        apply_schema(conn)
+        file_id = _insert_file(conn)
+        conn.execute("DROP TABLE picture_writes_staged")
+        conn.execute("PRAGMA user_version = 31")
+        conn.commit()
+
+        apply_schema(conn)  # the in-place upgrade
+
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        assert _columns(conn, "picture_writes_staged") == [
+            "file_id",
+            "sha256",
+            "ordinal",
+            "picture_type",
+            "mime",
+            "description",
+            "attributes",
+            "content",
+            "size_bytes",
+            "origin",
+            "note",
+            "staged_at",
+        ]
+        assert conn.execute("SELECT id FROM files").fetchall() == [(file_id,)]
+        conn.execute(
+            "INSERT INTO picture_writes_staged VALUES "
+            "(?, 'abc', 0, 3, 'image/jpeg', '', '{}', x'00', 1, 'manual', NULL, 'now')",
+            (file_id,),
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="UNIQUE"):
+            conn.execute(
+                "INSERT INTO picture_writes_staged VALUES "
+                "(?, 'abc', 1, 3, 'image/jpeg', '', '{}', x'00', 1, 'manual', NULL, 'now')",
+                (file_id,),
+            )
+    finally:
+        conn.close()
+
+
+_INSERT_PICTURE_WRITE = (
+    "INSERT INTO picture_writes (commit_id, created_at, origin, action, file_id, version, path, "
+    "sha256, ordinal, mime, description, attributes, content, size_bytes) "
+    "VALUES (1, 'now', 'manual', ?, ?, ?, '/lib/a.flac', 'abc', 0, 'image/jpeg', '', '{}', "
+    "x'00', 1)"
+)
+
+
+def test_v32_ledger_gains_the_append_only_picture_writes_keeping_its_files() -> None:
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.execute("PRAGMA foreign_keys=ON")
+        apply_schema(conn)
+        file_id = _insert_file(conn)
+        conn.execute("DROP TABLE picture_writes")
+        conn.execute("PRAGMA user_version = 32")
+        conn.commit()
+        assert "picture_writes" not in _table_names(conn)
+
+        apply_schema(conn)  # the in-place upgrade
+
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        assert conn.execute("SELECT id FROM files").fetchall() == [(file_id,)]
+        assert {
+            "idx_picture_writes_commit_id",
+            "idx_picture_writes_file_id_version",
+        } <= _schema_objects(conn, "index")
+        assert {"picture_writes_no_update", "picture_writes_no_delete"} <= _schema_objects(
+            conn, "trigger"
+        )
+        conn.execute(
+            "INSERT INTO commits (created_at, origin, status) VALUES ('now', 'manual', 'applied')"
+        )
+        conn.execute(_INSERT_PICTURE_WRITE, ("remove", file_id, 1))
+        with pytest.raises(sqlite3.IntegrityError, match="UNIQUE"):
+            conn.execute(_INSERT_PICTURE_WRITE, ("restore", file_id, 1))
+        with pytest.raises(sqlite3.IntegrityError, match="CHECK"):
+            conn.execute(_INSERT_PICTURE_WRITE, ("rename", file_id, 2))
+        with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+            conn.execute("UPDATE picture_writes SET note = 'rewritten'")
+        with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+            conn.execute("DELETE FROM files WHERE id = ?", (file_id,))
+        assert conn.execute("SELECT action, version FROM picture_writes").fetchall() == [
+            ("remove", 1),
+        ]
     finally:
         conn.close()

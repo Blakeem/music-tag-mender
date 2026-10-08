@@ -10,65 +10,31 @@ from __future__ import annotations
 
 from tagmend.engine import parsing
 
-# --- folder: Artist - Year - Album --------------------------------------------------
+# --- folder: Artist - Year - Album, then Artist - Album ----------------------------
 
 
-def test_parse_artist_year_album_bradley_nowell() -> None:
-    parsed = parsing.parse_artist_year_album("Sublime - 1998 - Acoustic Bradley Nowell and Friends")
-    assert parsed is not None
-    assert parsed.artist == "Sublime"
-    assert parsed.year == "1998"
-    assert parsed.album == "Acoustic Bradley Nowell and Friends"
+def test_parse_folder_reads_the_album_after_the_year() -> None:
+    album = parsing.parse_folder("Sublime - 1998 - Acoustic Bradley Nowell and Friends")
+    assert album == "Acoustic Bradley Nowell and Friends"
 
 
-def test_parse_artist_year_album_rejects_non_year_middle() -> None:
-    # A two-field name has no year in the middle -> the year pattern must not match.
-    assert parsing.parse_artist_year_album("Sublime - Sinsemilla") is None
+def test_parse_folder_reads_a_non_year_middle_as_part_of_the_album() -> None:
     # A middle token that is not a 1900/2000-era year is not a year.
-    assert parsing.parse_artist_year_album("Sublime - 1899 - Old") is None
-
-
-# --- folder: Artist - Album ---------------------------------------------------------
-
-
-def test_parse_artist_album_two_field() -> None:
-    parsed = parsing.parse_artist_album("Sublime - Sinsemilla")
-    assert parsed is not None
-    assert parsed.artist == "Sublime"
-    assert parsed.album == "Sinsemilla"
-    assert parsed.year is None
-
-
-def test_parse_artist_album_youtube_is_only_a_regex_hit() -> None:
-    # "Maphra - YouTube" parses structurally; corroboration (elsewhere) is what rejects it.
-    parsed = parsing.parse_artist_album("Maphra - YouTube")
-    assert parsed is not None
-    assert parsed.artist == "Maphra"
-    assert parsed.album == "YouTube"
-
-
-def test_parse_artist_album_keeps_separators_in_album() -> None:
-    parsed = parsing.parse_artist_album("Sublime - Misc LIVE+Acoustic+Extras")
-    assert parsed is not None
-    assert parsed.artist == "Sublime"
-    assert parsed.album == "Misc LIVE+Acoustic+Extras"
-
-
-# --- parse_folder: year first, then plain -------------------------------------------
-
-
-def test_parse_folder_prefers_year_pattern() -> None:
-    parsed = parsing.parse_folder("Sublime - 1998 - Acoustic Bradley Nowell and Friends")
-    assert parsed is not None
-    assert parsed.year == "1998"
-    assert parsed.album == "Acoustic Bradley Nowell and Friends"
+    assert parsing.parse_folder("Sublime - 1899 - Old") == "1899 - Old"
 
 
 def test_parse_folder_falls_back_to_two_field() -> None:
-    parsed = parsing.parse_folder("Sublime - Sinsemilla")
-    assert parsed is not None
-    assert parsed.year is None
-    assert parsed.album == "Sinsemilla"
+    assert parsing.parse_folder("Sublime - Sinsemilla") == "Sinsemilla"
+
+
+def test_parse_folder_youtube_is_only_a_regex_hit() -> None:
+    # "Maphra - YouTube" parses structurally. Corroboration (elsewhere) is what rejects it.
+    assert parsing.parse_folder("Maphra - YouTube") == "YouTube"
+
+
+def test_parse_folder_keeps_separators_in_album() -> None:
+    album = parsing.parse_folder("Sublime - Misc LIVE+Acoustic+Extras")
+    assert album == "Misc LIVE+Acoustic+Extras"
 
 
 def test_parse_folder_junk_names_return_none() -> None:
@@ -85,8 +51,6 @@ def test_parse_filename_track_strips_extension_and_splits() -> None:
         "Sublime - Acoustic Bradley Nowell and Friends - 01 - Waiting for Bud.mp3",
     )
     assert parsed is not None
-    assert parsed.artist == "Sublime"
-    assert parsed.album == "Acoustic Bradley Nowell and Friends"
     assert parsed.track == "01"
     assert parsed.title == "Waiting for Bud"
 

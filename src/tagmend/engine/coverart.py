@@ -6,10 +6,10 @@
 archive.org, so every request follows redirects.
 
 Each listing answer is cached in ``coverart_cache`` under a request hash carrying its own version
-token. A found listing never expires. A not-found answer (a 404, or a listing with no approved
-front) is served for 7 days only, because CAA gains art over time. A failure raises
-:class:`CoverArtError` and is never cached. Images are not cached. The User-Agent names the
-project and never a person.
+token. A found listing never expires. A not-found answer (a 404, a 400 for an id that is no UUID,
+or a listing with no approved front) is served for 7 days only, because CAA gains art over time.
+Any other failure raises :class:`CoverArtError` and is never cached. Images are not cached. The
+User-Agent names the project and never a person.
 """
 
 from __future__ import annotations
@@ -23,7 +23,11 @@ from typing import TYPE_CHECKING, Final, Literal, Protocol, Self, cast
 
 from tagmend.config import PROJECT_URL, build_user_agent
 from tagmend.engine import clock
-from tagmend.engine.lookup_clients import PacedHttp, Retry, decode_object
+from tagmend.engine.lookup_clients import (
+    PacedHttp,
+    decode_object,
+    retry_throttle_or_server_error,
+)
 from tagmend.engine.store import get_cached_coverart, put_cached_coverart
 from tagmend.engine.validation import require_choice
 from tagmend.log import get_logger
@@ -52,8 +56,8 @@ _LISTING_VERSION: Final = "1"
 _NOT_FOUND_TTL: Final = timedelta(days=7)
 _HTTP_OK: Final = 200
 _HTTP_NOT_FOUND: Final = 404
-_HTTP_TOO_MANY_REQUESTS: Final = 429
-_HTTP_SERVER_ERROR: Final = 500
+# CAA answers 400 only when the id is no UUID, so that answer is as final as a 404.
+_HTTP_BAD_REQUEST: Final = 400
 
 
 class CoverArtError(RuntimeError):
@@ -77,6 +81,9 @@ class CoverArtSource(Protocol):
 
     def front_image(self, kind: CoverArtKind, mbid: str) -> CoverArtFront | None:
         """Return the first approved front CAA holds for *mbid*, or ``None``."""
+
+    def has_cached_listing(self, kind: CoverArtKind, mbid: str) -> bool:
+        """Return whether :meth:`front_image` answers *kind*/*mbid* without a request."""
 
     def fetch_image(self, url: str) -> bytes:
         """Return the body of the image at *url*."""
@@ -134,18 +141,25 @@ class CoverArtClient:
         """Return the first approved front CAA holds for *mbid*, or ``None`` when it holds none.
 
         *kind* is ``release`` or ``release-group``. The cache answers first, else one paced
-        request. A 404 or a listing with no approved front is cached as not-found. Any other
+        request. A 404, a 400 or a listing with no approved front is cached as not-found. Any other
         failure raises :class:`CoverArtError` and caches nothing.
         """
-        require_choice("kind", kind, _KINDS)
-        request_key = _request_key(kind, mbid)
-
-        row = get_cached_coverart(self._conn, request_key)
-        hit, front = _read_cached(kind, mbid, row, clock.utc_now())
+        hit, front = self._cached(kind, mbid)
         if hit:
             return front
 
-        return self._fetch_and_cache(kind, mbid, request_key)
+        return self._fetch_and_cache(kind, mbid, _request_key(kind, mbid))
+
+    def has_cached_listing(self, kind: CoverArtKind, mbid: str) -> bool:
+        """Return whether :meth:`front_image` answers *kind*/*mbid* from the cache, found or not."""
+        hit, _ = self._cached(kind, mbid)
+        return hit
+
+    def _cached(self, kind: CoverArtKind, mbid: str) -> tuple[bool, CoverArtFront | None]:
+        """Return ``(hit, front)`` from the cache for the *kind* listing of *mbid*."""
+        require_choice("kind", kind, _KINDS)
+        row = get_cached_coverart(self._conn, _request_key(kind, mbid))
+        return _read_cached(kind, mbid, row, clock.utc_now())
 
     def fetch_image(self, url: str) -> bytes:
         """Return the body of the image at *url*, following redirects.
@@ -179,10 +193,13 @@ class CoverArtClient:
         return front
 
     def _request_listing(self, kind: CoverArtKind, mbid: str) -> dict[str, object] | None:
-        """GET the listing of *mbid*, or ``None`` on a 404, which means CAA holds no art for it."""
+        """GET the listing of *mbid*, or ``None`` when CAA holds no art for it, a 404 or a 400."""
         what = f"{kind} {mbid} listing"
         logger.debug("coverart listing request kind=%s mbid=%r", kind, mbid)
         response = self._send(f"{_API_URL}/{kind}/{mbid}/", what)
+        if response.status_code == _HTTP_BAD_REQUEST:
+            logger.info("coverart: CAA rejects %s id %r as no UUID", kind, mbid)
+            return None
         if response.status_code == _HTTP_NOT_FOUND:
             return None
         if response.status_code != _HTTP_OK:
@@ -195,20 +212,12 @@ class CoverArtClient:
         return self._http.send(
             # httpx follows no redirect by default, and CAA redirects every answer to archive.org.
             lambda client: client.get(url, follow_redirects=True),
-            verdict=_retry_verdict,
+            verdict=retry_throttle_or_server_error,
             error=lambda failure, attempts: CoverArtError(
                 f"{_SOURCE} {failure} after {attempts} attempt(s) for {what}",
             ),
             label=f"coverart {what}",
         )
-
-
-def _retry_verdict(response: httpx.Response) -> httpx.Response | Retry:
-    """Retry a throttle or a server fault and hand every other response back."""
-    status = response.status_code
-    if status == _HTTP_TOO_MANY_REQUESTS or status >= _HTTP_SERVER_ERROR:
-        return Retry(f"HTTP {status}")
-    return response
 
 
 def _request_key(kind: CoverArtKind, mbid: str) -> str:

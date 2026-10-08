@@ -44,14 +44,16 @@ Design notes (the spec):
 * **Name/id disagreement (held, not staged):** a name MusicBrainz records under neither its
   canonical form nor an alias for the file's own id, or a value the library pairs with two
   different ids, lands in ``name_id_disagreement`` for review.
-* **The file rule:** the selection is the first ``limit`` files that derive ``pending`` on
-  :data:`tagmend.engine.axis.ARTIST_AXIS`. Every unguarded name value on them is resolved, each
-  correction is cascade-staged on every in-scope carrier (present, not ``manual``, not
-  multi-value), and each selected file records its highest-ranked value outcome: a multi-value
-  file, a ``feat`` credit, a value with no correction or a held value records ``no_match``, a
-  lookup error records nothing, anything else records ``done``. An unselected carrier gets
-  no row. MusicBrainz results live in ``musicbrainz_artist_cache`` and getCorrection results in
-  ``lastfm_correction_cache``.
+* **The file rule:** the selection is the files that derive ``pending`` on
+  :data:`tagmend.engine.axis.ARTIST_AXIS`, in id order, until ``limit`` of them settle. Every
+  unguarded name value on them is resolved, each correction is cascade-staged on every in-scope
+  carrier (present, not ``manual``, not multi-value), and each selected file records its
+  highest-ranked value outcome: a multi-value file, a ``feat`` credit, a value with no
+  correction or a held value records ``no_match``, a lookup error records nothing, anything else
+  records ``done``. A file staging refuses or whose lookup fails settles nothing, so the next
+  pending files refill the selection until a lookup outlasts every retry. An unselected carrier
+  gets no row. MusicBrainz results live in ``musicbrainz_artist_cache`` and getCorrection
+  results in ``lastfm_correction_cache``.
 
 Like the rest of the conn-owning layer, the public function here owns its connection and
 commits; the building blocks in :mod:`tagmend.engine.store` never commit.
@@ -61,11 +63,13 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from contextlib import ExitStack
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Final, TypedDict
+from typing import TYPE_CHECKING, Final, Self, TypedDict
 
 from tagmend.engine import (
     axis,
+    axis_resolver,
     clock,
     db,
     ledger_lock,
@@ -74,8 +78,17 @@ from tagmend.engine import (
     staging,
     store,
 )
-from tagmend.engine.lastfm import LastfmClient, LastfmError, LastfmKeyError
-from tagmend.engine.musicbrainz import MusicBrainzClient, MusicBrainzError
+from tagmend.engine.lastfm import (
+    LastfmClient,
+    LastfmError,
+    LastfmKeyError,
+    LastfmUnavailableError,
+)
+from tagmend.engine.musicbrainz import (
+    MusicBrainzClient,
+    MusicBrainzError,
+    MusicBrainzUnavailableError,
+)
 from tagmend.engine.serialize import FieldDict
 from tagmend.engine.text_keys import artist_name_key
 from tagmend.engine.validation import check_limit
@@ -259,7 +272,11 @@ class _Tally:
     """Mutable accumulator for one ``resolve_artists`` run, frozen into the result at end."""
 
     settled: int = 0
-    staged_files: int = 0
+    staged_file_ids: set[int] = field(default_factory=set)
+    # Every value an earlier batch resolved, held, guarded or failed, so no batch asks again.
+    seen_values: set[str] = field(default_factory=set)
+    lookup_failed: bool = False
+    unavailable: bool = False
     skipped_multi_artist: int = 0
     skipped_sentinel: int = 0
     multi_artist_files: list[int] = field(default_factory=list)
@@ -292,15 +309,17 @@ def resolve_artists(  # noqa: PLR0913 - cohesive keyword-only scope + injection 
     """Normalize artist names: look up canonical forms and cascade-stage the changes.
 
     Scope is *file_ids* when given, else every file carrying *value* as ``artist`` or
-    ``albumartist``, else the whole library. The selection is the first *limit* (default
-    ``artist_stage_limit``) present files in scope that derive ``pending`` on the artist axis.
-    ``more`` is true when files settled and pending files in scope lie past the selection, and
-    false on a dry run. Every distinct ``artist``, ``albumartist`` and ``artists`` element value
-    on them is resolved except the guarded ones (empty / ``feat.`` / compilation sentinels). A
-    value whose files carry its own MBID is looked up by that id on MusicBrainz via *mb_client*
-    first. Every value left over is looked up on Last.fm getCorrection via *client*. Both tiers
-    are cached and paced, and together they build a ``value → correction`` map of the values
-    that actually change.
+    ``albumartist``, else the whole library. The selection is the present files in scope that
+    derive ``pending`` on the artist axis, in id order, until *limit* (default
+    ``artist_stage_limit``) of them settle. A file staging refuses or whose lookup fails settles
+    nothing, so the call reads past it until a lookup outlasts every retry. ``more`` is true
+    when files settled and pending files in scope lie past the selection, and false on a dry
+    run. Every distinct ``artist``, ``albumartist`` and ``artists`` element value on the
+    selection is resolved except the guarded ones (empty / ``feat.`` / compilation sentinels).
+    A value whose files carry its own MBID is looked up by that id on MusicBrainz via
+    *mb_client* first. Every value left over is looked up on Last.fm getCorrection via *client*.
+    Both tiers are cached and paced, and together they build a ``value → correction`` map of
+    the values that actually change.
 
     Each correction is then staged as an ``origin='auto'`` change on every in-scope carrier: a
     present file that is not ``manual`` and not multi-value. Each corrected field writes its own
@@ -310,7 +329,8 @@ def resolve_artists(  # noqa: PLR0913 - cohesive keyword-only scope + injection 
     file, a ``feat`` credit, a value with no correction or a held value, nothing for a lookup
     error or a file that cannot be staged (the file stays ``pending``), ``done`` otherwise. An
     unselected carrier gets no row. A rejected Last.fm key raises :class:`LastfmKeyError` and
-    stops the call.
+    stops the call. A raise from a later batch keeps what the earlier batches staged and
+    recorded.
 
     *dry_run* returns the proposed ``value → canonical`` mappings and the would-settle and
     would-stage counts and writes nothing. Lookups still run. A cached answer costs nothing and
@@ -328,6 +348,7 @@ def resolve_artists(  # noqa: PLR0913 - cohesive keyword-only scope + injection 
     tally = _Tally()
     pending_remaining = 0
     past_selection = 0
+    all_attempted = True
 
     connection = db.connect(settings.db_path)
     try:
@@ -344,27 +365,21 @@ def resolve_artists(  # noqa: PLR0913 - cohesive keyword-only scope + injection 
             file_ids=file_ids,
         )
         pending = store.pending_file_ids(connection, axis.ARTIST_AXIS, scoped_ids)
-        selected = pending[:effective_limit]
-        if selected:
-            carriers = _carriers(connection, scoped_ids)
-            values = _distinct_values(connection, selected, tally)
-            if values:
-                pairing = _value_mbids(connection, carriers)
-                unresolved = _resolve_by_mbid(
-                    settings,
-                    connection,
-                    values,
-                    pairing,
-                    mb_client,
-                    tally,
-                )
-                if unresolved:
-                    _resolve_values(settings, connection, unresolved, client, tally)
-            _stage_files(settings, connection, carriers, tally, dry_run=dry_run)
-            _settle_selected(connection, selected, tally, dry_run=dry_run)
+        with _Sources(settings, connection, lastfm=client, musicbrainz=mb_client) as sources:
+            attempted = _settle_pending(
+                settings,
+                connection,
+                scoped_ids,
+                pending,
+                effective_limit,
+                sources,
+                tally,
+                dry_run=dry_run,
+            )
         remaining = store.pending_file_ids(connection, axis.ARTIST_AXIS, scoped_ids)
         pending_remaining = len(remaining)
-        past_selection = len(set(remaining) - set(selected))
+        past_selection = len(set(remaining) - set(pending[:attempted]))
+        all_attempted = past_selection == 0
     finally:
         connection.close()
 
@@ -372,15 +387,120 @@ def resolve_artists(  # noqa: PLR0913 - cohesive keyword-only scope + injection 
         tally,
         pending_remaining=pending_remaining,
         past_selection=past_selection,
+        all_attempted=all_attempted,
         dry_run=dry_run,
     )
+
+
+def _settle_pending(  # noqa: PLR0913 - cohesive orchestration inputs
+    settings: Settings,
+    conn: sqlite3.Connection,
+    scoped_ids: list[int],
+    pending: list[int],
+    effective_limit: int,
+    sources: _Sources,
+    tally: _Tally,
+    *,
+    dry_run: bool,
+) -> int:
+    """Settle up to *effective_limit* of *pending* in id order. Return how many were attempted.
+
+    A refused file or a failed lookup settles nothing, so the next pending ids refill the call,
+    else files that fail on every call would fill the front of the id order. Only an unavailable
+    service stops the refill, so an outage does not walk the whole library. Each batch looks up
+    only the values no earlier batch saw. A raise from a later batch keeps what the earlier
+    batches staged and recorded.
+    """
+    attempted = 0
+    index: _CarrierIndex | None = None
+
+    while attempted < len(pending) and tally.settled < effective_limit:
+        if tally.unavailable:
+            break
+        batch = pending[attempted : attempted + effective_limit - tally.settled]
+        attempted += len(batch)
+        values = _distinct_values(conn, batch, tally)
+        if values:
+            if index is None:
+                index = _index_carriers(conn, scoped_ids)
+            corrected_before = set(tally.corrections)
+            unresolved = _resolve_by_mbid(values, index.pairing, sources, tally)
+            if unresolved:
+                _resolve_values(unresolved, sources, tally)
+            corrected_now = set(tally.corrections) - corrected_before
+            _stage_files(settings, conn, index.holders, corrected_now, tally, dry_run=dry_run)
+        _settle_selected(conn, batch, tally, dry_run=dry_run)
+    return attempted
+
+
+class _Sources:
+    """The two tiers' lookup clients, each built on first use and closed when the call ends.
+
+    A tier no value reaches builds no client, so a call that asks Last.fm nothing needs no key.
+    One client serves every batch, so its pacing spans the entire call.
+    """
+
+    def __init__(
+        self,
+        settings: Settings,
+        conn: sqlite3.Connection,
+        *,
+        lastfm: CorrectionSource | None,
+        musicbrainz: MBArtistSource | None,
+    ) -> None:
+        """Hold the injected clients. A missing one is built on its first use."""
+        self._settings = settings
+        self._conn = conn
+        self._injected_lastfm = lastfm
+        self._injected_musicbrainz = musicbrainz
+        self._lastfm: CorrectionSource | None = None
+        self._musicbrainz: MBArtistSource | None = None
+        self._stack = ExitStack()
+
+    def __enter__(self) -> Self:
+        """Return the sources. Nothing is built yet."""
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        """Close every client this call built."""
+        self._stack.close()
+
+    def lastfm(self) -> CorrectionSource:
+        """Return the Last.fm client, building it on the first call."""
+        if self._lastfm is None:
+            self._lastfm = self._stack.enter_context(
+                lookup_clients.injected_or_owned(
+                    self._injected_lastfm,
+                    lambda: LastfmClient.from_settings(self._settings, self._conn),
+                ),
+            )
+        return self._lastfm
+
+    def musicbrainz(self) -> MBArtistSource:
+        """Return the MusicBrainz client, building it on the first call."""
+        if self._musicbrainz is None:
+            self._musicbrainz = self._stack.enter_context(
+                lookup_clients.injected_or_owned(
+                    self._injected_musicbrainz,
+                    lambda: MusicBrainzClient.from_settings(self._settings, self._conn),
+                ),
+            )
+        return self._musicbrainz
+
+
+def _record_lookup_error(tally: _Tally, key: str, exc: Exception) -> None:
+    """Itemize a failed lookup under *key*, and flag an unavailable service to stop the refill."""
+    tally.error_items.append({"key": key, "message": str(exc)})
+    tally.lookup_failed = True
+    if isinstance(exc, LastfmUnavailableError | MusicBrainzUnavailableError):
+        tally.unavailable = True
 
 
 # --- carriers ------------------------------------------------------------------------
 
 
 def _carriers(conn: sqlite3.Connection, scoped_ids: list[int]) -> list[int]:
-    """Return the present, non-``manual`` files in scope: the ones a correction may stage on.
+    """Return the present, non-``manual`` files in scope, whose tags feed the carrier index.
 
     A ``manual`` file's values are a human decision, so no cascade rewrites them.
     """
@@ -406,10 +526,11 @@ def _distinct_values(
 ) -> list[str]:
     """Return the distinct, non-guarded ``artist``, ``albumartist`` and ``artists`` values.
 
-    Reads *selected*. Mutates *tally* with the sentinel/guard skip count. Order is stable
-    (first-seen).
+    Reads *selected* and skips every value an earlier batch saw. Adds each value it reads to
+    ``tally.seen_values`` and counts the guarded ones in ``tally.skipped_sentinel``. Order is
+    stable (first-seen).
     """
-    seen: set[str] = set()
+    seen = tally.seen_values
     ordered: list[str] = []
     for fid in selected:
         for value in _name_values(store.get_tags(conn, fid)):
@@ -423,29 +544,44 @@ def _distinct_values(
     return ordered
 
 
-# --- value -> MBID pairing -----------------------------------------------------------
+# --- the carrier index ---------------------------------------------------------------
 
 
-def _value_mbids(
-    conn: sqlite3.Connection,
-    candidate_ids: list[int],
-) -> dict[str, set[str]]:
-    """Map each name value in scope to the set of MusicBrainz ids the library pairs with it.
+@dataclass(frozen=True, slots=True)
+class _CarrierIndex:
+    """The carriers in scope, read once per call by :func:`_index_carriers`."""
+
+    pairing: dict[str, set[str]]
+    """Each name value to the set of MusicBrainz ids the library pairs with it."""
+
+    holders: dict[str, list[int]]
+    """Each name value to the ids, ascending, of the carriers a correction of it stages on."""
+
+
+def _index_carriers(conn: sqlite3.Connection, scoped_ids: list[int]) -> _CarrierIndex:
+    """Read every carrier in scope once into its value pairing and its value holders.
 
     The pairing is per field (``artist`` with ``musicbrainz_artistid``, ``albumartist`` with
     ``musicbrainz_albumartistid``) and only from single-valued fields, where the value and the
     id unambiguously describe each other. An ``artists`` element pairs with the
     ``musicbrainz_artistid`` entry at its own index while the two lists align. An empty set
     means the value carries no id anywhere. A set larger than one means the library disagrees
-    with itself about who this is.
+    with itself about who this is. A multi-value file is listed under no value in ``holders``,
+    since one corrected value cannot say which of its names it replaces.
     """
     pairing: dict[str, set[str]] = {}
-    for fid in candidate_ids:
-        for name, mbid in _name_id_pairs(store.get_tags(conn, fid)):
+    holders: dict[str, list[int]] = {}
+    for fid in _carriers(conn, scoped_ids):
+        tags = store.get_tags(conn, fid)
+        for name, mbid in _name_id_pairs(tags):
             bucket = pairing.setdefault(name, set())
             if mbid:
                 bucket.add(mbid)
-    return pairing
+        if _is_multi_value(tags):
+            continue
+        for value in dict.fromkeys(_name_values(tags)):
+            holders.setdefault(value, []).append(fid)
+    return _CarrierIndex(pairing=pairing, holders=holders)
 
 
 def _name_id_pairs(tags: Mapping[str, list[str]]) -> list[tuple[str, str]]:
@@ -467,12 +603,10 @@ def _name_id_pairs(tags: Mapping[str, list[str]]) -> list[tuple[str, str]]:
 # --- the MusicBrainz name tier -------------------------------------------------------
 
 
-def _resolve_by_mbid(  # noqa: PLR0913 - cohesive scope + injection params, mirrors _resolve_values
-    settings: Settings,
-    conn: sqlite3.Connection,
+def _resolve_by_mbid(
     values: list[str],
     pairing: dict[str, set[str]],
-    client: MBArtistSource | None,
+    sources: _Sources,
     tally: _Tally,
 ) -> list[str]:
     """Settle every value whose files already carry an MBID; return the rest for Last.fm.
@@ -499,11 +633,7 @@ def _resolve_by_mbid(  # noqa: PLR0913 - cohesive scope + injection params, mirr
     settled = set(ambiguous)
     lookups = [value for value in with_ids if len(pairing[value]) == 1]
     if lookups:
-        with lookup_clients.injected_or_owned(
-            client,
-            lambda: MusicBrainzClient.from_settings(settings, conn),
-        ) as source:
-            settled |= _lookup_each(lookups, pairing, source, tally)
+        settled |= _lookup_each(lookups, pairing, sources.musicbrainz(), tally)
 
     return [value for value in values if value not in settled]
 
@@ -522,7 +652,7 @@ def _lookup_each(
             artist = client.artist_by_mbid(mbid)
         except MusicBrainzError as exc:
             logger.warning("musicbrainz artist error for mbid=%r: %s", mbid, exc)
-            tally.error_items.append({"key": value, "message": str(exc)})
+            _record_lookup_error(tally, value, exc)
             settled.add(value)
             continue
         if artist is None:
@@ -582,20 +712,11 @@ def _classify_against_mb(value: str, artist: MBArtist, tally: _Tally) -> None:
 # --- the Last.fm correction tier -----------------------------------------------------
 
 
-def _resolve_values(
-    settings: Settings,
-    conn: sqlite3.Connection,
-    values: list[str],
-    client: CorrectionSource | None,
-    tally: _Tally,
-) -> None:
-    """Look up each value's correction via *client* (built if None); fill ``tally.corrections``."""
-    with lookup_clients.injected_or_owned(
-        client,
-        lambda: LastfmClient.from_settings(settings, conn),
-    ) as source:
-        for value in values:
-            _resolve_one_value(value, source, tally)
+def _resolve_values(values: list[str], sources: _Sources, tally: _Tally) -> None:
+    """Look up each value's correction on Last.fm and fill ``tally.corrections``."""
+    client = sources.lastfm()
+    for value in values:
+        _resolve_one_value(value, client, tally)
 
 
 def _resolve_one_value(
@@ -620,7 +741,7 @@ def _resolve_one_value(
         raise
     except LastfmError as exc:
         logger.warning("last.fm correction error for value=%r: %s", value, exc)
-        tally.error_items.append({"key": value, "message": str(exc)})
+        _record_lookup_error(tally, value, exc)
         return
 
     if correction is None or _is_placeholder(correction.name):
@@ -646,27 +767,25 @@ def _resolve_one_value(
 # --- staging -------------------------------------------------------------------------
 
 
-def _stage_files(
+def _stage_files(  # noqa: PLR0913 - cohesive per-batch staging inputs
     settings: Settings,
     conn: sqlite3.Connection,
-    carriers: list[int],
+    holders: dict[str, list[int]],
+    corrected_now: set[str],
     tally: _Tally,
     *,
     dry_run: bool,
 ) -> None:
-    """Stage the accumulated name change(s) on every carrier, all in this one staging run.
+    """Stage every holder of a value in *corrected_now*, in id order, with every correction so far.
 
-    A multi-value file is never a carrier, since one corrected value cannot say which of its
-    names it replaces.
+    A carrier an earlier batch staged is staged again, which replaces its row, so its target
+    holds every correction of the call. A carrier staging refused is not tried again.
     """
-    if not tally.corrections:
-        return
-    for fid in carriers:
-        tags = store.get_tags(conn, fid)
-        if _is_multi_value(tags):
+    staging_ids = sorted({fid for value in corrected_now for fid in holders.get(value, [])})
+    for fid in staging_ids:
+        if fid in tally.failed_files:
             continue
-
-        target = _build_target(tags, tally.corrections)
+        target = _build_target(store.get_tags(conn, fid), tally.corrections)
         if target is None:
             continue
 
@@ -680,7 +799,7 @@ def _stage_files(
             tally.error_items.append({"key": f"file_id={fid}", "message": str(exc)})
             tally.failed_files.add(fid)
             continue
-        tally.staged_files += 1
+        tally.staged_file_ids.add(fid)
 
 
 def _is_multi_value(tags: dict[str, list[str]]) -> bool:
@@ -860,6 +979,7 @@ def _build_result(
     *,
     pending_remaining: int,
     past_selection: int,
+    all_attempted: bool,
     dry_run: bool,
 ) -> ResolveArtistsResult:
     """Freeze the run's tally + counts into the public :class:`ResolveArtistsResult`."""
@@ -875,7 +995,7 @@ def _build_result(
     ]
     return ResolveArtistsResult(
         settled=tally.settled,
-        staged_files=tally.staged_files,
+        staged_files=len(tally.staged_file_ids),
         corrected_values=len(tally.corrections),
         skipped_multi_artist=tally.skipped_multi_artist,
         skipped_sentinel=tally.skipped_sentinel,
@@ -897,18 +1017,28 @@ def _build_result(
             {**d, "mbids": list(d["mbids"])} for d in tally.name_id_disagreement_values
         ],
         error_items=list(tally.error_items),
-        summary=_summarize(tally, pending_remaining=pending_remaining, more=more, dry_run=dry_run),
+        summary=_summarize(
+            tally,
+            pending_remaining=pending_remaining,
+            all_attempted=all_attempted,
+            more=more,
+            dry_run=dry_run,
+        ),
     )
 
 
-def _summarize(tally: _Tally, *, pending_remaining: int, more: bool, dry_run: bool) -> str:
-    """Build a short, plain human summary of what settled and what is left.
-
-    A dry run records nothing, so its remainder is not resumable and is worded accordingly.
-    """
+def _summarize(
+    tally: _Tally,
+    *,
+    pending_remaining: int,
+    all_attempted: bool,
+    more: bool,
+    dry_run: bool,
+) -> str:
+    """Build a short, plain human summary of what settled and what is left."""
     parts = [
         f"Settled {tally.settled} file(s): {len(tally.corrections)} value(s) corrected, "
-        f"staged {tally.staged_files} file(s).",
+        f"staged {len(tally.staged_file_ids)} file(s).",
         f"Multi-artist {tally.skipped_multi_artist} file(s), "
         f"sentinel/feat/empty {tally.skipped_sentinel} value(s), "
         f"{len(tally.already_canonical_values)} already canonical, "
@@ -917,18 +1047,13 @@ def _summarize(tally: _Tally, *, pending_remaining: int, more: bool, dry_run: bo
         f"needs review {len(tally.needs_review_values)}, "
         f"name/id disagreement {len(tally.name_id_disagreement_values)}.",
     ]
-    if dry_run:
-        parts.append(
-            f"A dry run records nothing, so {pending_remaining} file(s) in scope stay pending "
-            f"and an identical call previews the same files.",
-        )
-    elif more:
-        parts.append(f"{pending_remaining} file(s) still pending. Call again to continue.")
-    elif pending_remaining > 0:
-        parts.append(f"{pending_remaining} file(s) still pending.")
-    if tally.error_items:
-        parts.append(
-            f"{len(tally.error_items)} item(s) errored and their files stay pending. "
-            f"Re-run to retry.",
-        )
-    return " ".join(parts)
+    remainder = axis_resolver.remainder_parts(
+        pending_remaining=pending_remaining,
+        all_attempted=all_attempted,
+        more=more,
+        dry_run=dry_run,
+        lookup_failed=tally.lookup_failed,
+        unavailable=tally.unavailable,
+        errors=len(tally.error_items),
+    )
+    return " ".join([*parts, *remainder])

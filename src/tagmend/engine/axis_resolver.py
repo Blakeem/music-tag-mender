@@ -372,17 +372,40 @@ def _summarize[R](
     more: bool,
     dry_run: bool,
 ) -> str:
-    """Build a short, plain human summary of what settled and what is left.
+    """Build a short, plain human summary of what settled and what is left."""
+    settled = (
+        f"Settled {tally.settled} file(s): staged {tally.staged_files}, no_match {tally.no_match}."
+    )
+    remainder = remainder_parts(
+        pending_remaining=pending_remaining,
+        all_attempted=all_attempted,
+        more=more,
+        dry_run=dry_run,
+        lookup_failed=tally.lookup_failed,
+        unavailable=tally.unavailable,
+        errors=len(tally.error_items),
+    )
+    return " ".join([settled, *remainder])
+
+
+def remainder_parts(  # noqa: PLR0913 - the remainder facts every resolver summary words alike
+    *,
+    pending_remaining: int,
+    all_attempted: bool,
+    more: bool,
+    dry_run: bool,
+    lookup_failed: bool,
+    unavailable: bool,
+    errors: int,
+) -> list[str]:
+    """Word what a refilling resolver call left pending, for every resolver summary alike.
 
     A dry run records nothing, so its remainder is not resumable and is worded accordingly.
     Once every pending file was tried and no lookup failed, each file left is one staging
     refused, and the next call would refuse it again. Only an unavailable service is worth an
     immediate retry, since any other lookup error can recur on every call.
     """
-    errors = len(tally.error_items)
-    parts = [
-        f"Settled {tally.settled} file(s): staged {tally.staged_files}, no_match {tally.no_match}.",
-    ]
+    parts: list[str] = []
     if dry_run:
         parts.append(
             f"A dry run records nothing, so {pending_remaining} file(s) in scope stay pending "
@@ -390,15 +413,15 @@ def _summarize[R](
         )
     elif more:
         parts.append(f"{pending_remaining} file(s) still pending. Call again to continue.")
-    elif pending_remaining > 0 and all_attempted and not tally.lookup_failed:
+    elif pending_remaining > 0 and all_attempted and not lookup_failed:
         parts.append(
             f"{pending_remaining} file(s) still pending fail on every call. Fix each file, set "
             f"id3_droppable_frames, or scope the call by value or file_ids to skip them.",
         )
     elif pending_remaining > 0:
         parts.append(f"{pending_remaining} file(s) still pending.")
-    if tally.unavailable:
+    if unavailable:
         parts.append(f"{errors} item(s) errored and their files stay pending. Re-run to retry.")
     elif errors > 0:
         parts.append(f"{errors} item(s) errored and their files stay pending.")
-    return " ".join(parts)
+    return parts

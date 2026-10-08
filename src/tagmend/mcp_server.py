@@ -1881,8 +1881,9 @@ def resolve_genres(
     run is refused while anything is staged, since staging would replace that pending change.
     A Last.fm lookup error writes nothing, leaves that artist's files ``pending``, and is
     counted in ``errors`` and itemized in ``error_items`` (``{key, message}``, keyed by the
-    looked-up artist), so a re-run retries it. A rejected API key fails every lookup alike, so
-    it stops the call with ``{"ok": False, ...}`` instead.
+    looked-up artist), so a re-run retries it. A file staging refuses stays ``pending`` and is
+    itemized under the key ``file_id=<id>``. A rejected API key fails every lookup alike, so it
+    stops the call with ``{"ok": False, ...}`` instead.
 
     Args:
         value: Limit to files whose ``artist`` or ``albumartist`` tag equals this value.
@@ -1944,17 +1945,17 @@ def resolve_artists(
     and values whose MBID MusicBrainz does not know. Its gate is unchanged and stricter,
     because Last.fm has no id to anchor it (``source: lastfm``).
 
-    The selection is the first ``limit`` ``pending`` files in scope, and every name value on
-    them is resolved: ``artist``, ``albumartist`` and each element of the multi-value
-    ``artists`` list a library server builds its artist entities from. Where a value resolves,
-    the canonical name cascade-stages across every in-scope file carrying it (rewriting
-    ``artist``, ``albumartist`` and each equal ``artists`` element, exact-match only) plus that
-    field's OWN id field, as an ``auto`` change replacing ONLY those fields (every other managed
-    tag, incl. ``genre``, is preserved). An ``artists`` element is rewritten in place, keeping
-    the list's order and length, with its aligned ``musicbrainz_artistid`` entry. A ``manual``
-    file and a file whose ``artist`` or ``albumartist`` holds several values are never staged
-    on. Review with ``diff_tags`` and apply with ``commit_tags``.
-    ``revert_commit``/``revert_tags`` undo it.
+    The selection is the ``pending`` files in scope, in id order, until ``limit`` of them
+    settle, and every name value on them is resolved: ``artist``, ``albumartist`` and each
+    element of the multi-value ``artists`` list a library server builds its artist entities
+    from. Where a value resolves, the canonical name cascade-stages across every in-scope file
+    carrying it (rewriting ``artist``, ``albumartist`` and each equal ``artists`` element,
+    exact-match only) plus that field's OWN id field, as an ``auto`` change replacing ONLY those
+    fields (every other managed tag, incl. ``genre``, is preserved). An ``artists`` element is
+    rewritten in place, keeping the list's order and length, with its aligned
+    ``musicbrainz_artistid`` entry. A ``manual`` file and a file whose ``artist`` or
+    ``albumartist`` holds several values are never staged on. Review with ``diff_tags`` and
+    apply with ``commit_tags``. ``revert_commit``/``revert_tags`` undo it.
 
     Each file's status on this axis is ``pending``, ``staged``, ``done``, ``no_match``,
     ``manual`` or ``no_identity``. A ``done`` or ``no_match`` counts only while the identity and
@@ -1973,8 +1974,10 @@ def resolve_artists(
     ``no_correction``. A correction to a MusicBrainz special-purpose placeholder
     (``[unknown]``, ``[no artist]``, …) is treated as no correction. A lookup error is
     counted in ``errors`` and itemized in ``error_items`` (``{key, message}``, keyed by the
-    value). A rejected Last.fm API key fails every lookup alike, so it stops the call with
-    ``{"ok": False, ...}`` instead.
+    value). A file staging refuses stays ``pending`` and is itemized under the key
+    ``file_id=<id>``. A rejected Last.fm API key fails every lookup alike, so it stops the call
+    with ``{"ok": False, ...}`` instead. A call stopped after it read past refused or failed
+    files keeps what it staged and recorded before the stop, so ``diff_tags`` shows it.
 
     Three classes are **held**: reported so you can act on them, never staged.
     ``shrinks_credit_values`` are names whose canonical form is contained in the current
@@ -1991,8 +1994,9 @@ def resolve_artists(
         value: Limit to files whose ``artist`` or ``albumartist`` tag equals this value.
         file_ids: Limit to these specific file ids (overrides ``value``). An unknown id is
             refused.
-        limit: Max files to settle this call (default ``artist_stage_limit``). Call again
-            while ``more`` is true.
+        limit: Up to this many files settled this call (default ``artist_stage_limit``). A
+            file staging refuses or whose lookup fails does not count, so the call reads past
+            it until a lookup outlasts every retry. Call again while ``more`` is true.
         dry_run: Preview the ``value → canonical`` mappings and the would-settle and
             would-stage counts without writing anything. Lookups still run. A cached answer
             costs nothing and a cache miss makes a live request. A dry run skips the
@@ -2010,8 +2014,9 @@ def resolve_artists(
         API key).
         ``settled`` counts the selected files that left ``pending`` and ``staged_files`` every
         staged file, cascade included. ``pending_remaining`` recounts the present ``pending``
-        files in scope. ``more`` is true when files settled and pending files in scope lie
-        past the selection. It is false on a dry run.
+        files in scope. ``more`` is true when files settled and pending files in scope were
+        left unattempted (the limit was reached or an unavailable service stopped the call).
+        It is false on a dry run.
     """
     result = artists.resolve_artists(
         load_settings(),

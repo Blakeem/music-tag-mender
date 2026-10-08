@@ -1,6 +1,6 @@
 # TagMend Roadmap
 
-Updated 2026-10-04. This file lists only the remaining work, in order. `CLAUDE.md` maps what
+Updated 2026-10-07. This file lists only the remaining work, in order. `CLAUDE.md` maps what
 shipped. `PLAN.md` holds the design.
 
 The final run on a fresh copy of `E:\Music` is done. The working copy (`music/`) holds 11,162 files
@@ -67,13 +67,6 @@ The owner decides each one. TagMend never deletes a file.
   removed their wrong embedded pictures, their songs show it too. Each image shows the right
   album. Navidrome reads `cover.*` first, but `stage_covers` skips an album that shows a cover. So
   a larger front needs a hand write or a new stage option.
-- Artist page. `resolve_artists` stops at `artist_stage_limit` (300) files a call and does not
-  read past files staging refuses, as the other resolvers do. A page full of refused files repeats
-  on every call. The owner's `id3_droppable_frames` keeps this rare. The fix candidate ports the
-  refill.
-- Rebind candidates. A rebind folder's candidates rank without the disc and track totals the
-  convergence route now narrows by. So a one-file folder lists only 1-track singles, and a disc 1
-  folder lists the standard edition.
 
 ## 2. Copy promotion (B3)
 
@@ -118,7 +111,11 @@ command mirrors its MCP name with `-` for `_`.
   frames. A write that creates the first ID3v2 frame also leaves the ID3v1 comment out of ID3v2,
   so Navidrome stops showing it.
 - L25: the reader does not read Vorbis `TRACKTOTAL` or `DISCTOTAL`, so the song convergence
-  route sees a FLAC's totals only when `tracknumber` itself holds `n/N`.
+  route sees a FLAC's totals only when `tracknumber` itself holds `n/N`. A release stamp also
+  leaves those fields as they were. The live library holds 10 FLACs with no release id whose
+  totals live only there, and all 10 are settled. 47 FLACs in 6 folders hold a `TRACKTOTAL` that
+  differs from their tagged release, such as The Postal Service "Give Up" with 10 and 15 against
+  12.
 - L24: a release stamp clears a file's ISRC that MusicBrainz does not list for its track, unless
   the file already carries the stamped recording's id. So a file with no MusicBrainz ids loses its
   label ISRC. Stamps in commits 3 to 168 cleared 125 well-formed ISRCs. Some of those files moved

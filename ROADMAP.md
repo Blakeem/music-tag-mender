@@ -116,6 +116,9 @@ command mirrors its MCP name with `-` for `_`.
   totals live only there, and all 10 are settled. 47 FLACs in 6 folders hold a `TRACKTOTAL` that
   differs from their tagged release, such as The Postal Service "Give Up" with 10 and 15 against
   12.
+- L26: `resolve_songs` ends its summary with "Re-run to retry" for every errored file. A stored
+  fpcalc failure and a row with no signature are not retried by a re-run. So the two live files
+  fpcalc cannot decode (6466 and 9616) get that advice on every call.
 - L24: a release stamp clears a file's ISRC that MusicBrainz does not list for its track, unless
   the file already carries the stamped recording's id. So a file with no MusicBrainz ids loses its
   label ISRC. Stamps in commits 3 to 168 cleared 125 well-formed ISRCs. Some of those files moved
